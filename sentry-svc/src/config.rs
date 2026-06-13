@@ -7,7 +7,6 @@ pub struct Config {
     pub api: ApiConfig,
     pub monitoring: MonitoringConfig,
     pub persistence: PersistenceConfig,
-    pub logging: LoggingConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -43,11 +42,6 @@ pub struct MonitoringConfig {
 #[derive(Debug, Deserialize)]
 pub struct PersistenceConfig {
     pub audit_db: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LoggingConfig {
-    pub level: String,
 }
 
 /// Resolve a path relative to the executable's directory (not cwd).

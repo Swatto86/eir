@@ -5,7 +5,6 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::watch;
 use tracing::{info, warn};
 
 const RING_SIZE: usize = 50;
@@ -20,6 +19,8 @@ pub const TEXT_EXTENSIONS: &[&str] = &[
 pub type SharedChanges = Arc<Mutex<VecDeque<FileChange>>>;
 /// Send new directories to the running watcher thread after startup.
 pub type DirUpdateSender = std::sync::mpsc::Sender<PathBuf>;
+/// Dropping this handle signals the watcher thread to exit.
+pub type ShutdownHandle = std::sync::mpsc::SyncSender<()>;
 
 // ── Log parsing ───────────────────────────────────────────────────────────────
 
@@ -133,12 +134,14 @@ fn has_recent_log_files(dir: &Path, cutoff: SystemTime, max_depth: usize) -> boo
 
 /// Start the file-watch background thread watching `directories`.
 ///
-/// Returns a `DirUpdateSender` that the caller can use to add new directories
-/// at runtime (e.g. from periodic re-discovery in the main loop).
-pub fn spawn(directories: Vec<PathBuf>) -> (SharedChanges, watch::Sender<()>, DirUpdateSender) {
+/// Returns a `ShutdownHandle` — dropping it signals the thread to exit — and a
+/// `DirUpdateSender` for adding new directories at runtime.
+pub fn spawn(directories: Vec<PathBuf>) -> (SharedChanges, ShutdownHandle, DirUpdateSender) {
     let shared: SharedChanges = Arc::new(Mutex::new(VecDeque::new()));
     let shared_clone = shared.clone();
-    let (shutdown_tx, _shutdown_rx) = watch::channel(());
+    // SyncSender with cap 0: never blocks on send; drops when caller drops the handle,
+    // causing try_recv in the thread to return Disconnected → thread exits.
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel::<()>(0);
     let (dir_tx, dir_rx) = std::sync::mpsc::channel::<PathBuf>();
 
     if directories.is_empty() {
@@ -171,7 +174,7 @@ pub fn spawn(directories: Vec<PathBuf>) -> (SharedChanges, watch::Sender<()>, Di
         let mut watcher = watcher;
         let mut watched_dirs = watched;
 
-        loop {
+        while let Err(std::sync::mpsc::TryRecvError::Empty) = shutdown_rx.try_recv() {
             // Check for directories added by the main loop's re-discovery
             while let Ok(new_dir) = dir_rx.try_recv() {
                 if watched_dirs.contains(&new_dir) || !new_dir.exists() {

@@ -1,6 +1,6 @@
 use crate::models::EventLogEntry;
 use chrono::{DateTime, Utc};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -39,24 +39,30 @@ fn level_name(event_type: REPORT_EVENT_TYPE) -> Option<&'static str> {
     }
 }
 
-fn read_channel(channel: &str) -> Vec<EventLogEntry> {
+/// Read entries newer than `last_record` from a single event log channel.
+/// Returns the new entries (newest first) and the highest record number seen.
+/// On first call pass `last_record = 0` to prime the cursor without returning entries,
+/// or any prior max to receive only genuinely new events.
+fn read_channel_since(channel: &str, last_record: u32) -> (Vec<EventLogEntry>, u32) {
     let channel_w = wide(channel);
     let handle = match unsafe { OpenEventLogW(PCWSTR::null(), PCWSTR(channel_w.as_ptr())) } {
         Ok(h) => h,
         Err(e) => {
             warn!("Failed to open event log channel {channel}: {e}");
-            return vec![];
+            return (vec![], last_record);
         }
     };
 
     let mut entries = Vec::new();
     let mut buf = vec![0u8; 65536];
+    let mut new_max_record = last_record;
+    let mut done = false;
 
-    loop {
+    while !done {
         let mut bytes_read: u32 = 0;
         let mut min_bytes_needed: u32 = 0;
 
-        let ok = unsafe {
+        if unsafe {
             ReadEventLogW(
                 handle,
                 SEQUENTIAL_BACKWARDS,
@@ -66,15 +72,30 @@ fn read_channel(channel: &str) -> Vec<EventLogEntry> {
                 &mut bytes_read,
                 &mut min_bytes_needed,
             )
-        };
-
-        if ok.is_err() {
+        }
+        .is_err()
+        {
             break;
         }
 
         let mut offset = 0usize;
         while offset < bytes_read as usize {
             let record = unsafe { &*(buf.as_ptr().add(offset) as *const EVENTLOGRECORD) };
+
+            if record.Length == 0 {
+                done = true;
+                break;
+            }
+
+            // We read newest-first; stop once we reach records already delivered.
+            if last_record > 0 && record.RecordNumber <= last_record {
+                done = true;
+                break;
+            }
+
+            if record.RecordNumber > new_max_record {
+                new_max_record = record.RecordNumber;
+            }
 
             if let Some(level) = level_name(record.EventType) {
                 let source_ptr = unsafe {
@@ -101,22 +122,17 @@ fn read_channel(channel: &str) -> Vec<EventLogEntry> {
                 });
             }
 
-            if record.Length == 0 {
+            offset += record.Length as usize;
+
+            if entries.len() >= RING_SIZE {
+                done = true;
                 break;
             }
-            offset += record.Length as usize;
-        }
-
-        if entries.len() >= RING_SIZE {
-            break;
         }
     }
 
-    unsafe {
-        let _ = CloseEventLog(handle);
-    }
-    entries.truncate(RING_SIZE);
-    entries
+    unsafe { let _ = CloseEventLog(handle); }
+    (entries, new_max_record)
 }
 
 pub fn spawn(channels: Vec<String>, poll_interval_secs: u64) -> (SharedEntries, watch::Sender<()>) {
@@ -126,22 +142,37 @@ pub fn spawn(channels: Vec<String>, poll_interval_secs: u64) -> (SharedEntries, 
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(poll_interval_secs));
+        // Per-channel cursor: highest record number delivered so far.
+        // Initialised to 0 on first poll; after that only new records are returned.
+        let mut cursors: HashMap<String, u32> = HashMap::new();
+
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
                     let channels_clone = channels.clone();
-                    let new_entries = tokio::task::spawn_blocking(move || {
+                    let cursors_in = cursors.clone();
+
+                    let (new_entries, updated_cursors) = tokio::task::spawn_blocking(move || {
                         let mut all = VecDeque::new();
+                        let mut c = cursors_in;
                         for channel in &channels_clone {
-                            for e in read_channel(channel) {
+                            let last = *c.get(channel.as_str()).unwrap_or(&0);
+                            let (entries, new_last) = read_channel_since(channel, last);
+                            if new_last > last {
+                                c.insert(channel.clone(), new_last);
+                            }
+                            for e in entries {
                                 if all.len() >= RING_SIZE { break; }
                                 all.push_back(e);
                             }
                             if all.len() >= RING_SIZE { break; }
                         }
-                        all
-                    }).await.unwrap_or_default();
+                        (all, c)
+                    })
+                    .await
+                    .unwrap_or_default();
 
+                    cursors = updated_cursors;
                     let count = new_entries.len();
                     if let Ok(mut guard) = shared_clone.lock() {
                         *guard = new_entries;
