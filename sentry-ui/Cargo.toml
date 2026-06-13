@@ -1,0 +1,24 @@
+[package]
+name = "sentry-ui"
+version = "0.4.0"
+edition = "2021"
+authors = ["Swatto <claude.ai@swatto.co.uk>"]
+description = "Sentry system monitor — tray UI"
+license = "MIT"
+
+[[bin]]
+name = "sentry"
+path = "src/main.rs"
+
+[dependencies]
+sentry-proto = { path = "../sentry-proto" }
+tauri = { version = "2", features = ["tray-icon"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

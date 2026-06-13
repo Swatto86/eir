@@ -1,0 +1,46 @@
+[package]
+name = "sentry-svc"
+version = "0.4.0"
+edition = "2021"
+authors = ["Swatto <claude.ai@swatto.co.uk>"]
+description = "Sentry system monitor service — runs as LocalSystem"
+license = "MIT"
+
+[[bin]]
+name = "sentry-svc"
+path = "src/main.rs"
+
+[dependencies]
+sentry-proto = { path = "../sentry-proto" }
+windows = { version = "0.58", features = [
+    "Win32_System_EventLog",
+    "Win32_System_Com",
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_SystemInformation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_System_Wmi",
+    "Win32_Security",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_Storage_FileSystem",
+] }
+windows-service = "0.7"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["stream", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "sqlite", "migrate"] }
+chrono = { version = "0.4", features = ["serde"] }
+notify = "6"
+walkdir = "2"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+tokio-stream = "0.1"
+futures-util = "0.3"

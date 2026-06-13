@@ -24,11 +24,15 @@ jobs:
       - name: Cache Rust build artefacts
         uses: swatinem/rust-cache@v2
 
-      - name: Build installer and publish release
+      - name: Build service binary (sentry-svc.exe)
+        run: cargo build -p sentry-svc --release
+
+      - name: Build UI installer and publish release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          projectPath: sentry-ui
           tagName: ${{ github.ref_name }}
           releaseName: Sentry ${{ github.ref_name }}
           releaseBody: |
@@ -38,12 +42,28 @@ jobs:
             uses Claude AI to diagnose and fix problems automatically — service
             failures, disk pressure, log corruption, driver issues, and more.
 
-            ### Install
-            Download **`Sentry_${{ github.ref_name }}_x64-setup.exe`** and run it.
-            No administrator rights required (installs for the current user only).
+            ### Architecture
+            - **`sentry-svc.exe`** — Windows NT service (LocalSystem), handles all monitoring and repair
+            - **`sentry.exe`** — System tray UI, communicates with the service over a named pipe
 
-            ### First run
-            Copy `config.toml.example` to `config.toml` in the same folder as the
-            executable and fill in your API details before launching.
+            ### Install
+            1. Run **`Sentry_${{ github.ref_name }}_x64-setup.exe`** (requires administrator — installs for all users).
+            2. Place **`sentry-svc.exe`** in the Sentry install directory (same folder as `sentry.exe`).
+            3. Open an **Administrator** command prompt in that directory and run:
+               ```
+               sentry-svc.exe install
+               sc start SentrySvc
+               ```
+            4. Copy `config.toml.example` → `config.toml` in that directory and fill in your API key.
+            5. Launch **Sentry** from the Start Menu — the tray icon appears when connected.
           releaseDraft: true
           prerelease: false
+
+      - name: Upload service binary to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: target/release/sentry-svc.exe
+          asset_name: sentry-svc.exe
+          tag: ${{ github.ref }}
+          overwrite: true

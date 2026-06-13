@@ -1,13 +1,15 @@
 const invoke = window.__TAURI__.core.invoke;
 
 const STATUS_COLORS = {
-  Active:          'var(--green)',
-  Warning:         'var(--yellow)',
-  PendingApproval: 'var(--orange)',
-  Executing:       'var(--blue)',
-  Error:           'var(--red)',
-  Paused:          'var(--gray)',
-  Initializing:    'var(--gray)',
+  Active:               'var(--green)',
+  Warning:              'var(--yellow)',
+  PendingApproval:      'var(--orange)',
+  Executing:            'var(--blue)',
+  Error:                'var(--red)',
+  ServiceDisconnected:  'var(--red)',
+  Connecting:           'var(--gray)',
+  Paused:               'var(--gray)',
+  Initializing:         'var(--gray)',
 };
 
 // Hide on close (tray remains active)
@@ -55,6 +57,7 @@ function renderApproval(info) {
   const card = document.getElementById('approval-card');
   if (!info) { card.style.display = 'none'; return; }
 
+  card.dataset.approvalId = info.id;
   card.style.display = 'block';
   document.getElementById('approval-grid').innerHTML = `
     <span class="label">Diagnosis</span>  <span class="val">${esc(info.diagnosis)}</span>
@@ -147,8 +150,10 @@ async function togglePause() {
 }
 
 async function decide(approved) {
-  await invoke('decide_approval', { approved });
-  document.getElementById('approval-card').style.display = 'none';
+  const card = document.getElementById('approval-card');
+  const id = parseInt(card.dataset.approvalId ?? '0', 10);
+  await invoke('decide_approval', { id, approved });
+  card.style.display = 'none';
 }
 
 // Initial load + poll every 2 seconds
