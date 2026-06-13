@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, info};
 
 // ── Anthropic native request/response ────────────────────────────────────────
@@ -78,6 +79,11 @@ enum AiClientConfig {
         api_key: String,
         model: String,
     },
+    ClaudeCli {
+        binary: String,
+        model: String,
+        user_profile: Option<String>,
+    },
 }
 
 impl AiClient {
@@ -104,6 +110,14 @@ impl AiClient {
                         model: cfg.model.clone(),
                     }
                 }
+                ApiProvider::ClaudeCli => AiClientConfig::ClaudeCli {
+                    binary: cfg
+                        .claude_cli_path
+                        .clone()
+                        .unwrap_or_else(|| "claude".into()),
+                    model: cfg.model.clone(),
+                    user_profile: cfg.user_profile.clone(),
+                },
             };
         Ok(Self {
             http: Client::builder()
@@ -130,6 +144,14 @@ impl AiClient {
                 model,
             } => {
                 self.call_openai_compatible(base_url, api_key, model, &prompt)
+                    .await?
+            }
+            AiClientConfig::ClaudeCli {
+                binary,
+                model,
+                user_profile,
+            } => {
+                self.call_claude_cli(binary, model, user_profile.as_deref(), &prompt)
                     .await?
             }
         };
@@ -289,6 +311,72 @@ impl AiClient {
             }
         }
         Ok(out)
+    }
+
+    // ── Claude CLI subprocess (no API key — uses the logged-in claude session) ──
+
+    async fn call_claude_cli(
+        &self,
+        binary: &str,
+        model: &str,
+        user_profile: Option<&str>,
+        prompt: &str,
+    ) -> Result<String> {
+        let mut cmd = tokio::process::Command::new(binary);
+        cmd.arg("--print");
+        if !model.is_empty() {
+            cmd.args(["--model", model]);
+        }
+
+        // When the service runs as LocalSystem, set user-space env vars so the CLI
+        // can locate the logged-in session stored in the user's AppData.
+        if let Some(profile) = user_profile {
+            let appdata = format!("{profile}\\AppData\\Roaming");
+            let localappdata = format!("{profile}\\AppData\\Local");
+            let homepath = profile.strip_prefix("C:").unwrap_or(profile);
+            cmd.env("USERPROFILE", profile)
+                .env("HOMEPATH", homepath)
+                .env("HOMEDRIVE", "C:")
+                .env("APPDATA", &appdata)
+                .env("LOCALAPPDATA", &localappdata);
+        }
+
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn().context("Failed to spawn claude CLI")?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(prompt.as_bytes())
+                .await
+                .context("Failed to write prompt to claude CLI stdin")?;
+        }
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            child.wait_with_output(),
+        )
+        .await
+        .context("claude CLI timed out after 120s")?
+        .context("claude CLI process error")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "claude CLI exited with {}: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if text.is_empty() {
+            bail!("claude CLI returned empty output");
+        }
+
+        Ok(text)
     }
 }
 

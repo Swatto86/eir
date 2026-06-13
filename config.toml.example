@@ -1,15 +1,24 @@
 [api]
-# ── Option A: Anthropic native API ────────────────────────────────────────────
+# ── Option A: Claude CLI (no API key — uses your logged-in `claude` session) ──
+# This is the recommended option if you use Claude Code / Claude Max.
+# The service runs as LocalSystem, so `user_profile` tells it where to find your
+# login session. Set it to your Windows user profile directory.
+provider = "claude_cli"
+user_profile = "C:\\Users\\YourName"
+# claude_cli_path = "C:\\Users\\YourName\\AppData\\Roaming\\npm\\claude.cmd"  # if not in PATH
+model = ""   # leave empty to use the CLI's configured default, or set e.g. "claude-opus-4-8"
+
+# ── Option B: Anthropic native API ────────────────────────────────────────────
 # provider = "anthropic"
 # anthropic_api_key = "sk-ant-..."
-# model = "claude-opus-4"
+# model = "claude-opus-4-8"
 
-# ── Option B: claude-max-api-proxy (uses your Claude Max subscription) ────────
+# ── Option C: claude-max-api-proxy (OpenAI-compatible local proxy) ────────────
 # Run first: npx claude-max-api-proxy
-provider = "openai_compatible"
-base_url = "http://localhost:3456/v1"
-api_key = "not-needed"
-model = "claude-opus-4"
+# provider = "openai_compatible"
+# base_url = "http://localhost:3456/v1"
+# api_key = "not-needed"
+# model = "claude-opus-4-8"
 
 [monitoring]
 # Windows Event Log channels to tail
@@ -34,7 +43,3 @@ decision_interval_secs = 120
 
 [persistence]
 audit_db = "./sentry.db"
-
-[logging]
-# trace | debug | info | warn | error
-level = "info"

@@ -15,6 +15,8 @@ pub enum ApiProvider {
     #[default]
     Anthropic,
     OpenAiCompatible,
+    /// Spawn the local `claude` CLI binary (no API key required).
+    ClaudeCli,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,11 +25,18 @@ pub struct ApiConfig {
     pub provider: ApiProvider,
     /// Anthropic native: API key from console.anthropic.com
     pub anthropic_api_key: Option<String>,
-    /// OpenAI-compatible proxy (e.g. claude-max-api-proxy): base URL
+    /// OpenAI-compatible proxy: base URL
     pub base_url: Option<String>,
-    /// OpenAI-compatible proxy: API key sent as Bearer token ("not-needed" for claude-max-api-proxy)
+    /// OpenAI-compatible proxy: Bearer token ("not-needed" for claude-max-api-proxy)
     pub api_key: Option<String>,
+    /// Model name. Leave empty for claude_cli to use the CLI's configured default.
+    #[serde(default)]
     pub model: String,
+    /// claude_cli: path to the claude binary. Defaults to "claude" (must be in PATH).
+    pub claude_cli_path: Option<String>,
+    /// claude_cli: your Windows user profile root (e.g. C:\Users\Swatto).
+    /// Required when the service runs as LocalSystem so the CLI can find your login session.
+    pub user_profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

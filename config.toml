@@ -1,25 +1,14 @@
 [api]
-# provider = "anthropic"          # uses anthropic_api_key + api.anthropic.com
-# anthropic_api_key = "sk-ant-..."
-
-# claude-max-api-proxy (run: npx claude-max-api-proxy)
-provider = "openai_compatible"
-base_url = "http://localhost:3456/v1"
-api_key = "not-needed"
-model = "claude-opus-4"
+provider = "claude_cli"
+user_profile = "C:\\Users\\Swatto"
+model = ""
 
 [monitoring]
 event_log_channels = ["System", "Application", "Security"]
-log_directories = [
-    "C:\\Windows\\Logs",
-    "C:\\ProgramData",
-]
+log_directories = []
 event_log_poll_interval_secs = 30
 wmi_poll_interval_secs = 300
 decision_interval_secs = 120
 
 [persistence]
 audit_db = "./sentry.db"
-
-[logging]
-level = "info"
