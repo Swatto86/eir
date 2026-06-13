@@ -45,5 +45,5 @@ jobs:
 
             ### Uninstall
             Use **Add or Remove Programs** — the uninstaller stops and unregisters the service automatically.
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
