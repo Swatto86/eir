@@ -27,7 +27,26 @@
     }
   },
   "bundle": {
-    "active": false,
-    "icon": []
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "publisher": "Swatto",
+    "copyright": "© 2026 Swatto",
+    "category": "Utility",
+    "shortDescription": "Autonomous Windows system repair agent",
+    "longDescription": "Sentry monitors Windows system health and autonomously diagnoses and repairs problems — service failures, disk pressure, log corruption, driver issues, and more — using Claude AI as its reasoning engine.",
+    "windows": {
+      "allowDowngrades": false,
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English"],
+        "displayLanguageSelector": false
+      }
+    }
   }
 }

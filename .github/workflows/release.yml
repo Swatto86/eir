@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build artefacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Build installer and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Sentry ${{ github.ref_name }}
+          releaseBody: |
+            ## Sentry ${{ github.ref_name }}
+
+            Autonomous Windows system repair agent. Sentry monitors system health and
+            uses Claude AI to diagnose and fix problems automatically — service
+            failures, disk pressure, log corruption, driver issues, and more.
+
+            ### Install
+            Download **`Sentry_${{ github.ref_name }}_x64-setup.exe`** and run it.
+            No administrator rights required (installs for the current user only).
+
+            ### First run
+            Copy `config.toml.example` to `config.toml` in the same folder as the
+            executable and fill in your API details before launching.
+          releaseDraft: true
+          prerelease: false
