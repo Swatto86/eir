@@ -10,7 +10,8 @@ mod signals;
 
 use models::SignalSnapshot;
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 use tauri::{
@@ -305,8 +306,17 @@ async fn sentry_loop(state: SharedSentryState, tray: TrayIcon<tauri::Wry>) {
         cfg.monitoring.event_log_channels.clone(),
         cfg.monitoring.event_log_poll_interval_secs,
     );
-    let (file_watch_shared, _fw_shutdown) =
-        signals::file_watch::spawn(cfg.monitoring.log_directories.clone());
+    let extra_log_dirs = cfg.monitoring.log_directories.clone();
+    let initial_watch_dirs = tokio::task::spawn_blocking(move || {
+        signals::file_watch::discover_watch_dirs(&extra_log_dirs)
+    })
+    .await
+    .unwrap_or_default();
+    info!(count = initial_watch_dirs.len(), "Log directories auto-discovered");
+    let mut known_watch_dirs: HashSet<PathBuf> =
+        initial_watch_dirs.iter().cloned().collect();
+    let (file_watch_shared, _fw_shutdown, dir_update_tx) =
+        signals::file_watch::spawn(initial_watch_dirs);
     let (wmi_shared, _wmi_shutdown) =
         signals::wmi::spawn(cfg.monitoring.wmi_poll_interval_secs);
 
@@ -321,9 +331,32 @@ async fn sentry_loop(state: SharedSentryState, tray: TrayIcon<tauri::Wry>) {
 
     let mut ticker = interval(Duration::from_secs(cfg.monitoring.decision_interval_secs));
     info!(interval_secs = cfg.monitoring.decision_interval_secs, "Decision loop started");
+    let mut cycle_count = 0u64;
 
     loop {
         ticker.tick().await;
+        cycle_count += 1;
+
+        // Every 20 cycles re-scan for newly active log directories
+        if cycle_count.is_multiple_of(20) {
+            let extra = cfg.monitoring.log_directories.clone();
+            if let Ok(all) = tokio::task::spawn_blocking(move || {
+                signals::file_watch::discover_watch_dirs(&extra)
+            })
+            .await
+            {
+                let mut added = 0u32;
+                for dir in all {
+                    if known_watch_dirs.insert(dir.clone()) {
+                        let _ = dir_update_tx.send(dir);
+                        added += 1;
+                    }
+                }
+                if added > 0 {
+                    info!(count = added, "Added newly discovered log directories");
+                }
+            }
+        }
 
         if state.lock().unwrap().paused {
             update_tray(&tray, "Paused");

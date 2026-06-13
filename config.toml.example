@@ -15,10 +15,12 @@ model = "claude-opus-4"
 # Windows Event Log channels to tail
 event_log_channels = ["System", "Application", "Security"]
 
-# Directories whose new/modified *.log, *.txt etc. files are parsed for errors
+# Extra directories to watch in addition to the auto-discovered ones.
+# Standard locations (C:\Windows\Logs, %APPDATA%, %LOCALAPPDATA%,
+# %PROGRAMDATA%, %TEMP%) are discovered automatically at startup and
+# re-checked every 20 cycles. Add paths here only for non-standard locations.
 log_directories = [
-    "C:\\Windows\\Logs",
-    "C:\\ProgramData",
+    # "D:\\MyApp\\Logs",
 ]
 
 # How often to poll WMI for system state (CPU, memory, disk, services)
