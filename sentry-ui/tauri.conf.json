@@ -5,7 +5,7 @@
   "identifier": "co.swatto.sentry",
   "build": {
     "frontendDist": "../ui",
-    "beforeBuildCommand": "powershell -NoProfile -ExecutionPolicy Bypass -File build-svc.ps1",
+    "beforeBuildCommand": "powershell -NoProfile -ExecutionPolicy Bypass -File sentry-ui\\build-svc.ps1",
     "beforeDevCommand": ""
   },
   "app": {
