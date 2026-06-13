@@ -1,0 +1,19 @@
+[api]
+anthropic_api_key = "sk-ant-REPLACE_ME"
+model = "claude-sonnet-4-6"
+
+[monitoring]
+event_log_channels = ["System", "Application", "Security"]
+log_directories = [
+    "C:\\Windows\\Logs",
+    "C:\\ProgramData",
+]
+event_log_poll_interval_secs = 30
+wmi_poll_interval_secs = 300
+decision_interval_secs = 120
+
+[persistence]
+audit_db = "./sentry.db"
+
+[logging]
+level = "info"
