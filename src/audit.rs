@@ -116,9 +116,9 @@ pub async fn log_execution(
     pool: &SqlitePool,
     decision_id: i64,
     result: &ExecutionResult,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i64> {
     let timestamp = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
+    let id = sqlx::query(
         "INSERT INTO execution_log (decision_id, action, success, output, executed_at)
          VALUES (?, ?, ?, ?, ?)",
     )
@@ -128,6 +128,7 @@ pub async fn log_execution(
     .bind(&result.output)
     .bind(&timestamp)
     .execute(pool)
-    .await?;
-    Ok(())
+    .await?
+    .last_insert_rowid();
+    Ok(id)
 }

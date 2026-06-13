@@ -15,7 +15,11 @@ actions = [
     "task_enable",
     "registry_reset",
     "network_diagnostic",
-    # powershell_diagnostic is NOT auto-executed — always requires approval
+    # Phase 4 — lower-risk actions auto-approved
+    "driver_enable",
+    "process_kill",
+    "file_delete",
+    # powershell_diagnostic, driver_disable, software_uninstall, bcd_edit — always require approval
 ]
 
 [blocklist]

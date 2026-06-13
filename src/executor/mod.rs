@@ -1,7 +1,11 @@
+pub mod boot;
+pub mod driver;
 pub mod logs;
 pub mod powershell;
+pub mod process;
 pub mod registry;
 pub mod services;
+pub mod software;
 pub mod tasks;
 
 use crate::models::{ExecutionResult, FixAction};
@@ -73,6 +77,37 @@ pub async fn execute(action: &FixAction) -> ExecutionResult {
                 }
             };
             make_result(action, powershell::run_diagnostic(script).await)
+        }
+        FixAction::DriverDisable { driver_name } => {
+            let n = driver_name.clone();
+            make_result(action, driver::disable(&n).await)
+        }
+        FixAction::DriverEnable { driver_name } => {
+            let n = driver_name.clone();
+            make_result(action, driver::enable(&n).await)
+        }
+        FixAction::SoftwareUninstall { package_name } => {
+            let n = package_name.clone();
+            make_result(action, software::uninstall(&n).await)
+        }
+        FixAction::BcdEdit { element, value } => {
+            let (el, val) = (element.clone(), value.clone());
+            make_result(action, boot::bcd_edit(&el, &val).await)
+        }
+        FixAction::ProcessKill { process_name } => {
+            let n = process_name.clone();
+            make_result(action, process::kill(&n).await)
+        }
+        FixAction::FileDelete { path } => {
+            let safe = path.replace('\'', "''");
+            // Guard: refuse if path is a directory, and require the item to exist.
+            let script = format!(
+                r#"$item = Get-Item -LiteralPath '{safe}' -ErrorAction SilentlyContinue
+if (-not $item) {{ Write-Output 'Not found (already gone?): {safe}' }}
+elseif ($item.PSIsContainer) {{ Write-Error 'Refusing to delete directory: {safe}' }}
+else {{ Remove-Item -LiteralPath '{safe}' -Force -ErrorAction Stop; Write-Output 'Deleted: {safe}' }}"#
+            );
+            make_result(action, powershell::run_diagnostic(&script).await)
         }
     }
 }

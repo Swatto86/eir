@@ -116,8 +116,9 @@ impl AiClient {
         &self,
         snapshot: &SignalSnapshot,
         history: &[PastDecision],
+        feedback_summary: Option<&str>,
     ) -> Result<ClaudeDecision> {
-        let prompt = crate::ai::prompt::build(snapshot, history);
+        let prompt = crate::ai::prompt::build(snapshot, history, feedback_summary);
         let raw = match &self.config {
             AiClientConfig::Anthropic { api_key, model } => {
                 self.call_anthropic(api_key, model, &prompt).await?

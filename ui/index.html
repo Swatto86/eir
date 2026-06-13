@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sentry</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0f172a;
+      --surface:   #1e293b;
+      --border:    #334155;
+      --text:      #e2e8f0;
+      --muted:     #94a3b8;
+      --green:     #22c55e;
+      --yellow:    #eab308;
+      --orange:    #f97316;
+      --red:       #ef4444;
+      --blue:      #3b82f6;
+      --gray:      #6b7280;
+      --radius:    8px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Header ── */
+    header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 20px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    header h1 { font-size: 16px; font-weight: 600; letter-spacing: .04em; }
+    #status-dot {
+      width: 12px; height: 12px; border-radius: 50%;
+      background: var(--gray); flex-shrink: 0;
+      transition: background .4s;
+    }
+    #status-text { font-size: 13px; color: var(--muted); }
+    header .spacer { flex: 1; }
+    .btn {
+      padding: 5px 14px; border: 1px solid var(--border);
+      background: transparent; color: var(--text);
+      border-radius: var(--radius); cursor: pointer;
+      font-size: 13px; transition: background .15s;
+    }
+    .btn:hover { background: var(--border); }
+    .btn.danger { border-color: var(--red); color: var(--red); }
+    .btn.danger:hover { background: color-mix(in srgb, var(--red) 15%, transparent); }
+
+    /* ── Metrics bar ── */
+    .metrics {
+      display: flex; gap: 1px;
+      background: var(--border);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .metric {
+      flex: 1; background: var(--surface);
+      padding: 10px 16px; display: flex; flex-direction: column; gap: 4px;
+    }
+    .metric-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+    .metric-value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .bar-track { height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; }
+    .bar-fill  { height: 100%; border-radius: 2px; transition: width .4s; }
+
+    /* ── Body scroll area ── */
+    .body { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 16px; }
+
+    /* ── Approval card ── */
+    #approval-card {
+      background: color-mix(in srgb, var(--orange) 10%, var(--surface));
+      border: 1px solid var(--orange);
+      border-radius: var(--radius); padding: 16px; display: none;
+    }
+    #approval-card h2 { font-size: 14px; color: var(--orange); margin-bottom: 12px; }
+    .approval-grid { display: grid; grid-template-columns: 120px 1fr; gap: 4px 12px; font-size: 13px; margin-bottom: 14px; }
+    .approval-grid .label { color: var(--muted); }
+    .approval-grid .val  { color: var(--text); }
+    .approval-actions { display: flex; gap: 8px; }
+    .btn-approve { padding: 6px 20px; background: var(--green); border: none; border-radius: var(--radius); color: #fff; cursor: pointer; font-size: 13px; }
+    .btn-approve:hover { filter: brightness(1.1); }
+    .btn-reject  { padding: 6px 20px; background: transparent; border: 1px solid var(--red); border-radius: var(--radius); color: var(--red); cursor: pointer; font-size: 13px; }
+    .btn-reject:hover { background: color-mix(in srgb, var(--red) 12%, transparent); }
+
+    /* ── Two-column grid ── */
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+    /* ── Cards ── */
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+    .card-header { padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+    .card-body { padding: 0; }
+
+    /* ── Problem / execution rows ── */
+    .row { padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 13px; }
+    .row:last-child { border-bottom: none; }
+    .row-title { display: flex; align-items: center; gap: 8px; margin-bottom: 3px; }
+    .tag { font-size: 11px; padding: 1px 7px; border-radius: 20px; font-weight: 600; }
+    .tag-ok     { background: color-mix(in srgb, var(--green)  15%, transparent); color: var(--green); }
+    .tag-warn   { background: color-mix(in srgb, var(--yellow) 15%, transparent); color: var(--yellow); }
+    .tag-block  { background: color-mix(in srgb, var(--red)    15%, transparent); color: var(--red); }
+    .tag-auto   { background: color-mix(in srgb, var(--blue)   15%, transparent); color: var(--blue); }
+    .row-sub { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* ── Analysis ── */
+    .analysis-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+    .analysis-text { padding: 12px 14px; font-size: 13px; color: var(--muted); line-height: 1.7; }
+
+    /* ── Empty state ── */
+    .empty { padding: 24px 14px; text-align: center; color: var(--muted); font-size: 13px; }
+
+    /* ── Failed services ── */
+    .services-list { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 14px; }
+    .svc-chip { font-size: 11px; padding: 2px 8px; border-radius: 4px; background: color-mix(in srgb, var(--red) 12%, var(--surface)); border: 1px solid color-mix(in srgb, var(--red) 30%, transparent); color: var(--red); }
+
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div id="status-dot"></div>
+  <h1>Sentry</h1>
+  <span id="status-text">Initializing…</span>
+  <div class="spacer"></div>
+  <button class="btn" id="pause-btn" onclick="togglePause()">Pause</button>
+</header>
+
+<div class="metrics">
+  <div class="metric">
+    <span class="metric-label">CPU</span>
+    <span class="metric-value" id="cpu">—</span>
+    <div class="bar-track"><div class="bar-fill" id="cpu-bar" style="width:0;background:var(--blue)"></div></div>
+  </div>
+  <div class="metric">
+    <span class="metric-label">Memory</span>
+    <span class="metric-value" id="memory">—</span>
+    <div class="bar-track"><div class="bar-fill" id="mem-bar" style="width:0;background:var(--blue)"></div></div>
+  </div>
+  <div class="metric">
+    <span class="metric-label">Disk</span>
+    <span class="metric-value" id="disk">—</span>
+    <div class="bar-track"><div class="bar-fill" id="disk-bar" style="width:0;background:var(--blue)"></div></div>
+  </div>
+</div>
+
+<div class="body">
+
+  <!-- Approval card (hidden until needed) -->
+  <div id="approval-card">
+    <h2>⚠ Approval Required</h2>
+    <div class="approval-grid" id="approval-grid"></div>
+    <div class="approval-actions">
+      <button class="btn-approve" onclick="decide(true)">Approve</button>
+      <button class="btn-reject"  onclick="decide(false)">Reject</button>
+    </div>
+  </div>
+
+  <!-- Problems + Executions -->
+  <div class="two-col">
+    <div class="card">
+      <div class="card-header">Recent Problems</div>
+      <div class="card-body" id="problems-list">
+        <div class="empty">No problems detected yet</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">Recent Executions</div>
+      <div class="card-body" id="executions-list">
+        <div class="empty">No executions yet</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Failed services -->
+  <div class="card" id="services-card" style="display:none">
+    <div class="card-header">Failed Services</div>
+    <div class="services-list" id="services-list"></div>
+  </div>
+
+  <!-- Last analysis -->
+  <div class="analysis-card">
+    <div class="card-header">Last Analysis</div>
+    <div class="analysis-text" id="analysis-text">Waiting for first analysis cycle…</div>
+  </div>
+
+</div>
+
+<script src="main.js"></script>
+</body>
+</html>

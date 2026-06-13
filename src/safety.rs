@@ -46,5 +46,11 @@ fn action_key(action: &FixAction) -> String {
             format!("RegistryReset({key_path}/{value_name})")
         }
         FixAction::NetworkDiagnostic { command } => format!("NetworkDiagnostic({command})"),
+        FixAction::DriverDisable { driver_name } => format!("DriverDisable({driver_name})"),
+        FixAction::DriverEnable { driver_name } => format!("DriverEnable({driver_name})"),
+        FixAction::SoftwareUninstall { package_name } => format!("SoftwareUninstall({package_name})"),
+        FixAction::BcdEdit { element, value } => format!("BcdEdit({element}={value})"),
+        FixAction::ProcessKill { process_name } => format!("ProcessKill({process_name})"),
+        FixAction::FileDelete { path } => format!("FileDelete({path})"),
     }
 }

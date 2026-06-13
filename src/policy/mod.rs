@@ -92,6 +92,9 @@ impl ExecutionPolicy {
             FixAction::RegistryReset { key_path, .. } if self.path_blocked(key_path) => {
                 Some(format!("Registry path '{key_path}' is on the blocklist"))
             }
+            FixAction::FileDelete { path } if self.path_blocked(path) => {
+                Some(format!("Path '{path}' is on the blocklist"))
+            }
             _ => None,
         }
     }
@@ -122,5 +125,11 @@ fn action_type_name(action: &FixAction) -> &'static str {
         FixAction::TaskEnable { .. } => "task_enable",
         FixAction::RegistryReset { .. } => "registry_reset",
         FixAction::NetworkDiagnostic { .. } => "network_diagnostic",
+        FixAction::DriverDisable { .. } => "driver_disable",
+        FixAction::DriverEnable { .. } => "driver_enable",
+        FixAction::SoftwareUninstall { .. } => "software_uninstall",
+        FixAction::BcdEdit { .. } => "bcd_edit",
+        FixAction::ProcessKill { .. } => "process_kill",
+        FixAction::FileDelete { .. } => "file_delete",
     }
 }

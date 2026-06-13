@@ -1,15 +1,39 @@
 use crate::models::FileChange;
 use chrono::Utc;
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, Config};
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
 const RING_SIZE: usize = 50;
+const MAX_READ_BYTES: u64 = 65_536; // 64 KB — only read files below this size
+
+const TEXT_EXTENSIONS: &[&str] = &[
+    "log", "txt", "csv", "json", "xml", "ini", "cfg", "conf",
+    "err", "out", "trace", "debug", "warn", "error", "info",
+];
 
 pub type SharedChanges = Arc<Mutex<VecDeque<FileChange>>>;
+
+fn try_parse_log(path: &Path, size_bytes: u64) -> Option<crate::models::LogEvent> {
+    if size_bytes == 0 || size_bytes > MAX_READ_BYTES {
+        return None;
+    }
+    let ext = path.extension()?.to_str()?.to_lowercase();
+    if !TEXT_EXTENSIONS.contains(&ext.as_str()) {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let event = super::log_parser::parse(path, &content);
+    // Only keep events that found something interesting
+    if event.error_snippets.is_empty() && event.severity == "INFO" {
+        None
+    } else {
+        Some(event)
+    }
+}
 
 pub fn spawn(directories: Vec<String>) -> (SharedChanges, watch::Sender<()>) {
     let shared: SharedChanges = Arc::new(Mutex::new(VecDeque::new()));
@@ -45,7 +69,6 @@ pub fn spawn(directories: Vec<String>) -> (SharedChanges, watch::Sender<()>) {
         }
     }
 
-    // Keep watcher alive in its own thread
     std::thread::spawn(move || {
         let _watcher = watcher;
         for result in rx {
@@ -58,15 +81,17 @@ pub fn spawn(directories: Vec<String>) -> (SharedChanges, watch::Sender<()>) {
                     };
 
                     for path in event.paths {
-                        let size_bytes = std::fs::metadata(&path)
-                            .map(|m| m.len())
-                            .unwrap_or(0);
+                        let size_bytes =
+                            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+                        let log_event = try_parse_log(&path, size_bytes);
 
                         let change = FileChange {
                             path,
                             kind: kind.to_string(),
                             size_bytes,
                             timestamp: Utc::now(),
+                            log_event,
                         };
 
                         if let Ok(mut guard) = shared_clone.lock() {

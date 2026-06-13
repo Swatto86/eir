@@ -26,6 +26,20 @@ pub struct FileChange {
     pub kind: String,
     pub size_bytes: u64,
     pub timestamp: DateTime<Utc>,
+    /// Structured diagnostic info extracted from the file's content.
+    pub log_event: Option<LogEvent>,
+}
+
+/// Parsed diagnostic information extracted from a log file.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LogEvent {
+    /// Program that wrote this log, inferred from the file path.
+    pub program: String,
+    pub log_path: String,
+    /// Highest severity seen: "FATAL", "ERROR", "WARN", or "INFO".
+    pub severity: String,
+    /// Up to 5 error excerpts, each with 1 line of context before and 2 after.
+    pub error_snippets: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -92,6 +106,15 @@ pub enum FixAction {
     TaskEnable { task_name: String },
     RegistryReset { key_path: String, value_name: String, value_data: String },
     NetworkDiagnostic { command: String },
+    // Phase 4
+    DriverDisable { driver_name: String },
+    DriverEnable { driver_name: String },
+    SoftwareUninstall { package_name: String },
+    BcdEdit { element: String, value: String },
+    ProcessKill { process_name: String },
+    /// Delete a single file (e.g. corrupted cache, lock file, bad config).
+    /// Never deletes directories. Blocked by the path blocklist in policy.toml.
+    FileDelete { path: String },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
