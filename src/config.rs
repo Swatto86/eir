@@ -10,9 +10,24 @@ pub struct Config {
     pub logging: LoggingConfig,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiProvider {
+    #[default]
+    Anthropic,
+    OpenAiCompatible,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ApiConfig {
-    pub anthropic_api_key: String,
+    #[serde(default)]
+    pub provider: ApiProvider,
+    /// Anthropic native: API key from console.anthropic.com
+    pub anthropic_api_key: Option<String>,
+    /// OpenAI-compatible proxy (e.g. claude-max-api-proxy): base URL
+    pub base_url: Option<String>,
+    /// OpenAI-compatible proxy: API key sent as Bearer token ("not-needed" for claude-max-api-proxy)
+    pub api_key: Option<String>,
     pub model: String,
 }
 

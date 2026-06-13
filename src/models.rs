@@ -70,6 +70,31 @@ pub struct Problem {
     pub undo_instructions: String,
 }
 
+impl Problem {
+    pub fn parse_fix_action(&self) -> Option<FixAction> {
+        serde_json::from_value(self.proposed_fix.clone()).ok()
+    }
+}
+
+/// Matches Claude's proposed_fix `action` field values.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum FixAction {
+    ServiceRestart { service_name: String },
+    ServiceStop { service_name: String },
+    ServiceStart { service_name: String },
+    LogCleanup { path: String, days_old: u32 },
+    DiskCleanup { target: String },
+    PowerShellDiagnostic { script: String },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ExecutionResult {
+    pub action: String,
+    pub success: bool,
+    pub output: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClaudeDecision {
     pub analysis: String,

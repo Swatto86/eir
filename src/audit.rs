@@ -1,4 +1,4 @@
-use crate::models::{ClaudeDecision, PastDecision, SignalSnapshot};
+use crate::models::{ClaudeDecision, ExecutionResult, PastDecision, SignalSnapshot};
 use anyhow::Result;
 use chrono::Utc;
 use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
@@ -110,4 +110,24 @@ pub async fn get_recent_decisions(pool: &SqlitePool, limit: i64) -> Result<Vec<P
     }
 
     Ok(decisions)
+}
+
+pub async fn log_execution(
+    pool: &SqlitePool,
+    decision_id: i64,
+    result: &ExecutionResult,
+) -> anyhow::Result<()> {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO execution_log (decision_id, action, success, output, executed_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(decision_id)
+    .bind(&result.action)
+    .bind(if result.success { 1i64 } else { 0i64 })
+    .bind(&result.output)
+    .bind(&timestamp)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
