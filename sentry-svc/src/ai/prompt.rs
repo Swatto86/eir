@@ -53,6 +53,10 @@ Analyze thoroughly. For each LOG EVENT above, draw on your knowledge of that pro
 known issues and common fixes — including specific registry keys, cache paths, config
 locations, and documented workarounds. Propose the exact fix path for that program.
 
+Report at most the 5 most important problems, ordered by severity. Omit trivia and
+anything you would rate below 0.6 confidence. If the system is healthy, return an empty
+problems list. Keep every text field to one or two sentences.
+
 For EACH problem:
 1. Diagnosis: specific and actionable
 2. Root cause: why it is happening

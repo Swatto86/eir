@@ -40,8 +40,10 @@ wmi_poll_interval_secs = 300
 # How often to check the event log for new entries
 event_log_poll_interval_secs = 30
 
-# How often to run a full decision cycle (collect signals → analyse → act)
-decision_interval_secs = 120
+# How often to run a full decision cycle (collect signals → analyse → act).
+# A claude_cli analysis is typically 15-60s (occasionally up to ~100s on a very
+# messy system), so 300s leaves comfortable headroom between cycles.
+decision_interval_secs = 300
 
 [persistence]
 audit_db = "./sentry.db"
