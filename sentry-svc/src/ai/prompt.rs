@@ -5,7 +5,11 @@ pub fn build(
     history: &[PastDecision],
     feedback_summary: Option<&str>,
 ) -> String {
-    let snapshot_json = serde_json::to_string_pretty(snapshot).unwrap_or_default();
+    let mut snapshot_value = serde_json::to_value(snapshot).unwrap_or_default();
+    if let Some(obj) = snapshot_value.as_object_mut() {
+        obj.remove("decision_history");
+    }
+    let snapshot_json = serde_json::to_string_pretty(&snapshot_value).unwrap_or_default();
     let history_json = serde_json::to_string_pretty(history).unwrap_or_default();
 
     let log_events_section = format_log_events(snapshot);
@@ -68,7 +72,7 @@ Respond ONLY with valid JSON (no markdown, no preamble):
       "confidence": 0.90,
       "proposed_fix": {{
         "action": "file_delete",
-        "path": "C:\\Users\\Swatto\\AppData\\Local\\Microsoft\\Teams\\Cache"
+        "path": "C:\\Users\\<USERNAME>\\AppData\\Local\\Microsoft\\Teams\\Cache"
       }},
       "reasoning": "...",
       "side_effects": "...",

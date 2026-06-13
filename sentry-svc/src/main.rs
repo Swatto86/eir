@@ -236,6 +236,14 @@ fn push_execution(st: &mut SvcState, action: &str, success: bool, output: &str) 
 // ── Decision loop ─────────────────────────────────────────────────────────────
 
 async fn sentry_main<F: std::future::Future<Output = ()>>(shutdown: F) {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .init();
+
     let (pipe, mut ui_rx) = pipe_server::spawn();
     let mut st = SvcState::default();
 
@@ -254,12 +262,6 @@ async fn sentry_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         Ok(c) => c,
         Err(e) => fatal!(format!("config.toml: {e}")),
     };
-
-    let log_level = cfg.logging.level.parse().unwrap_or(tracing::Level::INFO);
-    tracing_subscriber::fmt()
-        .with_max_level(log_level)
-        .with_target(false)
-        .init();
 
     let pol = match policy::ExecutionPolicy::load(
         config::resolve("policy.toml").to_str().unwrap_or("policy.toml"),
@@ -421,7 +423,6 @@ async fn sentry_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                     &db,
                     &snapshot,
                     &claude_decision,
-                    false,
                 )
                 .await
                 {
@@ -516,6 +517,11 @@ async fn sentry_main<F: std::future::Future<Output = ()>>(shutdown: F) {
 
                             match audit::log_execution(&db, decision_id, &result).await {
                                 Ok(exec_id) => {
+                                    if let Err(e) =
+                                        audit::mark_decision_executed(&db, decision_id).await
+                                    {
+                                        error!("Failed to mark decision executed: {e}");
+                                    }
                                     if let Err(e) = feedback::record(
                                         &db,
                                         exec_id,
@@ -577,6 +583,11 @@ async fn sentry_main<F: std::future::Future<Output = ()>>(shutdown: F) {
 
                                 match audit::log_execution(&db, decision_id, &result).await {
                                     Ok(exec_id) => {
+                                        if let Err(e) =
+                                            audit::mark_decision_executed(&db, decision_id).await
+                                        {
+                                            error!("Failed to mark decision executed: {e}");
+                                        }
                                         if let Err(e) = feedback::record(
                                             &db,
                                             exec_id,

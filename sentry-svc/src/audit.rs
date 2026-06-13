@@ -18,7 +18,6 @@ pub async fn log_decision(
     pool: &SqlitePool,
     snapshot: &SignalSnapshot,
     decision: &ClaudeDecision,
-    executed: bool,
 ) -> Result<i64> {
     let timestamp = Utc::now().to_rfc3339();
     let snapshot_json = serde_json::to_string(snapshot)?;
@@ -28,17 +27,15 @@ pub async fn log_decision(
         .iter()
         .map(|p| p.confidence)
         .fold(0f32, f32::max);
-    let executed_int: i64 = if executed { 1 } else { 0 };
 
     let id = sqlx::query(
         "INSERT INTO decisions (timestamp, signal_snapshot, claude_response, confidence, executed)
-         VALUES (?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, 0)",
     )
     .bind(&timestamp)
     .bind(&snapshot_json)
     .bind(&response_json)
     .bind(max_confidence as f64)
-    .bind(executed_int)
     .execute(pool)
     .await?
     .last_insert_rowid();
@@ -62,6 +59,14 @@ pub async fn log_decision(
     .await?;
 
     Ok(id)
+}
+
+pub async fn mark_decision_executed(pool: &SqlitePool, decision_id: i64) -> Result<()> {
+    sqlx::query("UPDATE decisions SET executed = 1 WHERE id = ?")
+        .bind(decision_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn get_recent_decisions(pool: &SqlitePool, limit: i64) -> Result<Vec<PastDecision>> {
@@ -88,24 +93,23 @@ pub async fn get_recent_decisions(pool: &SqlitePool, limit: i64) -> Result<Vec<P
                 problems: vec![],
             });
 
-        let diagnosis = response
-            .problems
-            .first()
-            .map(|p| p.diagnosis.clone())
-            .unwrap_or_else(|| response.analysis.clone());
-
-        let fix_proposed = response
-            .problems
-            .first()
-            .map(|p| serde_json::to_string(&p.proposed_fix).unwrap_or_default())
-            .unwrap_or_default();
-
-        decisions.push(PastDecision {
-            timestamp: ts,
-            diagnosis,
-            confidence: confidence as f32,
-            fix_proposed,
-        });
+        if response.problems.is_empty() {
+            decisions.push(PastDecision {
+                timestamp: ts,
+                diagnosis: response.analysis.clone(),
+                confidence: confidence as f32,
+                fix_proposed: String::new(),
+            });
+        } else {
+            for p in &response.problems {
+                decisions.push(PastDecision {
+                    timestamp: ts,
+                    diagnosis: p.diagnosis.clone(),
+                    confidence: p.confidence,
+                    fix_proposed: serde_json::to_string(&p.proposed_fix).unwrap_or_default(),
+                });
+            }
+        }
     }
 
     Ok(decisions)

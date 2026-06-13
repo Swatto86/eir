@@ -183,12 +183,19 @@ impl AiClient {
         }
 
         let mut out = String::new();
+        let mut line_buf = String::new();
+        let mut done = false;
         let mut stream = resp.bytes_stream();
+
         while let Some(chunk) = stream.next().await {
+            if done { break; }
             let chunk = chunk.context("Anthropic stream read error")?;
-            for line in std::str::from_utf8(&chunk).unwrap_or("").lines() {
+            line_buf.push_str(std::str::from_utf8(&chunk).unwrap_or(""));
+            while let Some(pos) = line_buf.find('\n') {
+                let line = line_buf.drain(..=pos).collect::<String>();
                 if let Some(data) = line.trim().strip_prefix("data: ") {
                     if data == "[DONE]" {
+                        done = true;
                         break;
                     }
                     if let Ok(ev) = serde_json::from_str::<AnthropicEvent>(data) {
@@ -249,10 +256,16 @@ impl AiClient {
         }
 
         let mut out = String::new();
+        let mut line_buf = String::new();
+        let mut done = false;
         let mut stream = resp.bytes_stream();
+
         while let Some(chunk) = stream.next().await {
+            if done { break; }
             let chunk = chunk.context("OpenAI-compatible stream read error")?;
-            for line in std::str::from_utf8(&chunk).unwrap_or("").lines() {
+            line_buf.push_str(std::str::from_utf8(&chunk).unwrap_or(""));
+            while let Some(pos) = line_buf.find('\n') {
+                let line = line_buf.drain(..=pos).collect::<String>();
                 let line = line.trim();
                 // The proxy sends ":ok" as a heartbeat — skip it
                 if line.starts_with(':') {
@@ -260,6 +273,7 @@ impl AiClient {
                 }
                 if let Some(data) = line.strip_prefix("data: ") {
                     if data == "[DONE]" {
+                        done = true;
                         break;
                     }
                     if let Ok(chunk) = serde_json::from_str::<OpenAiChunk>(data) {
@@ -279,21 +293,16 @@ impl AiClient {
 }
 
 fn strip_fences(s: &str) -> &str {
-    if let Some(start) = s.find("```json") {
-        let after = &s[start + 7..];
-        return after
-            .find("```")
-            .map(|e| &after[..e])
-            .unwrap_or(after)
-            .trim();
-    }
-    if let Some(start) = s.find("```") {
-        let after = &s[start + 3..];
-        return after
-            .find("```")
-            .map(|e| &after[..e])
-            .unwrap_or(after)
-            .trim();
+    // Check ````json` before ```` to avoid matching the shorter fence first
+    for (open, close) in [("```json", "```"), ("```", "```"), ("~~~json", "~~~"), ("~~~", "~~~")] {
+        if let Some(start) = s.find(open) {
+            let after = &s[start + open.len()..];
+            return after
+                .find(close)
+                .map(|e| &after[..e])
+                .unwrap_or(after)
+                .trim();
+        }
     }
     s.trim()
 }

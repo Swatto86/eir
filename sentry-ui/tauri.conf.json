@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Sentry",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "identifier": "co.swatto.sentry",
   "build": {
     "frontendDist": "../ui",
-    "beforeBuildCommand": "cargo build -p sentry-svc --release",
+    "beforeBuildCommand": "cargo build -p sentry-svc --release && copy ..\\target\\release\\sentry-svc.exe bin\\sentry-svc.exe",
     "beforeDevCommand": ""
   },
   "app": {
@@ -40,10 +40,14 @@
     "category": "Utility",
     "shortDescription": "Autonomous Windows system repair agent",
     "longDescription": "Sentry monitors Windows system health and autonomously diagnoses and repairs problems — service failures, disk pressure, log corruption, driver issues, and more — using Claude AI as its reasoning engine.",
+    "resources": {
+      "bin/sentry-svc.exe": "sentry-svc.exe"
+    },
     "windows": {
       "allowDowngrades": false,
       "nsis": {
         "installMode": "perMachine",
+        "installerHooks": "installer-hooks.nsh",
         "languages": ["English"],
         "displayLanguageSelector": false
       }
