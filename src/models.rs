@@ -80,12 +80,18 @@ impl Problem {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum FixAction {
+    // Phase 2
     ServiceRestart { service_name: String },
     ServiceStop { service_name: String },
     ServiceStart { service_name: String },
     LogCleanup { path: String, days_old: u32 },
     DiskCleanup { target: String },
     PowerShellDiagnostic { script: String },
+    // Phase 3
+    TaskDisable { task_name: String },
+    TaskEnable { task_name: String },
+    RegistryReset { key_path: String, value_name: String, value_data: String },
+    NetworkDiagnostic { command: String },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

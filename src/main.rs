@@ -4,14 +4,14 @@ mod audit;
 mod config;
 mod executor;
 mod models;
+mod policy;
+mod safety;
 mod signals;
 
 use anyhow::Result;
 use models::SignalSnapshot;
 use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
-
-const CONFIDENCE_THRESHOLD: f32 = 0.80;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,7 +23,12 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    info!("Starting Sentry v0.2 (Phase 2 — Manual Approval)");
+    let pol = policy::ExecutionPolicy::load("policy.toml")?;
+    info!(
+        threshold = pol.execution.confidence_threshold,
+        rate_limit_mins = pol.execution.rate_limit_mins,
+        "Starting Sentry v0.3 (Phase 3 — Auto-Execution)"
+    );
 
     let db = audit::init_db(&cfg.persistence.audit_db).await?;
     let ai = ai::client::AiClient::new(&cfg.api)?;
@@ -85,6 +90,17 @@ async fn main() -> Result<()> {
             }
         };
 
+        // Periodically log overall success rate
+        if let Ok(rate) = safety::success_rate(&db).await {
+            info!(success_rate = format!("{:.1}%", rate * 100.0), "Execution stats");
+            if rate < 0.85 {
+                warn!(
+                    success_rate = format!("{:.1}%", rate * 100.0),
+                    "Success rate below 85% — consider raising confidence_threshold in policy.toml"
+                );
+            }
+        }
+
         for problem in &claude_decision.problems {
             info!(
                 confidence = problem.confidence,
@@ -92,35 +108,49 @@ async fn main() -> Result<()> {
                 "Problem identified"
             );
 
-            if problem.confidence < CONFIDENCE_THRESHOLD {
-                info!(
-                    confidence = problem.confidence,
-                    threshold = CONFIDENCE_THRESHOLD,
-                    "Skipping — confidence below threshold"
-                );
-                continue;
-            }
-
             let Some(action) = problem.parse_fix_action() else {
                 warn!(
                     fix = %problem.proposed_fix,
-                    "Proposed fix has unknown action type — skipping"
+                    "Unknown action type — skipping"
                 );
                 continue;
             };
 
-            match approval::prompt(problem, &action).await {
-                approval::Decision::Approved => {
+            match pol.evaluate(&action, problem.confidence) {
+                policy::Verdict::Block(reason) => {
+                    info!(reason = %reason, "Blocked by policy");
+                }
+                policy::Verdict::AutoApprove => {
+                    match safety::rate_limited(&db, &action, pol.execution.rate_limit_mins).await {
+                        Ok(true) => {
+                            info!(action = ?action, "Rate-limited — already executed recently");
+                            continue;
+                        }
+                        Err(e) => warn!("Rate limit check failed: {e}"),
+                        Ok(false) => {}
+                    }
+                    info!(action = ?action, "AUTO-EXECUTING");
                     let result = executor::execute(&action).await;
                     if let Err(e) = audit::log_execution(&db, decision_id, &result).await {
                         error!("Failed to log execution: {e}");
                     }
                 }
-                approval::Decision::Rejected => {
-                    info!(diagnosis = %problem.diagnosis, "Fix rejected by user");
-                }
-                approval::Decision::Skipped => {
-                    info!(diagnosis = %problem.diagnosis, "Fix skipped");
+                policy::Verdict::RequireApproval(reason) => {
+                    info!(reason = %reason, "Falling back to manual approval");
+                    match approval::prompt(problem, &action).await {
+                        approval::Decision::Approved => {
+                            let result = executor::execute(&action).await;
+                            if let Err(e) = audit::log_execution(&db, decision_id, &result).await {
+                                error!("Failed to log execution: {e}");
+                            }
+                        }
+                        approval::Decision::Rejected => {
+                            info!(diagnosis = %problem.diagnosis, "Rejected by user");
+                        }
+                        approval::Decision::Skipped => {
+                            info!(diagnosis = %problem.diagnosis, "Skipped by user");
+                        }
+                    }
                 }
             }
         }

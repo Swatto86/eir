@@ -1,0 +1,42 @@
+[execution]
+confidence_threshold = 0.85
+max_retries_per_issue = 3
+rate_limit_mins = 30
+auto_approve_on_success_rate = 0.95
+
+[whitelist]
+actions = [
+    "service_restart",
+    "service_stop",
+    "service_start",
+    "log_cleanup",
+    "disk_cleanup",
+    "task_disable",
+    "task_enable",
+    "registry_reset",
+    "network_diagnostic",
+    # powershell_diagnostic is NOT auto-executed — always requires approval
+]
+
+[blocklist]
+services = [
+    "NTDS",
+    "KDC",
+    "DFSR",
+    "NetLogon",
+    "Hyper-V",
+    "vmms",
+    "WdNisDrv",
+    "WinDefend",
+    "MsMpSvc",
+    "WSB",      # Windows Server Backup
+    "vss",      # Volume Shadow Copy
+]
+
+paths = [
+    "C:\\Windows\\System32",
+    "C:\\Windows\\SysWOW64",
+    "C:\\Windows\\WinSxS",
+    "C:\\Windows\\Boot",
+    "C:\\Windows\\Fonts",
+]
