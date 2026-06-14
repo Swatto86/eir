@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use sentry_proto::{SettingsUpdate, UiSettings};
+use eir_proto::{SettingsUpdate, UiSettings};
 use serde::{Deserialize, Serialize};
 use std::fs;
 
@@ -174,7 +174,7 @@ event_log_poll_interval_secs = 30
 wmi_poll_interval_secs = 300
 decision_interval_secs = 600
 [persistence]
-audit_db = "./sentry.db"
+audit_db = "./eir.db"
 "#;
 
     #[test]

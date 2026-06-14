@@ -1,3 +1,4 @@
 /target
-sentry.db
+eir.db
 config.toml
+eir-ui/bin/

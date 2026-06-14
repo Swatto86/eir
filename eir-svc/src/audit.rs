@@ -1,7 +1,7 @@
 use crate::models::{CallUsage, ClaudeDecision, ExecutionResult, PastDecision, SignalSnapshot};
 use anyhow::Result;
 use chrono::Utc;
-use sentry_proto::UsageSummary;
+use eir_proto::UsageSummary;
 use sqlx::{sqlite::SqliteConnectOptions, Row, SqlitePool};
 use std::str::FromStr;
 use tracing::info;

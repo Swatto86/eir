@@ -369,8 +369,8 @@ impl AiClient {
         if openrouter {
             // OpenRouter app attribution (optional but recommended).
             req = req
-                .header("HTTP-Referer", "https://github.com/Swatto86/sentry")
-                .header("X-Title", "Sentry");
+                .header("HTTP-Referer", "https://github.com/Swatto86/eir")
+                .header("X-Title", "Eir");
         }
 
         let resp = req

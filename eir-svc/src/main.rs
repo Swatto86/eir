@@ -10,7 +10,7 @@ mod safety;
 mod signals;
 
 use models::SignalSnapshot;
-use sentry_proto::{
+use eir_proto::{
     ApprovalInfo, ExecutionSummary, ProblemSummary, StatusPayload, UiMsg, UiSettings, UsageSummary,
 };
 use std::{
@@ -30,8 +30,8 @@ use windows_service::{
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
 
-const SERVICE_NAME: &str = "SentrySvc";
-const SERVICE_DISPLAY: &str = "Sentry System Monitor";
+const SERVICE_NAME: &str = "EirSvc";
+const SERVICE_DISPLAY: &str = "Eir System Monitor";
 
 // ── Windows service boilerplate ───────────────────────────────────────────────
 
@@ -74,7 +74,7 @@ fn run_service() -> windows_service::Result<()> {
         .build()
         .expect("Tokio runtime");
 
-    rt.block_on(sentry_main(async move {
+    rt.block_on(eir_main(async move {
         // Poll the atomic flag until Stop/Shutdown is received
         loop {
             if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
@@ -147,7 +147,7 @@ fn main() {
                     .build()
                     .expect("Tokio runtime");
                 // Standalone: run until Ctrl-C
-                rt.block_on(sentry_main(async {
+                rt.block_on(eir_main(async {
                     let _ = tokio::signal::ctrl_c().await;
                 }));
             }
@@ -192,7 +192,7 @@ impl Default for SvcState {
 }
 
 /// Restart the service to apply new settings: a detached helper stops then
-/// starts SentrySvc (LocalSystem — no UAC). It survives this process exiting.
+/// starts EirSvc (LocalSystem — no UAC). It survives this process exiting.
 fn restart_self() {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -200,7 +200,7 @@ fn restart_self() {
     let _ = std::process::Command::new("cmd")
         .args([
             "/C",
-            "sc stop SentrySvc & ping -n 4 127.0.0.1 >nul & sc start SentrySvc",
+            "sc stop EirSvc & ping -n 4 127.0.0.1 >nul & sc start EirSvc",
         ])
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn();
@@ -302,11 +302,11 @@ fn push_execution(st: &mut SvcState, action: &str, success: bool, output: &str) 
 
 // ── Decision loop ─────────────────────────────────────────────────────────────
 
-async fn sentry_main<F: std::future::Future<Output = ()>>(shutdown: F) {
+async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     // Log to a file next to the executable. A Windows service has no console, so
     // stdout is discarded — the file is the only way to see what the service did.
     let log_dir = config::resolve(".");
-    let file_appender = tracing_appender::rolling::never(&log_dir, "sentry.log");
+    let file_appender = tracing_appender::rolling::never(&log_dir, "eir.log");
     let (file_writer, log_guard) = tracing_appender::non_blocking(file_appender);
     // Keep the writer worker alive for the whole process.
     std::mem::forget(log_guard);
@@ -352,7 +352,7 @@ async fn sentry_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     info!(
         threshold = pol.execution.confidence_threshold,
         rate_limit_mins = pol.execution.rate_limit_mins,
-        "Starting Sentry v0.5 — service mode"
+        "Starting Eir v0.6 — service mode"
     );
 
     let db_path = config::resolve(&cfg.persistence.audit_db);

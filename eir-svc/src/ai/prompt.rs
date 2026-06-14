@@ -24,7 +24,7 @@ pub fn build(
     };
 
     format!(
-        r#"You are Sentry, an autonomous Windows system repair agent running on a home PC.
+        r#"You are Eir, an autonomous Windows system repair agent running on a home PC.
 Your job: analyze system signals, diagnose problems, and propose targeted fixes.
 {log_events_section}
 CURRENT SYSTEM STATE (full snapshot):

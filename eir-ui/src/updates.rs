@@ -10,7 +10,7 @@ use tokio::io::AsyncWriteExt;
 /// CREATE_NO_WINDOW — keep the console-based winget/powershell hidden.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-// ── Per-app notes / ignore list (persisted to %APPDATA%\Sentry\app-notes.json) ─
+// ── Per-app notes / ignore list (persisted to %APPDATA%\Eir\app-notes.json) ─
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct AppNote {
@@ -22,7 +22,7 @@ struct AppNote {
 
 fn notes_path() -> Option<std::path::PathBuf> {
     let base = std::env::var("APPDATA").ok()?;
-    let dir = std::path::Path::new(&base).join("Sentry");
+    let dir = std::path::Path::new(&base).join("Eir");
     let _ = std::fs::create_dir_all(&dir);
     Some(dir.join("app-notes.json"))
 }
@@ -252,7 +252,7 @@ pub struct AiCheckResult {
 const AI_CHECK_CAP: usize = 20;
 
 /// Names we never AI-check: drivers, runtimes, redistributables, self-updating
-/// suites, and Sentry itself. Keeps the batch to real, user-updatable apps.
+/// suites, and Eir itself. Keeps the batch to real, user-updatable apps.
 fn is_noise(name: &str) -> bool {
     let n = name.to_lowercase();
     const SKIP: &[&str] = &[
@@ -277,7 +277,7 @@ fn is_noise(name: &str) -> bool {
         "visual studio installer",
         "onedrive",
         "teams machine-wide",
-        "sentry",
+        "eir",
     ];
     SKIP.iter().any(|s| n.contains(s))
 }

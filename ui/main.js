@@ -471,7 +471,7 @@ document.getElementById('set-save').addEventListener('click', saveSettings);
 // ── Collapsible cards ───────────────────────────────────────────────────────
 
 function loadCollapsed() {
-  try { return JSON.parse(localStorage.getItem('sentryCollapsed') || '{}'); }
+  try { return JSON.parse(localStorage.getItem('eirCollapsed') || '{}'); }
   catch { return {}; }
 }
 
@@ -493,7 +493,7 @@ document.querySelector('.body').addEventListener('click', (e) => {
   card.classList.toggle('collapsed');
   const saved = loadCollapsed();
   saved[card.id] = card.classList.contains('collapsed');
-  localStorage.setItem('sentryCollapsed', JSON.stringify(saved));
+  localStorage.setItem('eirCollapsed', JSON.stringify(saved));
 });
 
 applyCollapsed();

@@ -62,10 +62,10 @@ wmi_poll_interval_secs = 300
 event_log_poll_interval_secs = 30
 
 # How often to run a full decision cycle (collect signals → analyse → act).
-# Sentry only calls Claude when there's an actionable change, so idle cycles are
+# Eir only calls the AI model when there's an actionable change, so idle cycles are
 # cheap; this interval mainly bounds how often it re-checks. 600s (10 min) keeps
 # subscription usage low. Lower it if you want faster reaction to new problems.
 decision_interval_secs = 600
 
 [persistence]
-audit_db = "./sentry.db"
+audit_db = "./eir.db"

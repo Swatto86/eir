@@ -1,17 +1,17 @@
 [package]
-name = "sentry-svc"
-version = "0.5.28"
+name = "eir-svc"
+version = "0.6.0"
 edition = "2021"
 authors = ["Swatto <claude.ai@swatto.co.uk>"]
-description = "Sentry system monitor service — runs as LocalSystem"
+description = "Eir system monitor service — runs as LocalSystem"
 license = "MIT"
 
 [[bin]]
-name = "sentry-svc"
+name = "eir-svc"
 path = "src/main.rs"
 
 [dependencies]
-sentry-proto = { path = "../sentry-proto" }
+eir-proto = { path = "../eir-proto" }
 windows = { version = "0.58", features = [
     "Win32_System_EventLog",
     "Win32_System_Com",

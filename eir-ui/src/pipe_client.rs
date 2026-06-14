@@ -1,5 +1,5 @@
 use anyhow::Result;
-use sentry_proto::{ServiceMsg, StatusPayload, UiMsg, PIPE_NAME};
+use eir_proto::{ServiceMsg, StatusPayload, UiMsg, PIPE_NAME};
 use std::sync::{Arc, Mutex};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -25,9 +25,9 @@ async fn run_on(status: SharedStatus, mut cmd_rx: mpsc::Receiver<UiMsg>, pipe_na
                 let mut s = status.lock().unwrap();
                 s.status = "ServiceDisconnected".to_string();
                 s.error = Some(
-                    "Sentry service is not running. \
-                     Run as Administrator: sentry-svc.exe install \
-                     then sc start SentrySvc"
+                    "Eir service is not running. \
+                     Run as Administrator: eir-svc.exe install \
+                     then sc start EirSvc"
                         .to_string(),
                 );
             }
@@ -58,7 +58,7 @@ async fn connect_and_run(
         }
     };
 
-    info!("Connected to Sentry service pipe");
+    info!("Connected to Eir service pipe");
 
     let (reader, mut writer) = tokio::io::split(client);
     let mut reader = BufReader::new(reader);
@@ -123,7 +123,7 @@ mod tests {
     /// line. Reproduces the UI Approve button → service path.
     #[tokio::test]
     async fn command_is_written_to_pipe() {
-        let name = r"\\.\pipe\SentrySvcTestClient";
+        let name = r"\\.\pipe\EirSvcTestClient";
         let mut server = ServerOptions::new()
             .first_pipe_instance(true)
             .pipe_mode(PipeMode::Byte)

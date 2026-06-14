@@ -4,7 +4,7 @@ mod pipe_client;
 mod updates;
 
 use pipe_client::SharedStatus;
-use sentry_proto::{SettingsUpdate, StatusPayload, UiMsg};
+use eir_proto::{SettingsUpdate, StatusPayload, UiMsg};
 use std::sync::{Arc, Mutex};
 use tauri::{
     image::Image,
@@ -51,7 +51,7 @@ async fn update_settings(settings: SettingsUpdate, tx: State<'_, UiCmdTx>) -> Re
 
 // ── Tray helpers ──────────────────────────────────────────────────────────────
 
-/// The app icon (dark shield + green "S"), decoded to RGBA once at startup.
+/// The app icon (dark shield + green "E"), decoded to RGBA once at startup.
 struct IconBase {
     rgba: Vec<u8>,
     width: u32,
@@ -85,7 +85,7 @@ fn status_accent(status: &str) -> Option<[u8; 3]> {
     }
 }
 
-/// Repaint the bright foreground (the green border + "S") with `target`,
+/// Repaint the bright foreground (the green border + "E") with `target`,
 /// leaving the dark shield background and transparent pixels intact.
 fn recolor(base: &IconBase, target: [u8; 3]) -> Vec<u8> {
     let mut out = base.rgba.clone();
@@ -113,7 +113,7 @@ fn make_icon(base: &IconBase, status: &str) -> Image<'static> {
 
 fn update_tray(tray: &TrayIcon<tauri::Wry>, base: &IconBase, status: &str) {
     let _ = tray.set_icon(Some(make_icon(base, status)));
-    let _ = tray.set_tooltip(Some(&format!("Sentry — {status}")));
+    let _ = tray.set_tooltip(Some(&format!("Eir — {status}")));
 }
 
 // ── Auto-update ─────────────────────────────────────────────────────────────────
@@ -159,7 +159,7 @@ fn main() {
 
     let status: SharedStatus = Arc::new(Mutex::new(StatusPayload {
         status: "Connecting".to_string(),
-        error: Some("Connecting to Sentry service…".to_string()),
+        error: Some("Connecting to Eir service…".to_string()),
         ..Default::default()
     }));
     let (ui_cmd_tx, ui_cmd_rx) = mpsc::channel::<UiMsg>(16);
@@ -181,12 +181,12 @@ fn main() {
             let pause_item =
                 MenuItem::with_id(app, "pause", "Pause Monitoring", true, None::<&str>)?;
             let sep = PredefinedMenuItem::separator(app)?;
-            let quit_item = MenuItem::with_id(app, "quit", "Quit Sentry", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit Eir", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open_item, &pause_item, &sep, &quit_item])?;
 
             let tray = TrayIconBuilder::new()
                 .icon(make_icon(&icon_base, "Connecting"))
-                .tooltip("Sentry — Connecting")
+                .tooltip("Eir — Connecting")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event({
@@ -247,7 +247,7 @@ fn main() {
         })
         .on_window_event(|window, event| {
             // Closing the window hides it to the tray; the service keeps running.
-            // Use "Quit Sentry" from the tray menu to exit completely.
+            // Use "Quit Eir" from the tray menu to exit completely.
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
                 api.prevent_close();
@@ -268,5 +268,5 @@ fn main() {
             updates::set_app_note
         ])
         .run(tauri::generate_context!())
-        .unwrap_or_else(|e| error!("Sentry UI failed: {e}"))
+        .unwrap_or_else(|e| error!("Eir UI failed: {e}"))
 }

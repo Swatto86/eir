@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PIPE_NAME: &str = r"\\.\pipe\SentrySvc";
+pub const PIPE_NAME: &str = r"\\.\pipe\EirSvc";
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct StatusPayload {
@@ -59,9 +59,9 @@ pub struct SettingsUpdate {
     pub log_directories: Vec<String>,
 }
 
-/// Aggregated Claude usage, surfaced in the UI so the user can see how much of
-/// their subscription Sentry is consuming. Cost is the equivalent pay-as-you-go
-/// API cost reported by the CLI — not a subscription charge.
+/// Aggregated AI usage, surfaced in the UI so the user can see how much of
+/// their subscription Eir is consuming. Cost is the equivalent pay-as-you-go
+/// API cost reported by the provider — not a subscription charge.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct UsageSummary {
     pub calls_today: u64,

@@ -1,4 +1,4 @@
-use sentry_proto::{ServiceMsg, StatusPayload, UiMsg, PIPE_NAME};
+use eir_proto::{ServiceMsg, StatusPayload, UiMsg, PIPE_NAME};
 use std::{
     collections::HashMap,
     ffi::c_void,
@@ -239,7 +239,7 @@ mod tests {
     /// request and unblock `request_approval`. Reproduces the UI → service path.
     #[tokio::test]
     async fn approve_message_resolves_request() {
-        let name = r"\\.\pipe\SentrySvcTestApprove";
+        let name = r"\\.\pipe\EirSvcTestApprove";
         let (srv, _ui_rx) = spawn_named(name);
         // Let the listener create the pipe instance.
         tokio::time::sleep(Duration::from_millis(150)).await;

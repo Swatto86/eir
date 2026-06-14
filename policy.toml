@@ -25,7 +25,7 @@ actions = [
 [blocklist]
 # Action types that are never executed — not even with approval.
 actions = [
-    "software_uninstall",   # one-way door: Sentry has no reinstall path, so never remove apps
+    "software_uninstall",   # one-way door: Eir has no reinstall path, so never remove apps
 ]
 
 services = [
