@@ -50,6 +50,13 @@ struct OpenAiRequest<'a> {
 #[derive(Deserialize)]
 struct OpenAiChunk {
     choices: Option<Vec<OpenAiChoice>>,
+    /// OpenRouter/free models may stream an error object instead of content.
+    error: Option<OpenAiStreamError>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiStreamError {
+    message: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -363,6 +370,12 @@ impl AiClient {
                         break;
                     }
                     if let Ok(chunk) = serde_json::from_str::<OpenAiChunk>(data) {
+                        // Surface a streamed error (e.g. free-tier rate limit)
+                        // instead of returning an opaque empty response.
+                        if let Some(err) = chunk.error {
+                            let msg = err.message.unwrap_or_else(|| "unknown error".into());
+                            bail!("model API error: {msg}");
+                        }
                         if let Some(choices) = chunk.choices {
                             if let Some(choice) = choices.into_iter().next() {
                                 if let Some(content) = choice.delta.content {
@@ -373,6 +386,9 @@ impl AiClient {
                     }
                 }
             }
+        }
+        if out.trim().is_empty() {
+            bail!("model returned an empty response (it may be rate-limited or unavailable)");
         }
         Ok(out)
     }
