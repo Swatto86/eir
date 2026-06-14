@@ -494,8 +494,15 @@ async fn run_claude_check(prompt: String, model: &str) -> Result<(Vec<AiUpdate>,
         .map_err(|e| e.to_string())?;
 
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        let detail = if detail.is_empty() {
+            "the app-update model must be a Claude model (e.g. sonnet / haiku / opus); free/OpenRouter models can't be used here".to_string()
+        } else {
+            detail.chars().take(300).collect()
+        };
         return Err(format!(
-            "claude exited with code {}",
+            "claude exited (code {}): {detail}",
             output.status.code().unwrap_or(-1)
         ));
     }
