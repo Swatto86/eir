@@ -11,6 +11,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
     Manager, State, WindowEvent,
 };
+use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::mpsc;
 use tracing::error;
 
@@ -107,6 +108,42 @@ fn update_tray(tray: &TrayIcon<tauri::Wry>, base: &IconBase, status: &str) {
     let _ = tray.set_tooltip(Some(&format!("Sentry — {status}")));
 }
 
+// ── Auto-update ─────────────────────────────────────────────────────────────────
+
+/// Check for updates shortly after startup and every 6 hours thereafter. When a
+/// newer signed release is published, download, install (runs the NSIS installer,
+/// which prompts for elevation and updates the service too), and relaunch.
+fn spawn_update_checker(handle: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        loop {
+            check_for_update(&handle).await;
+            tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+        }
+    });
+}
+
+async fn check_for_update(handle: &tauri::AppHandle) {
+    let updater = match handle.updater() {
+        Ok(u) => u,
+        Err(e) => {
+            error!("Updater unavailable: {e}");
+            return;
+        }
+    };
+    match updater.check().await {
+        Ok(Some(update)) => {
+            if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
+                error!("Update install failed: {e}");
+            } else {
+                handle.restart();
+            }
+        }
+        Ok(None) => {}
+        Err(e) => error!("Update check failed: {e}"),
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -122,10 +159,15 @@ fn main() {
     let status_for_loop = status.clone();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(status)
         .manage(UiCmdTx(ui_cmd_tx))
         .setup(move |app| {
             let icon_base = Arc::new(decode_icon());
+
+            // Background auto-update: check on startup, then every 6 hours.
+            // If a newer signed release exists, download, install, and relaunch.
+            spawn_update_checker(app.handle().clone());
 
             let open_item = MenuItem::with_id(app, "open", "Open Status", true, None::<&str>)?;
             let pause_item =

@@ -60,9 +60,25 @@ so uninstalling is not an available remedy. If the only real fix would be destru
 outside these actions, surface the diagnosis with a low-risk diagnostic instead of a
 destructive action.
 
-Report at most the 5 most important problems, ordered by severity. Omit trivia and
-anything you would rate below 0.6 confidence. If the system is healthy, return an empty
-problems list. Keep every text field to one or two sentences.
+Be conservative about what counts as a problem. The following are NORMAL Windows
+behaviour and MUST NOT be reported unless they directly coincide with a crash, a failed
+service, or a clear error/fatal log entry:
+  - DCOM/COM error 10016 (benign permission warnings Microsoft documents as ignorable)
+  - routine Windows Update activity, staged updates, or a pending reboot
+  - application/browser self-updaters checking or downloading (Edge, Chrome, etc.)
+  - routine service install / start-type-change events (7045/7040) with no failure
+  - informational events, expected periodic tasks, and normal log-file growth
+
+Only report a problem when ALL of these hold: (1) there is a concrete fault — a crash, a
+service that is failed/stopped but should be running, an error/fatal log entry, or resource
+exhaustion; (2) you can actually fix it with one of the actions above; and (3) your
+confidence is at least 0.80. If you cannot fix it, or it is benign or expected, do NOT
+report it — leave it out entirely. Do not re-report an issue from the decision history that
+remains unfixable; repeating it adds noise without value.
+
+Report at most the 5 most important problems, ordered by severity. If the system is healthy
+or the only findings are benign/unfixable, return an empty problems list. Keep every text
+field to one or two sentences.
 
 For EACH problem:
 1. Diagnosis: specific and actionable
