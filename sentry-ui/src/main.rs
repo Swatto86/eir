@@ -4,7 +4,7 @@ mod pipe_client;
 mod updates;
 
 use pipe_client::SharedStatus;
-use sentry_proto::{StatusPayload, UiMsg};
+use sentry_proto::{SettingsUpdate, StatusPayload, UiMsg};
 use std::sync::{Arc, Mutex};
 use tauri::{
     image::Image,
@@ -38,6 +38,13 @@ async fn decide_approval(id: u64, approved: bool, tx: State<'_, UiCmdTx>) -> Res
 #[tauri::command]
 async fn toggle_pause(tx: State<'_, UiCmdTx>) -> Result<(), String> {
     tx.0.send(UiMsg::TogglePause)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn update_settings(settings: SettingsUpdate, tx: State<'_, UiCmdTx>) -> Result<(), String> {
+    tx.0.send(UiMsg::UpdateSettings(Box::new(settings)))
         .await
         .map_err(|e| e.to_string())
 }
@@ -250,6 +257,7 @@ fn main() {
             get_status,
             decide_approval,
             toggle_pause,
+            update_settings,
             updates::list_app_updates,
             updates::update_app,
             updates::update_all_apps,

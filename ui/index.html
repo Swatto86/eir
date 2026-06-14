@@ -147,6 +147,16 @@
     .upd-dl { padding: 3px 12px; border: 1px solid var(--green); background: transparent; color: var(--green); border-radius: 6px; cursor: pointer; font-size: 11px; }
     .upd-dl:hover { background: color-mix(in srgb, var(--green) 14%, transparent); }
 
+    /* ── Settings ── */
+    #settings-card .card-header { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+    .set-grid { display: grid; grid-template-columns: 150px 1fr; gap: 8px 12px; padding: 14px; align-items: center; }
+    .set-grid label { color: var(--muted); font-size: 12px; }
+    .set-grid input, .set-grid select { width: 100%; padding: 5px 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 13px; font-family: inherit; }
+    .set-grid input:focus, .set-grid select:focus { outline: none; border-color: var(--blue); }
+    .set-actions { display: flex; align-items: center; gap: 12px; padding: 0 14px 14px; }
+    .set-save { padding: 6px 16px; background: var(--green); border: none; border-radius: 6px; color: #fff; cursor: pointer; font-size: 13px; }
+    .set-save:hover { filter: brightness(1.1); }
+
     /* ── Usage ── */
     .usage-grid { display: grid; grid-template-columns: 1fr auto auto; gap: 6px 20px; padding: 12px 14px; font-size: 13px; font-variant-numeric: tabular-nums; }
     .usage-grid .usage-h { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; text-align: right; }
@@ -252,10 +262,51 @@
     <div class="analysis-text" id="analysis-text">Waiting for first analysis cycle…</div>
   </div>
 
-  <!-- Claude usage -->
+  <!-- AI usage -->
   <div class="card" id="usage-card" style="display:none">
-    <div class="card-header">Claude Usage</div>
+    <div class="card-header">AI Usage</div>
     <div class="card-body" id="usage-body"></div>
+  </div>
+
+  <!-- Settings -->
+  <div class="card" id="settings-card">
+    <div class="card-header" id="settings-toggle">
+      ⚙ Settings <span class="hspacer"></span>
+      <span class="upd-btn" id="settings-show">Show</span>
+    </div>
+    <div class="card-body" id="settings-body" style="display:none">
+      <div class="set-grid">
+        <label for="set-provider">AI provider</label>
+        <select id="set-provider">
+          <option value="openrouter">OpenRouter (free models — no Claude usage)</option>
+          <option value="claude_cli">Claude CLI (your subscription)</option>
+          <option value="anthropic">Anthropic API (key)</option>
+          <option value="openai_compatible">OpenAI-compatible</option>
+        </select>
+        <label for="set-model">Model</label>
+        <input id="set-model" type="text" placeholder="nvidia/nemotron-3-super-120b-a12b:free">
+        <label for="set-or-key">OpenRouter key</label>
+        <input id="set-or-key" type="password" autocomplete="off">
+        <label for="set-an-key">Anthropic key</label>
+        <input id="set-an-key" type="password" autocomplete="off">
+        <label for="set-base">Base URL</label>
+        <input id="set-base" type="text" placeholder="(openai_compatible only)">
+        <label for="set-decint">Decision interval (s)</label>
+        <input id="set-decint" type="number" min="10">
+        <label for="set-elpoll">Event-log poll (s)</label>
+        <input id="set-elpoll" type="number" min="5">
+        <label for="set-wmipoll">System poll (s)</label>
+        <input id="set-wmipoll" type="number" min="30">
+        <label for="set-channels">Event-log channels</label>
+        <input id="set-channels" type="text" placeholder="System, Application, Security">
+        <label for="set-dirs">Extra log directories</label>
+        <input id="set-dirs" type="text" placeholder="C:\Logs, D:\App\Logs">
+      </div>
+      <div class="set-actions">
+        <button class="set-save" id="set-save">Save &amp; restart service</button>
+        <span class="upd-note" id="set-status"></span>
+      </div>
+    </div>
   </div>
 
 </div>

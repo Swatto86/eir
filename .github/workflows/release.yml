@@ -36,13 +36,13 @@ jobs:
             ## Sentry ${{ github.ref_name }}
 
             Autonomous Windows system repair agent. Sentry monitors system health and
-            uses Claude AI to diagnose and fix problems automatically — service
-            failures, disk pressure, log corruption, driver issues, and more.
+            uses AI to diagnose and fix problems automatically — service failures,
+            disk pressure, log corruption, driver issues, and more.
 
             ### Install
             1. Run **`Sentry_${{ github.ref_name }}_x64-setup.exe`** as Administrator.
                The installer registers and starts the `SentrySvc` Windows service and seeds `config.toml` automatically.
-            2. No API key needed — Sentry uses your logged-in `claude` CLI session and auto-detects it.
+            2. Pick your AI provider in the app's **Settings** panel — a free OpenRouter model (no cost), your logged-in Claude CLI session, or an API key.
             3. Launch **Sentry** from the Start Menu — the tray icon appears once the service connects.
 
             Already running an earlier version? It updates itself automatically.

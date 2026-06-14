@@ -20,9 +20,10 @@ model = ""   # leave empty to use the CLI's configured default, or set e.g. "cla
 # Free models are slower (30-90s) and a bit less reliable, but fine for a
 # background monitor. Pick a current free model from https://openrouter.ai/models
 # (filter: free). Good picks: a large free model with solid JSON output.
+# All of these are also editable in the app's Settings panel — no need to edit this file.
 # provider = "openrouter"
 # openrouter_api_key = "sk-or-v1-..."
-# model = "nvidia/nemotron-3-ultra-550b-a55b:free"   # or e.g. deepseek/deepseek-chat-v3-0324:free
+# model = "nvidia/nemotron-3-super-120b-a12b:free"   # tool-capable; or nemotron-3-ultra-550b:free
 
 # ── Option D: Anthropic native API ────────────────────────────────────────────
 # provider = "anthropic"

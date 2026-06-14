@@ -15,8 +15,44 @@ pub struct StatusPayload {
     pub recent_executions: Vec<ExecutionSummary>,
     pub pending_approval: Option<ApprovalInfo>,
     pub error: Option<String>,
-    /// Claude usage totals (claude_cli provider only); None when unavailable.
+    /// AI usage totals (recorded when the provider reports usage); None if unavailable.
     pub usage: Option<UsageSummary>,
+    /// Current configuration, surfaced so the UI can display and edit it.
+    pub settings: Option<UiSettings>,
+}
+
+/// Current settings shown in the UI. Secrets are never sent — only whether they
+/// are set, so the UI can show "configured" without exposing the value.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct UiSettings {
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    pub decision_interval_secs: u64,
+    pub event_log_poll_interval_secs: u64,
+    pub wmi_poll_interval_secs: u64,
+    pub event_log_channels: Vec<String>,
+    pub log_directories: Vec<String>,
+    pub openrouter_key_set: bool,
+    pub anthropic_key_set: bool,
+    pub api_key_set: bool,
+}
+
+/// A settings change from the UI. Secret fields are `None` to mean "unchanged";
+/// a non-empty value replaces the stored secret.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SettingsUpdate {
+    pub provider: String,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub openrouter_api_key: Option<String>,
+    pub anthropic_api_key: Option<String>,
+    pub api_key: Option<String>,
+    pub decision_interval_secs: u64,
+    pub event_log_poll_interval_secs: u64,
+    pub wmi_poll_interval_secs: u64,
+    pub event_log_channels: Vec<String>,
+    pub log_directories: Vec<String>,
 }
 
 /// Aggregated Claude usage, surfaced in the UI so the user can see how much of
@@ -73,4 +109,5 @@ pub enum ServiceMsg {
 pub enum UiMsg {
     Approve { id: u64, approved: bool },
     TogglePause,
+    UpdateSettings(Box<SettingsUpdate>),
 }

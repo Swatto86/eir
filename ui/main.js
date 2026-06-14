@@ -101,10 +101,13 @@ function renderUsage(u) {
   `;
 }
 
+let lastStatus = null;
+
 async function refresh() {
   let status;
   try { status = await invoke('get_status'); }
   catch (e) { console.error('get_status failed', e); return; }
+  lastStatus = status;
 
   // Status dot + text
   const dot = document.getElementById('status-dot');
@@ -294,6 +297,70 @@ document.getElementById('ai-updates-list').addEventListener('click', (e) => {
   const b = e.target.closest('.upd-dl');
   if (b) invoke('open_url', { url: b.dataset.url }).catch(err => console.error(err));
 });
+
+// ── Settings ────────────────────────────────────────────────────────────────
+
+function fillSettings() {
+  const s = lastStatus && lastStatus.settings;
+  if (!s) return;
+  document.getElementById('set-provider').value = s.provider || 'openrouter';
+  document.getElementById('set-model').value = s.model || '';
+  document.getElementById('set-base').value = s.base_url || '';
+  document.getElementById('set-decint').value = s.decision_interval_secs || 600;
+  document.getElementById('set-elpoll').value = s.event_log_poll_interval_secs || 30;
+  document.getElementById('set-wmipoll').value = s.wmi_poll_interval_secs || 300;
+  document.getElementById('set-channels').value = (s.event_log_channels || []).join(', ');
+  document.getElementById('set-dirs').value = (s.log_directories || []).join(', ');
+  document.getElementById('set-or-key').placeholder =
+    s.openrouter_key_set ? '•••••• set — blank keeps it' : 'not set';
+  document.getElementById('set-an-key').placeholder =
+    s.anthropic_key_set ? '•••••• set — blank keeps it' : 'not set';
+}
+
+function toggleSettings() {
+  const body = document.getElementById('settings-body');
+  const showing = body.style.display !== 'none';
+  if (showing) {
+    body.style.display = 'none';
+    document.getElementById('settings-show').textContent = 'Show';
+  } else {
+    fillSettings();
+    body.style.display = 'block';
+    document.getElementById('settings-show').textContent = 'Hide';
+  }
+}
+
+async function saveSettings() {
+  const splitList = v => v.split(/[,\n]/).map(x => x.trim()).filter(Boolean);
+  const orKey = document.getElementById('set-or-key').value.trim();
+  const anKey = document.getElementById('set-an-key').value.trim();
+  const settings = {
+    provider: document.getElementById('set-provider').value,
+    model: document.getElementById('set-model').value.trim(),
+    base_url: document.getElementById('set-base').value.trim(),
+    openrouter_api_key: orKey || null,
+    anthropic_api_key: anKey || null,
+    api_key: null,
+    decision_interval_secs: parseInt(document.getElementById('set-decint').value, 10) || 600,
+    event_log_poll_interval_secs: parseInt(document.getElementById('set-elpoll').value, 10) || 30,
+    wmi_poll_interval_secs: parseInt(document.getElementById('set-wmipoll').value, 10) || 300,
+    event_log_channels: splitList(document.getElementById('set-channels').value),
+    log_directories: splitList(document.getElementById('set-dirs').value),
+  };
+  const st = document.getElementById('set-status');
+  st.textContent = 'Saving… the service will restart (~15s).';
+  try {
+    await invoke('update_settings', { settings });
+    st.textContent = 'Saved. Service restarting — it will reconnect shortly.';
+    document.getElementById('set-or-key').value = '';
+    document.getElementById('set-an-key').value = '';
+  } catch (e) {
+    st.textContent = 'Failed: ' + e;
+  }
+}
+
+document.getElementById('settings-toggle').addEventListener('click', toggleSettings);
+document.getElementById('set-save').addEventListener('click', saveSettings);
 
 // Initial load + poll every 2 seconds
 refresh();

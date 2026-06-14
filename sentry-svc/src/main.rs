@@ -11,7 +11,7 @@ mod signals;
 
 use models::SignalSnapshot;
 use sentry_proto::{
-    ApprovalInfo, ExecutionSummary, ProblemSummary, StatusPayload, UiMsg, UsageSummary,
+    ApprovalInfo, ExecutionSummary, ProblemSummary, StatusPayload, UiMsg, UiSettings, UsageSummary,
 };
 use std::{
     collections::{HashSet, VecDeque},
@@ -116,7 +116,7 @@ fn install_service() {
     let svc = manager
         .create_service(&svc_info, ServiceAccess::ALL_ACCESS)
         .expect("Failed to create service");
-    svc.set_description("Autonomous Windows system repair agent powered by Claude AI")
+    svc.set_description("Autonomous Windows system repair agent powered by AI")
         .expect("Failed to set description");
     println!("{SERVICE_NAME} installed successfully.");
     println!("Start it with:  sc start {SERVICE_NAME}");
@@ -169,6 +169,7 @@ struct SvcState {
     status: String,
     error: Option<String>,
     usage: Option<UsageSummary>,
+    settings: Option<UiSettings>,
 }
 
 impl Default for SvcState {
@@ -185,8 +186,24 @@ impl Default for SvcState {
             status: "Initializing".to_string(),
             error: None,
             usage: None,
+            settings: None,
         }
     }
+}
+
+/// Restart the service to apply new settings: a detached helper stops then
+/// starts SentrySvc (LocalSystem — no UAC). It survives this process exiting.
+fn restart_self() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    let _ = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "sc stop SentrySvc & ping -n 4 127.0.0.1 >nul & sc start SentrySvc",
+        ])
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn();
 }
 
 fn build_status(st: &SvcState, pending: Option<ApprovalInfo>) -> StatusPayload {
@@ -203,6 +220,7 @@ fn build_status(st: &SvcState, pending: Option<ApprovalInfo>) -> StatusPayload {
         pending_approval: pending,
         error: st.error.clone(),
         usage: st.usage.clone(),
+        settings: st.settings.clone(),
     }
 }
 
@@ -316,10 +334,11 @@ async fn sentry_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         }};
     }
 
-    let cfg = match config::load("config.toml") {
+    let mut cfg = match config::load("config.toml") {
         Ok(c) => c,
         Err(e) => fatal!(format!("config.toml: {e}")),
     };
+    st.settings = Some(cfg.to_ui_settings());
 
     let pol = match policy::ExecutionPolicy::load(
         config::resolve("policy.toml").to_str().unwrap_or("policy.toml"),
@@ -390,14 +409,36 @@ async fn sentry_main<F: std::future::Future<Output = ()>>(shutdown: F) {
 
                 // Handle pending UI commands
                 while let Ok(cmd) = ui_rx.try_recv() {
-                    if let UiMsg::TogglePause = cmd {
-                        st.paused = !st.paused;
-                        st.status = if st.paused {
-                            "Paused".to_string()
-                        } else {
-                            "Active".to_string()
-                        };
-                        pipe.broadcast_status(build_status(&st, None));
+                    match cmd {
+                        UiMsg::TogglePause => {
+                            st.paused = !st.paused;
+                            st.status = if st.paused {
+                                "Paused".to_string()
+                            } else {
+                                "Active".to_string()
+                            };
+                            pipe.broadcast_status(build_status(&st, None));
+                        }
+                        UiMsg::UpdateSettings(update) => {
+                            cfg.apply_update(*update);
+                            st.settings = Some(cfg.to_ui_settings());
+                            match config::save(&cfg, "config.toml") {
+                                Ok(()) => {
+                                    info!("Settings saved — restarting service to apply");
+                                    st.status = "Restarting".to_string();
+                                    st.error = None;
+                                    pipe.broadcast_status(build_status(&st, None));
+                                    restart_self();
+                                    return; // SCM stop will follow; exit cleanly now
+                                }
+                                Err(e) => {
+                                    error!("Failed to save settings: {e}");
+                                    st.error = Some(format!("Save settings: {e}"));
+                                    pipe.broadcast_status(build_status(&st, None));
+                                }
+                            }
+                        }
+                        UiMsg::Approve { .. } => {} // resolved in pipe_server
                     }
                 }
 
@@ -473,7 +514,7 @@ async fn sentry_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                 let fingerprint = actionable_fingerprint(&snapshot);
                 match &fingerprint {
                     None => {
-                        info!("No actionable signals — skipping Claude analysis");
+                        info!("No actionable signals — skipping AI analysis");
                         if !st.paused {
                             st.status = "Active".to_string();
                             st.error = None;
@@ -508,9 +549,9 @@ async fn sentry_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             d
                         }
                         Err(e) => {
-                            error!("Claude analysis failed: {e}");
+                            error!("AI analysis failed: {e}");
                             st.status = "Error".to_string();
-                            st.error  = Some(format!("Claude: {e}"));
+                            st.error  = Some(format!("AI: {e}"));
                             pipe.broadcast_status(build_status(&st, None));
                             continue;
                         }
