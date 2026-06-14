@@ -41,9 +41,11 @@ jobs:
 
             ### Install
             1. Run **`Sentry_${{ github.ref_name }}_x64-setup.exe`** as Administrator.
-               The installer registers and starts the `SentrySvc` Windows service automatically.
-            2. Copy `config.toml.example` → `config.toml` in the install directory and fill in your API key.
+               The installer registers and starts the `SentrySvc` Windows service and seeds `config.toml` automatically.
+            2. No API key needed — Sentry uses your logged-in `claude` CLI session and auto-detects it.
             3. Launch **Sentry** from the Start Menu — the tray icon appears once the service connects.
+
+            Already running an earlier version? It updates itself automatically.
 
             ### Uninstall
             Use **Add or Remove Programs** — the uninstaller stops and unregisters the service automatically.
