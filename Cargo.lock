@@ -3487,7 +3487,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-proto"
-version = "0.5.25"
+version = "0.5.26"
 dependencies = [
  "serde",
  "serde_json",
@@ -3495,7 +3495,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-svc"
-version = "0.5.25"
+version = "0.5.26"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3520,7 +3520,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-ui"
-version = "0.5.25"
+version = "0.5.26"
 dependencies = [
  "anyhow",
  "image",

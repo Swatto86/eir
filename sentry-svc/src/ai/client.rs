@@ -146,6 +146,9 @@ impl AiClient {
                     .anthropic_api_key
                     .clone()
                     .context("[api] anthropic_api_key is required for provider = \"anthropic\"")?;
+                if cfg.model.trim().is_empty() {
+                    bail!("[api] a model is required for provider = \"anthropic\" (e.g. claude-opus-4-8)");
+                }
                 AiClientConfig::Anthropic {
                     api_key: key,
                     model: cfg.model.clone(),
@@ -167,6 +170,9 @@ impl AiClient {
                 let api_key = cfg.openrouter_api_key.clone().context(
                     "[api] openrouter_api_key is required for provider = \"openrouter\"",
                 )?;
+                if cfg.model.trim().is_empty() {
+                    bail!("[api] a model is required for provider = \"openrouter\" — pick one in Settings (e.g. nvidia/nemotron-3-super-120b-a12b:free)");
+                }
                 AiClientConfig::OpenRouter {
                     api_key,
                     model: cfg.model.clone(),

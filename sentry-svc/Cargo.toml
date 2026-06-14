@@ -1,6 +1,6 @@
 [package]
 name = "sentry-svc"
-version = "0.5.25"
+version = "0.5.26"
 edition = "2021"
 authors = ["Swatto <claude.ai@swatto.co.uk>"]
 description = "Sentry system monitor service — runs as LocalSystem"

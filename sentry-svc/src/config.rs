@@ -11,14 +11,17 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
 pub enum ApiProvider {
     #[default]
+    #[serde(rename = "anthropic")]
     Anthropic,
+    #[serde(rename = "openai_compatible", alias = "open_ai_compatible")]
     OpenAiCompatible,
     /// OpenRouter (openrouter.ai) — OpenAI-compatible; supports free models.
+    #[serde(rename = "openrouter", alias = "open_router")]
     OpenRouter,
     /// Spawn the local `claude` CLI binary (no API key required).
+    #[serde(rename = "claude_cli")]
     ClaudeCli,
 }
 
@@ -205,5 +208,13 @@ audit_db = "./sentry.db"
         assert_eq!(reparsed.monitoring.event_log_channels.len(), 2);
         // Blank api key keeps the prior value (None here).
         assert!(reparsed.api.anthropic_api_key.is_none());
+    }
+
+    #[test]
+    fn legacy_open_router_provider_alias_still_parses() {
+        // Older configs serialized OpenRouter as "open_router"; must still load.
+        let toml = SAMPLE.replace("\"claude_cli\"", "\"open_router\"");
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(cfg.api.provider.as_str(), "openrouter");
     }
 }
