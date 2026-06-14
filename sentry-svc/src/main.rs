@@ -410,6 +410,11 @@ async fn sentry_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     let mut cycle_count = 0u64;
     // Last analysed actionable-signal fingerprint; identical states are skipped.
     let mut last_fingerprint: Option<String> = None;
+    // When we last ran an analysis. None = never (forces a baseline run). Even on
+    // a healthy/idle system we re-analyse on this heartbeat so the UI shows a
+    // current "system healthy" result and the user can see it's alive.
+    let mut last_analysis_at: Option<std::time::Instant> = None;
+    const ANALYSIS_HEARTBEAT: Duration = Duration::from_secs(6 * 3600);
 
     let shutdown = std::pin::pin!(shutdown);
     tokio::select! {
@@ -540,30 +545,24 @@ async fn sentry_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                 let feedback_summary =
                     feedback::recent_summary(&db, 10).await.unwrap_or_default();
 
-                // ── Skip the Claude call when nothing actionable changed ──────
-                // Benign file writes and Information events don't warrant a call,
-                // and an unchanged state was already analysed last cycle. This is
-                // the main lever on subscription usage.
+                // ── Decide whether to call the AI ─────────────────────────────
+                // Skip benign/unchanged idle cycles to save usage — but always run
+                // the first analysis, on any actionable change, and on a periodic
+                // heartbeat, so the UI shows a current result even on a healthy box.
                 let fingerprint = actionable_fingerprint(&snapshot);
-                match &fingerprint {
-                    None => {
-                        info!("No actionable signals — skipping AI analysis");
-                        if !st.paused {
-                            st.status = "Active".to_string();
-                            st.error = None;
-                        }
-                        pipe.broadcast_status(build_status(&st, None));
-                        continue;
+                let changed =
+                    fingerprint.is_some() && fingerprint.as_deref() != last_fingerprint.as_deref();
+                let heartbeat_due = last_analysis_at
+                    .map(|t| t.elapsed() >= ANALYSIS_HEARTBEAT)
+                    .unwrap_or(true);
+                if !changed && !heartbeat_due {
+                    info!("No actionable change since last analysis — skipping");
+                    if !st.paused {
+                        st.status = "Active".to_string();
+                        st.error = None;
                     }
-                    Some(fp) if last_fingerprint.as_deref() == Some(fp.as_str()) => {
-                        info!("Signals unchanged since last analysis — skipping");
-                        if !st.paused {
-                            st.status = "Active".to_string();
-                        }
-                        pipe.broadcast_status(build_status(&st, None));
-                        continue;
-                    }
-                    _ => {}
+                    pipe.broadcast_status(build_status(&st, None));
+                    continue;
                 }
 
                 // ── Claude analysis ──────────────────────────────────────────
@@ -590,8 +589,10 @@ async fn sentry_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         }
                     };
 
-                // Remember this state so an identical one is skipped next cycle.
+                // Remember this state + time so unchanged idle cycles are skipped
+                // until the next heartbeat.
                 last_fingerprint = fingerprint;
+                last_analysis_at = Some(std::time::Instant::now());
 
                 st.last_analysis = claude_decision.analysis.clone();
                 st.error         = None;
