@@ -176,7 +176,7 @@
   <h1>Sentry</h1>
   <span id="status-text">Initializing…</span>
   <div class="spacer"></div>
-  <button class="btn" id="pause-btn" onclick="togglePause()">Pause</button>
+  <button class="btn" id="pause-btn">Pause</button>
 </header>
 
 <div class="metrics">
@@ -204,8 +204,8 @@
     <h2>⚠ Approval Required</h2>
     <div class="approval-grid" id="approval-grid"></div>
     <div class="approval-actions">
-      <button class="btn-approve" onclick="decide(true)">Approve</button>
-      <button class="btn-reject"  onclick="decide(false)">Reject</button>
+      <button class="btn-approve" id="approve-btn">Approve</button>
+      <button class="btn-reject"  id="reject-btn">Reject</button>
     </div>
   </div>
 

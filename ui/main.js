@@ -195,6 +195,7 @@ async function loadUpdates() {
   const countEl = document.getElementById('updates-count');
   const allBtn = document.getElementById('upd-all');
   if (updatesBusy) return;
+  list.innerHTML = '<div class="empty">Checking for updates…</div>';
   try {
     const ups = await invoke('list_app_updates');
     countEl.textContent = ups.length ? `(${ups.length})` : '';
@@ -246,6 +247,12 @@ async function updateAll() {
   btn.disabled = false; btn.textContent = 'Update all';
   loadUpdates();
 }
+
+// Header / approval buttons (wired here rather than inline — Tauri v2 injects a
+// CSP nonce that disables 'unsafe-inline', which would block inline onclick).
+document.getElementById('pause-btn').addEventListener('click', togglePause);
+document.getElementById('approve-btn').addEventListener('click', () => decide(true));
+document.getElementById('reject-btn').addEventListener('click', () => decide(false));
 
 document.getElementById('upd-refresh').addEventListener('click', loadUpdates);
 document.getElementById('upd-all').addEventListener('click', updateAll);

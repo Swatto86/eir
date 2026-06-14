@@ -1,6 +1,6 @@
 [package]
 name = "sentry-ui"
-version = "0.5.19"
+version = "0.5.20"
 edition = "2021"
 authors = ["Swatto <claude.ai@swatto.co.uk>"]
 description = "Sentry system monitor — tray UI"
