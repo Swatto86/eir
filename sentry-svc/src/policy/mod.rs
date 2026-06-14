@@ -125,6 +125,27 @@ impl ExecutionPolicy {
     }
 }
 
+fn action_type_name(action: &FixAction) -> &'static str {
+    match action {
+        FixAction::ServiceRestart { .. } => "service_restart",
+        FixAction::ServiceStop { .. } => "service_stop",
+        FixAction::ServiceStart { .. } => "service_start",
+        FixAction::LogCleanup { .. } => "log_cleanup",
+        FixAction::DiskCleanup { .. } => "disk_cleanup",
+        FixAction::PowerShellDiagnostic { .. } => "powershell_diagnostic",
+        FixAction::TaskDisable { .. } => "task_disable",
+        FixAction::TaskEnable { .. } => "task_enable",
+        FixAction::RegistryReset { .. } => "registry_reset",
+        FixAction::NetworkDiagnostic { .. } => "network_diagnostic",
+        FixAction::DriverDisable { .. } => "driver_disable",
+        FixAction::DriverEnable { .. } => "driver_enable",
+        FixAction::SoftwareUninstall { .. } => "software_uninstall",
+        FixAction::BcdEdit { .. } => "bcd_edit",
+        FixAction::ProcessKill { .. } => "process_kill",
+        FixAction::FileDelete { .. } => "file_delete",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,26 +174,5 @@ mod tests {
             package_name: "NordVPN".into(),
         };
         assert!(matches!(pol.evaluate(&action, 0.99), Verdict::Block(_)));
-    }
-}
-
-fn action_type_name(action: &FixAction) -> &'static str {
-    match action {
-        FixAction::ServiceRestart { .. } => "service_restart",
-        FixAction::ServiceStop { .. } => "service_stop",
-        FixAction::ServiceStart { .. } => "service_start",
-        FixAction::LogCleanup { .. } => "log_cleanup",
-        FixAction::DiskCleanup { .. } => "disk_cleanup",
-        FixAction::PowerShellDiagnostic { .. } => "powershell_diagnostic",
-        FixAction::TaskDisable { .. } => "task_disable",
-        FixAction::TaskEnable { .. } => "task_enable",
-        FixAction::RegistryReset { .. } => "registry_reset",
-        FixAction::NetworkDiagnostic { .. } => "network_diagnostic",
-        FixAction::DriverDisable { .. } => "driver_disable",
-        FixAction::DriverEnable { .. } => "driver_enable",
-        FixAction::SoftwareUninstall { .. } => "software_uninstall",
-        FixAction::BcdEdit { .. } => "bcd_edit",
-        FixAction::ProcessKill { .. } => "process_kill",
-        FixAction::FileDelete { .. } => "file_delete",
     }
 }
