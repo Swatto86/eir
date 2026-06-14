@@ -293,10 +293,12 @@ async function checkAiUpdates() {
       html += '<div class="empty">No updates found for non-winget apps.</div>';
     } else {
       html += r.updates.map(u => `
-        <div class="upd-row">
+        <div class="upd-row" data-name="${esc(u.name)}">
           <span class="upd-name" title="${esc(u.name)}">${esc(u.name)}</span>
           <span class="upd-ver">${esc(u.current || '?')} → ${esc(u.latest)}</span>
           ${u.url ? `<button class="upd-dl" data-url="${esc(u.url)}">Download</button>` : ''}
+          <button class="upd-mini note-btn">Note</button>
+          <button class="upd-mini ignore-btn">Ignore</button>
         </div>`).join('');
     }
     html += `<div class="upd-note">${esc(cost)} · AI-checked — verify before installing.</div>`;
@@ -311,8 +313,42 @@ async function checkAiUpdates() {
 
 document.getElementById('ai-check-btn').addEventListener('click', checkAiUpdates);
 document.getElementById('ai-updates-list').addEventListener('click', (e) => {
-  const b = e.target.closest('.upd-dl');
-  if (b) invoke('open_url', { url: b.dataset.url }).catch(err => console.error(err));
+  // Download link
+  const dl = e.target.closest('.upd-dl');
+  if (dl) { invoke('open_url', { url: dl.dataset.url }).catch(err => console.error(err)); return; }
+  const row = e.target.closest('.upd-row');
+  if (!row) return;
+  const name = row.dataset.name;
+  // Ignore: blacklist this app from future AI checks
+  if (e.target.closest('.ignore-btn')) {
+    invoke('set_app_note', { name, note: '', ignore: true })
+      .then(() => { row.innerHTML =
+        `<span class="upd-name">${esc(name)}</span><span class="upd-ver">ignored — won't be checked again</span>`; })
+      .catch(err => console.error(err));
+    return;
+  }
+  // Note: open an inline editor for a hint used in future checks
+  if (e.target.closest('.note-btn')) {
+    row.innerHTML = `
+      <span class="upd-name">${esc(name)}</span>
+      <span class="note-edit">
+        <input class="note-input" type="text" placeholder="e.g. my own app — ignore / latest is on my GitHub releases">
+        <button class="upd-mini note-save">Save</button>
+      </span>`;
+    const inp = row.querySelector('.note-input');
+    inp.focus();
+    inp.addEventListener('keydown', ev => { if (ev.key === 'Enter') row.querySelector('.note-save').click(); });
+    return;
+  }
+  // Save the typed note
+  if (e.target.closest('.note-save')) {
+    const val = row.querySelector('.note-input').value;
+    invoke('set_app_note', { name, note: val, ignore: false })
+      .then(() => { row.innerHTML =
+        `<span class="upd-name">${esc(name)}</span><span class="upd-ver">note saved — used on the next check</span>`; })
+      .catch(err => console.error(err));
+    return;
+  }
 });
 
 // ── Settings ────────────────────────────────────────────────────────────────
@@ -378,6 +414,36 @@ async function saveSettings() {
 
 document.getElementById('settings-toggle').addEventListener('click', toggleSettings);
 document.getElementById('set-save').addEventListener('click', saveSettings);
+
+// ── Collapsible cards ───────────────────────────────────────────────────────
+
+function loadCollapsed() {
+  try { return JSON.parse(localStorage.getItem('sentryCollapsed') || '{}'); }
+  catch { return {}; }
+}
+
+function applyCollapsed() {
+  const saved = loadCollapsed();
+  Object.entries(saved).forEach(([id, collapsed]) => {
+    const el = document.getElementById(id);
+    if (el && collapsed) el.classList.add('collapsed');
+  });
+}
+
+document.querySelector('.body').addEventListener('click', (e) => {
+  // Don't toggle when interacting with a control inside the header.
+  if (e.target.closest('button, input, select, a')) return;
+  const header = e.target.closest('.card-header.collapsible');
+  if (!header) return;
+  const card = header.closest('.card, .analysis-card');
+  if (!card || !card.id) return;
+  card.classList.toggle('collapsed');
+  const saved = loadCollapsed();
+  saved[card.id] = card.classList.contains('collapsed');
+  localStorage.setItem('sentryCollapsed', JSON.stringify(saved));
+});
+
+applyCollapsed();
 
 // Initial load + poll every 2 seconds
 refresh();

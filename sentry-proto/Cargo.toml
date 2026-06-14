@@ -1,6 +1,6 @@
 [package]
 name = "sentry-proto"
-version = "0.5.22"
+version = "0.5.23"
 edition = "2021"
 
 [dependencies]

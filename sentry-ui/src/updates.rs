@@ -3,11 +3,66 @@
 //! machine-scope packages can be installed.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
 use tokio::io::AsyncWriteExt;
 
 /// CREATE_NO_WINDOW — keep the console-based winget/powershell hidden.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+// ── Per-app notes / ignore list (persisted to %APPDATA%\Sentry\app-notes.json) ─
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct AppNote {
+    #[serde(default)]
+    ignore: bool,
+    #[serde(default)]
+    note: String,
+}
+
+fn notes_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var("APPDATA").ok()?;
+    let dir = std::path::Path::new(&base).join("Sentry");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("app-notes.json"))
+}
+
+fn load_notes() -> HashMap<String, AppNote> {
+    notes_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_notes(notes: &HashMap<String, AppNote>) -> Result<(), String> {
+    let path = notes_path().ok_or("cannot resolve notes path")?;
+    let json = serde_json::to_string_pretty(notes).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())
+}
+
+/// Record a note and/or ignore flag for an app, used in future AI checks.
+/// An empty note with ignore=false removes the entry.
+#[tauri::command]
+pub async fn set_app_note(name: String, note: String, ignore: bool) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let mut notes = load_notes();
+        let key = name.to_lowercase();
+        if note.trim().is_empty() && !ignore {
+            notes.remove(&key);
+        } else {
+            notes.insert(
+                key,
+                AppNote {
+                    ignore,
+                    note: note.trim().to_string(),
+                },
+            );
+        }
+        save_notes(&notes)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
 #[derive(Serialize, Clone, Debug)]
 pub struct AppUpdate {
@@ -319,7 +374,10 @@ pub async fn check_ai_updates() -> Result<AiCheckResult, String> {
     .map_err(|e| e.to_string())?
     .map_err(|e| format!("winget is not available: {e}"))?;
 
+    let notes = load_notes();
     let mut apps = parse_unmanaged(&String::from_utf8_lossy(&list_out.stdout));
+    // Drop apps the user has chosen to ignore.
+    apps.retain(|(n, _)| !notes.get(&n.to_lowercase()).map(|x| x.ignore).unwrap_or(false));
     let total = apps.len();
     let mut note = None;
     if apps.len() > AI_CHECK_CAP {
@@ -337,16 +395,21 @@ pub async fn check_ai_updates() -> Result<AiCheckResult, String> {
         });
     }
 
-    // 2. Ask Claude to look up the latest versions.
+    // 2. Ask Claude to look up the latest versions, honouring any user notes.
     let app_lines = apps
         .iter()
-        .map(|(n, v)| format!("- {n} ({v})"))
+        .map(|(n, v)| match notes.get(&n.to_lowercase()) {
+            Some(x) if !x.note.is_empty() => format!("- {n} ({v}) [user note: {}]", x.note),
+            _ => format!("- {n} ({v})"),
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let prompt = format!(
         "You are an application update checker. Below are installed Windows applications with their \
 current versions. Use web search to find each one's latest STABLE release from its official source. \
 Return ONLY the apps that have a NEWER version available.\n\n\
+Respect any [user note]: it may say an app is custom/self-built or give its real release source — \
+follow that guidance and do NOT report an update that contradicts the note.\n\n\
 Respond ONLY with JSON, no markdown:\n\
 {{\"updates\":[{{\"name\":\"<app>\",\"current\":\"<installed>\",\"latest\":\"<newer version>\",\"url\":\"<official download or releases page URL>\"}}]}}\n\
 Omit apps that are already current or that you cannot verify. Only include real, verified versions.\n\n\

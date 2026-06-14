@@ -164,6 +164,21 @@
     .usage-grid .usage-v { text-align: right; }
     .usage-note { padding: 0 14px 12px; font-size: 11px; color: var(--muted); }
 
+    /* ── Collapsible cards ── */
+    .card-header.collapsible, .analysis-card .card-header { cursor: pointer; user-select: none; }
+    .chev { display: inline-block; width: 10px; margin-right: 6px; color: var(--muted); font-size: 10px; transition: transform .15s; }
+    .card.collapsed .chev, .analysis-card.collapsed .chev { transform: rotate(-90deg); }
+    .card.collapsed > :not(.card-header), .analysis-card.collapsed > :not(.card-header) { display: none; }
+    .empty { padding: 16px 14px; }
+    .two-col { align-items: start; }
+
+    /* ── Per-app note editor ── */
+    .upd-mini { padding: 2px 8px; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 6px; cursor: pointer; font-size: 11px; }
+    .upd-mini:hover { background: var(--border); color: var(--text); }
+    .note-edit { display: flex; gap: 6px; flex: 1; align-items: center; }
+    .note-edit input { flex: 1; padding: 4px 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 12px; font-family: inherit; }
+    .note-edit input:focus { outline: none; border-color: var(--blue); }
+
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
@@ -211,14 +226,14 @@
 
   <!-- Problems + Executions -->
   <div class="two-col">
-    <div class="card">
-      <div class="card-header">Recent Problems</div>
+    <div class="card" id="problems-card">
+      <div class="card-header collapsible"><span class="chev">▾</span>Recent Problems</div>
       <div class="card-body" id="problems-list">
         <div class="empty">No problems detected yet</div>
       </div>
     </div>
-    <div class="card">
-      <div class="card-header">Recent Executions</div>
+    <div class="card" id="executions-card">
+      <div class="card-header collapsible"><span class="chev">▾</span>Recent Executions</div>
       <div class="card-body" id="executions-list">
         <div class="empty">No executions yet</div>
       </div>
@@ -227,8 +242,8 @@
 
   <!-- Available app updates -->
   <div class="card" id="updates-card">
-    <div class="card-header">
-      Available Updates <span class="upd-count" id="updates-count"></span>
+    <div class="card-header collapsible">
+      <span class="chev">▾</span>Available Updates <span class="upd-count" id="updates-count"></span>
       <span class="hspacer"></span>
       <button class="upd-btn" id="upd-refresh">Refresh</button>
       <button class="upd-btn upd-all" id="upd-all" style="display:none">Update all</button>
@@ -240,8 +255,8 @@
 
   <!-- Other updates (AI-checked, apps winget can't manage) -->
   <div class="card" id="ai-updates-card">
-    <div class="card-header">
-      Other Updates <span class="upd-count" id="ai-updates-count"></span>
+    <div class="card-header collapsible">
+      <span class="chev">▾</span>Other Updates <span class="upd-count" id="ai-updates-count"></span>
       <span class="hspacer"></span>
       <button class="upd-btn" id="ai-check-btn">Check other apps</button>
     </div>
@@ -252,19 +267,19 @@
 
   <!-- Failed services -->
   <div class="card" id="services-card" style="display:none">
-    <div class="card-header">Failed Services</div>
+    <div class="card-header collapsible"><span class="chev">▾</span>Failed Services</div>
     <div class="services-list" id="services-list"></div>
   </div>
 
   <!-- Last analysis -->
-  <div class="analysis-card">
-    <div class="card-header">Last Analysis</div>
+  <div class="analysis-card" id="analysis-card">
+    <div class="card-header collapsible"><span class="chev">▾</span>Last Analysis</div>
     <div class="analysis-text" id="analysis-text">Waiting for first analysis cycle…</div>
   </div>
 
   <!-- AI usage -->
   <div class="card" id="usage-card" style="display:none">
-    <div class="card-header">AI Usage</div>
+    <div class="card-header collapsible"><span class="chev">▾</span>AI Usage</div>
     <div class="card-body" id="usage-body"></div>
   </div>
 
