@@ -287,6 +287,7 @@ fn push_problem(
         blocked,
         auto_executed,
         reason,
+        at: chrono::Utc::now().timestamp(),
     });
 }
 
@@ -299,6 +300,7 @@ fn push_execution(st: &mut SvcState, action: &str, success: bool, output: &str) 
         action: action.to_string(),
         success,
         preview,
+        at: chrono::Utc::now().timestamp(),
     });
 }
 
@@ -439,6 +441,14 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             } else {
                                 "Active".to_string()
                             };
+                            pipe.broadcast_status(build_status(&st, None));
+                        }
+                        UiMsg::ClearProblems => {
+                            st.recent_problems.clear();
+                            pipe.broadcast_status(build_status(&st, None));
+                        }
+                        UiMsg::ClearExecutions => {
+                            st.recent_executions.clear();
                             pipe.broadcast_status(build_status(&st, None));
                         }
                         UiMsg::UpdateSettings(update) => {

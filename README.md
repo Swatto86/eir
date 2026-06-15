@@ -91,8 +91,9 @@ CLI it uses the CLI's built-in search (`update_check_model`, default **Haiku**).
   reversible fixes run automatically, no babysitting.
 - **Tunable autonomy** — set the auto-fix confidence threshold in Settings (default
   80%): lower to act on weaker hunches, higher to be more cautious.
-- **Approval backstop** — the few genuinely catastrophic actions (boot-config edits,
-  driver disabling, arbitrary PowerShell) still require your say-so.
+- **Approval backstop** — disruptive or irreversible actions (closing a program,
+  deleting a file, boot-config edits, driver disabling, arbitrary PowerShell) always
+  require your say-so; they're never auto-run.
 - **Never-uninstall guarantee** — software removal is a hard-blocked action.
 - **App update monitoring** — one panel: available updates via `winget`, plus a
   **Check other apps** button that uses your AI provider's web search (OpenRouter web

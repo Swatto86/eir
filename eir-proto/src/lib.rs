@@ -101,6 +101,9 @@ pub struct ProblemSummary {
     /// ran or needs no explanation.
     #[serde(default)]
     pub reason: Option<String>,
+    /// Unix timestamp (seconds) when this entry was recorded; 0 if unknown.
+    #[serde(default)]
+    pub at: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -108,6 +111,9 @@ pub struct ExecutionSummary {
     pub action: String,
     pub success: bool,
     pub preview: String,
+    /// Unix timestamp (seconds) when this execution ran; 0 if unknown.
+    #[serde(default)]
+    pub at: i64,
 }
 
 /// Messages sent FROM the service TO the UI.
@@ -124,4 +130,8 @@ pub enum UiMsg {
     Approve { id: u64, approved: bool },
     TogglePause,
     UpdateSettings(Box<SettingsUpdate>),
+    /// Clear the in-memory Recent Problems list.
+    ClearProblems,
+    /// Clear the in-memory Recent Executions list.
+    ClearExecutions,
 }

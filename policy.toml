@@ -23,10 +23,10 @@ actions = [
     "network_diagnostic",
     # Phase 4 — lower-risk actions auto-approved
     "driver_enable",
-    "file_delete",
     # Always require approval (disruptive or irreversible — never auto-run):
-    # process_kill (can close a foreground app/game), powershell_diagnostic,
-    # driver_disable, software_uninstall (also hard-blocked), bcd_edit
+    # file_delete (deletes a file, e.g. an app's config), process_kill (can close a
+    # foreground app/game), powershell_diagnostic, driver_disable,
+    # software_uninstall (also hard-blocked), bcd_edit
 ]
 
 [blocklist]

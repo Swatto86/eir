@@ -170,7 +170,8 @@
     .model-label { font-size: 11px; color: var(--muted); margin-right: 10px; max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
     /* ── Collapsible cards ── */
-    .card-header.collapsible, .analysis-card .card-header { cursor: pointer; user-select: none; }
+    .card-header.collapsible, .analysis-card .card-header { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px; }
+    .row-age { margin-left: auto; padding-left: 8px; color: var(--muted); font-size: 11px; white-space: nowrap; }
     .chev { display: inline-block; width: 10px; margin-right: 6px; color: var(--muted); font-size: 10px; transition: transform .15s; }
     .card.collapsed .chev, .analysis-card.collapsed .chev { transform: rotate(-90deg); }
     .card.collapsed > :not(.card-header), .analysis-card.collapsed > :not(.card-header) { display: none; }
@@ -233,13 +234,13 @@
   <!-- Problems + Executions -->
   <div class="two-col">
     <div class="card" id="problems-card">
-      <div class="card-header collapsible"><span class="chev">▾</span>Recent Problems</div>
+      <div class="card-header collapsible"><span class="chev">▾</span>Recent Problems<span class="hspacer"></span><button class="upd-btn" id="clear-problems">Clear</button></div>
       <div class="card-body" id="problems-list">
         <div class="empty">No problems detected yet</div>
       </div>
     </div>
     <div class="card" id="executions-card">
-      <div class="card-header collapsible"><span class="chev">▾</span>Recent Executions</div>
+      <div class="card-header collapsible"><span class="chev">▾</span>Recent Executions<span class="hspacer"></span><button class="upd-btn" id="clear-executions">Clear</button></div>
       <div class="card-body" id="executions-list">
         <div class="empty">No executions yet</div>
       </div>

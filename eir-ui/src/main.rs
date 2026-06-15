@@ -43,6 +43,20 @@ async fn toggle_pause(tx: State<'_, UiCmdTx>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn clear_problems(tx: State<'_, UiCmdTx>) -> Result<(), String> {
+    tx.0.send(UiMsg::ClearProblems)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn clear_executions(tx: State<'_, UiCmdTx>) -> Result<(), String> {
+    tx.0.send(UiMsg::ClearExecutions)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn update_settings(settings: SettingsUpdate, tx: State<'_, UiCmdTx>) -> Result<(), String> {
     tx.0.send(UiMsg::UpdateSettings(Box::new(settings)))
         .await
@@ -258,6 +272,8 @@ fn main() {
             decide_approval,
             toggle_pause,
             update_settings,
+            clear_problems,
+            clear_executions,
             updates::list_app_updates,
             updates::update_app,
             updates::update_all_apps,

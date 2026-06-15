@@ -34,6 +34,16 @@ window.__TAURI__.window.getCurrentWindow().onCloseRequested((e) => {
 
 function pct(v) { return `${Math.round(v)}%`; }
 
+// Relative age from a unix-seconds timestamp (0/missing → blank).
+function ago(ts) {
+  if (!ts) return '';
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
 function barColor(v) {
   if (v >= 90) return 'var(--red)';
   if (v >= 75) return 'var(--yellow)';
@@ -186,7 +196,7 @@ async function refresh() {
     'problems-list',
     status.recent_problems,
     p => `<div class="row">
-      <div class="row-title">${problemTag(p)}<span>${esc(p.diagnosis)}</span></div>
+      <div class="row-title">${problemTag(p)}<span>${esc(p.diagnosis)}</span><span class="row-age">${ago(p.at)}</span></div>
       <div class="row-sub">${esc(p.action)}${p.reason ? ' — ' + esc(p.reason) : ''}</div>
     </div>`,
     'No problems detected yet'
@@ -197,7 +207,7 @@ async function refresh() {
     'executions-list',
     status.recent_executions,
     e => `<div class="row">
-      <div class="row-title">${exTag(e)}<span>${esc(e.action)}</span></div>
+      <div class="row-title">${exTag(e)}<span>${esc(e.action)}</span><span class="row-age">${ago(e.at)}</span></div>
       <div class="row-sub">${esc(e.preview)}</div>
     </div>`,
     'No executions yet'
@@ -498,6 +508,16 @@ async function saveSettings() {
 
 document.getElementById('settings-toggle').addEventListener('click', toggleSettings);
 document.getElementById('set-save').addEventListener('click', saveSettings);
+
+// Clear the in-memory Recents (service-side; the next poll reflects the empty list).
+document.getElementById('clear-problems').addEventListener('click', async () => {
+  try { await invoke('clear_problems'); } catch (e) { console.error(e); }
+  refresh();
+});
+document.getElementById('clear-executions').addEventListener('click', async () => {
+  try { await invoke('clear_executions'); } catch (e) { console.error(e); }
+  refresh();
+});
 
 // ── Collapsible cards ───────────────────────────────────────────────────────
 
