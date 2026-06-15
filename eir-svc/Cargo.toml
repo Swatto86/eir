@@ -1,6 +1,6 @@
 [package]
 name = "eir-svc"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2021"
 authors = ["Swatto <claude.ai@swatto.co.uk>"]
 description = "Eir system monitor service — runs as LocalSystem"
