@@ -1,42 +1,34 @@
 [api]
-# ── Option A: Claude CLI (no API key — uses your logged-in `claude` session) ──
-# This is the recommended option if you use Claude Code / Claude Max.
+# ── Option A (default): OpenRouter — free models, no Claude usage ──────────────
+# Lowest-cost option. The `openrouter/free` meta-model auto-routes to a current
+# free model, so you don't have to track model names. Add your OpenRouter key in
+# the app's Settings panel (or here) — everything else is editable in Settings,
+# no need to touch this file. Get a key at https://openrouter.ai/keys
+provider = "openrouter"
+openrouter_api_key = ""   # required — paste your sk-or-v1-... key (or set it in Settings)
+model = "openrouter/free" # auto-routes to a free model; or pin one from https://openrouter.ai/models
+
+# Model for the on-demand "Other Updates" app check (which uses live web search).
+# It follows your main provider: OpenRouter uses the main model + OpenRouter's web
+# plugin; Claude CLI uses this model (blank = haiku). For OpenRouter this field is
+# ignored. Editable in Settings.
+update_check_model = "haiku"
+
+# ── Option B: Claude CLI (no API key — uses your logged-in `claude` session) ──
 # The service runs as LocalSystem. Leave user_profile and claude_cli_path blank
 # and it auto-detects: it scans C:\Users for the profile that holds a logged-in
 # Claude session (~/.claude/.credentials.json) and finds claude.exe under it.
-# Set them explicitly only to override auto-detection.
-provider = "claude_cli"
+# provider = "claude_cli"
 # user_profile = "C:\\Users\\YourName"
 # claude_cli_path = "C:\\Users\\YourName\\.local\\bin\\claude.exe"
-model = ""   # leave empty to use the CLI's configured default, or set e.g. "claude-opus-4-8"
+# model = ""   # leave empty to use the CLI's configured default, or e.g. "claude-opus-4-8"
 
-# Model for the on-demand "Other Updates" app check. This always runs through the
-# Claude CLI (it needs live web search), so it must be a Claude model — sonnet,
-# haiku, or opus. Free/OpenRouter models can't be used here. Blank = haiku (the
-# cheapest). Also editable in the app's Settings panel.
-update_check_model = "haiku"
-
-# ── Option B: Anthropic native API ────────────────────────────────────────────
+# ── Option C: Anthropic native API ────────────────────────────────────────────
 # provider = "anthropic"
 # anthropic_api_key = "sk-ant-..."
 # model = "claude-opus-4-8"
 
-# ── Option C: OpenRouter (openrouter.ai) — use FREE models, no Claude usage ───
-# Lowest-cost option: free models cost nothing and don't touch your Claude plan.
-# Free models are slower (30-90s) and a bit less reliable, but fine for a
-# background monitor. Pick a current free model from https://openrouter.ai/models
-# (filter: free). Good picks: a large free model with solid JSON output.
-# All of these are also editable in the app's Settings panel — no need to edit this file.
-# provider = "openrouter"
-# openrouter_api_key = "sk-or-v1-..."
-# model = "nvidia/nemotron-3-super-120b-a12b:free"   # tool-capable; or nemotron-3-ultra-550b:free
-
-# ── Option D: Anthropic native API ────────────────────────────────────────────
-# provider = "anthropic"
-# anthropic_api_key = "sk-ant-..."
-# model = "claude-opus-4-8"
-
-# ── Option E: claude-max-api-proxy (OpenAI-compatible local proxy) ────────────
+# ── Option D: claude-max-api-proxy (OpenAI-compatible local proxy) ────────────
 # Run first: npx claude-max-api-proxy
 # provider = "openai_compatible"
 # base_url = "http://localhost:3456/v1"

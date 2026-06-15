@@ -60,11 +60,13 @@ Each decision cycle (default every 10 minutes):
    a healthy machine still reports in. Idle cycles are essentially free.
 3. **Diagnose** — the AI returns a structured list of problems, each with a
    confidence score and a proposed root-cause fix.
-4. **Gate through policy** — low-confidence findings and benign Windows noise are
-   dropped; blocklisted actions (e.g. uninstalling software) are *never* executed,
-   even with approval.
-5. **Execute or ask** — safe, reversible fixes can run automatically; anything risky
-   waits for your approval in the tray UI.
+4. **Gate through policy** — findings below 80% confidence and benign Windows noise
+   are dropped; software uninstall is *never* executed; a few catastrophic actions
+   (boot-config edits, driver disabling, arbitrary PowerShell) always require
+   approval.
+5. **Execute** — reversible whitelisted fixes (service restart/start/stop, log/disk
+   cleanup, task enable/disable, registry reset, process kill, file delete) run
+   automatically at ≥80% confidence. The rest wait for approval in the tray UI.
 
 ## AI providers
 
@@ -72,23 +74,27 @@ Everything is configurable in the **Settings** panel — no file editing require
 
 | Provider | Cost | Web search | Notes |
 |----------|------|------------|-------|
-| **OpenRouter** | Free models available | No | Recommended default. Free models cost nothing and don't touch your Claude plan. |
+| **OpenRouter** *(default)* | Free models | Yes — web plugin | Recommended. `openrouter/free` auto-routes to a current free model; needs an API key. Doesn't touch your Claude plan. |
 | **Claude CLI** | Uses your Claude plan | Yes | No API key — reuses your logged-in `claude` session. |
 | **Anthropic API** | Pay-as-you-go | Yes | Direct API key from console.anthropic.com. |
-| **OpenAI-compatible** | Depends | Depends | Any OpenAI-style endpoint (e.g. a local proxy). |
+| **OpenAI-compatible** | Depends | No | Any OpenAI-style endpoint (e.g. a local proxy). |
 
-The main monitoring loop can run on a cheap/free model. The **app-update check** (see
-below) needs live web search, so it always runs through the Claude CLI on a Claude
-model (defaults to **Haiku**, the cheapest).
+The monitoring loop and the **app-update check** both use your configured provider.
+The app-update check needs live web search: on OpenRouter it uses the web plugin
+(works with free models — about £0.004 per check for the search), and on the Claude
+CLI it uses the CLI's built-in search (`update_check_model`, default **Haiku**).
 
 ## Features
 
-- **Autonomous diagnosis & repair** of common Windows faults, root-cause first.
-- **Approval workflow** — risky actions never run without your say-so.
+- **Autonomous diagnosis & repair** of common Windows faults, root-cause first —
+  reversible fixes run automatically at ≥80% confidence, no babysitting.
+- **Approval backstop** — the few genuinely catastrophic actions (boot-config edits,
+  driver disabling, arbitrary PowerShell) still require your say-so.
 - **Never-uninstall guarantee** — software removal is a hard-blocked action.
-- **App update monitoring** — surfaces available updates via `winget`, and uses AI
-  web search for apps no package manager tracks. Per-app notes let you correct or
-  silence false positives (e.g. for your own self-built apps).
+- **App update monitoring** — surfaces available updates via `winget`, and uses your
+  AI provider's web search (OpenRouter web plugin or Claude) for apps no package
+  manager tracks. Per-app notes let you correct or silence false positives (e.g. for
+  your own self-built apps).
 - **Usage transparency** — shows AI calls, tokens, and estimated cost in **GBP**.
   Free models are clearly marked as no-cost.
 - **Self-updating** — signed auto-updates via the GitHub releases feed.
@@ -103,9 +109,10 @@ model (defaults to **Haiku**, the cheapest).
    service and seeds the default config.
 3. Launch **Eir** from the Start Menu — the tray icon appears once the service
    connects.
-4. Open **Settings** and pick your AI provider. The free OpenRouter option needs an
-   [OpenRouter API key](https://openrouter.ai/keys); the Claude CLI option needs a
-   logged-in `claude` session and no key.
+4. The default provider is **OpenRouter**. Open **Settings**, paste your
+   [OpenRouter API key](https://openrouter.ai/keys), and Save — that's all it needs
+   (the `openrouter/free` model is preset). Prefer Claude? Switch the provider to
+   **Claude CLI**, which uses your logged-in `claude` session and needs no key.
 
 Already installed? Eir updates itself automatically.
 

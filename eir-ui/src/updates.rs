@@ -359,10 +359,11 @@ struct AiUpdateRaw {
     url: String,
 }
 
-/// On-demand: ask Claude (with web lookup) for updates to apps winget can't
-/// manage. `model` is the Claude model to use (empty = Haiku).
+/// On-demand: ask the configured AI provider (with live web search) for updates
+/// to apps winget can't manage. Uses OpenRouter's web plugin when the provider
+/// is OpenRouter, otherwise the Claude CLI — see `run_ai_check`.
 #[tauri::command]
-pub async fn check_ai_updates(model: String) -> Result<AiCheckResult, String> {
+pub async fn check_ai_updates() -> Result<AiCheckResult, String> {
     // 1. Apps winget can't manage.
     let list_out = tokio::task::spawn_blocking(|| {
         std::process::Command::new("winget")
@@ -416,7 +417,7 @@ Omit apps that are already current or that you cannot verify. Only include real,
 INSTALLED APPS:\n{app_lines}"
     );
 
-    let (updates, cost) = run_claude_check(prompt, &model).await?;
+    let (updates, cost) = run_ai_check(prompt).await?;
     Ok(AiCheckResult {
         updates,
         checked: apps.len(),
@@ -427,11 +428,7 @@ INSTALLED APPS:\n{app_lines}"
 
 /// Re-check a single app (using its stored note) — cheaper than a full sweep.
 #[tauri::command]
-pub async fn check_app_update(
-    name: String,
-    current: String,
-    model: String,
-) -> Result<AiCheckResult, String> {
+pub async fn check_app_update(name: String, current: String) -> Result<AiCheckResult, String> {
     let notes = load_notes();
     let key = name.to_lowercase();
     if notes.get(&key).map(|x| x.ignore).unwrap_or(false) {
@@ -456,13 +453,174 @@ Respond ONLY with JSON, no markdown:\n\
 Return an empty updates array if it is already current or you cannot verify a newer version.\n\n\
 APP: {name} ({current}){note_line}"
     );
-    let (updates, cost) = run_claude_check(prompt, &model).await?;
+    let (updates, cost) = run_ai_check(prompt).await?;
     Ok(AiCheckResult {
         updates,
         checked: 1,
         cost_usd: cost,
         note: None,
     })
+}
+
+/// Route an update-check prompt through whichever provider the service is
+/// configured for (read from config.toml next to the executable):
+/// OpenRouter free model + web plugin, or the Claude CLI (default fallback).
+async fn run_ai_check(prompt: String) -> Result<(Vec<AiUpdate>, f64), String> {
+    let cfg = resolve_ai_cfg();
+    if cfg.provider == "openrouter" {
+        let key = cfg.openrouter_api_key.unwrap_or_default();
+        if key.trim().is_empty() {
+            return Err("OpenRouter is selected but no API key is set — add it in Settings.".into());
+        }
+        let model = if cfg.model.trim().is_empty() {
+            "openrouter/free".to_string()
+        } else {
+            cfg.model.trim().to_string()
+        };
+        run_openrouter_check(prompt, &model, key.trim()).await
+    } else {
+        // Claude CLI (also the fallback for anthropic / openai_compatible, which
+        // don't have a built-in web path here). update_check_model -> haiku.
+        run_claude_check(prompt, &cfg.update_check_model).await
+    }
+}
+
+/// The AI settings the update check needs, read from the on-disk config.toml
+/// (the service keeps the API key out of the pipe payload, so read it directly).
+#[derive(Deserialize, Default)]
+struct FileApiCfg {
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    openrouter_api_key: Option<String>,
+    #[serde(default)]
+    update_check_model: String,
+}
+
+#[derive(Deserialize, Default)]
+struct FileCfg {
+    #[serde(default)]
+    api: FileApiCfg,
+}
+
+fn resolve_ai_cfg() -> FileApiCfg {
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("config.toml")))
+        .unwrap_or_else(|| std::path::PathBuf::from("config.toml"));
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| toml::from_str::<FileCfg>(&s).ok())
+        .map(|c| c.api)
+        .unwrap_or_default()
+}
+
+/// Ask OpenRouter (with its web-search plugin) for app updates. Works with free
+/// models — OpenRouter performs the search and feeds results to the model, so it
+/// is model-agnostic. Returns the parsed updates plus the call's USD cost.
+async fn run_openrouter_check(
+    prompt: String,
+    model: &str,
+    key: &str,
+) -> Result<(Vec<AiUpdate>, f64), String> {
+    let body = serde_json::json!({
+        "model": model,
+        "plugins": [{ "id": "web", "max_results": 5 }],
+        "messages": [{ "role": "user", "content": prompt }],
+    });
+    let resp = reqwest::Client::new()
+        .post("https://openrouter.ai/api/v1/chat/completions")
+        .bearer_auth(key)
+        .header("HTTP-Referer", "https://github.com/Swatto86/eir")
+        .header("X-Title", "Eir")
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(420))
+        .send()
+        .await
+        .map_err(|e| format!("OpenRouter request failed: {e}"))?;
+
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        let detail: String = text.chars().take(400).collect();
+        return Err(format!("OpenRouter error ({status}): {detail}"));
+    }
+
+    let parsed: OrResp =
+        serde_json::from_str(&text).map_err(|e| format!("bad OpenRouter response: {e}"))?;
+    if let Some(err) = parsed.error {
+        return Err(format!("OpenRouter error: {}", err.message));
+    }
+    let content = parsed
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|c| c.message.content)
+        .unwrap_or_default();
+    let cost = parsed.usage.and_then(|u| u.cost).unwrap_or(0.0);
+
+    let json = extract_json(&content);
+    let resp_updates: AiResp =
+        serde_json::from_str(json).map_err(|e| format!("could not parse update list: {e}"))?;
+    let updates = resp_updates
+        .updates
+        .into_iter()
+        .filter(|u| !u.name.is_empty() && !u.latest.is_empty())
+        .map(|u| AiUpdate {
+            name: u.name,
+            current: u.current,
+            latest: u.latest,
+            url: u.url,
+        })
+        .collect();
+    Ok((updates, cost))
+}
+
+#[derive(Deserialize)]
+struct OrResp {
+    #[serde(default)]
+    choices: Vec<OrChoice>,
+    #[serde(default)]
+    usage: Option<OrUsage>,
+    #[serde(default)]
+    error: Option<OrError>,
+}
+
+#[derive(Deserialize)]
+struct OrChoice {
+    message: OrMsg,
+}
+
+#[derive(Deserialize)]
+struct OrMsg {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OrUsage {
+    #[serde(default)]
+    cost: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct OrError {
+    #[serde(default)]
+    message: String,
+}
+
+/// Pull the JSON object out of a model response that may wrap it in prose or
+/// code fences (reasoning models often add commentary around the JSON).
+fn extract_json(s: &str) -> &str {
+    let t = strip_fences(s);
+    if let (Some(a), Some(b)) = (t.find('{'), t.rfind('}')) {
+        if b > a {
+            return &t[a..=b];
+        }
+    }
+    t
 }
 
 /// Spawn `claude --print --output-format json` with the given prompt and model,
