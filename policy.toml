@@ -1,5 +1,10 @@
 [execution]
-confidence_threshold = 0.85
+# Whitelisted, reversible actions auto-execute at or above this confidence with
+# no prompt (maximum-autonomy setting). The hard floor in policy/mod.rs (80%)
+# blocks anything below this. The genuinely catastrophic actions (bcd_edit,
+# driver_disable, powershell_diagnostic) are kept off the whitelist on purpose,
+# so they still require approval regardless of confidence.
+confidence_threshold = 0.80
 max_retries_per_issue = 3
 rate_limit_mins = 30
 auto_approve_on_success_rate = 0.95

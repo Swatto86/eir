@@ -204,6 +204,13 @@ async function refresh() {
 
   // Usage
   renderUsage(status.usage);
+
+  // If the service rejected a settings change (e.g. a provider that can't
+  // start), surface the reason next to the Save button — not just the header.
+  if (status.error && /settings|not applied/i.test(status.error)) {
+    const ss = document.getElementById('set-status');
+    if (ss) ss.textContent = status.error;
+  }
 }
 
 async function togglePause() {
@@ -454,6 +461,32 @@ async function saveSettings() {
     log_directories: splitList(document.getElementById('set-dirs').value),
   };
   const st = document.getElementById('set-status');
+
+  // Client-side guard: the service rejects (and silently reverts) a provider
+  // that can't start. Catch the common cases here with a clear message instead
+  // of a confusing revert to the previous provider.
+  const s = (lastStatus && lastStatus.settings) || {};
+  if (settings.provider === 'openrouter') {
+    if (!orKey && !s.openrouter_key_set) {
+      st.textContent = 'OpenRouter needs an API key — enter one above, then Save.';
+      return;
+    }
+    if (!settings.model) {
+      st.textContent = 'OpenRouter needs a model — e.g. nvidia/nemotron-3-super-120b-a12b:free';
+      return;
+    }
+  }
+  if (settings.provider === 'anthropic') {
+    if (!anKey && !s.anthropic_key_set) {
+      st.textContent = 'Anthropic needs an API key — enter one above, then Save.';
+      return;
+    }
+    if (!settings.model) {
+      st.textContent = 'Anthropic needs a model — e.g. claude-haiku-4-5';
+      return;
+    }
+  }
+
   st.textContent = 'Saving… the service will restart (~15s).';
   try {
     await invoke('update_settings', { settings });
