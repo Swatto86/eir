@@ -72,7 +72,14 @@ struct IconBase {
     height: u32,
 }
 
-const ICON_PNG: &[u8] = include_bytes!("../../icons/128x128.png");
+// Source the tray icon from the 256px asset and downsample with a quality
+// filter (see make_icon) — gives Windows a small, pre-filtered icon so its own
+// tray scaling barely runs, instead of a jagged 128px→~20px squash.
+const ICON_PNG: &[u8] = include_bytes!("../../icons/128x128@2x.png");
+
+/// Pixel size handed to Windows for the tray icon. 32 keeps it crisp in the
+/// overflow flyout (~28–32px) and only mildly downscaled in the small tray.
+const TRAY_ICON_PX: u32 = 32;
 
 fn decode_icon() -> IconBase {
     let img = image::load_from_memory(ICON_PNG)
@@ -122,7 +129,17 @@ fn make_icon(base: &IconBase, status: &str) -> Image<'static> {
         None => base.rgba.clone(),
         Some(target) => recolor(base, target),
     };
-    Image::new_owned(pixels, base.width, base.height)
+    // Downsample from the full-res (recoloured) image to the tray size with a
+    // high-quality filter so the edges stay smooth at small sizes.
+    let src = image::RgbaImage::from_raw(base.width, base.height, pixels)
+        .expect("icon buffer matches its dimensions");
+    let scaled = image::imageops::resize(
+        &src,
+        TRAY_ICON_PX,
+        TRAY_ICON_PX,
+        image::imageops::FilterType::Lanczos3,
+    );
+    Image::new_owned(scaled.into_raw(), TRAY_ICON_PX, TRAY_ICON_PX)
 }
 
 fn update_tray(tray: &TrayIcon<tauri::Wry>, base: &IconBase, status: &str) {
