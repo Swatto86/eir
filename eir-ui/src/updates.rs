@@ -267,13 +267,12 @@ fn is_noise(name: &str) -> bool {
         "maintenance service",
         ".net",
         "directx",
-        "nvidia",
         "realtek",
         "intel(r)",
         "host app",
         "web experience",
         "microsoft 365",
-        "office",
+        "microsoft office",
         "visual studio installer",
         "onedrive",
         "teams machine-wide",
@@ -786,14 +785,20 @@ Name                       Id                              Version       Availab
 7-Zip 25.01 (x64)          7zip.7zip                       25.01         26.01       winget
 Git                        ARP\\Machine\\X64\\Git_is1          2.52.0
 NVIDIA Graphics Driver     ARP\\Machine\\X64\\{B2FE1952}       596.49
+NVIDIA App                 ARP\\Machine\\X64\\{NVAPP0001}      11.0.5.260
+LibreOffice 25.8           ARP\\Machine\\X64\\{LO258000}       25.8.1
 iCloud Outlook             ARP\\Machine\\X64\\{81FA1580}       15.7.0.56";
         let apps = parse_unmanaged(sample);
-        // 7-Zip excluded (winget), NVIDIA Driver excluded (noise); Git + iCloud kept.
         let names: Vec<&str> = apps.iter().map(|(n, _)| n.as_str()).collect();
+        // Kept: real third-party apps, including NVIDIA's app and LibreOffice
+        // (no longer over-filtered by "nvidia"/"office").
         assert!(names.contains(&"Git"));
         assert!(names.contains(&"iCloud Outlook"));
+        assert!(names.contains(&"NVIDIA App"));
+        assert!(names.contains(&"LibreOffice 25.8"));
+        // Excluded: winget-managed (7-Zip) and the actual driver (caught by "driver").
         assert!(!names.contains(&"7-Zip 25.01 (x64)"));
-        assert!(!names.iter().any(|n| n.contains("NVIDIA")));
+        assert!(!names.contains(&"NVIDIA Graphics Driver"));
     }
 
     #[test]
