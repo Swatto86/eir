@@ -63,6 +63,10 @@ pub struct ApiConfig {
     /// Claude model for the on-demand app-update check (empty = Haiku).
     #[serde(default)]
     pub update_check_model: String,
+    /// Reasoning effort passed to the Claude CLI (`--effort`): low|medium|high|
+    /// xhigh|max. Empty = the CLI default. Only used by the claude_cli provider.
+    #[serde(default)]
+    pub effort: String,
     /// claude_cli: path to the claude binary. Defaults to "claude" (must be in PATH).
     pub claude_cli_path: Option<String>,
     /// claude_cli: your Windows user profile root (e.g. C:\Users\Swatto).
@@ -87,6 +91,16 @@ fn default_confidence() -> f32 {
     0.80
 }
 
+/// Accept only the Claude CLI's documented effort levels; anything else (incl.
+/// blank) becomes empty, i.e. the CLI default. Keeps an invalid value from being
+/// passed straight to `--effort`.
+fn normalize_effort(value: &str) -> String {
+    match value.trim().to_lowercase().as_str() {
+        e @ ("low" | "medium" | "high" | "xhigh" | "max") => e.to_string(),
+        _ => String::new(),
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PersistenceConfig {
     pub audit_db: String,
@@ -100,6 +114,7 @@ impl Config {
             provider: self.api.provider.as_str().to_string(),
             model: self.api.model.clone(),
             update_check_model: self.api.update_check_model.clone(),
+            effort: self.api.effort.clone(),
             base_url: self.api.base_url.clone().unwrap_or_default(),
             decision_interval_secs: self.monitoring.decision_interval_secs,
             event_log_poll_interval_secs: self.monitoring.event_log_poll_interval_secs,
@@ -118,6 +133,7 @@ impl Config {
         self.api.provider = ApiProvider::parse(&u.provider);
         self.api.model = u.model;
         self.api.update_check_model = u.update_check_model;
+        self.api.effort = normalize_effort(&u.effort);
         let keep = |cur: &mut Option<String>, new: Option<String>| {
             if let Some(v) = new {
                 if !v.trim().is_empty() {
@@ -196,6 +212,7 @@ audit_db = "./eir.db"
             provider: "openrouter".into(),
             model: "nvidia/nemotron-3-super-120b-a12b:free".into(),
             update_check_model: "claude-haiku-4-5".into(),
+            effort: "High".into(),
             base_url: Some(String::new()),
             openrouter_api_key: Some("sk-or-test".into()),
             anthropic_api_key: None,
@@ -219,6 +236,8 @@ audit_db = "./eir.db"
         assert_eq!(reparsed.monitoring.decision_interval_secs, 900);
         assert_eq!(reparsed.monitoring.confidence_threshold, 0.9);
         assert_eq!(reparsed.api.update_check_model, "claude-haiku-4-5");
+        // Effort is normalised (case-folded) and round-trips.
+        assert_eq!(reparsed.api.effort, "high");
         assert_eq!(reparsed.monitoring.event_log_channels.len(), 2);
         // Blank api key keeps the prior value (None here).
         assert!(reparsed.api.anthropic_api_key.is_none());

@@ -21,7 +21,8 @@ update_check_model = "haiku"
 # provider = "claude_cli"
 # user_profile = "C:\\Users\\YourName"
 # claude_cli_path = "C:\\Users\\YourName\\.local\\bin\\claude.exe"
-# model = ""   # leave empty to use the CLI's configured default, or e.g. "claude-opus-4-8"
+# model = ""   # leave empty to use the CLI's configured default, or e.g. "sonnet" / "claude-opus-4-8"
+# effort = ""  # Claude CLI reasoning effort: low|medium|high|xhigh|max (blank = CLI default)
 
 # ── Option C: Anthropic native API ────────────────────────────────────────────
 # provider = "anthropic"

@@ -610,6 +610,7 @@ function fillSettings() {
   if (!s) return;
   document.getElementById('set-provider').value = s.provider || 'openrouter';
   document.getElementById('set-model').value = s.model || '';
+  document.getElementById('set-effort').value = s.effort || '';
   document.getElementById('set-upd-model').value = s.update_check_model || '';
   document.getElementById('set-base').value = s.base_url || '';
   document.getElementById('set-conf').value = Math.round((s.confidence_threshold || 0.80) * 100);
@@ -644,6 +645,7 @@ async function saveSettings() {
   const settings = {
     provider: document.getElementById('set-provider').value,
     model: document.getElementById('set-model').value.trim(),
+    effort: document.getElementById('set-effort').value,
     update_check_model: document.getElementById('set-upd-model').value.trim(),
     base_url: document.getElementById('set-base').value.trim(),
     openrouter_api_key: orKey || null,

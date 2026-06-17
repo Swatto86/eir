@@ -34,6 +34,10 @@ pub struct UiSettings {
     /// Claude model used for the on-demand "Other Updates" AI check (it needs
     /// web search). Empty = the CLI's default model.
     pub update_check_model: String,
+    /// Reasoning effort for the Claude CLI provider (`--effort`): one of low,
+    /// medium, high, xhigh, max. Empty = the CLI's default. Ignored by other providers.
+    #[serde(default)]
+    pub effort: String,
     pub base_url: String,
     pub decision_interval_secs: u64,
     pub event_log_poll_interval_secs: u64,
@@ -56,6 +60,8 @@ pub struct SettingsUpdate {
     pub provider: String,
     pub model: String,
     pub update_check_model: String,
+    #[serde(default)]
+    pub effort: String,
     pub base_url: Option<String>,
     pub openrouter_api_key: Option<String>,
     pub anthropic_api_key: Option<String>,

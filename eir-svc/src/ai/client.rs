@@ -135,6 +135,8 @@ enum AiClientConfig {
         binary: String,
         model: String,
         user_profile: Option<String>,
+        /// `--effort` level (low|medium|high|xhigh|max); empty = CLI default.
+        effort: String,
     },
 }
 
@@ -199,6 +201,7 @@ impl AiClient {
                     binary,
                     model: cfg.model.clone(),
                     user_profile,
+                    effort: cfg.effort.clone(),
                 }
             }
         };
@@ -244,8 +247,9 @@ impl AiClient {
                 binary,
                 model,
                 user_profile,
+                effort,
             } => {
-                self.call_claude_cli(binary, model, user_profile.as_deref(), &prompt)
+                self.call_claude_cli(binary, model, effort, user_profile.as_deref(), &prompt)
                     .await?
             }
         };
@@ -456,6 +460,7 @@ impl AiClient {
         &self,
         binary: &str,
         model: &str,
+        effort: &str,
         user_profile: Option<&str>,
         prompt: &str,
     ) -> Result<(String, Option<CallUsage>)> {
@@ -464,6 +469,10 @@ impl AiClient {
         cmd.args(["--print", "--output-format", "json"]);
         if !model.is_empty() {
             cmd.args(["--model", model]);
+        }
+        // Reasoning effort (low|medium|high|xhigh|max); validated upstream.
+        if !effort.is_empty() {
+            cmd.args(["--effort", effort]);
         }
         // Reap the (large) claude process if this future is dropped on timeout.
         cmd.kill_on_drop(true);

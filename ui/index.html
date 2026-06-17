@@ -317,6 +317,15 @@
         </select>
         <label for="set-model">Model</label>
         <input id="set-model" type="text" placeholder="openrouter/free (auto-routes to a free model)">
+        <label for="set-effort">Reasoning effort</label>
+        <select id="set-effort">
+          <option value="">Default (Claude CLI only)</option>
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+          <option value="xhigh">XHigh</option>
+          <option value="max">Max</option>
+        </select>
         <label for="set-upd-model">App-update model</label>
         <input id="set-upd-model" type="text" placeholder="Claude CLI only (blank = haiku); OpenRouter uses the main model + web">
         <label for="set-or-key">OpenRouter key</label>
