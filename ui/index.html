@@ -144,6 +144,10 @@
     .svc-chip { font-size: 11px; padding: 2px 8px; border-radius: 4px; background: color-mix(in srgb, var(--red) 12%, var(--surface)); border: 1px solid color-mix(in srgb, var(--red) 30%, transparent); color: var(--red); }
 
     /* ── Available updates ── */
+    /* The card clips to its rounded corners (overflow:hidden); the trailing AI
+       note / result line carries no bottom padding, so without this it sits flush
+       against the clip edge and gets cut off. Give the body bottom breathing room. */
+    #updates-card .card-body { padding-bottom: 8px; }
     #updates-card .card-header { display: flex; align-items: center; gap: 8px; }
     .upd-count { color: var(--blue); font-weight: 600; }
     .card-header .hspacer { flex: 1; }
