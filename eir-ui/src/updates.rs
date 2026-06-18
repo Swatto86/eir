@@ -571,6 +571,40 @@ fn version_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     Some(x.cmp(&y))
 }
 
+/// True only when `latest` is a STRICTLY newer version than `current`. Numeric
+/// comparison when both parse as dotted-numeric; otherwise a normalized string
+/// inequality, so an identical version is never reported as an update. An empty
+/// `latest` is never newer; an empty/unknown `current` lets any real `latest`
+/// through (we'd rather show an unverifiable update than silently hide one).
+fn is_newer(latest: &str, current: &str) -> bool {
+    if latest.trim().is_empty() {
+        return false;
+    }
+    match version_cmp(latest, current) {
+        Some(std::cmp::Ordering::Greater) => true,
+        Some(_) => false,
+        None => normalize_version(latest) != normalize_version(current),
+    }
+}
+
+/// Resolve the installed version of an AI-returned app name against the apps we
+/// actually queried (keyed lowercased name -> version). Display names are fuzzy —
+/// the model may echo "Revision Tool" for a winget "Revision Tool version 2.9.0" —
+/// so fall back to a contains-either-way match after an exact hit fails.
+fn match_installed<'a>(
+    installed: &'a HashMap<String, String>,
+    name: &str,
+) -> Option<&'a String> {
+    let n = name.to_lowercase();
+    if let Some(v) = installed.get(&n) {
+        return Some(v);
+    }
+    installed
+        .iter()
+        .find(|(k, _)| !k.is_empty() && (k.contains(&n) || n.contains(k.as_str())))
+        .map(|(_, v)| v)
+}
+
 /// Read an installed app's version from `winget list --id <id> --exact`.
 async fn winget_installed_version(id: &str) -> Option<String> {
     let id = id.to_string();
@@ -1879,7 +1913,28 @@ Omit apps that are already current or that you cannot verify. Only include real,
 INSTALLED APPS:\n{app_lines}"
     );
 
-    let (updates, cost) = run_ai_check(prompt).await?;
+    let (raw_updates, cost) = run_ai_check(prompt).await?;
+    // Deterministic guard: keep only updates that are STRICTLY newer than the
+    // version actually installed right now. The model is told to return only newer
+    // releases, but a fuzzy comparison (or an over-eager search) can slip an
+    // equal/older "update" through — drop those, and stamp each surviving row with
+    // the authoritative installed version so the UI never carries a stale `current`.
+    let installed: HashMap<String, String> =
+        apps.iter().map(|(n, v)| (n.to_lowercase(), v.clone())).collect();
+    let updates = raw_updates
+        .into_iter()
+        .filter_map(|mut u| {
+            let cur = match_installed(&installed, &u.name)
+                .cloned()
+                .unwrap_or_else(|| u.current.clone());
+            if is_newer(&u.latest, &cur) {
+                u.current = cur;
+                Some(u)
+            } else {
+                None
+            }
+        })
+        .collect();
     Ok(AiCheckResult {
         updates,
         checked: apps.len(),
@@ -1901,6 +1956,14 @@ pub async fn check_app_update(name: String, current: String) -> Result<AiCheckRe
             note: Some(format!("{name} is on your ignore list.")),
         });
     }
+    // Re-read the version installed RIGHT NOW instead of trusting the value the UI
+    // row captured when it was first rendered. After a manual upgrade that value is
+    // stale, so the old code re-confirmed the same false positive every time — a
+    // Re-check could never clear once the real install moved on. winget's live
+    // reading wins; the caller's value is only a fallback when winget can't find it.
+    let installed = winget_installed_version_by_name(&name)
+        .await
+        .unwrap_or(current);
     let note_line = match notes.get(&key) {
         Some(x) if !x.note.is_empty() => format!(" [user note: {}]", x.note),
         _ => String::new(),
@@ -1913,9 +1976,19 @@ follow it and do NOT report an update that contradicts the note.\n\n\
 Respond ONLY with JSON, no markdown:\n\
 {{\"updates\":[{{\"name\":\"{name}\",\"current\":\"<installed>\",\"latest\":\"<newer version>\",\"url\":\"<official download or releases page URL>\"}}]}}\n\
 Return an empty updates array if it is already current or you cannot verify a newer version.\n\n\
-APP: {name} ({current}){note_line}"
+APP: {name} ({installed}){note_line}"
     );
     let (updates, cost) = run_ai_check(prompt).await?;
+    // Same strictly-newer guard as the full sweep: never surface an "update" that
+    // isn't actually ahead of what's installed, and report the real current version.
+    let updates = updates
+        .into_iter()
+        .filter(|u| is_newer(&u.latest, &installed))
+        .map(|mut u| {
+            u.current = installed.clone();
+            u
+        })
+        .collect();
     Ok(AiCheckResult {
         updates,
         checked: 1,
@@ -2601,5 +2674,39 @@ mod tests {
         assert_eq!(classify_version("2.1.0", "2.0.0"), "verified"); // newer than expected is fine
         assert_eq!(classify_version("1.0.0", "2.0.0"), "mismatch"); // still the old version
         assert_eq!(classify_version("Unknown", "2.0.0"), "unverified");
+    }
+
+    #[test]
+    fn is_newer_only_accepts_strictly_higher() {
+        // The Revision Tool regression: an AI "2.7.5" must NOT count as an update
+        // over an installed "2.9.0", nor over an equal version.
+        assert!(!is_newer("2.7.5", "2.9.0"));
+        assert!(!is_newer("2.9.0", "2.9.0"));
+        assert!(!is_newer("2.7.1", "2.7.5"));
+        // A genuinely newer release is reported; `v`-prefixes are normalized.
+        assert!(is_newer("2.7.5", "2.7.1"));
+        assert!(is_newer("v2.9.1", "2.9.0"));
+        // Empty latest is never an update; unknown current lets a real latest pass.
+        assert!(!is_newer("", "2.9.0"));
+        assert!(is_newer("2.9.0", ""));
+        // Dotted dates still compare numerically (newer minor wins).
+        assert!(is_newer("2024.02", "2024.01"));
+        // Truly non-numeric tags fall back to a string inequality: equal is never
+        // an update, differing is.
+        assert!(!is_newer("nightly", "nightly"));
+        assert!(is_newer("build-b", "build-a"));
+    }
+
+    #[test]
+    fn match_installed_resolves_fuzzy_names() {
+        let mut installed = std::collections::HashMap::new();
+        installed.insert("revision tool version 2.9.0".to_string(), "2.9.0".to_string());
+        installed.insert("krita".to_string(), "5.2.0".to_string());
+        // The AI echoes a clean "Revision Tool"; it must still resolve to 2.9.0.
+        assert_eq!(match_installed(&installed, "Revision Tool"), Some(&"2.9.0".to_string()));
+        // Exact (case-insensitive) hit.
+        assert_eq!(match_installed(&installed, "Krita"), Some(&"5.2.0".to_string()));
+        // No overlap -> no match (caller falls back to the AI's own `current`).
+        assert_eq!(match_installed(&installed, "Obsidian"), None);
     }
 }
