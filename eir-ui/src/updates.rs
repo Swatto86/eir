@@ -400,7 +400,13 @@ async fn verify_winget_batch(
         o.verification = verification;
         o.to = found;
         o.detail = detail.clone();
-        emit_phase(app, &up.id, if o.success { "done" } else { "failed" }, i + 1, total);
+        emit_phase(
+            app,
+            &up.id,
+            if o.success { "done" } else { "failed" },
+            i + 1,
+            total,
+        );
         outcomes.push(o);
     }
     outcomes
@@ -483,8 +489,13 @@ fn emit_phase(app: &AppHandle, key: &str, phase: &str, index: usize, total: usiz
 // ── Post-update verification ─────────────────────────────────────────────────
 
 enum VerifyTarget {
-    Winget { id: String },
-    ByName { name: String, verify_exe: Option<String> },
+    Winget {
+        id: String,
+    },
+    ByName {
+        name: String,
+        verify_exe: Option<String>,
+    },
 }
 
 /// Confirm an app now reports `expected` (or newer). Returns (verification, found
@@ -544,40 +555,97 @@ fn normalize_version(v: &str) -> String {
     v.trim().trim_start_matches(['v', 'V']).trim().to_string()
 }
 
+/// Parse a version's leading dotted-numeric run into its components, e.g.
+/// "1.7.12227.37421622" -> [1, 7, 12227, 37421622]. The run stops at the first
+/// non-numeric label, so "2.43.0.windows.1" -> [2, 43, 0]. Returns None when there
+/// is no parseable dotted-numeric head (or a component overflows u64) — the signal
+/// callers use to fall back to a string comparison.
+fn numeric_components(s: &str) -> Option<Vec<u64>> {
+    let s = normalize_version(s);
+    let head: String = s
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let parts: Vec<u64> = head
+        .split('.')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts)
+    }
+}
+
 /// Compare two version strings numerically, component by component. Returns None
 /// when neither side begins with a parseable dotted-numeric version.
 fn version_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
-    fn parse(s: &str) -> Option<Vec<u64>> {
-        let s = normalize_version(s);
-        let head: String = s
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.')
-            .collect();
-        let parts: Vec<u64> = head
-            .split('.')
-            .filter(|p| !p.is_empty())
-            .map(|p| p.parse::<u64>().ok())
-            .collect::<Option<Vec<_>>>()?;
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts)
-        }
-    }
-    let (mut x, mut y) = (parse(a)?, parse(b)?);
+    let (mut x, mut y) = (numeric_components(a)?, numeric_components(b)?);
     let n = x.len().max(y.len());
     x.resize(n, 0);
     y.resize(n, 0);
     Some(x.cmp(&y))
 }
 
+/// Detect a "marketing truncation": a numeric `latest` that only looks newer than
+/// `current` because it is a SHORT marketing version held up against `current`'s
+/// LONGER build/revision version that shares the same major. This is the signature
+/// of cross-product / cross-scheme conflation — e.g. an installed "NVIDIA FrameView
+/// SDK 1.7.12227.37421622" reported as upgradable to the FrameView *app*'s
+/// marketing "1.9": `1.9` wins only on the minor while ignoring the 12227.37421622
+/// of real build precision the proposal omits entirely. Comparing the two is
+/// meaningless, so such a "newer" verdict must not be trusted.
+///
+/// Conservative by construction — it fires ONLY when every part of that shape
+/// holds: both sides parse numerically; `current` is at least two components
+/// longer than `latest` (a build/revision tail `latest` lacks); the majors agree
+/// (the win lands on a later component, never the leading one); and `current`
+/// carries genuine non-zero precision beyond `latest`'s length. It deliberately
+/// does NOT touch bare-major bumps such as a driver "551.86.0.0" -> "552", because
+/// those are structurally identical to legitimate major upgrades like Chrome
+/// "85.0.4183.121" -> "86" and cannot be told apart from the version strings
+/// alone; the recourse for that residual case is the per-app Ignore list.
+fn is_marketing_truncation(latest: &str, current: &str) -> bool {
+    let (Some(l), Some(c)) = (numeric_components(latest), numeric_components(current)) else {
+        return false;
+    };
+    // `current` must be materially longer — a build/revision tail `latest` omits.
+    if c.len() < l.len() + 2 {
+        return false;
+    }
+    // First component where they differ (zero-extending `latest`, as version_cmp
+    // does). `latest` must win there, on a component it actually has (a real value,
+    // not zero-padding) and past the major (index >= 1, so the leading component
+    // agrees — this is not an ambiguous bare-major bump).
+    let divergence = (0..c.len()).find_map(|i| {
+        let li = l.get(i).copied().unwrap_or(0);
+        (li != c[i]).then_some((i, li > c[i]))
+    });
+    let Some((index, latest_wins)) = divergence else {
+        return false;
+    };
+    if !latest_wins || index == 0 {
+        return false;
+    }
+    // `current` must carry real (non-zero) precision beyond `latest`'s length —
+    // the build/revision numbers that make the comparison incoherent.
+    c[l.len()..].iter().any(|&part| part != 0)
+}
+
 /// True only when `latest` is a STRICTLY newer version than `current`. Numeric
 /// comparison when both parse as dotted-numeric; otherwise a normalized string
 /// inequality, so an identical version is never reported as an update. An empty
 /// `latest` is never newer; an empty/unknown `current` lets any real `latest`
-/// through (we'd rather show an unverifiable update than silently hide one).
+/// through (we'd rather show an unverifiable update than silently hide one). A
+/// numeric "newer" that is really a marketing truncation of a longer build version
+/// (see is_marketing_truncation) is rejected — that is the cross-scheme false
+/// positive that surfaced an unkillable "FrameView SDK 1.7.x -> 1.9" row.
 fn is_newer(latest: &str, current: &str) -> bool {
     if latest.trim().is_empty() {
+        return false;
+    }
+    if is_marketing_truncation(latest, current) {
         return false;
     }
     match version_cmp(latest, current) {
@@ -591,10 +659,7 @@ fn is_newer(latest: &str, current: &str) -> bool {
 /// actually queried (keyed lowercased name -> version). Display names are fuzzy —
 /// the model may echo "Revision Tool" for a winget "Revision Tool version 2.9.0" —
 /// so fall back to a contains-either-way match after an exact hit fails.
-fn match_installed<'a>(
-    installed: &'a HashMap<String, String>,
-    name: &str,
-) -> Option<&'a String> {
+fn match_installed<'a>(installed: &'a HashMap<String, String>, name: &str) -> Option<&'a String> {
     let n = name.to_lowercase();
     if let Some(v) = installed.get(&n) {
         return Some(v);
@@ -616,7 +681,10 @@ fn is_version_token(token: &str) -> bool {
     let t = token.trim().trim_start_matches('(').trim_end_matches(')');
     let t = t.strip_prefix(['v', 'V']).unwrap_or(t);
     // Split into a leading numeric-dotted core and any remainder.
-    let core_len = t.chars().take_while(|c| c.is_ascii_digit() || *c == '.').count();
+    let core_len = t
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .count();
     let mut core: String = t.chars().take(core_len).collect();
     let mut rest: String = t.chars().skip(core_len).collect();
     // A trailing dot belongs to the qualifier, not the core ("2.43.0" + ".windows.1").
@@ -631,7 +699,9 @@ fn is_version_token(token: &str) -> bool {
     // and is alphanumerics/dots/hyphens/plus only (covers -rc1, .windows.1, +build).
     rest.is_empty()
         || (rest.starts_with(['-', '+', '.'])
-            && rest.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')))
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')))
 }
 
 /// A trailing token that qualifies a build but carries no product identity — CPU
@@ -645,8 +715,16 @@ fn is_arch_qualifier(token: &str) -> bool {
         .to_ascii_lowercase();
     matches!(
         t.as_str(),
-        "x64" | "x86" | "amd64" | "arm64" | "win64" | "win32"
-            | "32-bit" | "64-bit" | "32bit" | "64bit"
+        "x64"
+            | "x86"
+            | "amd64"
+            | "arm64"
+            | "win64"
+            | "win32"
+            | "32-bit"
+            | "64-bit"
+            | "32bit"
+            | "64bit"
     )
 }
 
@@ -917,7 +995,11 @@ fn brand_label(host: &str) -> Option<String> {
         return None;
     }
     let last2 = format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]);
-    let suffix_labels = if MULTI_SUFFIXES.contains(&last2.as_str()) { 2 } else { 1 };
+    let suffix_labels = if MULTI_SUFFIXES.contains(&last2.as_str()) {
+        2
+    } else {
+        1
+    };
     labels
         .len()
         .checked_sub(suffix_labels + 1)
@@ -1009,7 +1091,13 @@ fn sanitise_args(kind: InstallerKind, raw: &[String]) -> Vec<String> {
         "/passive",
         "/suppressmsgboxes",
     ];
-    const ALLOW_MSI: &[&str] = &["/qn", "/quiet", "/norestart", "/passive", "REBOOT=ReallySuppress"];
+    const ALLOW_MSI: &[&str] = &[
+        "/qn",
+        "/quiet",
+        "/norestart",
+        "/passive",
+        "REBOOT=ReallySuppress",
+    ];
     let allow: &[&str] = match kind {
         InstallerKind::Exe => ALLOW_EXE,
         InstallerKind::Msi => ALLOW_MSI,
@@ -1054,7 +1142,10 @@ fn validate_plan(raw: InstallPlanRaw, name: &str, current: &str) -> Result<Insta
     if parsed.port().is_some() {
         return Err("installer URL uses a non-default port".into());
     }
-    let host = parsed.host_str().ok_or("installer URL has no host")?.to_lowercase();
+    let host = parsed
+        .host_str()
+        .ok_or("installer URL has no host")?
+        .to_lowercase();
     if host.parse::<std::net::IpAddr>().is_ok() {
         return Err("installer URL host is a raw IP".into());
     }
@@ -1074,7 +1165,12 @@ fn validate_plan(raw: InstallPlanRaw, name: &str, current: &str) -> Result<Insta
     } else {
         return Err("installer URL does not end in .exe or .msi".into());
     };
-    let sha256 = match raw.sha256.as_ref().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty() && s != "null") {
+    let sha256 = match raw
+        .sha256
+        .as_ref()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty() && s != "null")
+    {
         Some(s) if is_hex64(&s) => Some(s),
         Some(_) => return Err("provided sha256 is not 64 hex characters".into()),
         None => None,
@@ -1163,7 +1259,12 @@ async fn make_plan(
     let notes = load_notes();
     let key = name.to_lowercase();
     if notes.get(&key).map(|x| x.ignore).unwrap_or(false) {
-        return (None, None, 0.0, Some(format!("{name} is on your ignore list.")));
+        return (
+            None,
+            None,
+            0.0,
+            Some(format!("{name} is on your ignore list.")),
+        );
     }
     let note_line = match notes.get(&key) {
         Some(x) if !x.note.is_empty() => format!(" [user note: {}]", x.note),
@@ -1437,7 +1538,10 @@ fn installs_elevated_blocking(jobs: Vec<InstallJob>) -> Result<HashMap<String, i
         // Only the local file path + allow-listed args ever reach the shell.
         let (fp, mut arglist) = match job.kind {
             InstallerKind::Exe => (file_q.clone(), Vec::<String>::new()),
-            InstallerKind::Msi => ("'msiexec'".to_string(), vec!["'/i'".to_string(), file_q.clone()]),
+            InstallerKind::Msi => (
+                "'msiexec'".to_string(),
+                vec!["'/i'".to_string(), file_q.clone()],
+            ),
         };
         for a in &job.args {
             arglist.push(format!("'{}'", a.replace('\'', "''")));
@@ -1576,7 +1680,14 @@ async fn apply_install_result(app: &AppHandle, o: &mut AppOutcome, plan: &Instal
         o.success = verification != "mismatch";
         o.to = found;
         o.detail = if o.success {
-            format!("installed{}", if code == 3010 { " (reboot required)" } else { "" })
+            format!(
+                "installed{}",
+                if code == 3010 {
+                    " (reboot required)"
+                } else {
+                    ""
+                }
+            )
         } else {
             "installer ran but the new version was not detected".into()
         };
@@ -1594,7 +1705,13 @@ async fn apply_install_result(app: &AppHandle, o: &mut AppOutcome, plan: &Instal
 }
 
 /// Build a manual-fallback outcome (no direct installer, or no silent switch).
-fn manual_outcome(name: &str, current: &str, cost: f64, detail: String, releases: Option<String>) -> AppOutcome {
+fn manual_outcome(
+    name: &str,
+    current: &str,
+    cost: f64,
+    detail: String,
+    releases: Option<String>,
+) -> AppOutcome {
     let mut o = AppOutcome::new(&name.to_lowercase(), name, "manual", current);
     o.cost_usd = cost;
     o.releases_url = releases.clone().unwrap_or_default();
@@ -1617,7 +1734,11 @@ fn info_outcome(detail: String, success: bool) -> AppOutcome {
 /// Update one non-winget app via the AI: plan -> validate -> download -> install
 /// -> verify. Falls back to a manual outcome when no safe direct install exists.
 #[tauri::command]
-pub async fn install_ai_app(app: AppHandle, name: String, current: String) -> Result<AppOutcome, String> {
+pub async fn install_ai_app(
+    app: AppHandle,
+    name: String,
+    current: String,
+) -> Result<AppOutcome, String> {
     let key = name.to_lowercase();
     emit_phase(&app, &key, "planning", 0, 1);
     let (plan, releases, cost, reason) = make_plan(&name, &current).await;
@@ -1765,8 +1886,7 @@ pub async fn update_everything(app: AppHandle) -> Result<Vec<AppOutcome>, String
         match run_installs_elevated(jobs.clone()).await {
             Ok(map) => {
                 for j in &jobs {
-                    if let (Some(plan), Some(o)) =
-                        (plans.get(&j.key), ai_outcomes.get_mut(&j.key))
+                    if let (Some(plan), Some(o)) = (plans.get(&j.key), ai_outcomes.get_mut(&j.key))
                     {
                         let code = map.get(&j.key).copied().unwrap_or(-1);
                         apply_install_result(&app, o, plan, code).await;
@@ -2036,8 +2156,10 @@ INSTALLED APPS:\n{app_lines}"
     // releases, but a fuzzy comparison (or an over-eager search) can slip an
     // equal/older "update" through — drop those, and stamp each surviving row with
     // the authoritative installed version so the UI never carries a stale `current`.
-    let installed: HashMap<String, String> =
-        apps.iter().map(|(n, v)| (n.to_lowercase(), v.clone())).collect();
+    let installed: HashMap<String, String> = apps
+        .iter()
+        .map(|(n, v)| (n.to_lowercase(), v.clone()))
+        .collect();
     let updates = raw_updates
         .into_iter()
         .filter_map(|mut u| {
@@ -2196,7 +2318,11 @@ fn resolve_ai_cfg() -> FileApiCfg {
 /// Ask OpenRouter (with its web-search plugin) for app updates. Works with free
 /// models — OpenRouter performs the search and feeds results to the model, so it
 /// is model-agnostic. Returns the parsed updates plus the call's USD cost.
-async fn run_openrouter_raw(prompt: String, model: &str, key: &str) -> Result<(String, f64), String> {
+async fn run_openrouter_raw(
+    prompt: String,
+    model: &str,
+    key: &str,
+) -> Result<(String, f64), String> {
     let body = serde_json::json!({
         "model": model,
         "plugins": [{ "id": "web", "max_results": 5 }],
@@ -2711,7 +2837,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.kind, InstallerKind::Msi);
-        assert_eq!(p.silent_args, vec!["/qn".to_string(), "/norestart".to_string()]);
+        assert_eq!(
+            p.silent_args,
+            vec!["/qn".to_string(), "/norestart".to_string()]
+        );
     }
 
     #[test]
@@ -2719,8 +2848,14 @@ mod tests {
         assert!(validate_plan(raw("http://github.com/a/b/x.exe"), "X App", "1").is_err()); // not https
         assert!(validate_plan(raw("https://1.2.3.4/x.exe"), "X App", "1").is_err()); // raw IP
         assert!(validate_plan(raw("https://github.com/a/b/x.zip"), "X App", "1").is_err()); // bad extension
-        assert!(validate_plan(raw("https://totally-unrelated.example/x.exe"), "Bar App", "1").is_err()); // untrusted host
-        assert!(validate_plan(raw("https://user:pw@github.com/a/x.exe"), "X App", "1").is_err()); // credentials
+        assert!(validate_plan(
+            raw("https://totally-unrelated.example/x.exe"),
+            "Bar App",
+            "1"
+        )
+        .is_err()); // untrusted host
+        assert!(validate_plan(raw("https://user:pw@github.com/a/x.exe"), "X App", "1").is_err());
+        // credentials
     }
 
     #[test]
@@ -2755,7 +2890,10 @@ mod tests {
             .iter()
             .any(|a| a.contains("rm") || a.contains("calc") || a.contains('&')));
         // The MSI allow-list is separate; an exe-only switch is dropped.
-        assert_eq!(sanitise_args(InstallerKind::Msi, &["/qn".into(), "/S".into()]), vec!["/qn".to_string()]);
+        assert_eq!(
+            sanitise_args(InstallerKind::Msi, &["/qn".into(), "/S".into()]),
+            vec!["/qn".to_string()]
+        );
     }
 
     #[test]
@@ -2784,9 +2922,15 @@ mod tests {
 
     #[test]
     fn version_compare_and_classify() {
-        assert_eq!(version_cmp("2.0.0", "1.9.9"), Some(std::cmp::Ordering::Greater));
+        assert_eq!(
+            version_cmp("2.0.0", "1.9.9"),
+            Some(std::cmp::Ordering::Greater)
+        );
         assert_eq!(version_cmp("1.0", "1.0.0"), Some(std::cmp::Ordering::Equal));
-        assert_eq!(version_cmp("v2.1", "v2.0"), Some(std::cmp::Ordering::Greater));
+        assert_eq!(
+            version_cmp("v2.1", "v2.0"),
+            Some(std::cmp::Ordering::Greater)
+        );
         assert_eq!(classify_version("2.0.0", "2.0.0"), "verified");
         assert_eq!(classify_version("2.1.0", "2.0.0"), "verified"); // newer than expected is fine
         assert_eq!(classify_version("1.0.0", "2.0.0"), "mismatch"); // still the old version
@@ -2815,15 +2959,117 @@ mod tests {
     }
 
     #[test]
+    fn numeric_components_parses_leading_dotted_run() {
+        assert_eq!(
+            numeric_components("1.7.12227.37421622"),
+            Some(vec![1, 7, 12227, 37421622])
+        );
+        // The run stops at the first non-numeric label (Git-for-Windows style):
+        // the ".windows.1" suffix is dropped, leaving the numeric core.
+        assert_eq!(
+            numeric_components("v2.43.0.windows.1"),
+            Some(vec![2, 43, 0])
+        );
+        assert_eq!(numeric_components("2024.02"), Some(vec![2024, 2]));
+        // No parseable dotted-numeric head -> None (drives the string fallback).
+        assert_eq!(numeric_components("nightly"), None);
+        assert_eq!(numeric_components(""), None);
+    }
+
+    #[test]
+    fn is_newer_rejects_marketing_truncation() {
+        // The motivating bug: an installed 4-part SDK build reported as upgradable
+        // to the separate FrameView *app*'s 2-part marketing version. "1.9" beats
+        // "1.7.…" only on the minor while ignoring the 12227.37421622 build tail —
+        // an incoherent cross-product comparison that must never surface.
+        assert!(!is_newer("1.9", "1.7.12227.37421622"));
+        // A direct sibling with a much smaller build tail — still rejected, because
+        // the guard is structural (no magnitude threshold to slip under).
+        assert!(!is_newer("1.9", "1.6.0.4590"));
+        // The whole minor-divergence family: a short marketing `latest` vs a long
+        // build `current` sharing the major, with the build/revision tail dropped.
+        assert!(!is_newer("10.1", "10.0.19041.4046"));
+        assert!(!is_newer("12.6", "12.4.131.0"));
+        assert!(!is_newer("9.7", "9.5.0.6294"));
+        assert!(!is_newer("8.2", "8.1.7600.16385"));
+        assert!(!is_newer("3.5", "3.4.2.10481"));
+        assert!(!is_newer("6.1", "6.0.2312.40001"));
+        assert!(!is_newer("1.16", "1.14.6.30146"));
+        assert!(!is_newer("2.2", "2.1.0.20240115"));
+        assert!(!is_newer("1.3", "1.2.11.8"));
+        assert!(!is_newer("3.12", "3.11.2150.1013"));
+        assert!(!is_newer("10.20", "10.2.3.40066"));
+    }
+
+    #[test]
+    fn is_newer_keeps_real_updates_the_guard_must_not_eat() {
+        // Same-length big-build upgrade of the SAME family — the case that proves
+        // the guard keys on the MISMATCH between the two versions, not on "current
+        // has big numbers". Both are 4-part builds; 1.7.x < 1.8.x is a real update.
+        assert!(is_newer("1.8.13000.41000000", "1.7.12227.37421622"));
+        assert!(is_newer("1.0.22631.40000000", "1.0.22621.39000000"));
+        // `latest` LONGER than `current` (adds build detail) — current's missing
+        // tail is an implicit .0, so the comparison is sound. Must be kept.
+        assert!(is_newer("1.0.7600.16385", "1.0"));
+        assert!(is_newer("85.0.4183.83", "85"));
+        assert!(is_newer("1.0.1", "1.0.0.0"));
+        // Component count shrinks by one, but it is a genuine point/minor release
+        // (the omitted tail is too short to be a build/revision number).
+        assert!(is_newer("1.3", "1.2.3"));
+        assert!(is_newer("116.0", "115.0.1"));
+        // A short `current` whose omitted tail is all zeros is just padding, not
+        // build precision — "1.7.0.0" -> "1.9" is a real minor bump.
+        assert!(is_newer("1.9", "1.7.0.0"));
+        // Bare-major bump (4-part build -> next major) — structurally identical to
+        // a driver cross-product case, so the guard leaves it ALONE; it stays the
+        // (correct, common) real update, e.g. Chrome 85 -> 86.
+        assert!(is_newer("86", "85.0.4183.121"));
+        // Ordinary same-scheme updates are unaffected.
+        assert!(is_newer("1.3.0", "1.2.3"));
+        assert!(is_newer("119.0.6045.105", "118.0.5993.88"));
+        assert!(is_newer("1.10.0", "1.9.0"));
+    }
+
+    #[test]
+    fn marketing_truncation_predicate_is_conservative() {
+        // Fires on the FrameView shape.
+        assert!(is_marketing_truncation("1.9", "1.7.12227.37421622"));
+        // Does NOT fire when the majors differ — an ambiguous bare-major bump
+        // (driver "551.86.0.0" -> "552") indistinguishable from a real one.
+        assert!(!is_marketing_truncation("552", "551.86.0.0"));
+        assert!(!is_marketing_truncation("23", "22.11.0.62007"));
+        // Does NOT fire when current's omitted tail is all zeros (1.7.0.0 ~= 1.7).
+        assert!(!is_marketing_truncation("1.9", "1.7.0.0"));
+        // Does NOT fire when latest is longer, equal-length, or only one longer.
+        assert!(!is_marketing_truncation("1.0.7600.16385", "1.0"));
+        assert!(!is_marketing_truncation(
+            "1.8.13000.41000000",
+            "1.7.12227.37421622"
+        ));
+        assert!(!is_marketing_truncation("1.3", "1.2.3"));
+        // Non-numeric input never qualifies.
+        assert!(!is_marketing_truncation("nightly", "1.2.3.4"));
+    }
+
+    #[test]
     fn clean_app_name_strips_trailing_version() {
         // The Inno Setup default that started this — version baked into the name,
         // and the SAME stable identity must fall out of any release.
-        assert_eq!(clean_app_name("Revision Tool version 2.9.0"), "Revision Tool");
-        assert_eq!(clean_app_name("Revision Tool version 2.7.1"), "Revision Tool");
+        assert_eq!(
+            clean_app_name("Revision Tool version 2.9.0"),
+            "Revision Tool"
+        );
+        assert_eq!(
+            clean_app_name("Revision Tool version 2.7.1"),
+            "Revision Tool"
+        );
         // Bare and v-prefixed trailing versions.
         assert_eq!(clean_app_name("Krita 5.2.0"), "Krita");
         assert_eq!(clean_app_name("Obsidian v1.5.3"), "Obsidian");
-        assert_eq!(clean_app_name("K-Lite Codec Pack 17.8.5"), "K-Lite Codec Pack");
+        assert_eq!(
+            clean_app_name("K-Lite Codec Pack 17.8.5"),
+            "K-Lite Codec Pack"
+        );
         // No trailing version -> unchanged (incl. a dot inside a real name).
         assert_eq!(clean_app_name("Discord"), "Discord");
         assert_eq!(clean_app_name("Acrobat Reader DC"), "Acrobat Reader DC");
@@ -2842,7 +3088,10 @@ mod tests {
         // common real installer shape).
         assert_eq!(clean_app_name("7-Zip 23.01 (x64)"), "7-Zip");
         assert_eq!(clean_app_name("OBS Studio 30.0.2 (64-bit)"), "OBS Studio");
-        assert_eq!(clean_app_name("VLC media player 3.0.20 x64"), "VLC media player");
+        assert_eq!(
+            clean_app_name("VLC media player 3.0.20 x64"),
+            "VLC media player"
+        );
         // Arch alone (no version) still folds 32/64-bit builds of one product.
         assert_eq!(clean_app_name("Far Manager x64"), "Far Manager");
         // Dangling connector glyphs are trimmed, not baked into the key.
@@ -2892,12 +3141,21 @@ mod tests {
     #[test]
     fn match_installed_resolves_fuzzy_names() {
         let mut installed = std::collections::HashMap::new();
-        installed.insert("revision tool version 2.9.0".to_string(), "2.9.0".to_string());
+        installed.insert(
+            "revision tool version 2.9.0".to_string(),
+            "2.9.0".to_string(),
+        );
         installed.insert("krita".to_string(), "5.2.0".to_string());
         // The AI echoes a clean "Revision Tool"; it must still resolve to 2.9.0.
-        assert_eq!(match_installed(&installed, "Revision Tool"), Some(&"2.9.0".to_string()));
+        assert_eq!(
+            match_installed(&installed, "Revision Tool"),
+            Some(&"2.9.0".to_string())
+        );
         // Exact (case-insensitive) hit.
-        assert_eq!(match_installed(&installed, "Krita"), Some(&"5.2.0".to_string()));
+        assert_eq!(
+            match_installed(&installed, "Krita"),
+            Some(&"5.2.0".to_string())
+        );
         // No overlap -> no match (caller falls back to the AI's own `current`).
         assert_eq!(match_installed(&installed, "Obsidian"), None);
     }
