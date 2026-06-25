@@ -15,7 +15,7 @@ use eir_proto::{
     AdvisorStatus, ApprovalInfo, ExecutionSummary, ProblemSummary, StatusPayload, UiMsg,
     UiSettings, UpdaterStatus, UsageSummary,
 };
-use models::{FixAction, PendingApproval, SignalSnapshot, SystemState};
+use models::{ExecutionResult, FixAction, PendingApproval, SignalSnapshot, SystemState};
 use sqlx::SqlitePool;
 use std::{
     collections::{HashSet, VecDeque},
@@ -181,6 +181,10 @@ struct SvcState {
     updater: UpdaterStatus,
     /// True while an update cycle is in flight (prevents overlapping cycles).
     updater_running: bool,
+    /// Debug-labels of fix actions currently queued or executing on the executor
+    /// worker. Used to dedupe duplicate enqueues and to reflect "Executing" status
+    /// while any action runs off the decision loop.
+    in_flight: HashSet<String>,
     /// Advisor-mode status broadcast to the UI.
     advisor: Option<AdvisorStatus>,
     /// Escalation AI spend accumulated today (reset at the UTC day boundary).
@@ -210,6 +214,7 @@ impl Default for SvcState {
             settings: None,
             updater: UpdaterStatus::default(),
             updater_running: false,
+            in_flight: HashSet::new(),
             advisor: None,
             advisor_spent_today: 0.0,
             advisor_escalations_today: 0,
@@ -353,45 +358,103 @@ fn spawn_update_cycle(
     });
 }
 
-/// The status to settle on when not mid-action: paused beats everything, then an
-/// outstanding approval, otherwise active.
+/// The status to settle on when not mid-cycle: paused beats everything, then an
+/// outstanding approval, then an action still executing off the loop, otherwise active.
 fn resting_status(st: &SvcState) -> String {
     if st.paused {
         "Paused"
     } else if !st.pending.is_empty() {
         "PendingApproval"
+    } else if !st.in_flight.is_empty() {
+        "Executing"
     } else {
         "Active"
     }
     .to_string()
 }
 
-/// Execute an approved/auto-approved action and record its outcome: the execution
-/// log, the decision's executed flag, and the feedback baseline for measuring
-/// whether the system improved. Shared by the auto-execute and user-approval paths.
-async fn execute_and_record(
-    db: &SqlitePool,
-    st: &mut SvcState,
-    action: &FixAction,
+/// A fix action handed to the executor worker, with everything needed to run it
+/// and to record the outcome back on the decision loop afterwards.
+struct ExecJob {
+    action: FixAction,
     decision_id: i64,
-    baseline: &SystemState,
-) {
-    let result = executor::execute(action).await;
-    push_execution(st, &result.action, result.success, &result.output);
+    baseline: SystemState,
+    /// `format!("{action:?}")` — the dedupe key and the label shown in the activity feed.
+    label: String,
+    diagnosis: String,
+    confidence: f32,
+    /// Why it ran (e.g. "approved by user"); None for an autonomous fix.
+    reason: Option<String>,
+}
 
-    match audit::log_execution(db, decision_id, &result).await {
-        Ok(exec_id) => {
-            if let Err(e) = audit::mark_decision_executed(db, decision_id).await {
-                error!("Failed to mark decision executed: {e}");
+/// The result of one executor job, folded back into `SvcState` on the decision loop.
+struct ExecOutcome {
+    label: String,
+    /// `result.action` (the executed action's Debug form) for the execution log entry.
+    exec_action: String,
+    success: bool,
+    output: String,
+    diagnosis: String,
+    confidence: f32,
+    reason: Option<String>,
+}
+
+/// Spawn the single executor worker. It serialises fix-action execution off the
+/// decision loop: each job runs `executor::execute` (panic-isolated) and writes the
+/// audit/feedback records, then reports an [`ExecOutcome`] back over `done_tx` for the
+/// loop to fold into `SvcState`. Because execution no longer blocks the loop, UI
+/// commands and status updates stay responsive however long an action takes.
+fn spawn_executor(
+    db: &SqlitePool,
+    mut job_rx: tokio::sync::mpsc::UnboundedReceiver<ExecJob>,
+    done_tx: tokio::sync::mpsc::UnboundedSender<ExecOutcome>,
+) {
+    let db = db.clone();
+    tokio::spawn(async move {
+        while let Some(job) = job_rx.recv().await {
+            let action = job.action;
+            // Isolate a panicking action so the worker survives to run the next job.
+            let result = match tokio::spawn(async move { executor::execute(&action).await }).await {
+                Ok(r) => r,
+                Err(_join) => ExecutionResult {
+                    action: job.label.clone(),
+                    success: false,
+                    output: "execution task panicked".to_string(),
+                },
+            };
+
+            match audit::log_execution(&db, job.decision_id, &result).await {
+                Ok(exec_id) => {
+                    if let Err(e) = audit::mark_decision_executed(&db, job.decision_id).await {
+                        error!("Failed to mark decision executed: {e}");
+                    }
+                    if let Err(e) = feedback::record(
+                        &db,
+                        exec_id,
+                        &result.action,
+                        result.success,
+                        &job.baseline,
+                    )
+                    .await
+                    {
+                        error!("Failed to record feedback: {e}");
+                    }
+                }
+                Err(e) => error!("Failed to log execution: {e}"),
             }
-            if let Err(e) =
-                feedback::record(db, exec_id, &result.action, result.success, baseline).await
-            {
-                error!("Failed to record feedback: {e}");
-            }
+
+            // If the loop has gone away the whole service is shutting down — ignore.
+            let _ = done_tx.send(ExecOutcome {
+                label: job.label,
+                exec_action: result.action,
+                success: result.success,
+                output: result.output,
+                diagnosis: job.diagnosis,
+                confidence: job.confidence,
+                reason: job.reason,
+            });
         }
-        Err(e) => error!("Failed to log execution: {e}"),
-    }
+    });
 }
 
 /// Fingerprint of the *actionable* signals in a snapshot — error-level log
@@ -646,6 +709,13 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     // Coarse live progress ("checking…", "updating {app}…") from a running cycle, so
     // the UI's phase label tracks reality instead of freezing on the start label.
     let (update_progress_tx, mut update_progress_rx) = tokio::sync::mpsc::channel::<String>(16);
+    // Fix actions run on a dedicated serialised worker off the loop; jobs go out on
+    // exec_tx and finished outcomes come back on exec_done_rx (drained below), so a
+    // slow repair never stalls UI commands or status folding. Unbounded sends never
+    // block the loop (job volume is bounded by problems-per-cycle plus approvals).
+    let (exec_tx, exec_rx) = tokio::sync::mpsc::unbounded_channel::<ExecJob>();
+    let (exec_done_tx, mut exec_done_rx) = tokio::sync::mpsc::unbounded_channel::<ExecOutcome>();
+    spawn_executor(&db, exec_rx, exec_done_tx);
     let mut cycle_count = 0u64;
     // Last analysed actionable-signal fingerprint; identical states are skipped.
     let mut last_fingerprint: Option<String> = None;
@@ -693,6 +763,25 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             st.updater.phase = phase;
                             pipe.broadcast_status(build_status(&st));
                         }
+                        continue;
+                    }
+                    Some(outcome) = exec_done_rx.recv() => {
+                        // A fix action finished on the worker — fold its result in.
+                        st.in_flight.remove(&outcome.label);
+                        push_execution(&mut st, &outcome.exec_action, outcome.success, &outcome.output);
+                        push_problem(
+                            &mut st,
+                            &outcome.diagnosis,
+                            outcome.confidence,
+                            &outcome.label,
+                            false,
+                            true,
+                            outcome.reason,
+                        );
+                        // Don't touch st.error here: an execution outcome must not wipe
+                        // an unrelated AI/connection error set by another path.
+                        st.status = resting_status(&st);
+                        pipe.broadcast_status(build_status(&st));
                         continue;
                     }
                     Some(cmd) = ui_rx.recv() => {
@@ -752,26 +841,27 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                     warn!("Failed to delete pending approval {id}: {e}");
                                 }
                                 if approved {
-                                    info!(action = ?pa.action, "UI-approved — executing");
-                                    st.status = "Executing".to_string();
-                                    pipe.broadcast_status(build_status(&st));
-                                    execute_and_record(
-                                        &db,
-                                        &mut st,
-                                        &pa.action,
-                                        pa.decision_id,
-                                        &pa.baseline,
-                                    )
-                                    .await;
-                                    push_problem(
-                                        &mut st,
-                                        &pa.info.diagnosis,
-                                        pa.info.confidence,
-                                        &pa.info.action,
-                                        false,
-                                        true,
-                                        Some("approved by user".into()),
-                                    );
+                                    let label = pa.info.action.clone();
+                                    if st.in_flight.contains(&label) {
+                                        // Same action already running off-loop — resolve
+                                        // this card without enqueueing a second run.
+                                        info!(action = %label, "Approved action already executing — not re-running");
+                                    } else {
+                                        info!(action = ?pa.action, "UI-approved — queueing for execution");
+                                        // Hand off to the executor worker; the outcome
+                                        // (execution log + problem entry) is folded in
+                                        // when it finishes, so the loop stays responsive.
+                                        st.in_flight.insert(label.clone());
+                                        let _ = exec_tx.send(ExecJob {
+                                            action: pa.action,
+                                            decision_id: pa.decision_id,
+                                            baseline: pa.baseline,
+                                            label,
+                                            diagnosis: pa.info.diagnosis.clone(),
+                                            confidence: pa.info.confidence,
+                                            reason: Some("approved by user".into()),
+                                        });
+                                    }
                                 } else {
                                     info!(id, diagnosis = %pa.info.diagnosis, "UI-rejected");
                                     push_problem(
@@ -986,8 +1076,11 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                     .unwrap_or(true);
                 if !changed && !heartbeat_due {
                     info!("No actionable change since last analysis — skipping");
+                    // resting_status keeps a still-running off-loop fix as "Executing"
+                    // (and an outstanding approval as "PendingApproval") instead of
+                    // flipping the UI to "Active" mid-action.
+                    st.status = resting_status(&st);
                     if !st.paused {
-                        st.status = "Active".to_string();
                         st.error = None;
                     }
                     pipe.broadcast_status(build_status(&st));
@@ -1165,28 +1258,25 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 Ok(false) => {}
                             }
 
-                            info!(action = ?action, "AUTO-EXECUTING");
-                            st.status = "Executing".to_string();
-                            pipe.broadcast_status(build_status(&st));
-
-                            execute_and_record(
-                                &db,
-                                &mut st,
-                                &action,
+                            let label = format!("{action:?}");
+                            if st.in_flight.contains(&label) {
+                                info!(action = %label, "Already executing — skipping duplicate");
+                                continue;
+                            }
+                            info!(action = ?action, "AUTO-EXECUTING (queued)");
+                            // Hand off to the executor worker and move on; the outcome
+                            // is folded in when it finishes (see exec_done_rx arm).
+                            st.in_flight.insert(label.clone());
+                            let _ = exec_tx.send(ExecJob {
+                                action: action.clone(),
                                 decision_id,
-                                &snapshot.system_state,
-                            )
-                            .await;
-                            push_problem(
-                                &mut st,
-                                &problem.diagnosis,
-                                problem.confidence,
-                                &format!("{action:?}"),
-                                false,
-                                true,
-                                None,
-                            );
-                            st.status = resting_status(&st);
+                                baseline: snapshot.system_state.clone(),
+                                label,
+                                diagnosis: problem.diagnosis.clone(),
+                                confidence: problem.confidence,
+                                reason: None,
+                            });
+                            st.status = "Executing".to_string();
                             pipe.broadcast_status(build_status(&st));
                         }
 
@@ -1196,8 +1286,13 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             // the UI whenever they like — the loop never stalls and
                             // the approval never expires out from under them.
                             let action_label = format!("{action:?}");
-                            if st.pending.iter().any(|p| p.info.action == action_label) {
-                                info!(action = %action_label, "Already awaiting approval — skipping duplicate");
+                            // Skip if it's already queued for approval OR already running
+                            // off-loop — otherwise a re-surfacing problem could queue a
+                            // second card for an in-flight approved action and double-run it.
+                            if st.pending.iter().any(|p| p.info.action == action_label)
+                                || st.in_flight.contains(&action_label)
+                            {
+                                info!(action = %action_label, "Already awaiting approval or executing — skipping duplicate");
                                 continue;
                             }
                             info!(reason = %reason, action = %action_label, "Queued for approval");
@@ -1263,6 +1358,8 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                     "Paused"
                 } else if !st.pending.is_empty() {
                     "PendingApproval"
+                } else if !st.in_flight.is_empty() {
+                    "Executing"
                 } else if problems_found {
                     "Warning"
                 } else {
@@ -1278,6 +1375,26 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         _ = shutdown => {
             info!("Shutdown signal received — stopping service loop");
         }
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    /// resting_status must order Paused > PendingApproval > Executing > Active, so an
+    /// off-loop fix keeps the UI on "Executing" (the off-loop-execution invariant).
+    #[test]
+    fn resting_status_precedence() {
+        let mut st = SvcState::default();
+        assert_eq!(resting_status(&st), "Active");
+
+        st.in_flight.insert("ServiceRestart".into());
+        assert_eq!(resting_status(&st), "Executing");
+
+        // Paused outranks an in-flight execution.
+        st.paused = true;
+        assert_eq!(resting_status(&st), "Paused");
     }
 }
 
