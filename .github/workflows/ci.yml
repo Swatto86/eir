@@ -28,6 +28,12 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      # eir-ui's tauri_build validates the bundle resources (incl. bin/eir-svc.exe,
+      # a gitignored artifact) during a bare `cargo clippy`/`cargo test`, so stage the
+      # service binary first — exactly what `tauri build`'s beforeBuildCommand does.
+      - name: Stage service binary
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File eir-ui/build-svc.ps1
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
