@@ -248,28 +248,9 @@ async function refresh() {
 
   renderApprovals(status.pending_approvals);
 
-  renderList(
-    'problems-list',
-    status.recent_problems,
-    p => `<div class="row">
-      <div class="row-title">${problemTag(p)}<span>${esc(p.diagnosis)}</span><span class="row-age">${ago(p.at)}</span></div>
-      <div class="row-sub">${esc(p.action)}${p.reason ? ' — ' + esc(p.reason) : ''}</div>
-    </div>`,
-    'No problems detected yet'
-  );
-
-  renderList(
-    'executions-list',
-    status.recent_executions,
-    e => `<div class="row">
-      <div class="row-title">${exTag(e)}<span>${esc(e.action)}</span><span class="row-age">${ago(e.at)}</span></div>
-      <div class="row-sub">${esc(e.preview)}</div>
-    </div>`,
-    'No executions yet'
-  );
-
-  const analysis = document.getElementById('analysis-text');
-  analysis.textContent = status.last_analysis || 'Waiting for first analysis cycle…';
+  // What the agent is thinking + the chronological activity feed.
+  renderAiNow(status);
+  renderActivity(status);
 
   renderUsage(status.usage);
 
@@ -296,6 +277,55 @@ async function decide(id, approved, card) {
     console.error('decide_approval failed', e);
     if (card) card.querySelectorAll('button').forEach(b => (b.disabled = false));
   }
+}
+
+// ── What the agent is thinking + the activity feed ──────────────────────────
+
+function renderAiNow(status) {
+  const txt = document.getElementById('ai-now-text');
+  const meta = document.getElementById('ai-now-meta');
+  txt.textContent = status.last_analysis || 'Waiting for the first analysis cycle…';
+  const bits = [];
+  if (status.settings) bits.push(`<span>${esc(analysisLabel(status.settings))}</span>`);
+  const a = status.advisor;
+  if (a && a.escalated) {
+    bits.push(`<span class="ai-badge ai-escalated">⤴ escalated${a.escalation_model ? ' → ' + esc(a.escalation_model) : ''}</span>`);
+    if (a.reason) bits.push(`<span>${esc(a.reason)}</span>`);
+  } else if (a && a.enabled) {
+    bits.push('<span class="ai-badge tag-ok">advisor on</span>');
+  }
+  if (a && a.spent_today_usd) bits.push(`<span>escalation spend today ~${fmtGbp(a.spent_today_usd)}</span>`);
+  meta.innerHTML = bits.join('');
+}
+
+// Merge problems (diagnoses) + executions (fixes) into one chronological list.
+function activityItems(status) {
+  const items = [];
+  for (const p of (status.recent_problems || [])) {
+    const icon = p.blocked ? '🚫' : (p.auto_executed ? '🔧' : '🔎');
+    const why = [p.action, p.reason].filter(Boolean).map(esc).join(' — ');
+    items.push({ at: p.at || 0, icon, head: `${problemTag(p)}<span class="act-text">${esc(p.diagnosis)}</span>`, why });
+  }
+  for (const e of (status.recent_executions || [])) {
+    const icon = e.success ? '✅' : '❌';
+    items.push({ at: e.at || 0, icon, head: `${exTag(e)}<span class="act-text">${esc(e.action)}</span>`, why: esc(e.preview || '') });
+  }
+  items.sort((a, b) => (b.at || 0) - (a.at || 0));
+  return items;
+}
+
+function renderActivity(status) {
+  const el = document.getElementById('activity-list');
+  const items = activityItems(status);
+  if (!items.length) { el.innerHTML = '<div class="empty">No activity yet</div>'; return; }
+  el.innerHTML = items.map(it => `
+    <div class="act-item">
+      <div class="act-icon">${it.icon}</div>
+      <div class="act-main">
+        <div class="act-head">${it.head}<span class="act-when">${ago(it.at)}</span></div>
+        ${it.why ? `<div class="act-why">${it.why}</div>` : ''}
+      </div>
+    </div>`).join('');
 }
 
 // ── App updates (driven by the LocalSystem service — no UAC) ─────────────────
@@ -462,18 +492,44 @@ function fillSettings() {
   document.getElementById('set-an-key').placeholder =
     s.anthropic_key_set ? '•••••• set — blank keeps it' : 'not set';
   fillUpdaterSettings(lastStatus.updater && lastStatus.updater.settings);
+  fillAdvisorSettings(lastStatus.advisor && lastStatus.advisor.settings);
 }
 
-function toggleSettings() {
-  const body = document.getElementById('settings-body');
-  const showing = body.style.display !== 'none';
-  if (showing) {
-    body.style.display = 'none';
-    document.getElementById('settings-show').textContent = 'Show';
-  } else {
-    fillSettings();
-    body.style.display = 'block';
-    document.getElementById('settings-show').textContent = 'Hide';
+function openSettings() {
+  fillSettings();
+  document.getElementById('settings-modal').classList.add('open');
+}
+function closeSettings() {
+  document.getElementById('settings-modal').classList.remove('open');
+}
+
+// ── Advisor settings (apply live — no service restart) ───────────────────────
+
+function fillAdvisorSettings(s) {
+  if (!s) return;
+  document.getElementById('set-adv-enabled').checked = !!s.enabled;
+  document.getElementById('set-adv-model').value = s.escalation_model || '';
+  document.getElementById('set-adv-effort').value = s.escalation_effort || '';
+  document.getElementById('set-adv-conf').value = Math.round((s.low_confidence_threshold || 0.6) * 100);
+  document.getElementById('set-adv-budget').value =
+    s.budget_usd_per_day != null ? s.budget_usd_per_day : 0.5;
+}
+
+async function saveAdvisorSettings() {
+  const settings = {
+    enabled: document.getElementById('set-adv-enabled').checked,
+    escalation_model: document.getElementById('set-adv-model').value.trim(),
+    escalation_effort: document.getElementById('set-adv-effort').value,
+    low_confidence_threshold: (parseInt(document.getElementById('set-adv-conf').value, 10) || 60) / 100,
+    budget_usd_per_day: parseFloat(document.getElementById('set-adv-budget').value) || 0,
+  };
+  const st = document.getElementById('set-adv-status');
+  st.textContent = 'Saving…';
+  try {
+    await invoke('set_advisor_settings', { settings });
+    st.textContent = 'Saved — applies immediately.';
+  } catch (e) {
+    st.textContent = 'Failed: ' + e;
   }
 }
 
@@ -525,16 +581,19 @@ async function saveSettings() {
   }
 }
 
-document.getElementById('settings-toggle').addEventListener('click', toggleSettings);
-document.getElementById('set-save').addEventListener('click', saveSettings);
-
-// Clear the in-memory Recents (service-side; the next poll reflects the empty list).
-document.getElementById('clear-problems').addEventListener('click', async () => {
-  try { await invoke('clear_problems'); } catch (e) { console.error(e); }
-  refresh();
+// Settings modal: open from the gear; close via ×, backdrop click, or Escape.
+document.getElementById('open-settings').addEventListener('click', openSettings);
+document.getElementById('close-settings').addEventListener('click', closeSettings);
+document.getElementById('settings-modal').addEventListener('click', (e) => {
+  if (e.target.id === 'settings-modal') closeSettings();
 });
-document.getElementById('clear-executions').addEventListener('click', async () => {
-  try { await invoke('clear_executions'); } catch (e) { console.error(e); }
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSettings(); });
+document.getElementById('set-save').addEventListener('click', saveSettings);
+document.getElementById('set-adv-save').addEventListener('click', saveAdvisorSettings);
+
+// Clear the activity feed (the in-memory problems + executions, service-side).
+document.getElementById('clear-activity').addEventListener('click', async () => {
+  try { await invoke('clear_problems'); await invoke('clear_executions'); } catch (e) { console.error(e); }
   refresh();
 });
 

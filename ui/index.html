@@ -216,6 +216,35 @@
     .note-edit input { flex: 1; padding: 4px 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 12px; font-family: inherit; }
     .note-edit input:focus { outline: none; border-color: var(--blue); }
 
+    /* ── AI-now panel ── */
+    #ai-now .card-body { padding: 12px 14px; }
+    .ai-now-text { font-size: 13px; color: var(--text); line-height: 1.6; white-space: pre-wrap; }
+    .ai-now-meta { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 11px; color: var(--muted); }
+    .ai-badge { font-size: 11px; padding: 1px 8px; border-radius: 20px; font-weight: 600; }
+    .ai-escalated { background: color-mix(in srgb, var(--blue) 18%, transparent); color: var(--blue); }
+    .gear { font-size: 15px; line-height: 1; }
+
+    /* ── Activity feed ── */
+    .act-item { display: flex; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 13px; }
+    .act-item:last-child { border-bottom: none; }
+    .act-icon { flex-shrink: 0; width: 18px; text-align: center; }
+    .act-main { flex: 1; min-width: 0; }
+    .act-head { display: flex; align-items: center; gap: 8px; }
+    .act-head .act-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .act-why { color: var(--muted); font-size: 12px; margin-top: 3px; line-height: 1.5; }
+    .act-when { margin-left: auto; padding-left: 8px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+
+    /* ── Settings modal ── */
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: flex-start; justify-content: center; padding: 36px 20px; z-index: 100; overflow-y: auto; }
+    .modal-overlay.open { display: flex; }
+    .modal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); width: 100%; max-width: 640px; box-shadow: 0 20px 60px rgba(0,0,0,.5); }
+    .modal-header { display: flex; align-items: center; gap: 8px; padding: 14px 18px; border-bottom: 1px solid var(--border); font-size: 14px; font-weight: 600; position: sticky; top: 0; background: var(--surface); border-radius: var(--radius) var(--radius) 0 0; }
+    .modal-header .hspacer { flex: 1; }
+    .modal-close { background: transparent; border: none; color: var(--muted); font-size: 22px; cursor: pointer; line-height: 1; padding: 0 4px; }
+    .modal-close:hover { color: var(--text); }
+    .modal-body { padding: 0 0 8px; }
+    .set-section-title { padding: 16px 18px 2px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
@@ -230,6 +259,7 @@
   <div class="spacer"></div>
   <span id="model-label" class="model-label"></span>
   <button class="btn" id="pause-btn">Pause</button>
+  <button class="btn" id="open-settings" title="Settings"><span class="gear">⚙</span></button>
 </header>
 
 <div class="metrics">
@@ -255,20 +285,19 @@
   <!-- Pending approvals — one card per queued action; stays until acted on -->
   <div id="approvals"></div>
 
-  <!-- Problems + Executions -->
-  <div class="two-col">
-    <div class="card" id="problems-card">
-      <div class="card-header collapsible"><span class="chev">▾</span>Recent Problems<span class="hspacer"></span><button class="upd-btn" id="clear-problems">Clear</button></div>
-      <div class="card-body" id="problems-list">
-        <div class="empty">No problems detected yet</div>
-      </div>
+  <!-- What the agent is currently thinking (the AI's analysis + advisor state) -->
+  <div class="card" id="ai-now">
+    <div class="card-header collapsible"><span class="chev">▾</span>What the agent is thinking</div>
+    <div class="card-body">
+      <div class="ai-now-text" id="ai-now-text">Waiting for the first analysis cycle…</div>
+      <div class="ai-now-meta" id="ai-now-meta"></div>
     </div>
-    <div class="card" id="executions-card">
-      <div class="card-header collapsible"><span class="chev">▾</span>Recent Executions<span class="hspacer"></span><button class="upd-btn" id="clear-executions">Clear</button></div>
-      <div class="card-body" id="executions-list">
-        <div class="empty">No executions yet</div>
-      </div>
-    </div>
+  </div>
+
+  <!-- Activity feed — diagnoses + fixes, newest first -->
+  <div class="card" id="activity-card">
+    <div class="card-header collapsible"><span class="chev">▾</span>Activity<span class="hspacer"></span><button class="upd-btn" id="clear-activity">Clear</button></div>
+    <div class="card-body" id="activity-list"><div class="empty">No activity yet</div></div>
   </div>
 
   <!-- Autonomous updates — driven by the LocalSystem service (no UAC) -->
@@ -295,25 +324,21 @@
     <div class="services-list" id="services-list"></div>
   </div>
 
-  <!-- Last analysis -->
-  <div class="analysis-card" id="analysis-card">
-    <div class="card-header collapsible"><span class="chev">▾</span>Last Analysis</div>
-    <div class="analysis-text" id="analysis-text">Waiting for first analysis cycle…</div>
-  </div>
-
   <!-- AI usage -->
   <div class="card" id="usage-card" style="display:none">
     <div class="card-header collapsible"><span class="chev">▾</span>AI Usage</div>
     <div class="card-body" id="usage-body"></div>
   </div>
 
-  <!-- Settings -->
-  <div class="card" id="settings-card">
-    <div class="card-header" id="settings-toggle">
-      ⚙ Settings <span class="hspacer"></span>
-      <span class="upd-btn" id="settings-show">Show</span>
-    </div>
-    <div class="card-body" id="settings-body" style="display:none">
+</div><!-- /.body -->
+
+<!-- Settings modal (opened from the header gear) -->
+<div class="modal-overlay" id="settings-modal">
+  <div class="modal">
+    <div class="modal-header">⚙ Settings<span class="hspacer"></span><button class="modal-close" id="close-settings" title="Close">×</button></div>
+    <div class="modal-body">
+
+      <div class="set-section-title">AI provider &amp; monitoring</div>
       <div class="set-grid">
         <label for="set-provider">AI provider</label>
         <select id="set-provider">
@@ -359,7 +384,33 @@
         <span class="upd-note" id="set-status"></span>
       </div>
 
-      <div class="set-grid" style="border-top:1px solid var(--border); margin-top:4px; padding-top:14px;">
+      <div class="set-section-title">Advisor mode — re-think harder when the agent is unsure</div>
+      <div class="set-grid">
+        <label for="set-adv-enabled">Enable advisor mode</label>
+        <input id="set-adv-enabled" type="checkbox" style="width:auto; justify-self:start;">
+        <label for="set-adv-model">Escalation model</label>
+        <input id="set-adv-model" type="text" placeholder="e.g. opus, or a stronger model id (blank = keep base)">
+        <label for="set-adv-effort">Escalation effort</label>
+        <select id="set-adv-effort">
+          <option value="">Keep base (Claude CLI only)</option>
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+          <option value="xhigh">XHigh</option>
+          <option value="max">Max</option>
+        </select>
+        <label for="set-adv-conf">Escalate below confidence (%)</label>
+        <input id="set-adv-conf" type="number" min="0" max="95" step="5" placeholder="60">
+        <label for="set-adv-budget">Daily escalation budget (£/$)</label>
+        <input id="set-adv-budget" type="number" min="0" step="0.1" placeholder="0.50">
+      </div>
+      <div class="set-actions">
+        <button class="set-save" id="set-adv-save" style="background:var(--blue)">Save advisor settings</button>
+        <span class="upd-note" id="set-adv-status"></span>
+      </div>
+
+      <div class="set-section-title">App updates</div>
+      <div class="set-grid">
         <label for="set-upd-enabled">Auto-update apps</label>
         <input id="set-upd-enabled" type="checkbox" style="width:auto; justify-self:start;">
         <label for="set-upd-interval">Check interval (hours)</label>
@@ -386,7 +437,6 @@
       </div>
     </div>
   </div>
-
 </div>
 
 <script src="main.js"></script>
