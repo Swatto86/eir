@@ -13,7 +13,8 @@ mod updater;
 
 use models::{FixAction, PendingApproval, SignalSnapshot, SystemState};
 use eir_proto::{
-    ApprovalInfo, ExecutionSummary, ProblemSummary, StatusPayload, UiMsg, UiSettings, UsageSummary,
+    ApprovalInfo, ExecutionSummary, ProblemSummary, StatusPayload, UiMsg, UiSettings, UpdaterStatus,
+    UsageSummary,
 };
 use sqlx::SqlitePool;
 use std::{
@@ -176,6 +177,10 @@ struct SvcState {
     error: Option<String>,
     usage: Option<UsageSummary>,
     settings: Option<UiSettings>,
+    /// Autonomous-updater status broadcast to the UI.
+    updater: UpdaterStatus,
+    /// True while an update cycle is in flight (prevents overlapping cycles).
+    updater_running: bool,
 }
 
 impl Default for SvcState {
@@ -194,6 +199,8 @@ impl Default for SvcState {
             error: None,
             usage: None,
             settings: None,
+            updater: UpdaterStatus::default(),
+            updater_running: false,
         }
     }
 }
@@ -228,7 +235,33 @@ fn build_status(st: &SvcState) -> StatusPayload {
         error: st.error.clone(),
         usage: st.usage.clone(),
         settings: st.settings.clone(),
+        updater: Some(st.updater.clone()),
     }
+}
+
+/// Spawn one update cycle on a detached task so the multi-minute run never blocks the
+/// monitoring loop. The cycle builds its own AI client from the current config and
+/// reports the finished [`updater::orchestrator::CycleSummary`] back over `done_tx`.
+fn spawn_update_cycle(
+    cfg: &config::Config,
+    db: &SqlitePool,
+    done_tx: &tokio::sync::mpsc::Sender<updater::orchestrator::CycleSummary>,
+) {
+    let ai = ai::client::AiClient::new(&cfg.api).ok();
+    let updater_cfg = cfg.updater.clone();
+    let model = cfg.api.update_check_model.clone();
+    let pool = db.clone();
+    let tx = done_tx.clone();
+    let cycle_id = chrono::Utc::now().timestamp();
+    tokio::spawn(async move {
+        let ctx = updater::orchestrator::EngineCtx {
+            ai: ai.as_ref(),
+            config: &updater_cfg,
+            model_override: &model,
+        };
+        let summary = updater::orchestrator::run_cycle(&pool, &ctx, cycle_id).await;
+        let _ = tx.send(summary).await;
+    });
 }
 
 /// The status to settle on when not mid-action: paused beats everything, then an
@@ -416,6 +449,17 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         Ok(d) => d,
         Err(e) => fatal!(format!("DB init: {e}")),
     };
+    // Seed the updater status from config + history, and clear any stale install
+    // staging left by a previous run.
+    updater::download::cleanup_stale_staging();
+    st.updater = UpdaterStatus {
+        enabled: cfg.updater.enabled,
+        settings: cfg.updater.to_view(),
+        ..Default::default()
+    };
+    if let Ok(recent) = updater::history::recent(&db, 50).await {
+        st.updater.recent = recent;
+    }
     // A bad AI config must NOT kill the service — degrade instead, so the pipe
     // and UI stay alive and the user can fix it in Settings.
     let ai = match ai::client::AiClient::new(&cfg.api) {
@@ -475,6 +519,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         interval_secs = cfg.monitoring.decision_interval_secs,
         "Decision loop started"
     );
+    // Finished update cycles report back here; an in-flight cycle never blocks the loop.
+    let (update_done_tx, mut update_done_rx) =
+        tokio::sync::mpsc::channel::<updater::orchestrator::CycleSummary>(2);
     let mut cycle_count = 0u64;
     // Last analysed actionable-signal fingerprint; identical states are skipped.
     let mut last_fingerprint: Option<String> = None;
@@ -493,6 +540,27 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                 // Pause and settings changes respond promptly.
                 tokio::select! {
                     _ = ticker.tick() => {}
+                    Some(summary) = update_done_rx.recv() => {
+                        // An update cycle finished — fold its result into the status.
+                        st.updater_running = false;
+                        st.updater.running = false;
+                        st.updater.last_run = chrono::Utc::now().timestamp();
+                        st.updater.last_cost_usd = summary.cost_usd;
+                        st.updater.notes = summary.notes.clone();
+                        st.updater.apps = updater::orchestrator::app_rows(&summary);
+                        st.updater.phase = "idle".to_string();
+                        if let Ok(recent) = updater::history::recent(&db, 50).await {
+                            st.updater.recent = recent;
+                        }
+                        st.updater.next_run = if cfg.updater.enabled {
+                            st.updater.last_run + cfg.updater.schedule_interval_secs as i64
+                        } else {
+                            0
+                        };
+                        info!(apps = st.updater.apps.len(), "Update cycle complete");
+                        pipe.broadcast_status(build_status(&st));
+                        continue;
+                    }
                     Some(cmd) = ui_rx.recv() => {
                         match cmd {
                         UiMsg::TogglePause => {
@@ -589,6 +657,55 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             st.status = resting_status(&st);
                             pipe.broadcast_status(build_status(&st));
                         }
+                        UiMsg::RunUpdatesNow => {
+                            if !st.updater_running {
+                                st.updater_running = true;
+                                st.updater.running = true;
+                                st.updater.enabled = cfg.updater.enabled;
+                                st.updater.phase = "checking…".to_string();
+                                pipe.broadcast_status(build_status(&st));
+                                spawn_update_cycle(&cfg, &db, &update_done_tx);
+                            }
+                        }
+                        UiMsg::UpdateUpdaterSettings(update) => {
+                            // Applied live — no service restart (unlike provider settings).
+                            cfg.updater.apply_view(*update);
+                            st.updater.enabled = cfg.updater.enabled;
+                            st.updater.settings = cfg.updater.to_view();
+                            st.updater.next_run = if !cfg.updater.enabled {
+                                0
+                            } else if st.updater.last_run > 0 {
+                                st.updater.last_run + cfg.updater.schedule_interval_secs as i64
+                            } else {
+                                chrono::Utc::now().timestamp()
+                                    + cfg.updater.schedule_interval_secs as i64
+                            };
+                            if let Err(e) = config::save(&cfg, "config.toml") {
+                                warn!("Failed to save updater settings: {e}");
+                            }
+                            pipe.broadcast_status(build_status(&st));
+                        }
+                        UiMsg::SetAppIgnore { id, ignore, note } => {
+                            let key = id.to_lowercase();
+                            if ignore {
+                                if !cfg.updater.ignored.iter().any(|x| x.eq_ignore_ascii_case(&key))
+                                {
+                                    cfg.updater.ignored.push(key.clone());
+                                }
+                            } else {
+                                cfg.updater.ignored.retain(|x| !x.eq_ignore_ascii_case(&key));
+                            }
+                            let n = note.trim();
+                            if n.is_empty() {
+                                cfg.updater.notes.remove(&key);
+                            } else {
+                                cfg.updater.notes.insert(key, n.to_string());
+                            }
+                            if let Err(e) = config::save(&cfg, "config.toml") {
+                                warn!("Failed to save app note: {e}");
+                            }
+                            pipe.broadcast_status(build_status(&st));
+                        }
                         }
                         continue;
                     }
@@ -613,6 +730,25 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         if added > 0 {
                             info!(count = added, "Added newly discovered log directories");
                         }
+                    }
+                }
+
+                // ── Autonomous updater: start a scheduled cycle when due ──────
+                {
+                    let now = chrono::Utc::now().timestamp();
+                    let interval_secs = cfg.updater.schedule_interval_secs as i64;
+                    let due = cfg.updater.enabled
+                        && !st.paused
+                        && !st.updater_running
+                        && (st.updater.last_run == 0 || now - st.updater.last_run >= interval_secs);
+                    if due {
+                        info!("Autonomous update cycle due — starting");
+                        st.updater_running = true;
+                        st.updater.running = true;
+                        st.updater.enabled = true;
+                        st.updater.phase = "checking…".to_string();
+                        pipe.broadcast_status(build_status(&st));
+                        spawn_update_cycle(&cfg, &db, &update_done_tx);
                     }
                 }
 

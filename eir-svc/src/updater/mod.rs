@@ -8,14 +8,7 @@
 //!   - per-method infrastructure adapters (winget/choco/scoop/msstore/native).
 //!
 //! It runs inside the LocalSystem service, so package managers and installers run
-//! with no UAC prompt. Building out across phases.
-//
-// The subsystem is assembled across phases: the pure core and adapters land before
-// the orchestrator and loop that consume them, so parts are intentionally unused
-// mid-build. This blanket allow (which propagates to child modules) keeps each
-// phase green under `clippy -D warnings`; it is removed once the engine is wired
-// into the service loop (Phase 8), at which point any genuinely dead code surfaces.
-#![allow(dead_code)]
+//! with no UAC prompt.
 
 pub mod check;
 pub mod config;

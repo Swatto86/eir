@@ -23,6 +23,81 @@ pub struct StatusPayload {
     pub usage: Option<UsageSummary>,
     /// Current configuration, surfaced so the UI can display and edit it.
     pub settings: Option<UiSettings>,
+    /// Autonomous-updater status (None until the service reports it). `#[serde(default)]`
+    /// keeps an older payload (without this field) decodable.
+    #[serde(default)]
+    pub updater: Option<UpdaterStatus>,
+}
+
+/// Live status of the autonomous app updater, rendered by the UI.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct UpdaterStatus {
+    pub enabled: bool,
+    /// True while a cycle is in progress.
+    pub running: bool,
+    /// Coarse phase text ("idle", "checking…", "updating apps…").
+    pub phase: String,
+    /// Unix seconds of the last completed cycle (0 = never).
+    pub last_run: i64,
+    /// Unix seconds the next scheduled cycle is due (0 = not scheduled).
+    pub next_run: i64,
+    /// AI cost (USD) of the last cycle.
+    pub last_cost_usd: f64,
+    /// Notes from the last cycle (truncation, check failures).
+    pub notes: Vec<String>,
+    /// Per-app result of the last cycle.
+    pub apps: Vec<UpdaterAppRow>,
+    /// Recent attempt history (newest first).
+    pub recent: Vec<UpdateAttemptRow>,
+    /// Editable updater settings, surfaced for the Settings panel.
+    pub settings: UpdaterSettingsView,
+}
+
+/// One app's result in the last update cycle.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct UpdaterAppRow {
+    pub id: String,
+    pub name: String,
+    pub from: String,
+    pub to: String,
+    /// The method that ultimately handled it (or the last one tried).
+    pub method: String,
+    /// "verified" | "installed" | "failed" | "skipped".
+    pub state: String,
+    pub detail: String,
+    /// Authenticode result for a native install (empty otherwise).
+    pub signature: String,
+}
+
+/// One persisted attempt, for the history view.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct UpdateAttemptRow {
+    pub name: String,
+    pub method: String,
+    pub success: bool,
+    pub detail: String,
+    /// Unix seconds.
+    pub at: i64,
+}
+
+/// Updater settings shown in the UI (no secrets).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct UpdaterSettingsView {
+    pub enabled: bool,
+    pub schedule_interval_secs: u64,
+    pub methods: Vec<String>,
+    pub native_enabled: bool,
+    pub native_signature_policy: String,
+}
+
+/// An updater-settings change from the UI.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct UpdaterSettingsUpdate {
+    pub enabled: bool,
+    pub schedule_interval_secs: u64,
+    pub methods: Vec<String>,
+    pub native_enabled: bool,
+    pub native_signature_policy: String,
 }
 
 /// Current settings shown in the UI. Secrets are never sent — only whether they
@@ -160,11 +235,24 @@ pub enum ServiceMsg {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UiMsg {
-    Approve { id: u64, approved: bool },
+    Approve {
+        id: u64,
+        approved: bool,
+    },
     TogglePause,
     UpdateSettings(Box<SettingsUpdate>),
     /// Clear the in-memory Recent Problems list.
     ClearProblems,
     /// Clear the in-memory Recent Executions list.
     ClearExecutions,
+    /// Run an update cycle now (on demand).
+    RunUpdatesNow,
+    /// Apply updater settings live (no service restart).
+    UpdateUpdaterSettings(Box<UpdaterSettingsUpdate>),
+    /// Ignore/un-ignore an app, or set a per-app note for the AI.
+    SetAppIgnore {
+        id: String,
+        ignore: bool,
+        note: String,
+    },
 }

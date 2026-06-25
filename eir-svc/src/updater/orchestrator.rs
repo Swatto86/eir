@@ -8,7 +8,7 @@
 use crate::ai::client::AiClient;
 use crate::updater::config::UpdaterConfig;
 use crate::updater::domain::{
-    AttemptOutcome, ErrorCategory, Method, NextStep, Remedy, UpdateCandidate,
+    AttemptOutcome, ErrorCategory, Method, NextStep, Remedy, UpdateCandidate, Verification,
 };
 use crate::updater::methods::{choco, detect, msstore, native, scoop, winget};
 use crate::updater::{check, diagnose, history};
@@ -219,10 +219,63 @@ pub async fn available_methods(cfg: &UpdaterConfig, ai: Option<&AiClient>) -> Ve
 
 /// The outcome of one full update cycle.
 pub struct CycleSummary {
-    pub cycle_id: i64,
     pub results: Vec<(UpdateCandidate, Vec<AttemptOutcome>)>,
     pub notes: Vec<String>,
     pub cost_usd: f64,
+}
+
+/// Flatten a cycle's per-candidate attempts into one UI row each: the winning attempt
+/// (the verified/installed one if any, else the last tried) decides the row's state.
+pub fn app_rows(summary: &CycleSummary) -> Vec<eir_proto::UpdaterAppRow> {
+    summary
+        .results
+        .iter()
+        .map(|(cand, outcomes)| {
+            let winner = outcomes
+                .iter()
+                .find(|o| o.success)
+                .or_else(|| outcomes.last());
+            let (method, state, detail, signature, to) = match winner {
+                None => (
+                    String::new(),
+                    "skipped".to_string(),
+                    "no available method".to_string(),
+                    String::new(),
+                    String::new(),
+                ),
+                Some(o) => {
+                    let state = if o.success {
+                        if o.verification == Verification::Verified {
+                            "verified"
+                        } else {
+                            "installed"
+                        }
+                    } else {
+                        "failed"
+                    };
+                    (
+                        o.method.as_str().to_string(),
+                        state.to_string(),
+                        o.detail.clone(),
+                        o.signature.clone().unwrap_or_default(),
+                        o.installed_version
+                            .clone()
+                            .unwrap_or_else(|| cand.available.clone()),
+                    )
+                }
+            };
+            eir_proto::UpdaterAppRow {
+                id: cand.id.clone(),
+                name: cand.name.clone(),
+                from: cand.current.clone(),
+                to,
+                method,
+                state,
+                detail,
+                signature,
+            }
+        })
+        .collect()
 }
 
 /// Run one full cycle: check for candidates, heal each (bounded by the per-run app
@@ -257,7 +310,6 @@ pub async fn run_cycle(pool: &SqlitePool, ctx: &EngineCtx<'_>, cycle_id: i64) ->
     }
 
     CycleSummary {
-        cycle_id,
         results,
         notes,
         cost_usd: spent,

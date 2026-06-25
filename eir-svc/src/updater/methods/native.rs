@@ -45,7 +45,6 @@ APP: {name} ({current}){note_line}"
 /// A validated plan plus the bits the caller needs when it is rejected.
 pub struct PlanOutcome {
     pub plan: Option<InstallPlan>,
-    pub releases: Option<String>,
     pub cost_usd: f64,
     pub reason: Option<String>,
 }
@@ -104,17 +103,15 @@ pub async fn make_plan(
         Err(e) => {
             return PlanOutcome {
                 plan: None,
-                releases: None,
                 cost_usd: 0.0,
                 reason: Some(e.to_string()),
             }
         }
     };
     let cost_usd = usage.map(|u| u.cost_usd).unwrap_or(0.0);
-    let (plan, releases, reason) = plan_from_response(&content, name, current);
+    let (plan, _releases, reason) = plan_from_response(&content, name, current);
     PlanOutcome {
         plan,
-        releases,
         cost_usd,
         reason,
     }

@@ -185,8 +185,6 @@ struct AiUpdateRaw {
     current: String,
     #[serde(default)]
     latest: String,
-    #[serde(default)]
-    url: String,
 }
 
 /// Ask the AI which unmanaged apps have a newer version, and turn the verified ones
@@ -306,7 +304,6 @@ mod tests {
             name: name.to_string(),
             current: current.to_string(),
             latest: latest.to_string(),
-            url: String::new(),
         }
     }
 

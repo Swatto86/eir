@@ -21,6 +21,26 @@ pub enum SignaturePolicy {
     AllowUnsigned,
 }
 
+impl SignaturePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignaturePolicy::RequireValid => "require_valid",
+            SignaturePolicy::RequirePublisherMatch => "require_publisher_match",
+            SignaturePolicy::AllowUnsigned => "allow_unsigned",
+        }
+    }
+
+    /// Parse a wire token; anything unrecognised falls back to the safe default so a
+    /// bad value never weakens the gate.
+    pub fn from_token(s: &str) -> SignaturePolicy {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "require_publisher_match" => SignaturePolicy::RequirePublisherMatch,
+            "allow_unsigned" => SignaturePolicy::AllowUnsigned,
+            _ => SignaturePolicy::RequireValid,
+        }
+    }
+}
+
 /// Configuration for the autonomous updater. Field order matters for TOML
 /// serialization: all scalars/arrays come before the `notes` sub-table so the
 /// emitted `[updater]` section is valid (a sub-table must follow its parent's
@@ -59,6 +79,31 @@ pub struct UpdaterConfig {
     /// Per-app freeform hints for the AI, keyed by the stable app identity. A
     /// `BTreeMap` so serialization is deterministic (stable diffs/tests).
     pub notes: BTreeMap<String, String>,
+}
+
+impl UpdaterConfig {
+    /// The settings the UI shows (no secrets here).
+    pub fn to_view(&self) -> eir_proto::UpdaterSettingsView {
+        eir_proto::UpdaterSettingsView {
+            enabled: self.enabled,
+            schedule_interval_secs: self.schedule_interval_secs,
+            methods: self.methods.clone(),
+            native_enabled: self.native_enabled,
+            native_signature_policy: self.native_signature_policy.as_str().to_string(),
+        }
+    }
+
+    /// Apply a UI settings change in place. The schedule is clamped to a sane floor,
+    /// and an empty method list is ignored (keeps the existing one).
+    pub fn apply_view(&mut self, u: eir_proto::UpdaterSettingsUpdate) {
+        self.enabled = u.enabled;
+        self.schedule_interval_secs = u.schedule_interval_secs.max(300);
+        if !u.methods.is_empty() {
+            self.methods = u.methods;
+        }
+        self.native_enabled = u.native_enabled;
+        self.native_signature_policy = SignaturePolicy::from_token(&u.native_signature_policy);
+    }
 }
 
 impl Default for UpdaterConfig {

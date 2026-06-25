@@ -4,7 +4,7 @@
 
 use crate::updater::domain::{AttemptOutcome, ErrorCategory, UpdateCandidate};
 use anyhow::Result;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 
 /// The failure category as the stable snake_case token serde gives it (NULL on
 /// success), so the stored value matches what the wire/UI use.
@@ -48,11 +48,36 @@ pub async fn record_attempts(
     Ok(())
 }
 
+/// The most recent attempts, newest first, for the UI's history view.
+pub async fn recent(pool: &SqlitePool, limit: i64) -> Result<Vec<eir_proto::UpdateAttemptRow>> {
+    let rows = sqlx::query(
+        "SELECT name, method, success, detail, created_at FROM update_attempts \
+         ORDER BY id DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::new();
+    for r in rows {
+        let created: String = r.try_get("created_at")?;
+        let at = chrono::DateTime::parse_from_rfc3339(&created)
+            .map(|d| d.timestamp())
+            .unwrap_or(0);
+        out.push(eir_proto::UpdateAttemptRow {
+            name: r.try_get("name")?,
+            method: r.try_get("method")?,
+            success: r.try_get::<i64, _>("success")? != 0,
+            detail: r.try_get("detail").unwrap_or_default(),
+            at,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::updater::domain::{Method, Verification};
-    use sqlx::Row;
 
     #[tokio::test]
     async fn migration_applies_and_attempt_round_trips() {
