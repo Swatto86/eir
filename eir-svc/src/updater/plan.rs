@@ -65,7 +65,18 @@ pub struct InstallPlan {
 
 /// Multi-tenant release hosts trusted to serve any vendor's installer. A specific
 /// vendor's own domain is accepted separately via host_matches_name.
-const TRUSTED_HOSTS: &[&str] = &["github.com", "objects.githubusercontent.com"];
+///
+/// These are GitHub's *release-asset* origins only. We deliberately do NOT trust the
+/// wildcard `*.github.io` (Pages) or `raw./gist.githubusercontent.com`, because those
+/// namespaces serve ARBITRARY user-controlled files — trusting them would let a
+/// poisoned AI URL like `attacker.github.io/krita/setup.exe` pass the gate for any
+/// app. A vendor that publishes only via Pages is routed through host_matches_name
+/// (brand-label equality) or falls back to manual download.
+const TRUSTED_HOSTS: &[&str] = &[
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
 
 /// Two-label public suffixes we recognise so the brand label is taken from the
 /// right position (e.g. vendor.co.uk -> "vendor", not "co"). Not exhaustive — an
@@ -94,13 +105,7 @@ fn brand_label(host: &str) -> Option<String> {
 }
 
 fn host_trusted(host: &str) -> bool {
-    let h = host.to_lowercase();
-    TRUSTED_HOSTS.contains(&h.as_str())
-        || h.ends_with(".github.io")
-        // GitHub serves release assets from various CDN subdomains it owns
-        // (objects./release-assets.githubusercontent.com); trust the whole domain.
-        || h == "githubusercontent.com"
-        || h.ends_with(".githubusercontent.com")
+    TRUSTED_HOSTS.contains(&host.to_lowercase().as_str())
 }
 
 /// Lowercased alphanumeric token of a string (for app-name/domain matching).
@@ -447,7 +452,15 @@ mod tests {
     fn host_gate_trusts_github_and_vendor_only() {
         assert!(host_acceptable("github.com", "Anything"));
         assert!(host_acceptable("objects.githubusercontent.com", "Anything"));
-        assert!(host_acceptable("foo.github.io", "Anything"));
+        assert!(host_acceptable(
+            "release-assets.githubusercontent.com",
+            "Anything"
+        ));
+        // *.github.io (Pages) and raw/gist user content serve arbitrary files — NOT
+        // trusted for any app, even though they are GitHub-owned.
+        assert!(!host_acceptable("foo.github.io", "Anything"));
+        assert!(!host_acceptable("attacker.github.io", "Krita"));
+        assert!(!host_acceptable("raw.githubusercontent.com", "Anything"));
         // Exact brand-label match accepts the real vendor domain…
         assert!(host_acceptable("download.krita.org", "Krita"));
         assert!(host_acceptable("obsidian.md", "Obsidian"));

@@ -182,8 +182,6 @@ struct AiResp {
 struct AiUpdateRaw {
     name: String,
     #[serde(default)]
-    current: String,
-    #[serde(default)]
     latest: String,
 }
 
@@ -263,6 +261,12 @@ INSTALLED APPS:\n{app_lines}"
 /// strictly newer than what is actually installed and not on the ignore list, and
 /// stamping each with the authoritative installed version. Split out so the
 /// filtering is unit-testable without a live provider.
+///
+/// Identity is anchored to the machine: an update whose name does not resolve to an
+/// actually-installed app (the real `winget list` set) is DROPPED. This preserves the
+/// "native installs only ever UPDATE apps the machine already has" invariant — without
+/// it, the (untrusted) AI could name a fabricated app and thereby choose an arbitrary
+/// vendor domain that the name-keyed host gate would then accept.
 fn native_candidates_from(
     updates: &[AiUpdateRaw],
     installed: &HashMap<String, String>,
@@ -273,9 +277,11 @@ fn native_candidates_from(
         if u.name.trim().is_empty() || u.latest.trim().is_empty() {
             continue;
         }
-        let cur = match_installed(installed, &u.name)
-            .cloned()
-            .unwrap_or_else(|| u.current.clone());
+        // Only a genuinely-installed app is a valid native UPDATE target.
+        let cur = match match_installed(installed, &u.name) {
+            Some(v) => v.clone(),
+            None => continue,
+        };
         if !is_newer(&u.latest, &cur) {
             continue;
         }
@@ -299,10 +305,9 @@ fn native_candidates_from(
 mod tests {
     use super::*;
 
-    fn upd(name: &str, current: &str, latest: &str) -> AiUpdateRaw {
+    fn upd(name: &str, latest: &str) -> AiUpdateRaw {
         AiUpdateRaw {
             name: name.to_string(),
-            current: current.to_string(),
             latest: latest.to_string(),
         }
     }
@@ -321,10 +326,11 @@ mod tests {
             ..UpdaterConfig::default()
         };
         let updates = vec![
-            upd("Obsidian", "1.5.0", "1.6.0"), // newer -> kept
-            upd("Krita", "5.2.0", "5.3.0"),    // newer but ignored -> dropped
-            upd("OldTool", "2.9.0", "2.7.5"),  // AI hallucinated an older "update" -> dropped
-            upd("Empty", "1.0", ""),           // no latest -> dropped
+            upd("Obsidian", "1.6.0"), // installed + newer -> kept
+            upd("Krita", "5.3.0"),    // newer but ignored -> dropped
+            upd("OldTool", "2.7.5"),  // installed but older -> dropped
+            upd("Empty", ""),         // no latest -> dropped
+            upd("GhostApp", "9.0"),   // NOT installed (AI fabrication) -> dropped
         ];
         let cands = native_candidates_from(&updates, &installed, &cfg);
         let names: Vec<&str> = cands.iter().map(|c| c.name.as_str()).collect();

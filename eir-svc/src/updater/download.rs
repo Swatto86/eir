@@ -24,8 +24,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 // ── SYSTEM-only staging ──────────────────────────────────────────────────────
 
 /// Root of the installer staging area: `%ProgramData%\Eir\staging`, locked down to
-/// SYSTEM + Administrators so a Medium-integrity process can't tamper with a staged
-/// installer (the re-hash before launch is then belt-and-braces, not the only line).
+/// SYSTEM + Administrators (fail-closed — staging is refused if the lockdown can't be
+/// applied) so a lesser-integrity process can't tamper with a staged installer. The
+/// re-hash before launch is then genuine belt-and-braces on top of the ACL.
 fn staging_root() -> PathBuf {
     std::env::var("ProgramData")
         .ok()
@@ -34,11 +35,13 @@ fn staging_root() -> PathBuf {
 }
 
 static ACL_ONCE: std::sync::Once = std::sync::Once::new();
+static ACL_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Strip inherited ACEs and grant only SYSTEM + Administrators full control, so the
-/// staged installer cannot be read or replaced by a normal user. Best-effort: the
-/// re-hash before launch still guards integrity if this fails on an odd box.
-fn lock_down_acl(dir: &Path) {
+/// staged installer cannot be read or replaced by a lesser-integrity process.
+/// Returns whether it succeeded — this is a load-bearing control (see `ensure_root`),
+/// not best-effort.
+fn lock_down_acl(dir: &Path) -> bool {
     let p = dir.to_string_lossy().to_string();
     let status = std::process::Command::new("icacls")
         .args([
@@ -51,15 +54,29 @@ fn lock_down_acl(dir: &Path) {
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .status();
-    if !matches!(status, Ok(s) if s.success()) {
-        warn!("could not lock down staging dir ACL: {}", dir.display());
-    }
+    matches!(status, Ok(s) if s.success())
 }
 
+/// Ensure the staging root exists AND is locked down. FAIL CLOSED: if the ACL could
+/// not be applied, return an error so no installer is ever staged (let alone run as
+/// SYSTEM) from a directory a non-admin might be able to write.
 fn ensure_root() -> std::io::Result<PathBuf> {
+    use std::sync::atomic::Ordering;
     let root = staging_root();
     std::fs::create_dir_all(&root)?;
-    ACL_ONCE.call_once(|| lock_down_acl(&root));
+    ACL_ONCE.call_once(|| {
+        let ok = lock_down_acl(&root);
+        if !ok {
+            warn!("could not lock down staging dir ACL: {}", root.display());
+        }
+        ACL_OK.store(ok, Ordering::SeqCst);
+    });
+    if !ACL_OK.load(Ordering::SeqCst) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "staging directory could not be locked to SYSTEM/Administrators",
+        ));
+    }
     Ok(root)
 }
 
@@ -176,8 +193,13 @@ pub fn signature_gate(
                     sig.display()
                 ));
             }
+            // Exact (case-insensitive) signer-CN equality, not a substring test, so a
+            // short common substring can't satisfy the pin. NOTE: `expected_publisher`
+            // is currently AI-sourced, so this policy is a tripwire ("valid signature
+            // whose CN equals the claimed publisher"), not a true vendor pin — a
+            // trusted per-app publisher map would harden it further.
             match expected_publisher.map(str::trim).filter(|p| !p.is_empty()) {
-                Some(pubr) if sig.subject.to_lowercase().contains(&pubr.to_lowercase()) => Ok(()),
+                Some(pubr) if sig.cn.eq_ignore_ascii_case(pubr) => Ok(()),
                 Some(pubr) => Err(format!(
                     "signature rejected: signer '{}' does not match expected publisher '{pubr}'",
                     if sig.cn.is_empty() { &sig.subject } else { &sig.cn }

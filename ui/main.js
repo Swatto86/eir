@@ -335,8 +335,14 @@ function renderUpdater(u) {
   const nowBtn = document.getElementById('upd-now');
   if (!u) { stateEl.textContent = ''; return; }
 
-  stateEl.textContent = u.running ? '· running…' : (u.enabled ? '· auto' : '· manual');
-  if (nowBtn) { nowBtn.disabled = !!u.running; nowBtn.textContent = u.running ? 'Updating…' : '⬆ Update now'; }
+  stateEl.textContent = u.running ? '· running…' : (u.enabled ? '· auto' : '· off');
+  if (nowBtn) {
+    // The service ignores a manual run unless the updater is enabled (the master
+    // switch also gates the pipe-triggered run), so reflect that in the button.
+    nowBtn.disabled = !!u.running || !u.enabled;
+    nowBtn.textContent = u.running ? 'Updating…' : '⬆ Update now';
+    nowBtn.title = u.enabled ? '' : 'Enable auto-updates in Settings first';
+  }
 
   const bits = [];
   if (u.running && u.phase) bits.push(esc(u.phase));

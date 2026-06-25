@@ -274,11 +274,20 @@ fn remedy_ok(remedy: &Remedy, method: Method, ctx: &StepContext) -> bool {
         Remedy::KillProcess { name } => {
             let n = name.trim().to_ascii_lowercase();
             let stem = n.strip_suffix(".exe").unwrap_or(&n);
-            // The named process must be non-trivial AND actually implicated by the
-            // error, so the AI can't smuggle in an unrelated process to kill.
-            !stem.is_empty()
-                && stem.len() >= 3
-                && ctx.error_text.to_ascii_lowercase().contains(stem)
+            if stem.len() < 5 {
+                return false;
+            }
+            // The stem must appear as a WHOLE TOKEN of the captured error (not a
+            // substring of a larger path/word like "setuphost" matching "host"), so
+            // the AI can only kill a process the error actually names as the blocker.
+            ctx.error_text
+                .to_ascii_lowercase()
+                .split(|c: char| {
+                    c.is_whitespace()
+                        || matches!(c, '\\' | '/' | '"' | '\'' | ':' | ',' | ';' | '(' | ')')
+                })
+                .map(|t| t.strip_suffix(".exe").unwrap_or(t))
+                .any(|t| t == stem)
         }
     }
 }

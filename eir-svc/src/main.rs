@@ -254,12 +254,24 @@ fn spawn_update_cycle(
     let tx = done_tx.clone();
     let cycle_id = chrono::Utc::now().timestamp();
     tokio::spawn(async move {
-        let ctx = updater::orchestrator::EngineCtx {
-            ai: ai.as_ref(),
-            config: &updater_cfg,
-            model_override: &model,
-        };
-        let summary = updater::orchestrator::run_cycle(&pool, &ctx, cycle_id).await;
+        // Run the cycle in an inner task so a panic surfaces as a JoinError instead
+        // of silently aborting — otherwise no summary is sent and `updater_running`
+        // would latch true forever, wedging every future cycle.
+        let inner = tokio::spawn(async move {
+            let ctx = updater::orchestrator::EngineCtx {
+                ai: ai.as_ref(),
+                config: &updater_cfg,
+                model_override: &model,
+            };
+            updater::orchestrator::run_cycle(&pool, &ctx, cycle_id).await
+        });
+        let summary = inner
+            .await
+            .unwrap_or_else(|_| updater::orchestrator::CycleSummary {
+                results: Vec::new(),
+                notes: vec!["update cycle aborted unexpectedly".to_string()],
+                cost_usd: 0.0,
+            });
         let _ = tx.send(summary).await;
     });
 }
@@ -661,10 +673,15 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::RunUpdatesNow => {
-                            if !st.updater_running {
+                            // Gate the manual trigger on the SAME controls as the
+                            // scheduled run: the master switch and pause. The command
+                            // pipe is writable by any authenticated user (so the
+                            // Medium-integrity UI can send it), so a manual run must
+                            // not be able to override the admin's enabled/pause state.
+                            if cfg.updater.enabled && !st.paused && !st.updater_running {
                                 st.updater_running = true;
                                 st.updater.running = true;
-                                st.updater.enabled = cfg.updater.enabled;
+                                st.updater.enabled = true;
                                 st.updater.phase = "checking…".to_string();
                                 pipe.broadcast_status(build_status(&st));
                                 spawn_update_cycle(&cfg, &db, &update_done_tx);
