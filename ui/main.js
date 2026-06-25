@@ -15,22 +15,17 @@ function analysisLabel(s) {
   if (!s) return '';
   let model = (s.model || '').trim();
   if (!model) {
-    // claude_cli supplies its own default when --model is omitted; openrouter
-    // routes to the free meta-model; others have no default, so be honest.
     model = s.provider === 'openrouter' ? 'openrouter/free'
       : s.provider === 'claude_cli' ? 'default model'
       : '(no model set)';
   }
   let label = `${providerName(s.provider)} · ${model}`;
-  // Effort only affects the Claude CLI provider.
   const effort = (s.effort || '').trim();
   if (s.provider === 'claude_cli' && effort) label += ` · ${effort} effort`;
   return label;
 }
 
-// Describe which provider/model the "Other Updates" web check will use. It
-// follows the configured provider: OpenRouter free model + web plugin, or the
-// Claude CLI (update_check_model, blank = haiku).
+// Which provider/model the app-update web check uses.
 function updateCheckLabel(s) {
   if (!s) return '';
   if (s.provider === 'openrouter') {
@@ -73,6 +68,16 @@ function ago(ts) {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
+// Relative time until a future unix-seconds timestamp.
+function until(ts) {
+  if (!ts) return '';
+  const s = Math.floor(ts - Date.now() / 1000);
+  if (s <= 0) return 'due';
+  if (s < 3600) return `${Math.ceil(s / 60)}m`;
+  if (s < 86400) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
+}
+
 function barColor(v) {
   if (v >= 90) return 'var(--red)';
   if (v >= 75) return 'var(--yellow)';
@@ -106,9 +111,7 @@ function renderList(containerId, items, rowFn, emptyText) {
   el.innerHTML = items.map(rowFn).join('');
 }
 
-// Build one approval card. The "What this will do" block and the Reversible/
-// Irreversible flag come from the service's deterministic explainer, so they are
-// trustworthy; side-effects/undo are the AI's supporting commentary.
+// Build one approval card.
 function approvalCard(info) {
   const flag = info.reversible
     ? '<span class="tag tag-ok">Reversible</span>'
@@ -156,6 +159,9 @@ function esc(s) {
     .replace(/>/g, '&gt;');
 }
 
+// Escape a value for use inside a double-quoted HTML attribute.
+function escAttr(s) { return esc(s).replace(/"/g, '&quot;'); }
+
 function fmtTokens(n) {
   if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
@@ -170,8 +176,6 @@ function renderUsage(u) {
   if (!u) { card.style.display = 'none'; return; }
   card.style.display = 'block';
   const provider = (lastStatus && lastStatus.settings && lastStatus.settings.provider) || '';
-  // Free models (OpenRouter free) and the Claude subscription incur no charge,
-  // so don't show a misleading dollar figure for them.
   const free = provider === 'openrouter' || provider === 'claude_cli';
   const costCell = c => free ? '—' : fmtGbp(c);
   const note = provider === 'openrouter'
@@ -201,7 +205,6 @@ async function refresh() {
   catch (e) { console.error('get_status failed', e); return; }
   lastStatus = status;
 
-  // Status dot + text
   const dot = document.getElementById('status-dot');
   const txt = document.getElementById('status-text');
   dot.style.background = STATUS_COLORS[status.status] ?? 'var(--gray)';
@@ -209,7 +212,6 @@ async function refresh() {
     ? `Error: ${status.error}`
     : status.status.replace(/([A-Z])/g, ' $1').trim();
 
-  // Live model labels: which model handles issue analysis vs app-update checks.
   const ml = document.getElementById('model-label');
   if (status.settings) {
     const s = status.settings;
@@ -223,11 +225,9 @@ async function refresh() {
     ml.textContent = '';
   }
 
-  // Pause button label
   document.getElementById('pause-btn').textContent =
     status.paused ? 'Resume' : 'Pause';
 
-  // Metrics
   document.getElementById('cpu').textContent    = pct(status.cpu);
   document.getElementById('memory').textContent = pct(status.memory);
   document.getElementById('disk').textContent   = pct(status.disk);
@@ -235,7 +235,6 @@ async function refresh() {
   setBar('mem-bar',  status.memory);
   setBar('disk-bar', status.disk);
 
-  // Failed services
   const svcCard = document.getElementById('services-card');
   const svcList = document.getElementById('services-list');
   if (status.failed_services && status.failed_services.length > 0) {
@@ -247,10 +246,8 @@ async function refresh() {
     svcCard.style.display = 'none';
   }
 
-  // Pending approvals (persistent queue — one card each)
   renderApprovals(status.pending_approvals);
 
-  // Problems
   renderList(
     'problems-list',
     status.recent_problems,
@@ -261,7 +258,6 @@ async function refresh() {
     'No problems detected yet'
   );
 
-  // Executions
   renderList(
     'executions-list',
     status.recent_executions,
@@ -272,15 +268,14 @@ async function refresh() {
     'No executions yet'
   );
 
-  // Analysis
   const analysis = document.getElementById('analysis-text');
   analysis.textContent = status.last_analysis || 'Waiting for first analysis cycle…';
 
-  // Usage
   renderUsage(status.usage);
 
-  // If the service rejected a settings change (e.g. a provider that can't
-  // start), surface the reason next to the Save button — not just the header.
+  // App updates (service-driven).
+  renderUpdater(status.updater);
+
   if (status.error && /settings|not applied/i.test(status.error)) {
     const ss = document.getElementById('set-status');
     if (ss) ss.textContent = status.error;
@@ -292,9 +287,7 @@ async function togglePause() {
   refresh();
 }
 
-// Approve/Reject a specific queued action. Buttons disable on click to avoid a
-// double-submit; the card vanishes on the next status poll once the service has
-// removed it from the queue.
+// Approve/Reject a specific queued action.
 async function decide(id, approved, card) {
   if (card) card.querySelectorAll('button').forEach(b => (b.disabled = true));
   try {
@@ -305,241 +298,123 @@ async function decide(id, approved, card) {
   }
 }
 
-// ── Available app updates (winget + AI-driven) ──────────────────────────────
+// ── App updates (driven by the LocalSystem service — no UAC) ─────────────────
 
-let updatesBusy = false;
-
-// Escape a value for use inside a double-quoted HTML attribute.
-function escAttr(s) { return esc(s).replace(/"/g, '&quot;'); }
-
-// Find an update row (winget or AI) by its stable key.
-function rowByKey(key) {
-  return [...document.querySelectorAll('.upd-row')].find(r => r.dataset.key === key) || null;
-}
-
-// A coloured badge summarising one app's update outcome.
-function outcomeBadge(o) {
-  if (o.method === 'manual')         return '<span class="upd-badge tag-warn">Manual</span>';
-  if (!o.success)                    return '<span class="upd-badge tag-block">Failed</span>';
-  if (o.verification === 'verified') return '<span class="upd-badge tag-ok">Verified</span>';
-  if (o.verification === 'mismatch') return '<span class="upd-badge tag-block">Not updated</span>';
-  return '<span class="upd-badge tag-warn">Installed (unverified)</span>';
-}
-
-// The canonical interactive non-winget app row, shared by "Check other apps" and
-// "Update everything". Always offers Re-check / Note / Ignore so the user can
-// correct the AI (e.g. tell it where to fetch their own tool), and Download when
-// a url (or releases page) is known. Accepts AiUpdate {name,current,latest,url}
-// or an AppOutcome-shaped object {name, from, latest, url, releasesUrl}.
-function aiRow(o) {
-  const name = o.name || '';
-  const current = (o.current != null ? o.current : o.from) || '';
-  const latest = o.latest || '';
-  const url = o.url || o.releasesUrl || '';
-  const ver = `${esc(current || '?')}${latest ? ' → ' + esc(latest) : ''}`;
-  return `
-    <div class="upd-row" data-key="${escAttr(name.toLowerCase())}" data-name="${escAttr(name)}" data-current="${escAttr(current)}">
-      <span class="upd-name" title="${escAttr(name)}">${esc(name)}</span>
-      <span class="upd-ver">${ver}</span>
-      <span class="upd-actions"><button class="upd-install install-btn">Install</button>${url ? `<button class="upd-dl" data-url="${escAttr(url)}">Download</button>` : ''}</span>
-      <button class="upd-mini recheck-btn">Re-check</button>
-      <button class="upd-mini note-btn">Note</button>
-      <button class="upd-mini ignore-btn">Ignore</button>
-      <span class="upd-status"></span>
-    </div>`;
-}
-
-// Materialise interactive rows in #ai-updates-list for any non-winget outcome
-// that doesn't already have a row, so "Update everything" results are actionable
-// (Re-check / Note / Ignore / Download), not just summary text.
-function ensureAiRows(outcomes) {
-  const list = document.getElementById('ai-updates-list');
-  const ai = (outcomes || []).filter(o => o.key !== '__info__' && o.method !== 'winget');
-  if (!ai.length) return;
-  if (!list.querySelector('.upd-row')) list.innerHTML = '';
-  for (const o of ai) {
-    if (rowByKey(o.key)) continue;
-    list.insertAdjacentHTML('beforeend',
-      aiRow({ name: o.name, current: o.from, latest: o.latest, url: o.url, releasesUrl: o.releases_url }));
-  }
-}
-
-const PHASE_TEXT = {
-  planning: 'finding installer…', downloading: 'downloading…',
-  installing: 'installing…', verifying: 'verifying…', done: '', failed: '',
+const UPD_BADGE = {
+  verified:  '<span class="upd-badge tag-ok">Verified</span>',
+  installed: '<span class="upd-badge tag-warn">Installed</span>',
+  failed:    '<span class="upd-badge tag-block">Failed</span>',
+  skipped:   '<span class="upd-badge tag-warn">Skipped</span>',
 };
 
-// Live per-row phase from the service's 'update-progress' events.
-function applyPhase(key, phase) {
-  if (!key || key === '*') return;
-  const row = rowByKey(key);
-  if (!row) return;
-  const s = row.querySelector('.upd-status');
-  if (s && !s.querySelector('.upd-badge')) s.textContent = PHASE_TEXT[phase] ?? phase;
+function methodLabel(m) {
+  return ({ winget: 'winget', choco: 'Chocolatey', scoop: 'Scoop', msstore: 'Store', native: 'AI installer' })[m] || m || '';
 }
 
-// Render a finished AppOutcome onto its row: badge in the status slot, the now-
-// stale Install/Download actions removed, a one-line detail beneath. The
-// Re-check/Note/Ignore controls are intentionally KEPT so the user can correct a
-// manual/failed result (tell the AI the source, then re-check).
-function renderOutcome(o) {
-  const row = rowByKey(o.key);
-  if (!row) return;
-  const actions = row.querySelector('.upd-actions');
-  if (actions) actions.textContent = '';
-  const status = row.querySelector('.upd-status');
-  if (status) status.innerHTML = outcomeBadge(o);
-  let res = row.querySelector('.upd-result');
-  if (!res) { res = document.createElement('span'); res.className = 'upd-result'; row.appendChild(res); }
-  const ver = o.to ? `now ${o.to}` : '';
-  res.textContent = [o.detail, o.signature, ver].filter(Boolean).join(' · ');
+function updaterAppRow(a) {
+  const ver = `${esc(a.from || '?')}${a.to ? ' → ' + esc(a.to) : ''}`;
+  const badge = UPD_BADGE[a.state] || '';
+  const meth = a.method ? `<span class="upd-status">via ${esc(methodLabel(a.method))}</span>` : '';
+  const detailText = [a.detail, a.signature].filter(Boolean).join(' · ');
+  const detail = detailText ? `<span class="upd-result">${esc(detailText)}</span>` : '';
+  return `<div class="upd-row" data-id="${escAttr(a.id)}">
+    <span class="upd-name" title="${escAttr(a.name)}">${esc(a.name)}</span>
+    <span class="upd-ver">${ver}</span>${meth}${badge}
+    <button class="upd-mini upd-ignore" data-id="${escAttr(a.id)}" title="Don't check this app again">Ignore</button>
+    ${detail}
+  </div>`;
 }
 
-function showSummary(outcomes) {
-  const sum = document.getElementById('upd-summary');
-  sum.style.display = 'block';
-  sum.style.whiteSpace = 'pre-wrap';
-  outcomes = outcomes || [];
-  // Info/status rows (AI-check failure, truncation notes) carry a sentinel key
-  // and are shown as notes, not counted as apps.
-  const notes = outcomes.filter(o => o.key === '__info__');
-  const apps = outcomes.filter(o => o.key !== '__info__');
-  if (!apps.length && !notes.length) { sum.textContent = 'Nothing to update.'; return; }
-  let verified = 0, unverified = 0, failed = 0, manual = 0;
-  for (const o of apps) {
-    if (o.method === 'manual') manual++;
-    else if (!o.success) failed++;
-    else if (o.verification === 'verified') verified++;
-    else unverified++;
+function renderUpdater(u) {
+  const stateEl = document.getElementById('updater-state');
+  const metaEl = document.getElementById('updater-meta');
+  const appsEl = document.getElementById('updater-apps');
+  const notesEl = document.getElementById('updater-notes');
+  const histWrap = document.getElementById('updater-history-wrap');
+  const histEl = document.getElementById('updater-history');
+  const nowBtn = document.getElementById('upd-now');
+  if (!u) { stateEl.textContent = ''; return; }
+
+  stateEl.textContent = u.running ? '· running…' : (u.enabled ? '· auto' : '· manual');
+  if (nowBtn) { nowBtn.disabled = !!u.running; nowBtn.textContent = u.running ? 'Updating…' : '⬆ Update now'; }
+
+  const bits = [];
+  if (u.running && u.phase) bits.push(esc(u.phase));
+  if (u.last_run) bits.push('last run ' + ago(u.last_run));
+  if (u.enabled && u.next_run) bits.push('next in ' + until(u.next_run));
+  if (u.last_cost_usd) bits.push('~' + fmtGbp(u.last_cost_usd));
+  metaEl.style.display = bits.length ? 'block' : 'none';
+  metaEl.textContent = bits.join(' · ');
+
+  if (u.apps && u.apps.length) {
+    appsEl.innerHTML = u.apps.map(updaterAppRow).join('');
+  } else if (u.running) {
+    appsEl.innerHTML = '<div class="empty">Checking for updates…</div>';
+  } else if (u.last_run) {
+    appsEl.innerHTML = '<div class="empty">Everything up to date.</div>';
+  } else {
+    appsEl.innerHTML = '<div class="empty">Enable auto-updates in Settings, or click “Update now”.</div>';
   }
-  const head = [
-    verified   && `${verified} verified`,
-    unverified && `${unverified} installed (unverified)`,
-    failed     && `${failed} failed`,
-    manual     && `${manual} need manual install`,
-  ].filter(Boolean).join(' · ') || (apps.length ? 'done' : '');
-  const noteLines = notes.map(o => `• ${o.detail}`);
-  const appLines = apps.map(o => {
-    const tag = o.method === 'manual' ? 'manual'
-      : !o.success ? 'failed'
-      : o.verification === 'verified' ? 'verified' : 'unverified';
-    return `${o.name}: ${tag}${o.detail ? ' — ' + o.detail : ''}`;
-  });
-  sum.textContent = [head, ...noteLines, ...appLines].filter(Boolean).join('\n');
+
+  notesEl.innerHTML = (u.notes && u.notes.length)
+    ? u.notes.map(n => `<div class="upd-note">• ${esc(n)}</div>`).join('') : '';
+
+  if (u.recent && u.recent.length) {
+    histWrap.style.display = 'block';
+    histEl.innerHTML = u.recent.slice(0, 15).map(r =>
+      `<div class="upd-note">${r.success ? '✓' : '✗'} ${esc(r.name)} ` +
+      `<span style="opacity:.7">(${esc(methodLabel(r.method))})</span>` +
+      `${r.detail ? ' — ' + esc(r.detail) : ''} <span class="row-age">${ago(r.at)}</span></div>`
+    ).join('');
+  } else {
+    histWrap.style.display = 'none';
+  }
 }
 
-async function loadUpdates() {
-  const list = document.getElementById('updates-list');
-  const countEl = document.getElementById('updates-count');
-  const allBtn = document.getElementById('upd-all');
-  // Don't refresh (and wipe result badges) while any update/install is running.
-  if (updatesBusy || aiBusy) return;
-  // Clear any stale "update everything" summary from a previous run.
-  const sum = document.getElementById('upd-summary');
-  if (sum) { sum.style.display = 'none'; sum.textContent = ''; }
-  list.innerHTML = '<div class="empty">Checking for updates…</div>';
+async function updateNow() {
+  try { await invoke('run_updates_now'); }
+  catch (e) { console.error('run_updates_now failed', e); }
+}
+
+// ── Updater settings (apply live — no service restart) ───────────────────────
+
+const METHOD_BOXES = [['m-winget', 'winget'], ['m-choco', 'choco'], ['m-scoop', 'scoop'], ['m-msstore', 'msstore']];
+
+function fillUpdaterSettings(s) {
+  if (!s) return;
+  document.getElementById('set-upd-enabled').checked = !!s.enabled;
+  document.getElementById('set-upd-interval').value =
+    Math.max(1, Math.round((s.schedule_interval_secs || 86400) / 3600));
+  const methods = s.methods || [];
+  for (const [id, name] of METHOD_BOXES) document.getElementById(id).checked = methods.includes(name);
+  document.getElementById('set-native-enabled').checked = !!s.native_enabled;
+  document.getElementById('set-sigpol').value = s.native_signature_policy || 'require_valid';
+}
+
+async function saveUpdaterSettings() {
+  const methods = METHOD_BOXES.filter(([id]) => document.getElementById(id).checked).map(([, n]) => n);
+  const settings = {
+    enabled: document.getElementById('set-upd-enabled').checked,
+    schedule_interval_secs:
+      Math.max(1, parseInt(document.getElementById('set-upd-interval').value, 10) || 24) * 3600,
+    methods,
+    native_enabled: document.getElementById('set-native-enabled').checked,
+    native_signature_policy: document.getElementById('set-sigpol').value,
+  };
+  const st = document.getElementById('set-upd-status');
+  st.textContent = 'Saving…';
   try {
-    const ups = await invoke('list_app_updates');
-    countEl.textContent = ups.length ? `(${ups.length})` : '';
-    allBtn.style.display = ups.length ? 'inline-block' : 'none';
-    if (!ups.length) {
-      list.innerHTML = '<div class="empty">All apps up to date</div>';
-      return;
-    }
-    list.innerHTML = ups.map(u => `
-      <div class="upd-row" data-key="${escAttr(u.id)}" data-id="${escAttr(u.id)}"
-           data-name="${escAttr(u.name)}" data-current="${escAttr(u.current)}" data-available="${escAttr(u.available)}">
-        <span class="upd-name" title="${escAttr(u.id)}">${esc(u.name)}</span>
-        <span class="upd-ver">${esc(u.current)} → ${esc(u.available)}</span>
-        <span class="upd-actions"><button class="upd-update">Update</button></span>
-        <span class="upd-status"></span>
-      </div>`).join('');
+    await invoke('set_updater_settings', { settings });
+    st.textContent = 'Saved — applies immediately.';
   } catch (e) {
-    list.innerHTML = `<div class="empty">${esc(String(e))}</div>`;
-    countEl.textContent = '';
-    allBtn.style.display = 'none';
+    st.textContent = 'Failed: ' + e;
   }
 }
 
-async function updateOne(row, btn) {
-  if (updatesBusy || aiBusy) return;
-  updatesBusy = true;
-  if (btn) { btn.disabled = true; btn.textContent = 'Updating…'; }
-  try {
-    const o = await invoke('update_app', {
-      id: row.dataset.id, name: row.dataset.name,
-      current: row.dataset.current, available: row.dataset.available,
-    });
-    renderOutcome(o);
-  } catch (e) {
-    if (btn) { btn.disabled = false; btn.textContent = 'Failed'; btn.title = String(e); }
-    console.error('update_app failed', e);
-  }
-  updatesBusy = false;
-}
-
-async function updateAll() {
-  if (updatesBusy || aiBusy) return;
-  updatesBusy = true;
-  const btn = document.getElementById('upd-all');
-  btn.disabled = true; btn.textContent = 'Updating…';
-  try {
-    const outcomes = await invoke('update_all_apps');
-    outcomes.forEach(renderOutcome);
-    showSummary(outcomes);
-  } catch (e) {
-    console.error('update_all_apps failed', e);
-    btn.title = String(e);
-  }
-  btn.disabled = false; btn.textContent = 'Update all (winget)';
-  updatesBusy = false;
-}
-
-// Update EVERYTHING: winget apps (one UAC) then AI-driven installs of non-winget
-// apps (downloaded, then one UAC), each verified. Progress streams in live.
-async function updateEverything() {
-  if (updatesBusy || aiBusy) return;
-  updatesBusy = true; aiBusy = true;
-  const btn = document.getElementById('upd-everything');
-  btn.disabled = true; btn.textContent = 'Updating everything…';
-  const sum = document.getElementById('upd-summary');
-  sum.style.display = 'block'; sum.style.whiteSpace = 'pre-wrap';
-  sum.textContent = 'Updating winget apps, then finding and installing other apps… this can take a few minutes.';
-  try {
-    const outcomes = await invoke('update_everything');
-    ensureAiRows(outcomes);            // create interactive rows for AI/manual apps
-    outcomes.forEach(renderOutcome);   // stamp each result onto its row
-    showSummary(outcomes);             // full per-app report
-  } catch (e) {
-    console.error('update_everything failed', e);
-    sum.textContent = 'Update everything failed: ' + String(e);
-  }
-  btn.disabled = false; btn.textContent = '⬆ Update everything';
-  updatesBusy = false; aiBusy = false;
-}
-
-// Install one non-winget app via the AI (plan → download → install → verify).
-async function installAiApp(row, btn) {
-  if (updatesBusy || aiBusy) return;
-  aiBusy = true;
-  if (btn) { btn.disabled = true; btn.textContent = 'Installing…'; }
-  try {
-    const o = await invoke('install_ai_app', {
-      name: row.dataset.name, current: row.dataset.current || '',
-    });
-    renderOutcome(o);
-  } catch (e) {
-    if (btn) { btn.disabled = false; btn.textContent = 'Failed'; btn.title = String(e); }
-    console.error('install_ai_app failed', e);
-  }
-  aiBusy = false;
-}
-
-// Header / approval buttons (wired here rather than inline — Tauri v2 injects a
-// CSP nonce that disables 'unsafe-inline', which would block inline onclick).
+// ── Header / approval / update wiring ────────────────────────────────────────
+// (wired here rather than inline — Tauri v2's CSP nonce blocks inline handlers)
 document.getElementById('pause-btn').addEventListener('click', togglePause);
 
-// Approve/Reject buttons are rendered per-card, so delegate from the container.
 document.getElementById('approvals').addEventListener('click', (e) => {
   const btn = e.target.closest('.btn-approve, .btn-reject');
   if (!btn) return;
@@ -548,112 +423,16 @@ document.getElementById('approvals').addEventListener('click', (e) => {
   decide(id, btn.classList.contains('btn-approve'), btn.closest('.approval-card'));
 });
 
-document.getElementById('upd-refresh').addEventListener('click', loadUpdates);
-document.getElementById('upd-all').addEventListener('click', updateAll);
-document.getElementById('upd-everything').addEventListener('click', updateEverything);
-document.getElementById('updates-list').addEventListener('click', (e) => {
-  const b = e.target.closest('.upd-update');
-  if (b) updateOne(b.closest('.upd-row'), b);
-});
+document.getElementById('upd-now').addEventListener('click', updateNow);
+document.getElementById('set-upd-save').addEventListener('click', saveUpdaterSettings);
 
-// Live per-row progress for any update/install in flight (no polling).
-window.__TAURI__.event.listen('update-progress', (e) => {
-  const p = e.payload || {};
-  applyPhase(p.key, p.phase);
-}).catch(err => console.error('progress subscribe failed', err));
-
-// ── Other updates (AI-checked) ──────────────────────────────────────────────
-
-let aiBusy = false;
-
-async function checkAiUpdates() {
-  if (aiBusy) return;
-  aiBusy = true;
-  const list = document.getElementById('ai-updates-list');
-  const btn = document.getElementById('ai-check-btn');
-  btn.disabled = true; btn.textContent = 'Checking…';
-  list.innerHTML = '<div class="empty">Asking AI to check the web for newer versions… this can take a minute.</div>';
-  try {
-    const r = await invoke('check_ai_updates');
-    const cost = `Checked ${r.checked} app${r.checked === 1 ? '' : 's'} · ~${fmtGbp(r.cost_usd)}`;
-    let html = '<div class="upd-note">Apps not covered by winget:</div>';
-    if (r.note) html += `<div class="upd-note">${esc(r.note)}</div>`;
-    if (!r.updates.length) {
-      html += '<div class="empty">No updates found for non-winget apps.</div>';
-    } else {
-      html += r.updates.map(aiRow).join('');
-    }
-    html += `<div class="upd-note">${esc(cost)} · AI installs are downloaded, verified, and version-checked. Verify before installing.</div>`;
-    list.innerHTML = html;
-  } catch (e) {
-    list.innerHTML = `<div class="empty">${esc(String(e))}</div>`;
-  }
-  aiBusy = false;
-  btn.disabled = false; btn.textContent = 'Check other apps';
-}
-
-document.getElementById('ai-check-btn').addEventListener('click', checkAiUpdates);
-document.getElementById('ai-updates-list').addEventListener('click', (e) => {
-  // Download link
-  const dl = e.target.closest('.upd-dl');
-  if (dl) { invoke('open_url', { url: dl.dataset.url }).catch(err => console.error(err)); return; }
-  const row = e.target.closest('.upd-row');
-  if (!row) return;
-  const name = row.dataset.name;
-  // AI-driven install of this app (plan → download → install → verify)
-  const inst = e.target.closest('.install-btn');
-  if (inst) { installAiApp(row, inst); return; }
-  // Ignore: blacklist this app from future AI checks
-  if (e.target.closest('.ignore-btn')) {
-    invoke('set_app_note', { name, note: '', ignore: true })
-      .then(() => { row.innerHTML =
-        `<span class="upd-name">${esc(name)}</span><span class="upd-ver">ignored — won't be checked again</span>`; })
-      .catch(err => console.error(err));
-    return;
-  }
-  // Note: open an inline editor for a hint used in future checks
-  if (e.target.closest('.note-btn')) {
-    row.innerHTML = `
-      <span class="upd-name">${esc(name)}</span>
-      <span class="note-edit">
-        <input class="note-input" type="text" placeholder="e.g. my own app — ignore / latest is on my GitHub releases">
-        <button class="upd-mini note-save">Save</button>
-      </span>`;
-    const inp = row.querySelector('.note-input');
-    inp.focus();
-    inp.addEventListener('keydown', ev => { if (ev.key === 'Enter') row.querySelector('.note-save').click(); });
-    return;
-  }
-  // Save the typed note, then offer a one-app re-check using it
-  if (e.target.closest('.note-save')) {
-    const val = row.querySelector('.note-input').value;
-    invoke('set_app_note', { name, note: val, ignore: false })
-      .then(() => { row.innerHTML =
-        `<span class="upd-name">${esc(name)}</span><span class="upd-ver">note saved</span>` +
-        `<button class="upd-mini recheck-btn">Re-check now</button>`; })
-      .catch(err => console.error(err));
-    return;
-  }
-  // Re-check just this app (uses its stored note) — no full sweep
-  if (e.target.closest('.recheck-btn')) {
-    const current = row.dataset.current || '';
-    row.innerHTML = `<span class="upd-name">${esc(name)}</span><span class="upd-ver">re-checking…</span>`;
-    invoke('check_app_update', { name, current }).then(r => {
-      if (r.updates && r.updates.length) {
-        const u = r.updates[0];
-        // Replace the whole row with a fresh interactive one (full controls).
-        row.outerHTML = aiRow({ name, current: u.current || current, latest: u.latest, url: u.url });
-      } else {
-        row.innerHTML =
-          `<span class="upd-name">${esc(name)}</span>` +
-          `<span class="upd-ver">up to date${r.note ? ' — ' + esc(r.note) : ''} · ~${fmtGbp(r.cost_usd)}</span>` +
-          `<button class="upd-mini note-btn">Note</button>`;
-      }
-    }).catch(err => {
-      row.innerHTML = `<span class="upd-name">${esc(name)}</span><span class="upd-ver">re-check failed: ${esc(String(err))}</span><button class="upd-mini recheck-btn">Re-check</button>`;
-    });
-    return;
-  }
+// Per-app "Ignore" — stop checking this app (delegated from the list).
+document.getElementById('updater-apps').addEventListener('click', (e) => {
+  const ig = e.target.closest('.upd-ignore');
+  if (!ig) return;
+  invoke('set_app_ignore', { id: ig.dataset.id, ignore: true, note: '' })
+    .then(() => { const row = ig.closest('.upd-row'); if (row) row.style.opacity = '.5'; })
+    .catch(err => console.error('set_app_ignore failed', err));
 });
 
 // ── Settings ────────────────────────────────────────────────────────────────
@@ -676,6 +455,7 @@ function fillSettings() {
     s.openrouter_key_set ? '•••••• set — blank keeps it' : 'not set';
   document.getElementById('set-an-key').placeholder =
     s.anthropic_key_set ? '•••••• set — blank keeps it' : 'not set';
+  fillUpdaterSettings(lastStatus.updater && lastStatus.updater.settings);
 }
 
 function toggleSettings() {
@@ -713,13 +493,7 @@ async function saveSettings() {
   };
   const st = document.getElementById('set-status');
 
-  // Client-side guard: the service rejects (and silently reverts) a provider
-  // that can't start. Catch the common cases here with a clear message instead
-  // of a confusing revert to the previous provider.
   const s = (lastStatus && lastStatus.settings) || {};
-  // OpenRouter: a blank model means the free auto-routing model. Don't hard-block
-  // on a missing key — the service can auto-detect one from the OpenRouter CLI
-  // (~/.openrouter/config.json) and will report back if none is found anywhere.
   if (settings.provider === 'openrouter' && !settings.model) {
     settings.model = 'openrouter/free';
   }
@@ -774,7 +548,6 @@ function applyCollapsed() {
 }
 
 document.querySelector('.body').addEventListener('click', (e) => {
-  // Don't toggle when interacting with a control inside the header.
   if (e.target.closest('button, input, select, a')) return;
   const header = e.target.closest('.card-header.collapsible');
   if (!header) return;
@@ -791,10 +564,6 @@ applyCollapsed();
 // Initial load + poll every 2 seconds
 refresh();
 setInterval(refresh, 2000);
-
-// Check for app updates on launch, then hourly
-loadUpdates();
-setInterval(loadUpdates, 60 * 60 * 1000);
 
 // Fetch the USD→GBP rate so costs display in pounds
 invoke('gbp_per_usd').then(r => { if (r > 0) gbpRate = r; }).catch(() => {});

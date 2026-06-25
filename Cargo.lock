@@ -840,20 +840,15 @@ version = "0.8.10"
 dependencies = [
  "anyhow",
  "eir-proto",
- "futures-util",
  "image",
- "reqwest 0.12.28",
  "serde",
  "serde_json",
- "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-updater",
  "tokio",
- "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
- "url",
 ]
 
 [[package]]

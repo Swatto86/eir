@@ -1,10 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod pipe_client;
-mod updates;
+mod util;
 
 use pipe_client::SharedStatus;
-use eir_proto::{SettingsUpdate, StatusPayload, UiMsg};
+use eir_proto::{SettingsUpdate, StatusPayload, UiMsg, UpdaterSettingsUpdate};
 use std::sync::{Arc, Mutex};
 use tauri::{
     image::Image,
@@ -59,6 +59,35 @@ async fn clear_executions(tx: State<'_, UiCmdTx>) -> Result<(), String> {
 #[tauri::command]
 async fn update_settings(settings: SettingsUpdate, tx: State<'_, UiCmdTx>) -> Result<(), String> {
     tx.0.send(UiMsg::UpdateSettings(Box::new(settings)))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn run_updates_now(tx: State<'_, UiCmdTx>) -> Result<(), String> {
+    tx.0.send(UiMsg::RunUpdatesNow)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_updater_settings(
+    settings: UpdaterSettingsUpdate,
+    tx: State<'_, UiCmdTx>,
+) -> Result<(), String> {
+    tx.0.send(UiMsg::UpdateUpdaterSettings(Box::new(settings)))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_app_ignore(
+    id: String,
+    ignore: bool,
+    note: String,
+    tx: State<'_, UiCmdTx>,
+) -> Result<(), String> {
+    tx.0.send(UiMsg::SetAppIgnore { id, ignore, note })
         .await
         .map_err(|e| e.to_string())
 }
@@ -204,9 +233,6 @@ fn main() {
         .setup(move |app| {
             let icon_base = Arc::new(decode_icon());
 
-            // Remove any installer staging dirs left by a previous run.
-            updates::cleanup_stale_stage_dirs();
-
             // Background auto-update: check on startup, then every 6 hours.
             // If a newer signed release exists, download, install, and relaunch.
             spawn_update_checker(app.handle().clone());
@@ -294,18 +320,11 @@ fn main() {
             update_settings,
             clear_problems,
             clear_executions,
-            updates::list_app_updates,
-            updates::update_app,
-            updates::update_all_apps,
-            updates::update_everything,
-            updates::install_ai_app,
-            updates::plan_app_install,
-            updates::verify_app_version,
-            updates::check_ai_updates,
-            updates::check_app_update,
-            updates::gbp_per_usd,
-            updates::open_url,
-            updates::set_app_note
+            run_updates_now,
+            set_updater_settings,
+            set_app_ignore,
+            util::gbp_per_usd,
+            util::open_url
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| error!("Eir UI failed: {e}"))

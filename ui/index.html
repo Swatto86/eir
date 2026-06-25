@@ -271,20 +271,21 @@
     </div>
   </div>
 
-  <!-- Available app updates (winget + AI-checked apps winget can't manage) -->
+  <!-- Autonomous updates — driven by the LocalSystem service (no UAC) -->
   <div class="card" id="updates-card">
     <div class="card-header collapsible">
-      <span class="chev">▾</span>Available Updates <span class="upd-count" id="updates-count"></span>
+      <span class="chev">▾</span>App Updates <span class="upd-count" id="updater-state"></span>
       <span class="hspacer"></span>
-      <button class="upd-btn" id="upd-refresh">Refresh</button>
-      <button class="upd-btn upd-all" id="upd-all" style="display:none">Update all (winget)</button>
-      <button class="upd-btn upd-everything" id="upd-everything">⬆ Update everything</button>
-      <button class="upd-btn" id="ai-check-btn">Check other apps</button>
+      <button class="upd-btn upd-everything" id="upd-now">⬆ Update now</button>
     </div>
     <div class="card-body">
-      <div id="upd-summary" class="upd-summary" style="display:none"></div>
-      <div id="updates-list"><div class="empty">Checking for updates…</div></div>
-      <div id="ai-updates-list"></div>
+      <div id="updater-meta" class="upd-summary" style="display:none"></div>
+      <div id="updater-apps"><div class="empty">Enable auto-updates in Settings, or click “Update now”.</div></div>
+      <div id="updater-notes"></div>
+      <div id="updater-history-wrap" style="display:none">
+        <div class="upd-note" style="border-top:1px solid var(--border); margin-top:6px; padding-top:8px;">Recent attempts</div>
+        <div id="updater-history"></div>
+      </div>
     </div>
   </div>
 
@@ -356,6 +357,32 @@
       <div class="set-actions">
         <button class="set-save" id="set-save">Save &amp; restart service</button>
         <span class="upd-note" id="set-status"></span>
+      </div>
+
+      <div class="set-grid" style="border-top:1px solid var(--border); margin-top:4px; padding-top:14px;">
+        <label for="set-upd-enabled">Auto-update apps</label>
+        <input id="set-upd-enabled" type="checkbox" style="width:auto; justify-self:start;">
+        <label for="set-upd-interval">Check interval (hours)</label>
+        <input id="set-upd-interval" type="number" min="1" placeholder="24">
+        <label>Update via</label>
+        <div id="set-methods" style="display:flex; gap:14px; flex-wrap:wrap; font-size:12px;">
+          <label style="color:var(--text)"><input type="checkbox" id="m-winget" style="width:auto"> winget</label>
+          <label style="color:var(--text)"><input type="checkbox" id="m-choco" style="width:auto"> Chocolatey</label>
+          <label style="color:var(--text)"><input type="checkbox" id="m-scoop" style="width:auto"> Scoop</label>
+          <label style="color:var(--text)"><input type="checkbox" id="m-msstore" style="width:auto"> Store</label>
+        </div>
+        <label for="set-native-enabled">AI-found installers</label>
+        <input id="set-native-enabled" type="checkbox" style="width:auto; justify-self:start;">
+        <label for="set-sigpol">Installer signature</label>
+        <select id="set-sigpol">
+          <option value="require_valid">Require valid signature (default)</option>
+          <option value="require_publisher_match">Require publisher match</option>
+          <option value="allow_unsigned">Allow unsigned — least safe</option>
+        </select>
+      </div>
+      <div class="set-actions">
+        <button class="set-save" id="set-upd-save" style="background:var(--blue)">Save updater settings</button>
+        <span class="upd-note" id="set-upd-status"></span>
       </div>
     </div>
   </div>
