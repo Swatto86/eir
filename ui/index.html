@@ -83,6 +83,12 @@
        own overflow-y actually scrolls; without it the column grows past the
        viewport and the bottom (e.g. the Settings save button) is clipped. */
     .body { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 16px; }
+    /* The cards are flex children of this column. Without this, a short window
+       lets them flex-shrink to fit; combined with .card{overflow:hidden} that
+       clips their content AND removes the body's overflow, so the scrollbar
+       never appears and the cut text is unreachable. Pin their natural height
+       so the body overflows and scrolls instead. */
+    .body > * { flex-shrink: 0; }
 
     /* ── Approval cards (one per queued action) ── */
     #approvals { display: flex; flex-direction: column; gap: 12px; }
@@ -235,15 +241,23 @@
     .act-when { margin-left: auto; padding-left: 8px; color: var(--muted); font-size: 11px; white-space: nowrap; }
 
     /* ── Settings modal ── */
-    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: flex-start; justify-content: center; padding: 36px 20px; z-index: 100; overflow-y: auto; }
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; padding: 28px 20px; z-index: 100; }
     .modal-overlay.open { display: flex; }
-    .modal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); width: 100%; max-width: 640px; box-shadow: 0 20px 60px rgba(0,0,0,.5); }
-    .modal-header { display: flex; align-items: center; gap: 8px; padding: 14px 18px; border-bottom: 1px solid var(--border); font-size: 14px; font-weight: 600; position: sticky; top: 0; background: var(--surface); border-radius: var(--radius) var(--radius) 0 0; }
+    /* Flex column capped at the viewport so the header/footer stay put and only
+       the field area scrolls. A position:sticky header inside a scrolling
+       overlay drifts down with the content — this avoids that entirely. */
+    .modal { display: flex; flex-direction: column; max-height: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); width: 100%; max-width: 640px; box-shadow: 0 20px 60px rgba(0,0,0,.5); overflow: hidden; }
+    .modal-header { flex-shrink: 0; display: flex; align-items: center; gap: 8px; padding: 14px 18px; border-bottom: 1px solid var(--border); font-size: 14px; font-weight: 600; background: var(--surface); }
     .modal-header .hspacer { flex: 1; }
     .modal-close { background: transparent; border: none; color: var(--muted); font-size: 22px; cursor: pointer; line-height: 1; padding: 0 4px; }
     .modal-close:hover { color: var(--text); }
-    .modal-body { padding: 0 0 8px; }
+    .modal-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0 0 8px; }
+    .set-section { border-top: 1px solid var(--border); }
+    .set-section:first-child { border-top: none; }
     .set-section-title { padding: 16px 18px 2px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+    .set-section-desc { padding: 2px 18px 4px; font-size: 12px; color: var(--muted); line-height: 1.5; }
+    .set-note { padding: 8px 18px 0; font-size: 11.5px; color: var(--muted); line-height: 1.5; }
+    .set-note code { font-family: 'Cascadia Code', Consolas, monospace; font-size: 11px; color: var(--text); }
 
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
@@ -338,7 +352,9 @@
     <div class="modal-header">⚙ Settings<span class="hspacer"></span><button class="modal-close" id="close-settings" title="Close">×</button></div>
     <div class="modal-body">
 
+      <div class="set-section">
       <div class="set-section-title">AI provider &amp; monitoring</div>
+      <div class="set-section-desc">Which AI model Eir uses to diagnose problems, plus how often it polls Windows for signals. Saving these restarts the service (~15&nbsp;s).</div>
       <div class="set-grid">
         <label for="set-provider">AI provider</label>
         <select id="set-provider">
@@ -383,8 +399,11 @@
         <button class="set-save" id="set-save">Save &amp; restart service</button>
         <span class="upd-note" id="set-status"></span>
       </div>
+      </div>
 
-      <div class="set-section-title">Advisor mode — re-think harder when the agent is unsure</div>
+      <div class="set-section">
+      <div class="set-section-title">Advisor mode</div>
+      <div class="set-section-desc">When the agent is unsure, it re-analyses the problem once at a stronger model or higher effort, then acts on the better answer. Off by default; applies live.</div>
       <div class="set-grid">
         <label for="set-adv-enabled">Enable advisor mode</label>
         <input id="set-adv-enabled" type="checkbox" style="width:auto; justify-self:start;">
@@ -401,15 +420,19 @@
         </select>
         <label for="set-adv-conf">Escalate below confidence (%)</label>
         <input id="set-adv-conf" type="number" min="0" max="95" step="5" placeholder="60">
-        <label for="set-adv-budget">Daily escalation budget (£/$)</label>
+        <label for="set-adv-budget">Daily escalation budget (USD)</label>
         <input id="set-adv-budget" type="number" min="0" step="0.1" placeholder="0.50">
       </div>
+      <div class="set-note">The daily budget caps spend only on metered API providers (Anthropic key or OpenAI-compatible). Claude&nbsp;CLI and OpenRouter report no per-call cost, so escalations there are capped at <code>24/day</code> instead.</div>
       <div class="set-actions">
         <button class="set-save" id="set-adv-save" style="background:var(--blue)">Save advisor settings</button>
         <span class="upd-note" id="set-adv-status"></span>
       </div>
+      </div>
 
+      <div class="set-section">
       <div class="set-section-title">App updates</div>
+      <div class="set-section-desc">Eir updates your apps unattended — no UAC prompts — through the methods you allow below. Applies live.</div>
       <div class="set-grid">
         <label for="set-upd-enabled">Auto-update apps</label>
         <input id="set-upd-enabled" type="checkbox" style="width:auto; justify-self:start;">
@@ -434,6 +457,7 @@
       <div class="set-actions">
         <button class="set-save" id="set-upd-save" style="background:var(--blue)">Save updater settings</button>
         <span class="upd-note" id="set-upd-status"></span>
+      </div>
       </div>
     </div>
   </div>

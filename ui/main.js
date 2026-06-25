@@ -304,11 +304,11 @@ function activityItems(status) {
   for (const p of (status.recent_problems || [])) {
     const icon = p.blocked ? '🚫' : (p.auto_executed ? '🔧' : '🔎');
     const why = [p.action, p.reason].filter(Boolean).map(esc).join(' — ');
-    items.push({ at: p.at || 0, icon, head: `${problemTag(p)}<span class="act-text">${esc(p.diagnosis)}</span>`, why });
+    items.push({ at: p.at || 0, icon, head: `${problemTag(p)}<span class="act-text" title="${escAttr(p.diagnosis)}">${esc(p.diagnosis)}</span>`, why });
   }
   for (const e of (status.recent_executions || [])) {
     const icon = e.success ? '✅' : '❌';
-    items.push({ at: e.at || 0, icon, head: `${exTag(e)}<span class="act-text">${esc(e.action)}</span>`, why: esc(e.preview || '') });
+    items.push({ at: e.at || 0, icon, head: `${exTag(e)}<span class="act-text" title="${escAttr(e.action)}">${esc(e.action)}</span>`, why: esc(e.preview || '') });
   }
   items.sort((a, b) => (b.at || 0) - (a.at || 0));
   return items;
