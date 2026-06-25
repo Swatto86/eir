@@ -48,8 +48,9 @@ fn upgrade_args(id: &str, force: bool) -> Vec<String> {
 
 /// Run winget directly and capture its merged output. The service is SYSTEM, so no
 /// elevation wrapper is needed; winget also suppresses its live progress bar when
-/// stdout isn't a console, which keeps the capture clean.
-async fn run_winget(args: Vec<String>) -> (i32, String) {
+/// stdout isn't a console, which keeps the capture clean. Shared with the Store
+/// method (which is winget with `--source msstore`).
+pub(crate) async fn run_winget(args: Vec<String>) -> (i32, String) {
     let res = tokio::task::spawn_blocking(move || {
         std::process::Command::new("winget")
             .args(&args)
@@ -221,7 +222,7 @@ fn is_winget_chatter(line: &str) -> bool {
 /// run-on of UI frames; split those back out, drop the progress noise, licence
 /// boilerplate, and step chatter, then join what's left. Real status and error lines
 /// always survive, so a failure still carries winget's own reason.
-fn clean_winget_output(raw: &str) -> String {
+pub(crate) fn clean_winget_output(raw: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     for seg in raw.split(['\r', '\n']) {
         let seg = seg.trim();

@@ -7,8 +7,8 @@
 use crate::ai::client::{extract_json, AiClient};
 use crate::updater::config::UpdaterConfig;
 use crate::updater::domain::{Method, UpdateCandidate};
-use crate::updater::methods::winget;
-use crate::updater::names::match_installed;
+use crate::updater::methods::{choco, msstore, scoop, winget};
+use crate::updater::names::{clean_app_name, match_installed};
 use crate::updater::version::is_newer;
 use crate::updater::winget_parse::parse_unmanaged;
 use serde::Deserialize;
@@ -32,57 +32,134 @@ fn ignored(cfg: &UpdaterConfig, id: &str) -> bool {
     cfg.ignored.iter().any(|ig| ig.eq_ignore_ascii_case(id))
 }
 
-/// Collect every update candidate across the enabled methods.
+/// Add a manager candidate if it isn't ignored or already covered by an
+/// earlier (more-preferred) manager. The app's primary method is `primary`; the
+/// native installer is appended as a self-healing fallback when available.
+#[allow(clippy::too_many_arguments)]
+fn push_candidate(
+    out: &mut Vec<UpdateCandidate>,
+    seen: &mut HashSet<String>,
+    cfg: &UpdaterConfig,
+    native_avail: bool,
+    name: &str,
+    current: &str,
+    available: &str,
+    package_id: Option<String>,
+    primary: Method,
+) {
+    let id = clean_app_name(name).to_lowercase();
+    if id.is_empty() || ignored(cfg, &id) || !seen.insert(id.clone()) {
+        return;
+    }
+    let mut methods = vec![primary];
+    if native_avail && primary != Method::Native {
+        methods.push(Method::Native);
+    }
+    out.push(UpdateCandidate {
+        id,
+        name: name.to_string(),
+        current: current.to_string(),
+        available: available.to_string(),
+        package_id,
+        methods,
+    });
+}
+
+/// Collect every update candidate across the available methods, de-duplicated by app
+/// identity (earlier, more-preferred managers win) and filtered by the ignore list.
 pub async fn collect(
     ai: Option<&AiClient>,
     cfg: &UpdaterConfig,
     model_override: &str,
+    available: &[Method],
 ) -> CheckResult {
-    let enabled: Vec<Method> = cfg
-        .methods
-        .iter()
-        .filter_map(|m| Method::from_token(m))
-        .collect();
+    let native_avail = available.contains(&Method::Native);
     let mut candidates: Vec<UpdateCandidate> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut notes: Vec<String> = Vec::new();
     let mut cost = 0.0;
+    // Names any manager already covers, so the AI check skips them.
+    let mut managed: HashSet<String> = HashSet::new();
 
-    // 1. winget upgrade candidates (winget first, native as a fallback).
-    let winget_ups = if enabled.contains(&Method::Winget) {
-        winget::list_updates().await
-    } else {
-        Vec::new()
-    };
-    let managed: HashSet<String> = winget_ups.iter().map(|u| u.name.to_lowercase()).collect();
-    for u in &winget_ups {
-        let id = crate::updater::names::clean_app_name(&u.name).to_lowercase();
-        if ignored(cfg, &id) {
-            continue;
+    if available.contains(&Method::Winget) {
+        for u in winget::list_updates().await {
+            managed.insert(u.name.to_lowercase());
+            push_candidate(
+                &mut candidates,
+                &mut seen,
+                cfg,
+                native_avail,
+                &u.name,
+                &u.current,
+                &u.available,
+                Some(u.id.clone()),
+                Method::Winget,
+            );
         }
-        let mut methods = vec![Method::Winget];
-        if cfg.native_enabled && ai.is_some() {
-            methods.push(Method::Native);
+    }
+    if available.contains(&Method::Choco) {
+        for u in choco::list_outdated().await {
+            managed.insert(u.name.to_lowercase());
+            push_candidate(
+                &mut candidates,
+                &mut seen,
+                cfg,
+                native_avail,
+                &u.name,
+                &u.current,
+                &u.available,
+                Some(u.name.clone()),
+                Method::Choco,
+            );
         }
-        candidates.push(UpdateCandidate {
-            id,
-            name: u.name.clone(),
-            current: u.current.clone(),
-            available: u.available.clone(),
-            package_id: Some(u.id.clone()),
-            methods,
-        });
+    }
+    if available.contains(&Method::Scoop) {
+        for u in scoop::list_outdated().await {
+            managed.insert(u.name.to_lowercase());
+            push_candidate(
+                &mut candidates,
+                &mut seen,
+                cfg,
+                native_avail,
+                &u.name,
+                &u.current,
+                &u.available,
+                Some(u.name.clone()),
+                Method::Scoop,
+            );
+        }
+    }
+    if available.contains(&Method::MsStore) {
+        for u in msstore::list_updates().await {
+            managed.insert(u.name.to_lowercase());
+            push_candidate(
+                &mut candidates,
+                &mut seen,
+                cfg,
+                native_avail,
+                &u.name,
+                &u.current,
+                &u.available,
+                Some(u.id.clone()),
+                Method::MsStore,
+            );
+        }
     }
 
-    // 2. AI check for apps winget can't manage -> native candidates.
-    if cfg.native_enabled {
+    // The AI web-search pass over apps no manager covers -> native candidates.
+    if native_avail {
         if let Some(ai) = ai {
             match check_unmanaged(ai, cfg, model_override, &managed).await {
-                Ok((mut native_cands, c, note)) => {
+                Ok((native_cands, c, note)) => {
                     cost += c;
                     if let Some(n) = note {
                         notes.push(n);
                     }
-                    candidates.append(&mut native_cands);
+                    for cand in native_cands {
+                        if seen.insert(cand.id.clone()) {
+                            candidates.push(cand);
+                        }
+                    }
                 }
                 Err(e) => notes.push(format!("couldn't check non-winget apps: {e}")),
             }

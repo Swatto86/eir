@@ -1,15 +1,16 @@
-//! The self-healing loop. For each candidate it tries methods in order; on a
-//! failure it picks the next method to try. This phase is purely deterministic
-//! (winget -> native ladder); Phase 6 inserts the AI diagnostician between the
-//! attempt and the next-method choice. Either way Rust classifies the error and
-//! decides — the AI only ever proposes within the bounds Rust allows.
+//! The self-healing loop. For each candidate it tries an update method; on a
+//! non-terminal failure the AI diagnostician reads the real captured error and
+//! proposes the next method (or an allow-listed remedy), validated by Rust, until one
+//! verifies or the methods/attempt cap are exhausted. Rust always classifies the
+//! error and has the final say; the AI only proposes within the bounds Rust allows,
+//! and a deterministic ladder runs whenever the AI is unavailable.
 
 use crate::ai::client::AiClient;
 use crate::updater::config::UpdaterConfig;
 use crate::updater::domain::{
     AttemptOutcome, ErrorCategory, Method, NextStep, Remedy, UpdateCandidate,
 };
-use crate::updater::methods::{native, winget};
+use crate::updater::methods::{choco, detect, msstore, native, scoop, winget};
 use crate::updater::{check, diagnose, history};
 use sqlx::SqlitePool;
 use std::os::windows::process::CommandExt;
@@ -60,6 +61,9 @@ async fn dispatch(
     let force = matches!(remedy, Some(Remedy::Force));
     match method {
         Method::Winget => winget::attempt_with(candidate, force).await,
+        Method::Choco => choco::attempt(candidate).await,
+        Method::Scoop => scoop::attempt(candidate).await,
+        Method::MsStore => msstore::attempt(candidate).await,
         Method::Native => match ctx.ai {
             Some(ai) => {
                 let note = ctx.config.notes.get(&candidate.id).map(String::as_str);
@@ -81,10 +85,6 @@ async fn dispatch(
                 "no AI provider configured for native installs",
             ),
         },
-        // Implemented in Phase 7; never reached today (check never proposes them).
-        Method::Choco | Method::Scoop | Method::MsStore => {
-            AttemptOutcome::failed(method, ErrorCategory::NotFound, "method not available yet")
-        }
     }
 }
 
@@ -181,18 +181,35 @@ pub async fn heal(
     attempts
 }
 
-/// Methods usable right now: enabled in config and implemented. Package-manager
-/// detection (choco/scoop presence) arrives in Phase 7; until then only winget and
-/// native are offered.
-pub fn available_methods(cfg: &UpdaterConfig, ai: Option<&AiClient>) -> Vec<Method> {
+/// Methods usable right now: enabled in config AND present on this machine. Missing
+/// Chocolatey is bootstrapped when `bootstrap_managers` is set; Scoop is only used if
+/// a user already has it (never installed as SYSTEM); native is offered when an AI
+/// provider is configured.
+pub async fn available_methods(cfg: &UpdaterConfig, ai: Option<&AiClient>) -> Vec<Method> {
     let enabled: Vec<Method> = cfg
         .methods
         .iter()
         .filter_map(|m| Method::from_token(m))
         .collect();
+    let has = |m: Method| enabled.contains(&m);
     let mut v = Vec::new();
-    if enabled.contains(&Method::Winget) {
+    if has(Method::Winget) && detect::winget_available() {
         v.push(Method::Winget);
+    }
+    if has(Method::Choco) {
+        let mut present = detect::choco_available();
+        if !present && cfg.bootstrap_managers {
+            present = detect::bootstrap_choco().await;
+        }
+        if present {
+            v.push(Method::Choco);
+        }
+    }
+    if has(Method::Scoop) && detect::scoop_available() {
+        v.push(Method::Scoop);
+    }
+    if has(Method::MsStore) && detect::winget_available() {
+        v.push(Method::MsStore);
     }
     if cfg.native_enabled && ai.is_some() {
         v.push(Method::Native);
@@ -212,8 +229,8 @@ pub struct CycleSummary {
 /// and budget caps), and persist every attempt. The cycle id groups this run's
 /// attempts in the history table.
 pub async fn run_cycle(pool: &SqlitePool, ctx: &EngineCtx<'_>, cycle_id: i64) -> CycleSummary {
-    let check = check::collect(ctx.ai, ctx.config, ctx.model_override).await;
-    let available = available_methods(ctx.config, ctx.ai);
+    let available = available_methods(ctx.config, ctx.ai).await;
+    let check = check::collect(ctx.ai, ctx.config, ctx.model_override, &available).await;
     let budget = ctx.config.budget_usd_per_run;
     let mut spent = check.cost_usd;
     let mut notes = check.notes;
