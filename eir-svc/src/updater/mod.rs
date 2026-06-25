@@ -20,6 +20,7 @@
 pub mod config;
 pub mod domain;
 pub mod download;
+pub mod methods;
 pub mod names;
 pub mod plan;
 pub mod verify;

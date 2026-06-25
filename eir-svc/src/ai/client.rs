@@ -549,6 +549,190 @@ impl AiClient {
     }
 }
 
+// ── Web-search completion (app-update plan / diagnosis) ───────────────────────
+//
+// A general "ask the model this prompt, with live web search" entry point, used by
+// the updater to resolve an official installer URL and to read failure errors. It
+// consolidates the two web paths the old UI engine re-implemented: OpenRouter's
+// `web` plugin, and the Claude CLI's built-in search. Other providers (Anthropic,
+// OpenAI-compatible) have no web path here, so — as the UI did — they fall back to
+// the Claude CLI for the check.
+
+#[derive(Serialize)]
+struct WebPlugin {
+    id: &'static str,
+    max_results: u32,
+}
+
+#[derive(Serialize)]
+struct OpenRouterWebRequest<'a> {
+    model: &'a str,
+    plugins: Vec<WebPlugin>,
+    messages: Vec<ChatMessage<'a>>,
+}
+
+#[derive(Deserialize)]
+struct OrResp {
+    #[serde(default)]
+    choices: Vec<OrChoice>,
+    #[serde(default)]
+    usage: Option<OrUsage>,
+    #[serde(default)]
+    error: Option<OrError>,
+}
+
+#[derive(Deserialize)]
+struct OrChoice {
+    message: OrMsg,
+}
+
+#[derive(Deserialize)]
+struct OrMsg {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OrUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    cost: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct OrError {
+    #[serde(default)]
+    message: String,
+}
+
+impl AiClient {
+    /// Ask the configured provider for a completion of `prompt`, with live web
+    /// search. `model_override` (the configured `update_check_model`) selects the
+    /// model where it applies. Returns the raw text plus usage/cost.
+    pub async fn complete(
+        &self,
+        prompt: &str,
+        model_override: &str,
+    ) -> Result<(String, Option<CallUsage>)> {
+        match &self.config {
+            AiClientConfig::OpenRouter { api_key, model } => {
+                let m = if model_override.trim().is_empty() {
+                    model.clone()
+                } else {
+                    model_override.trim().to_string()
+                };
+                self.call_openrouter_web(api_key, &m, prompt).await
+            }
+            AiClientConfig::ClaudeCli {
+                binary,
+                user_profile,
+                effort,
+                ..
+            } => {
+                let m = claude_model_or_haiku(model_override);
+                self.call_claude_cli(binary, &m, effort, user_profile.as_deref(), prompt)
+                    .await
+            }
+            // No built-in web path for these providers — borrow the Claude CLI for
+            // the web-search check, exactly as the old UI engine did.
+            AiClientConfig::Anthropic { .. } | AiClientConfig::OpenAiCompatible { .. } => {
+                let user_profile = resolve_user_profile(None);
+                let binary = resolve_claude_binary(None, user_profile.as_deref());
+                let m = claude_model_or_haiku(model_override);
+                self.call_claude_cli(&binary, &m, "", user_profile.as_deref(), prompt)
+                    .await
+            }
+        }
+    }
+
+    /// OpenRouter with its web-search plugin (non-streaming). Works with free
+    /// models — OpenRouter performs the search and feeds results to the model.
+    async fn call_openrouter_web(
+        &self,
+        api_key: &str,
+        model: &str,
+        prompt: &str,
+    ) -> Result<(String, Option<CallUsage>)> {
+        let body = OpenRouterWebRequest {
+            model,
+            plugins: vec![WebPlugin {
+                id: "web",
+                max_results: 5,
+            }],
+            messages: vec![ChatMessage {
+                role: "user",
+                content: prompt,
+            }],
+        };
+        let resp = self
+            .http
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("HTTP-Referer", "https://github.com/Swatto86/eir")
+            .header("X-Title", "Eir")
+            .json(&body)
+            .send()
+            .await
+            .context("OpenRouter request failed")?;
+
+        let status = resp.status();
+        let text = resp.text().await.context("OpenRouter read failed")?;
+        if !status.is_success() {
+            let detail: String = text.chars().take(400).collect();
+            bail!("OpenRouter error ({status}): {detail}");
+        }
+        let parsed: OrResp = serde_json::from_str(&text).context("bad OpenRouter response")?;
+        if let Some(err) = parsed.error {
+            if !err.message.is_empty() {
+                bail!("OpenRouter error: {}", err.message);
+            }
+        }
+        let content = parsed
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .unwrap_or_default();
+        let usage = parsed.usage.map(|u| CallUsage {
+            input_tokens: u.prompt_tokens.unwrap_or(0),
+            output_tokens: u.completion_tokens.unwrap_or(0),
+            cache_creation: 0,
+            cache_read: 0,
+            cost_usd: u.cost.unwrap_or(0.0),
+        });
+        Ok((content, usage))
+    }
+}
+
+/// Map a requested model to a Claude model the CLI will accept. Claude aliases
+/// (`haiku`/`sonnet`/`opus`) and any `claude*` id pass through; everything else —
+/// blank, or a non-Claude id such as an OpenRouter model — becomes `haiku` (the
+/// app-update check needs live web search, which only the Claude models do here).
+pub(crate) fn claude_model_or_haiku(model: &str) -> String {
+    let m = model.trim();
+    let lower = m.to_lowercase();
+    let is_claude =
+        matches!(lower.as_str(), "haiku" | "sonnet" | "opus") || lower.starts_with("claude");
+    if is_claude {
+        m.to_string()
+    } else {
+        "haiku".to_string()
+    }
+}
+
+/// Pull the JSON object out of a model response that may wrap it in prose or code
+/// fences (reasoning models often add commentary around the JSON).
+pub(crate) fn extract_json(s: &str) -> &str {
+    let t = strip_fences(s);
+    match (t.find('{'), t.rfind('}')) {
+        (Some(a), Some(b)) if b > a => &t[a..=b],
+        _ => t,
+    }
+}
+
 /// A configured value counts as "set" if it is non-empty and not the shipped
 /// placeholder (the example config uses "YourName").
 fn is_real(value: &str) -> bool {
