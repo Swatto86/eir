@@ -132,7 +132,10 @@ SECURITY POSTURE — the snapshot's "security" block reports the firewall and Wi
 Defender. These ARE faults worth fixing proactively, with the matching safe action:
   - A firewall profile reported false (off) is a real exposure: propose firewall_enable
     for that profile, or "all" if more than one is off. Re-enabling the firewall is safe
-    and reversible.
+    and reversible. BUT if other evidence shows a third-party firewall / endpoint-security
+    product is active (its service or process is present), do NOT propose firewall_enable —
+    that product may keep the Windows Firewall off on purpose. (A profile a Group Policy
+    controls is already reported as null here, so it will not appear as a fault.)
   - Defender "realtime_enabled": false means on-access protection is OFF — propose
     defender_realtime_enable. BUT if "antivirus_enabled" is false, a THIRD-PARTY antivirus
     has taken over and Defender is passive by design — that is NORMAL, do NOT force it on.

@@ -33,11 +33,12 @@ pub async fn firewall_enable(profile: &str) -> Result<String> {
 /// Refresh Windows Defender's signature definitions. Only ever pulls newer
 /// definitions, so it is always safe to run.
 pub async fn defender_signature_update() -> Result<String> {
-    // Bounded longer than the default — a definition download can take a minute.
+    // Use the default cap (120s) — the action runs inline in the decision loop, so a
+    // longer ceiling would hold up other UI commands for that whole window. An update
+    // that genuinely needs longer simply fails and retries on a later cycle.
     let script = "Update-MpSignature -ErrorAction Stop; \
                   Write-Output 'Defender signatures updated'";
-    super::powershell::run_diagnostic_with_timeout(script, std::time::Duration::from_secs(300))
-        .await
+    super::powershell::run_diagnostic(script).await
 }
 
 /// Re-enable Windows Defender real-time (on-access) protection.

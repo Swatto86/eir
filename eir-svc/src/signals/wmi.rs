@@ -10,7 +10,8 @@ use windows::core::PCWSTR;
 use windows::Win32::NetworkManagement::IpHelper::{GetAdaptersInfo, IP_ADAPTER_INFO};
 use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_DWORD,
+    REG_VALUE_TYPE,
 };
 use windows::Win32::System::Services::{
     CloseServiceHandle, EnumServicesStatusExW, OpenSCManagerW, ENUM_SERVICE_STATUS_PROCESSW,
@@ -31,23 +32,52 @@ fn get_uptime_secs() -> u64 {
     unsafe { GetTickCount64() / 1000 }
 }
 
-/// Gets CPU usage via WMI PowerShell query. Runs on a blocking thread — the subprocess latency is fine.
-fn get_cpu_usage() -> f32 {
-    let out = std::process::Command::new("powershell.exe")
-        .args([
-            "-NonInteractive",
-            "-NoProfile",
-            "-Command",
-            "(Get-WmiObject Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average",
-        ])
-        .output();
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout)
-            .trim()
-            .parse::<f32>()
-            .unwrap_or(0.0),
-        Err(_) => 0.0,
+/// Run a short PowerShell signal probe on the blocking thread with a hard cap.
+/// Returns the captured stdout, or None if it failed or exceeded `timeout` (the
+/// child is then killed). The snapshot loop awaits each `snapshot_state` before the
+/// next tick, so an unbounded probe (e.g. a wedged Get-MpComputerStatus on a
+/// degraded box) would otherwise stall every signal — the cap bounds that. Outputs
+/// here are tiny (a number / one line), so reading after exit can't deadlock a pipe.
+fn ps_capped(command: &str, timeout: std::time::Duration) -> Option<String> {
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let mut child = std::process::Command::new("powershell.exe")
+        .args(["-NonInteractive", "-NoProfile", "-Command", command])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => return None,
+        }
     }
+    let out = child.wait_with_output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// CPU usage via a WMI PowerShell query, bounded so a slow WMI host can't stall the
+/// snapshot loop.
+fn get_cpu_usage() -> f32 {
+    ps_capped(
+        "(Get-WmiObject Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average",
+        std::time::Duration::from_secs(15),
+    )
+    .and_then(|s| s.trim().parse::<f32>().ok())
+    .unwrap_or(0.0)
 }
 
 fn get_memory() -> (f32, f32) {
@@ -258,7 +288,9 @@ fn get_windows_update_status() -> String {
     }
 }
 
-/// Read a REG_DWORD value, returning None if the key/value is missing or not a DWORD.
+/// Read a REG_DWORD value, returning None if the key/value is missing or is not a
+/// 4-byte REG_DWORD (the type is checked, not just the length, so a 4-byte string or
+/// binary value is rejected rather than misread as a u32).
 fn read_reg_dword(root: HKEY, subkey: &str, value: &str) -> Option<u32> {
     let subkey_w = wide(subkey);
     let value_w = wide(value);
@@ -269,17 +301,18 @@ fn read_reg_dword(root: HKEY, subkey: &str, value: &str) -> Option<u32> {
         }
         let mut data: u32 = 0;
         let mut data_len = std::mem::size_of::<u32>() as u32;
+        let mut value_type = REG_VALUE_TYPE::default();
         let ok = RegQueryValueExW(
             hkey,
             PCWSTR(value_w.as_ptr()),
             None,
-            None,
+            Some(&mut value_type),
             Some(&mut data as *mut u32 as *mut u8),
             Some(&mut data_len),
         )
         .is_ok();
         let _ = RegCloseKey(hkey);
-        if ok && data_len as usize == std::mem::size_of::<u32>() {
+        if ok && value_type == REG_DWORD && data_len as usize == std::mem::size_of::<u32>() {
             Some(data)
         } else {
             None
@@ -287,24 +320,44 @@ fn read_reg_dword(root: HKEY, subkey: &str, value: &str) -> Option<u32> {
     }
 }
 
-/// Firewall on/off per profile, from the SharedAccess policy keys. The "standard"
-/// profile is what the UI calls "private". A missing value stays None (unknown),
-/// so the AI never reads "couldn't read it" as "firewall is off".
+/// Resolve a profile's *effective* firewall state from the Group Policy value (if
+/// any) and the local SharedAccess value. Group Policy wins when present:
+///   - policy ON  → Some(true): the firewall is enforced on, nothing to do.
+///   - policy OFF → None: a GPO is deliberately holding it off and `netsh` cannot
+///     override that, so Eir treats it as "not ours to fix" rather than a fault —
+///     this is what stops a futile firewall_enable loop on managed machines.
+///   - no policy  → the local value is the effective one (and locally fixable).
+fn effective_firewall(policy: Option<bool>, local: Option<bool>) -> Option<bool> {
+    match policy {
+        Some(true) => Some(true),
+        Some(false) => None,
+        None => local,
+    }
+}
+
+/// Firewall on/off per profile, reflecting the effective (GPO-aware) state. A value
+/// that cannot be read stays None (unknown), so the AI never reads "couldn't read it"
+/// as "firewall is off". Note the SharedAccess store calls the private profile
+/// "StandardProfile" while the GPO store calls it "PrivateProfile".
 fn get_firewall() -> FirewallStatus {
-    const BASE: &str =
+    const LOCAL: &str =
         "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy";
-    let read = |profile: &str| {
-        read_reg_dword(
-            HKEY_LOCAL_MACHINE,
-            &format!("{BASE}\\{profile}"),
-            "EnableFirewall",
-        )
-        .map(|v| v != 0)
+    const POLICY: &str = "SOFTWARE\\Policies\\Microsoft\\WindowsFirewall";
+    let resolve = |local_dir: &str, policy_dir: &str| {
+        let read = |base: &str, dir: &str| {
+            read_reg_dword(
+                HKEY_LOCAL_MACHINE,
+                &format!("{base}\\{dir}"),
+                "EnableFirewall",
+            )
+            .map(|v| v != 0)
+        };
+        effective_firewall(read(POLICY, policy_dir), read(LOCAL, local_dir))
     };
     FirewallStatus {
-        domain: read("DomainProfile"),
-        private: read("StandardProfile"),
-        public: read("PublicProfile"),
+        domain: resolve("DomainProfile", "DomainProfile"),
+        private: resolve("StandardProfile", "PrivateProfile"),
+        public: resolve("PublicProfile", "PublicProfile"),
     }
 }
 
@@ -328,22 +381,17 @@ fn parse_defender_status(line: &str) -> DefenderStatus {
     }
 }
 
-/// Query Windows Defender via PowerShell. Absent Defender / a failed query leaves
-/// every field None (handled by parse_defender_status on empty output).
+/// Query Windows Defender via PowerShell, bounded by ps_capped. Absent Defender, a
+/// failed query, or a timeout leaves every field None (handled by
+/// parse_defender_status on empty output).
 fn get_defender() -> DefenderStatus {
-    let out = std::process::Command::new("powershell.exe")
-        .args([
-            "-NonInteractive",
-            "-NoProfile",
-            "-Command",
-            "$s = Get-MpComputerStatus -ErrorAction SilentlyContinue; \
-             if ($s) { '{0}|{1}|{2}' -f $s.RealTimeProtectionEnabled, $s.AntivirusEnabled, $s.AntivirusSignatureAge }",
-        ])
-        .output();
-    match out {
-        Ok(o) => parse_defender_status(&String::from_utf8_lossy(&o.stdout)),
-        Err(_) => DefenderStatus::default(),
-    }
+    ps_capped(
+        "$s = Get-MpComputerStatus -ErrorAction SilentlyContinue; \
+         if ($s) { '{0}|{1}|{2}' -f $s.RealTimeProtectionEnabled, $s.AntivirusEnabled, $s.AntivirusSignatureAge }",
+        std::time::Duration::from_secs(15),
+    )
+    .map(|s| parse_defender_status(&s))
+    .unwrap_or_default()
 }
 
 fn snapshot_state() -> SystemState {
@@ -435,7 +483,26 @@ pub fn current(shared: &SharedState) -> SystemState {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_defender_status;
+    use super::{effective_firewall, parse_defender_status};
+
+    #[test]
+    fn gpo_enforced_on_firewall_is_never_a_fault() {
+        // GPO forces the firewall ON; the stale local value must not surface a fault.
+        assert_eq!(effective_firewall(Some(true), Some(false)), Some(true));
+    }
+
+    #[test]
+    fn gpo_enforced_off_firewall_is_hands_off() {
+        // A GPO holding it off is not Eir's to fix (netsh can't override) → None.
+        assert_eq!(effective_firewall(Some(false), Some(true)), None);
+    }
+
+    #[test]
+    fn locally_managed_firewall_uses_the_local_value() {
+        assert_eq!(effective_firewall(None, Some(false)), Some(false));
+        assert_eq!(effective_firewall(None, Some(true)), Some(true));
+        assert_eq!(effective_firewall(None, None), None);
+    }
 
     #[test]
     fn defender_status_parses_a_healthy_line() {
