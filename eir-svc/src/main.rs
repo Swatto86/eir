@@ -1091,6 +1091,11 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                 let feedback_summary =
                     feedback::recent_summary(&db, 10).await.unwrap_or_default();
 
+                // Tier-2 (optional): give one not-yet-explained learned fact a one-sentence
+                // human-readable AI explanation (text only — never changes behaviour). Skips
+                // the AI call entirely when every fact is already labelled.
+                learn::label_one(&db, ai, &cfg.api.update_check_model).await;
+
                 // Refresh the "what Eir has learned" card every cycle (incl. idle ones) so
                 // it reflects facts formed by both the decision loop and the updater.
                 if let Ok(facts) = learn::facts_for_view(&db).await {

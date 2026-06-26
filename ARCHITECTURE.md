@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-06-25 · **Release:** v0.14.0
+**Last updated:** 2026-06-26 · **Release:** v0.15.0
 
 Eir is an autonomous Windows system-repair agent: it watches a machine's health,
 uses an AI model to diagnose problems, and applies least-destructive fixes —
@@ -718,7 +718,9 @@ So the entire closed loop is: execute → record before → next-cycle record af
 
 ## Self-improvement: machine-pattern learning
 
-> **Status: Phases 1–4 shipped (v0.14.0); Phase 5 (optional AI labeller) planned.** Eir adapts to the specific
+> **Status: Phases 1–5 shipped (v0.15.0) — the self-improvement layer is complete.**
+> (The one deferred item is the `RecurringFingerprint` sub-detector within Phase 3 —
+> it overlaps `FixIneffective` and needs per-decision fingerprint identity.) Eir adapts to the specific
 > machine it runs on instead of relying only on hardcoded rules: it learns self-updaters,
 > failing update methods, ineffective service fixes, and actions the user keeps rejecting,
 > and applies them at the updater's method order and the issue-analysis confidence gate —
@@ -873,8 +875,15 @@ behaviour change is the trust risk, and the card is the answer.
    evidence and **Pin / Disable / Forget** (`UiMsg::SetLearnedFact`); precedence enforced
    in the store (`user_disabled`/`user_pinned` survive reinforcement and the
    evidence-window reconcile; a disabled self-updater fact stops being applied).
-5. **Phase 5 (optional) — AI labeller (Tier 2).** Bounded AI explanation / narrower
-   scope under the advisor budget; strict re-validation discards any widening/kind-change.
+5. **Phase 5 — AI labeller (Tier 2). ✅ Shipped (v0.15.0).** `learn/label.rs` gives a
+   not-yet-explained fact a one-sentence, human-readable explanation for the UI card. The
+   AI is **read-only**: it returns explanation TEXT only (sanitised, ≤200 chars) — it
+   never creates a fact or changes its kind/subject/effect, and `source` stays `detector`
+   so the fact keeps its decay/clear lifecycle. **Bounded** by an `ai_label_attempted_at`
+   marker (migration 0010): each fact is attempted at most once, so total AI calls ≤ the
+   number of facts and steady state is zero (review fix — previously an unusable reply
+   re-fired a call every cycle and starved the queue). Scoped to a deterministic-only
+   narrowing was not needed since the AI never touches structure.
 
 ### Superseding the hardcode
 

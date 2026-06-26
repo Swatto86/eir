@@ -225,10 +225,11 @@ fn view_summary(kind: &str, subject: &str) -> String {
     }
 }
 
-/// Every learned fact (all statuses), newest first, for the UI transparency card.
+/// Every learned fact (all statuses), newest first, for the UI transparency card. A
+/// Tier-2 AI explanation, when present, replaces the deterministic summary.
 pub async fn facts_for_view(pool: &SqlitePool) -> Result<Vec<eir_proto::LearnedFactView>> {
     let rows = sqlx::query(
-        "SELECT id, kind, subject, evidence_json, status, source FROM learned_facts \
+        "SELECT id, kind, subject, evidence_json, status, source, ai_explanation FROM learned_facts \
          ORDER BY (status = 'user_disabled'), (status = 'expired'), last_reinforced_at DESC",
     )
     .fetch_all(pool)
@@ -237,15 +238,80 @@ pub async fn facts_for_view(pool: &SqlitePool) -> Result<Vec<eir_proto::LearnedF
     for r in rows {
         let kind: String = r.try_get("kind")?;
         let subject: String = r.try_get("subject")?;
+        let ai: Option<String> = r.try_get("ai_explanation")?;
+        let labelled = ai.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let summary = if labelled {
+            ai.unwrap()
+        } else {
+            view_summary(&kind, &subject)
+        };
+        // Provenance shown to the user is "ai_labelled" only when an explanation exists;
+        // the DB source column stays 'detector' to preserve the decay/clear lifecycle.
+        let source = if labelled {
+            "ai_labelled".to_string()
+        } else {
+            r.try_get("source")?
+        };
         out.push(eir_proto::LearnedFactView {
             id: r.try_get("id")?,
-            summary: view_summary(&kind, &subject),
+            summary,
             detail: r.try_get("evidence_json").unwrap_or_default(),
             status: r.try_get("status")?,
-            source: r.try_get("source")?,
+            source,
         });
     }
     Ok(out)
+}
+
+/// One detector fact the Tier-2 labeller has NOT yet attempted (active/pinned only).
+/// Returns (id, kind, subject, evidence). None when every fact has been attempted —
+/// keying on the attempt marker (not on ai_explanation) is what bounds total AI calls to
+/// one per fact, even when a fact's explanation can't be produced.
+pub async fn next_unlabelled(pool: &SqlitePool) -> Result<Option<(i64, String, String, String)>> {
+    let row = sqlx::query(
+        "SELECT id, kind, subject, evidence_json FROM learned_facts \
+         WHERE source = 'detector' AND status IN ('active', 'user_pinned') \
+           AND ai_label_attempted_at IS NULL \
+         ORDER BY last_reinforced_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(r) => Ok(Some((
+            r.try_get("id")?,
+            r.try_get("kind")?,
+            r.try_get("subject")?,
+            r.try_get("evidence_json").unwrap_or_default(),
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// Mark that the labeller has attempted this fact, so it is not re-queried regardless of
+/// whether a usable explanation was produced (a re-attempt only happens if the fact is
+/// forgotten and re-forms as a new row).
+pub async fn mark_label_attempted(pool: &SqlitePool, id: i64) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query("UPDATE learned_facts SET ai_label_attempted_at = ? WHERE id = ?")
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Attach a Tier-2 AI explanation to a fact. Text only — the AI never changes a fact's
+/// kind, subject, or effect, so this cannot alter behaviour. The `source` column stays
+/// `'detector'` so the fact keeps its detector lifecycle (decay via `expire_unsupported`,
+/// reset via `clear_detector_facts`); the UI's "AI" provenance is derived from the
+/// presence of the explanation, not from this column.
+pub async fn set_ai_explanation(pool: &SqlitePool, id: i64, explanation: &str) -> Result<()> {
+    sqlx::query("UPDATE learned_facts SET ai_explanation = ? WHERE id = ?")
+        .bind(explanation)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Apply a user override to a learned fact by id: "pin" (always keep), "disable"
@@ -389,6 +455,33 @@ mod tests {
         let rows = rejection_rows(&pool, 30).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].action_label, "ProcessKill { process_name: \"x\" }");
+        drop(pool);
+    }
+
+    #[tokio::test]
+    async fn labelling_is_attempted_at_most_once_per_fact() {
+        let pool = test_pool("label").await;
+        let su = LearnedFactKind::SelfUpdaterSuspected.as_token();
+        upsert_fact(
+            &pool,
+            su,
+            "discord",
+            &Effect::Skip.to_json(),
+            "3 timeouts",
+            30,
+        )
+        .await
+        .unwrap();
+
+        // Before any attempt, the fact is offered to the labeller.
+        let first = next_unlabelled(&pool).await.unwrap();
+        assert_eq!(first.as_ref().map(|f| f.2.as_str()), Some("discord"));
+        let id = first.unwrap().0;
+
+        // After marking the attempt — even with NO explanation stored (the unusable-reply
+        // case) — it must NOT be offered again, so it can't re-fire an AI call each cycle.
+        mark_label_attempted(&pool, id).await.unwrap();
+        assert!(next_unlabelled(&pool).await.unwrap().is_none());
         drop(pool);
     }
 }

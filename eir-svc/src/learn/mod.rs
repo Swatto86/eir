@@ -13,9 +13,11 @@
 
 mod apply;
 mod detect;
+mod label;
 mod store;
 
 pub use apply::LearnedFacts;
+pub use label::label_one;
 pub use store::{
     active_self_updater_subjects, clear_detector_facts, facts_for_view, record_rejection,
     set_learned_fact,
