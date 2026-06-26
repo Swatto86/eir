@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-06-26 · **Release:** v0.15.0
+**Last updated:** 2026-06-26 · **Release:** v0.16.0
 
 Eir is an autonomous Windows system-repair agent: it watches a machine's health,
 uses an AI model to diagnose problems, and applies least-destructive fixes —
@@ -68,7 +68,7 @@ Eir is a single Cargo workspace (`resolver = "2"`) with three crates, plus a sta
 |-------|-------|--------|----------------|
 | `eir-proto` | shared/contract | (lib) | Wire types for the UI↔service named-pipe protocol (serde, snake_case). Pure types, no I/O. Depended on by both other crates (`eir-proto = { path = "../eir-proto" }`). |
 | `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service: signal collection, AI client, policy, execution, autonomous updater, SQLite audit DB. Heavy `windows` 0.58 feature set. |
-| `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-updater` 2, `tokio` (full), `image` (png), tracing. `build-dependencies`: `tauri-build` 2. |
+| `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), tracing. `build-dependencies`: `tauri-build` 2. |
 
 All three crates are versioned in lockstep — currently `0.11.3` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`).
 
@@ -142,7 +142,7 @@ The NSIS install hooks (`eir-ui/installer-hooks.nsh`, wired via `bundle.windows.
 - **PREUNINSTALL**: `sc stop EirSvc` + `eir-svc.exe uninstall`.
 - **POSTUNINSTALL**: empty.
 
-`bundle.windows.allowDowngrades: false`; targets `["nsis"]` only; main window `visible: false` (starts hidden to tray).
+`bundle.windows.allowDowngrades: false`; targets `["nsis"]` only; main window `visible: false`. Manual launches show/focus it during Tauri setup; Windows-login autostart passes `--hidden` so it stays in the tray.
 
 ### Version-bump locations
 
@@ -231,13 +231,15 @@ Commands (`main.rs:28-112`, plus `util.rs`):
 - `set_updater_settings(UpdaterSettingsUpdate)` → `UpdateUpdaterSettings`.
 - `set_app_ignore { id, ignore, note }` → `SetAppIgnore`.
 - `set_advisor_settings(AdvisorSettingsUpdate)` → `SetAdvisorSettings`.
+- `get_autostart_enabled` / `set_autostart_enabled { enabled }` — UI-local commands backed by `tauri-plugin-autostart`; they never cross the service pipe.
 - `util::gbp_per_usd` (USD→GBP rate via a hidden PowerShell `Invoke-RestMethod`, with a `0.79` offline fallback) and `util::open_url` (validates `http(s)://` then `Start-Process`) — UI-local helpers, not pipe traffic (`util.rs`).
 
-Every command except `get_status` is `async`, sends one `UiMsg` on `UiCmdTx`, and maps a send error to `Err(String)`. Commands are **fire-and-forget**: success means "queued to the pipe writer," not "applied by the service." The UI observes the effect only on the next polled snapshot.
+Every service-facing command is `async`, sends one `UiMsg` on `UiCmdTx`, and maps a send error to `Err(String)`. Those commands are **fire-and-forget**: success means "queued to the pipe writer," not "applied by the service." The UI observes the effect only on the next polled snapshot. `get_status`, the autostart commands, and `util::*` are UI-local and do not use the pipe.
 
 ### Tray (`main.rs:114-323`)
 
 - Tray icon is built from an embedded 128px PNG (`ICON_PNG`), recoloured per status (`status_accent` maps states to RGBA tints: green=Active/untouched, amber=Warning, orange=PendingApproval, blue=Executing, red=Error/ServiceDisconnected, grey=other) and Lanczos3-downsampled to 32px (`make_icon`, `recolor`, `decode_icon`).
+- Start-with-Windows is registered by `tauri-plugin-autostart` with the app name `Eir` and the `--hidden` argument. The UI preference is stored in Tauri's app config directory as `ui-preferences.json`, defaults to enabled on first run, and is synced to the OS startup entry during Tauri setup. This separate preference prevents a user-disabled startup entry from being re-enabled on the next manual launch.
 - A background task polls the cached status every 500ms and only repaints the tray icon/tooltip when `status` changes (`main.rs:311-323`).
 - Tray menu: Open Status / Pause Monitoring / Quit. "Pause" sends `UiMsg::TogglePause` directly via the cloned `UiCmdTx`; left-click shows the window (`main.rs:259-302`).
 - **Close-to-tray**: `WindowEvent::CloseRequested` hides the window and `prevent_close()`s; the service keeps running; Quit fully exits (`main.rs:327-334`). The JS also redundantly intercepts `onCloseRequested` (`main.js:54-57`).
@@ -249,7 +251,7 @@ Every command except `get_status` is `async`, sends one `UiMsg` on `UiCmdTx`, an
 - `refresh()` (`main.js:202-264`) maps `status.status` to a header dot colour (`STATUS_COLORS`), renders the metric bars (colour-coded by threshold in `barColor`), failed-services chips, the model labels (`analysisLabel`/`updateCheckLabel`), then delegates to `renderApprovals`, `renderAiNow`, `renderActivity`, `renderUsage`, `renderUpdater`.
 - **XSS hygiene**: all service-supplied strings go through `esc()` / `escAttr()` before insertion into `innerHTML` (`main.js:155-163`); applied consistently across approvals, activity, updater rows, and service chips.
 - **Activity feed** merges `recent_problems` + `recent_executions` into one list sorted by `at` descending, with emoji/tag per kind (`activityItems`, `main.js:301-329`).
-- **Settings** are a modal populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings`; three independent save buttons map to `update_settings` (warns it restarts the service ~15s), `set_updater_settings`, and `set_advisor_settings` (both "apply live"). Inputs are converted (e.g. confidence % → 0–1 float, hours → seconds) before sending (`main.js:421-588`).
+- **Settings** are a modal populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. Four independent save buttons map to `set_autostart_enabled` (applies immediately, no service pipe), `update_settings` (warns it restarts the service ~15s), `set_updater_settings`, and `set_advisor_settings` (both apply live). Inputs are converted (e.g. confidence % → 0–1 float, hours → seconds) before sending (`main.js`).
 - Collapsed-card state is persisted in `localStorage` (`main.js:606-633`).
 
 ### Clear / Approve / Ignore / Update-now flows
@@ -999,4 +1001,3 @@ Current gaps surfaced while mapping each subsystem (the self-improvement plan ab
 - improvement_score / feedback math have no unit tests in feedback/mod.rs (only updater::history has a round-trip test); scoring correctness is unverified.
 - config has no schema versioning/migration mechanism; forward-compat relies on per-field serde(default) and would silently drop unknown keys on save (toml round-trips only known fields).
 - All AI usage cost is recorded in usage_log only when the provider returns usage (chiefly claude_cli); other providers may leave cost/token data empty, skewing usage_summary.
-

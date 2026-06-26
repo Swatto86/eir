@@ -360,6 +360,19 @@
     <div class="modal-body">
 
       <div class="set-section">
+      <div class="set-section-title">Windows startup</div>
+      <div class="set-section-desc">Launch Eir automatically when you sign in. Startup launches stay hidden in the tray; manual launches open the status window.</div>
+      <div class="set-grid">
+        <label for="set-autostart">Start with Windows</label>
+        <input id="set-autostart" type="checkbox" style="width:auto; justify-self:start;">
+      </div>
+      <div class="set-actions">
+        <button class="set-save" id="set-autostart-save" style="background:var(--blue)">Save startup setting</button>
+        <span class="upd-note" id="set-autostart-status"></span>
+      </div>
+      </div>
+
+      <div class="set-section">
       <div class="set-section-title">AI provider &amp; monitoring</div>
       <div class="set-section-desc">Which AI model Eir uses to diagnose problems, plus how often it polls Windows for signals. Saving these restarts the service (~15&nbsp;s).</div>
       <div class="set-grid">

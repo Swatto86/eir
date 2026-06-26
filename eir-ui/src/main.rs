@@ -7,21 +7,103 @@ use eir_proto::{
     AdvisorSettingsUpdate, SettingsUpdate, StatusPayload, UiMsg, UpdaterSettingsUpdate,
 };
 use pipe_client::SharedStatus;
-use std::sync::{Arc, Mutex};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
-    Manager, State, WindowEvent,
+    AppHandle, Manager, State, WindowEvent,
 };
+use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{error, warn};
 
 // ── Managed state ─────────────────────────────────────────────────────────────
 
 /// Sender for UI commands (approve, toggle_pause) to the pipe client.
 struct UiCmdTx(mpsc::Sender<UiMsg>);
+
+const AUTOSTART_ARG: &str = "--hidden";
+const UI_PREFERENCES_FILE: &str = "ui-preferences.json";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct UiPreferences {
+    #[serde(default = "default_autostart_enabled")]
+    autostart_enabled: bool,
+}
+
+impl Default for UiPreferences {
+    fn default() -> Self {
+        Self {
+            autostart_enabled: default_autostart_enabled(),
+        }
+    }
+}
+
+fn default_autostart_enabled() -> bool {
+    true
+}
+
+fn preferences_path(handle: &AppHandle) -> Result<PathBuf, String> {
+    let dir = handle.path().app_config_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| format!("Create config directory: {e}"))?;
+    Ok(dir.join(UI_PREFERENCES_FILE))
+}
+
+fn load_preferences(handle: &AppHandle) -> UiPreferences {
+    let path = match preferences_path(handle) {
+        Ok(path) => path,
+        Err(e) => {
+            warn!("Could not resolve UI preferences path: {e}");
+            return UiPreferences::default();
+        }
+    };
+
+    match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+            warn!("Could not parse UI preferences: {e}");
+            UiPreferences::default()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => UiPreferences::default(),
+        Err(e) => {
+            warn!("Could not read UI preferences: {e}");
+            UiPreferences::default()
+        }
+    }
+}
+
+fn save_preferences(handle: &AppHandle, preferences: &UiPreferences) -> Result<(), String> {
+    let path = preferences_path(handle)?;
+    let raw = serde_json::to_string_pretty(preferences).map_err(|e| e.to_string())?;
+    fs::write(path, raw).map_err(|e| format!("Save UI preferences: {e}"))
+}
+
+fn apply_autostart_preference(handle: &AppHandle, enabled: bool) -> Result<bool, String> {
+    let manager = handle.autolaunch();
+    if enabled {
+        manager.enable().map_err(|e| e.to_string())?;
+    } else {
+        manager.disable().map_err(|e| e.to_string())?;
+    }
+    manager.is_enabled().map_err(|e| e.to_string())
+}
+
+fn sync_autostart_on_startup(handle: &AppHandle) {
+    let preferences = load_preferences(handle);
+    if let Err(e) = apply_autostart_preference(handle, preferences.autostart_enabled) {
+        warn!("Could not apply autostart preference: {e}");
+    }
+}
+
+fn launched_hidden() -> bool {
+    std::env::args().any(|arg| arg == AUTOSTART_ARG)
+}
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
@@ -116,6 +198,23 @@ async fn set_advisor_settings(
     tx.0.send(UiMsg::SetAdvisorSettings(Box::new(settings)))
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_autostart_enabled(handle: AppHandle) -> Result<bool, String> {
+    Ok(handle
+        .autolaunch()
+        .is_enabled()
+        .map_err(|e| e.to_string())?)
+}
+
+#[tauri::command]
+fn set_autostart_enabled(enabled: bool, handle: AppHandle) -> Result<bool, String> {
+    let preferences = UiPreferences {
+        autostart_enabled: enabled,
+    };
+    save_preferences(&handle, &preferences)?;
+    apply_autostart_preference(&handle, enabled)
 }
 
 // ── Tray helpers ──────────────────────────────────────────────────────────────
@@ -253,11 +352,20 @@ fn main() {
     let status_for_loop = status.clone();
 
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name("Eir")
+                .arg(AUTOSTART_ARG)
+                .build(),
+        )
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(status)
         .manage(UiCmdTx(ui_cmd_tx))
         .setup(move |app| {
             let icon_base = Arc::new(decode_icon());
+            let start_hidden = launched_hidden();
+
+            sync_autostart_on_startup(app.handle());
 
             // Background auto-update: check on startup, then every 6 hours.
             // If a newer signed release exists, download, install, and relaunch.
@@ -309,6 +417,13 @@ fn main() {
                 })
                 .build(app)?;
 
+            if !start_hidden {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+
             // Background: pipe client + tray colour sync
             let status_pipe = status_for_loop.clone();
             tauri::async_runtime::spawn(async move {
@@ -352,6 +467,8 @@ fn main() {
             set_app_ignore,
             set_learned_fact,
             set_advisor_settings,
+            get_autostart_enabled,
+            set_autostart_enabled,
             util::gbp_per_usd,
             util::open_url
         ])

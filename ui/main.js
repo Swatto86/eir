@@ -521,7 +521,39 @@ document.getElementById('learned-list').addEventListener('click', (e) => {
 
 // ── Settings ────────────────────────────────────────────────────────────────
 
-function fillSettings() {
+async function fillAutostartSetting() {
+  const box = document.getElementById('set-autostart');
+  const st = document.getElementById('set-autostart-status');
+  box.disabled = true;
+  st.textContent = 'Checking…';
+  try {
+    box.checked = await invoke('get_autostart_enabled');
+    st.textContent = '';
+  } catch (e) {
+    st.textContent = 'Unavailable: ' + e;
+  } finally {
+    box.disabled = false;
+  }
+}
+
+async function saveAutostartSetting() {
+  const box = document.getElementById('set-autostart');
+  const st = document.getElementById('set-autostart-status');
+  const enabled = box.checked;
+  box.disabled = true;
+  st.textContent = 'Saving…';
+  try {
+    box.checked = await invoke('set_autostart_enabled', { enabled });
+    st.textContent = 'Saved — applies immediately.';
+  } catch (e) {
+    st.textContent = 'Failed: ' + e;
+  } finally {
+    box.disabled = false;
+  }
+}
+
+async function fillSettings() {
+  fillAutostartSetting();
   const s = lastStatus && lastStatus.settings;
   if (!s) return;
   document.getElementById('set-provider').value = s.provider || 'openrouter';
@@ -638,6 +670,7 @@ document.getElementById('settings-modal').addEventListener('click', (e) => {
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSettings(); });
 document.getElementById('set-save').addEventListener('click', saveSettings);
 document.getElementById('set-adv-save').addEventListener('click', saveAdvisorSettings);
+document.getElementById('set-autostart-save').addEventListener('click', saveAutostartSetting);
 
 // Clear the activity feed (the in-memory problems + executions, service-side).
 document.getElementById('clear-activity').addEventListener('click', async () => {
