@@ -26,8 +26,8 @@ It runs as a pair:
   protected logs and apply fixes without a UAC prompt. It does the monitoring,
   reasoning, and (approved) repairs.
 - **Eir tray app** — a lightweight desktop UI that shows current status, recent
-  problems and executions, AI usage/cost, and app updates. It's where you approve
-  fixes and change every setting.
+  problems and executions, AI usage/cost, learned machine-specific patterns, and
+  app updates. It's where you approve fixes and change every setting.
 
 The two talk over a secured local named pipe (`\\.\pipe\EirSvc`).
 
@@ -72,6 +72,11 @@ Each decision cycle (default every 10 minutes):
    size, age, and what kind of file it is). The queue is persistent: it never
    times out and survives a service restart, so an approval is always waiting for
    you, not gone if you missed a pop-up.
+6. **Learn conservatively** — Eir mines its own audit history for repeated local
+   patterns, such as package-manager methods that always fail for a specific app or
+   fixes that never improve a recurring issue. Learned facts can only reduce or
+   reorder actions, never make Eir more aggressive, and every fact is visible in the
+   UI with Pin / Disable / Forget controls.
 
 > **Architecture & design:** see [ARCHITECTURE.md](ARCHITECTURE.md) — a living document
 > covering every subsystem (signals, decision loop, executor/policy, updater,
@@ -107,6 +112,12 @@ CLI it uses the CLI's built-in search (`update_check_model`, default **Haiku**).
   cache vs. irreplaceable data). The approval queue is persistent: it never expires
   and survives restarts, so nothing slips away while you're not looking.
 - **Never-uninstall guarantee** — software removal is a hard-blocked action.
+- **Machine-pattern learning** — repeated local evidence teaches Eir which app-update
+  paths, signals, or fixes are not useful on this machine. Learning is conservative,
+  decays/rechecks over time, and is fully user-overridable from the tray UI.
+- **Advisor mode** — optional bounded escalation that lets Eir re-run one analysis at
+  a stronger model or higher Claude CLI effort when the base model flags ambiguity or
+  reports low confidence. Daily spend and attempt caps keep it bounded.
 - **App updates, applied for you** — one panel updates everything. `winget`-managed
   apps update in a single batch; apps no package manager tracks are handled by the
   AI: it finds the official installer via web search, and Eir validates it
@@ -119,7 +130,7 @@ CLI it uses the CLI's built-in search (`update_check_model`, default **Haiku**).
   Free models are clearly marked as no-cost.
 - **Self-updating** — signed auto-updates via the GitHub releases feed.
 - **Stays out of the way** — closing the window hides to the tray; the service keeps
-  running.
+  running. The tray app can start with Windows and launch hidden.
 
 ## Install
 
@@ -138,9 +149,11 @@ Already installed? Eir updates itself automatically.
 
 ## Configuration
 
-All settings live in the in-app **Settings** panel: AI provider and models, API
-keys, polling intervals, watched event-log channels and directories. The service
-persists them to `config.toml` next to its executable and restarts to apply.
+All settings live in the in-app **Settings** panel: start-with-Windows, AI provider
+and models, API keys, advisor escalation, polling intervals, watched event-log
+channels and directories, and app-updater settings. Provider/monitoring settings are
+persisted to `config.toml` next to the service executable and the service restarts to
+apply them; updater/advisor settings apply live.
 
 `config.toml.example` documents every field for reference, but you should never need
 to edit it by hand.

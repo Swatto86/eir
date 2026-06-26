@@ -70,7 +70,7 @@ Eir is a single Cargo workspace (`resolver = "2"`) with three crates, plus a sta
 | `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service: signal collection, AI client, policy, execution, autonomous updater, SQLite audit DB. Heavy `windows` 0.58 feature set. |
 | `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), tracing. `build-dependencies`: `tauri-build` 2. |
 
-All three crates are versioned in lockstep — currently `0.11.3` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`).
+All three crates are versioned in lockstep — currently `0.16.0` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`.
 
 The dependency graph is acyclic and points inward: `eir-proto` depends on nothing internal; `eir-svc` and `eir-ui` each depend only on `eir-proto`. The UI and service never link against each other — they are separate processes coupled solely through the `eir-proto` wire contract over `\\.\pipe\EirSvc`.
 
@@ -171,22 +171,23 @@ The UI subsystem is a thin Tauri tray app (`eir-ui`) that talks to the LocalSyst
 
 Two tagged enums carry everything (`#[serde(tag = "type", rename_all = "snake_case")]`):
 
-- **`ServiceMsg`** (service → UI), one variant: `Status(StatusPayload)` (`lib.rs:269-273`).
-- **`UiMsg`** (UI → service) (`lib.rs:276-304`): `Approve { id: u64, approved: bool }`, `TogglePause`, `UpdateSettings(Box<SettingsUpdate>)`, `ClearProblems`, `ClearExecutions`, `RunUpdatesNow`, `ClearUpdateHistory`, `UpdateUpdaterSettings(Box<UpdaterSettingsUpdate>)`, `SetAppIgnore { id: String, ignore: bool, note: String }`, `SetAdvisorSettings(Box<AdvisorSettingsUpdate>)`. (`Box` keeps the enum small since the settings variants are large.)
+- **`ServiceMsg`** (service → UI), one variant: `Status(StatusPayload)` (`lib.rs:287-292`).
+- **`UiMsg`** (UI → service) (`lib.rs:294-329`): `Approve { id: u64, approved: bool }`, `TogglePause`, `UpdateSettings(Box<SettingsUpdate>)`, `ClearProblems`, `ClearExecutions`, `RunUpdatesNow`, `ClearUpdateHistory`, `SetLearnedFact { id: i64, op: String }`, `UpdateUpdaterSettings(Box<UpdaterSettingsUpdate>)`, `SetAppIgnore { id: String, ignore: bool, note: String }`, `SetAdvisorSettings(Box<AdvisorSettingsUpdate>)`. (`Box` keeps the enum small since the settings variants are large.)
 
-**`StatusPayload`** (`lib.rs:5-34`) is the single snapshot the UI renders, carrying: `status` (string state machine value), `paused`, `cpu`/`memory`/`disk` (`f32` percentages), `failed_services`, `last_analysis`, `recent_problems: Vec<ProblemSummary>`, `recent_executions: Vec<ExecutionSummary>`, `pending_approvals: Vec<ApprovalInfo>`, `error: Option<String>`, `usage: Option<UsageSummary>`, `settings: Option<UiSettings>`, `updater: Option<UpdaterStatus>`, `advisor: Option<AdvisorStatus>`. Derives `Default` so the channel can be seeded empty.
+**`StatusPayload`** (`lib.rs:5-38`) is the single snapshot the UI renders, carrying: `status` (string state machine value), `paused`, `cpu`/`memory`/`disk` (`f32` percentages), `failed_services`, `last_analysis`, `recent_problems: Vec<ProblemSummary>`, `recent_executions: Vec<ExecutionSummary>`, `pending_approvals: Vec<ApprovalInfo>`, `error: Option<String>`, `usage: Option<UsageSummary>`, `settings: Option<UiSettings>`, `updater: Option<UpdaterStatus>`, `advisor: Option<AdvisorStatus>`, and `learned_facts: Vec<LearnedFactView>`. Derives `Default` so the channel can be seeded empty.
 
 Supporting types:
-- **`ApprovalInfo`** (`lib.rs:207-240`): `id: u64`, `diagnosis`, `root_cause`, `confidence: f32`, `action` (debug render of the fix), `reason` (policy verdict), `side_effects`, `undo_instructions`, plus the trust-critical deterministic fields `action_summary`, `target`, `target_details`, `reversible: bool`, `created_at: i64`. The doc comment notes `action_summary` is "derived from the action type, not the AI, so it can be trusted."
-- **`ProblemSummary`** (`lib.rs:242-256`): `diagnosis`, `confidence`, `action`, `blocked`, `auto_executed`, `reason: Option<String>`, `at: i64`.
-- **`ExecutionSummary`** (`lib.rs:258-266`): `action`, `success`, `preview`, `at: i64`.
-- **`UpdaterStatus`** (`lib.rs:73-95`): `enabled`, `running`, `phase`, `last_run`/`next_run` (unix secs), `last_cost_usd`, `notes: Vec<String>`, `apps: Vec<UpdaterAppRow>`, `recent: Vec<UpdateAttemptRow>`, `settings: UpdaterSettingsView`. `UpdaterAppRow` carries per-app `state` ("verified"|"installed"|"failed"|"skipped"), `method`, `signature`; `UpdateAttemptRow` is history.
-- **`AdvisorStatus`** (`lib.rs:38-51`): `enabled`, `escalated`, `escalation_model`, `reason`, `spent_today_usd`, `settings: AdvisorSettingsView`.
+- **`ApprovalInfo`** (`lib.rs:226-259`): `id: u64`, `diagnosis`, `root_cause`, `confidence: f32`, `action` (debug render of the fix), `reason` (policy verdict), `side_effects`, `undo_instructions`, plus the trust-critical deterministic fields `action_summary`, `target`, `target_details`, `reversible: bool`, `created_at: i64`. The doc comment notes `action_summary` is "derived from the action type, not the AI, so it can be trusted."
+- **`ProblemSummary`** (`lib.rs:261-275`): `diagnosis`, `confidence`, `action`, `blocked`, `auto_executed`, `reason: Option<String>`, `at: i64`.
+- **`ExecutionSummary`** (`lib.rs:277-285`): `action`, `success`, `preview`, `at: i64`.
+- **`UpdaterStatus`** (`lib.rs:92-114`): `enabled`, `running`, `phase`, `last_run`/`next_run` (unix secs), `last_cost_usd`, `notes: Vec<String>`, `apps: Vec<UpdaterAppRow>`, `recent: Vec<UpdateAttemptRow>`, `settings: UpdaterSettingsView`. `UpdaterAppRow` carries per-app `state` ("verified"|"installed"|"failed"|"skipped"), `method`, `signature`; `UpdateAttemptRow` is history.
+- **`LearnedFactView`** (`lib.rs:42-60`): `id`, `summary`, `detail`, `status`, `source` for the UI's "What Eir has learned" card.
+- **`AdvisorStatus`** (`lib.rs:64-77`): `enabled`, `escalated`, `escalation_model`, `reason`, `spent_today_usd`, `settings: AdvisorSettingsView`.
 - **`UiSettings`** / **`UsageSummary`** plus the `*Update` mirrors (`SettingsUpdate`, `UpdaterSettingsUpdate`, `AdvisorSettingsUpdate`) that flow back as `UiMsg` payloads.
 
-**Backward-compat invariant**: every field added after the original protocol is annotated `#[serde(default)]` (e.g. `pending_approvals`, `updater`, `advisor`, `effort`, the deterministic `ApprovalInfo` fields, all `at` timestamps). This lets an older service or UI decode a newer payload without error — a deliberate forward/backward-compatibility design across version skew.
+**Backward-compat invariant**: every field added after the original protocol is annotated `#[serde(default)]` (e.g. `pending_approvals`, `updater`, `advisor`, `learned_facts`, `effort`, the deterministic `ApprovalInfo` fields, all `at` timestamps). This lets an older service or UI decode a newer payload without error — a deliberate forward/backward-compatibility design across version skew.
 
-**Secret-handling invariant**: `UiSettings` never carries secret values, only booleans (`openrouter_key_set`, `anthropic_key_set`, `api_key_set`) so the UI shows "configured" without exposing keys (`lib.rs:144-170`). Inbound `SettingsUpdate` uses `Option<String>` for secrets where `None` = "unchanged" and a non-empty value replaces the stored secret (`lib.rs:172-192`); the JS sends `null` to preserve (`main.js:552-554`).
+**Secret-handling invariant**: `UiSettings` never carries secret values, only booleans (`openrouter_key_set`, `anthropic_key_set`, `api_key_set`) so the UI shows "configured" without exposing keys (`lib.rs:163-189`). Inbound `SettingsUpdate` uses `Option<String>` for secrets where `None` = "unchanged" and a non-empty value replaces the stored secret (`lib.rs:191-211`); the JS sends `null` to preserve (`main.js:552-554`).
 
 ### Named-pipe security / ACL model (`pipe_server.rs:16-48`)
 
@@ -223,6 +224,7 @@ Managed state: `SharedStatus` (the cached payload) and `UiCmdTx(mpsc::Sender<UiM
 Commands (`main.rs:28-112`, plus `util.rs`):
 - `get_status` — **synchronous**, returns a clone of the cached `StatusPayload`. This is the UI's only read path; it never hits the pipe directly.
 - `decide_approval { id, approved }` → `UiMsg::Approve`.
+- `set_learned_fact { id, op }` → `UiMsg::SetLearnedFact` (`op` is `pin`, `disable`, or `forget`).
 - `toggle_pause` → `UiMsg::TogglePause`.
 - `clear_problems` / `clear_executions` → `ClearProblems` / `ClearExecutions`.
 - `update_settings(SettingsUpdate)` → `UpdateSettings`.
@@ -251,7 +253,7 @@ Every service-facing command is `async`, sends one `UiMsg` on `UiCmdTx`, and map
 - `refresh()` (`main.js:202-264`) maps `status.status` to a header dot colour (`STATUS_COLORS`), renders the metric bars (colour-coded by threshold in `barColor`), failed-services chips, the model labels (`analysisLabel`/`updateCheckLabel`), then delegates to `renderApprovals`, `renderAiNow`, `renderActivity`, `renderUsage`, `renderUpdater`.
 - **XSS hygiene**: all service-supplied strings go through `esc()` / `escAttr()` before insertion into `innerHTML` (`main.js:155-163`); applied consistently across approvals, activity, updater rows, and service chips.
 - **Activity feed** merges `recent_problems` + `recent_executions` into one list sorted by `at` descending, with emoji/tag per kind (`activityItems`, `main.js:301-329`).
-- **Settings** are a modal populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. Four independent save buttons map to `set_autostart_enabled` (applies immediately, no service pipe), `update_settings` (warns it restarts the service ~15s), `set_updater_settings`, and `set_advisor_settings` (both apply live). Inputs are converted (e.g. confidence % → 0–1 float, hours → seconds) before sending (`main.js`).
+- **Settings** are a modal populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. Independent save buttons map to `set_autostart_enabled` (applies immediately, no service pipe), `update_settings` (warns it restarts the service ~15s), `set_updater_settings`, and `set_advisor_settings` (both apply live). Inputs are converted (e.g. confidence % → 0–1 float, hours → seconds) before sending (`main.js`).
 - Collapsed-card state is persisted in `localStorage` (`main.js:606-633`).
 
 ### Clear / Approve / Ignore / Update-now flows
@@ -260,6 +262,7 @@ Every service-facing command is `async`, sends one `UiMsg` on `UiCmdTx`, and map
 - **Pause**: header button (and tray menu) → `toggle_pause` → `UiMsg::TogglePause`; the button label flips Pause/Resume based on `status.paused` (`main.js:228-229, 266-269`).
 - **Clear (Activity)**: one button fires both `clear_problems` and `clear_executions` then `refresh()`s (`main.js:601-604`). **Clear (Updates)** → `clear_update_history` (clears last cycle + persisted attempts).
 - **Ignore (per app)**: delegated click on `#updater-apps` sends `set_app_ignore { id, ignore:true, note:"" }` and optimistically dims the row (`main.js:472-478`).
+- **Learned fact override**: delegated click on `#learned-list` sends `set_learned_fact { id, op }`; the service updates the persisted fact and refreshes the broadcast list (`main.js:511-519`, `main.rs:930-934`).
 - **Update now**: `#upd-now` → `run_updates_now` → `UiMsg::RunUpdatesNow`. The button is disabled when the updater is `running` or `!enabled`, because "the service ignores a manual run unless the updater is enabled" — the UI mirrors that gate rather than enforcing it (`main.js:369-375, 412-415`).
 
 ## Service decision loop, state & off-loop executor
@@ -637,13 +640,13 @@ Native candidate identity is anchored to the machine (`native_candidates_from`, 
 
 ## Persistence, audit DB & the existing feedback loop
 
-Eir's persistence layer is a single SQLite database, opened once at service start and shared as an `sqlx::SqlitePool` passed by reference into every read/write helper. There is no ORM and no repository abstraction: each table has hand-written `INSERT`/`SELECT` queries with positional binds, grouped by concern into three modules — `eir-svc/src/audit.rs` (decisions, executions, usage, approvals), `eir-svc/src/feedback/mod.rs` (before/after outcome scoring), and `eir-svc/src/updater/history.rs` (autonomous-updater attempt log). The schema lives in `migrations/*.sql` and is applied at boot via the embedded `sqlx::migrate!("../migrations")`.
+Eir's persistence layer is a single SQLite database, opened once at service start and shared as an `sqlx::SqlitePool` passed by reference into every read/write helper. There is no ORM and no repository abstraction: each table has hand-written `INSERT`/`SELECT` queries with positional binds, grouped by concern into four modules — `eir-svc/src/audit.rs` (decisions, executions, usage, approvals), `eir-svc/src/feedback/mod.rs` (before/after outcome scoring), `eir-svc/src/updater/history.rs` (autonomous-updater attempt log), and `eir-svc/src/learn/store.rs` (learned facts and user overrides). The schema lives in `migrations/*.sql` and is applied at boot via the embedded `sqlx::migrate!("../migrations")`.
 
-This is the *only* durable substrate Eir has to learn from. Importantly, today the loop's "learning" is entirely prompt-based: a human-readable feedback summary plus the last 5 decisions are injected into the AI prompt each cycle. There is no model fine-tuning, no policy auto-adjustment, and several rich tables (`system_state_history`, the full `signal_snapshot`, per-attempt updater costs) are written but never read back into any decision.
+This is the durable substrate Eir learns from. The original feedback loop still injects a human-readable feedback summary plus the last 5 decisions into the AI prompt each cycle, and the newer self-improvement layer derives conservative `learned_facts` from the same audit/update history. There is still no model fine-tuning or policy auto-adjustment; learning is represented as explicit, user-visible rows with conservative effects.
 
 ### Database bootstrap
 
-`audit::init_db(path)` (`eir-svc/src/audit.rs:12`) builds `SqliteConnectOptions` from `sqlite:{path}?mode=rwc` with `create_if_missing(true)`, connects a pool, and runs all migrations. The DB path comes from `config.persistence.audit_db` (a plain string field, `eir-svc/src/config.rs:163`); the sample default is `./eir.db` (`config.rs:264`). Migrations are versioned `0001`–`0007` and applied in order on every start (idempotent — all use `CREATE TABLE IF NOT EXISTS`).
+`audit::init_db(path)` (`eir-svc/src/audit.rs:12`) builds `SqliteConnectOptions` from `sqlite:{path}?mode=rwc` with `create_if_missing(true)`, connects a pool, and runs all migrations. The DB path comes from `config.persistence.audit_db` (a plain string field, `eir-svc/src/config.rs:163`); the sample default is `./eir.db` (`config.rs:264`). Migrations are versioned `0001`–`0010` and applied in order on every start (idempotent/additive table and column creation).
 
 ### Full schema (every table)
 
@@ -897,17 +900,14 @@ attempts, the seed is redundant and can be reduced to an empty slice (kept as th
 seam) or removed. Do **not** remove it pre-emptively — that regresses cold-start for the
 one app already known to behave this way.
 
-### Open questions (to resolve at implementation)
+### Residual implementation notes
 
-- `FixIneffective` join key: `execution_feedback.action` stores the Debug form of the
-  action, not `action_type_name` — normalise before grouping.
-- `RejectedSignal` needs the fingerprint at rejection time: store it on the
-  pending-approval/decision at proposal time, or re-derive from `decisions.signal_snapshot`.
 - Make thresholds/windows/half-lives config (`policy.toml`/`UpdaterConfig` with
   `#[serde(default)]`) rather than consts, per the project's config-over-magic-numbers bias.
 - `improvement_score` is noisy (cpu/mem weighted 0.3 vs failed_services 10.0) — prefer the
   failed-services component for `FixIneffective`.
-- Where each detector runs (updater cycle vs decision loop) to avoid redundant scans.
+- `RecurringFingerprint` remains deferred; it overlaps `FixIneffective` and still needs
+  per-decision fingerprint identity before it can be applied cleanly.
 
 
 ---
@@ -918,10 +918,8 @@ Current gaps surfaced while mapping each subsystem (the self-improvement plan ab
 
 **Workspace, build & delivery pipeline**
 
-- I did not open ui/index.html or ui/main.js contents, eir-ui/src/main.rs, or eir-ui/gen/; the frontend/wiring internals (how main.js uses withGlobalTauri, how the composition root injects adapters) are out of scope for this build/delivery map and unverified here.
-- I confirmed the staging COPY logic and gitignore status statically but did not execute a full `cargo tauri build` to observe the bundle being produced, nor the release workflow end-to-end (compile/static-verified, not run-verified). Whether the signing secrets are actually configured in the GitHub repo is unverifiable from the source tree.
-- The two build.rs files: the root build.rs reads `tauri_build::build()` (3 lines); eir-ui/build.rs is 42 bytes and was not separately opened — its exact content is assumed equivalent but unconfirmed.
-- policy.toml and config.toml.example are referenced as bundle resources but I did not read them; their schema/contents are out of scope here.
+- The repo still contains a root `tauri.conf.json` that is not the documented/canonical build config. The supported build path uses `cargo tauri build --config eir-ui/tauri.conf.json`; the root config is stale enough to confuse contributors and should either be removed or made an explicit compatibility shim.
+- This documentation pass did not execute a full `cargo tauri build` to observe the bundle being produced, nor the release workflow end-to-end (compile/static-verified, not run-verified). Whether the signing secrets are configured in the GitHub repo is unverifiable from the source tree.
 - The release process is described as manual version-bump + tag push inferred from CLAUDE.md conventions and git history ([release] markers); there is no scripted bump tool in the read files, so the exact human steps are convention, not enforced by code.
 - No automated check verifies the four version locations stay in sync (Cargo.toml x3 + tauri.conf.json); a drift would not be caught by the CI gate as currently written.
 
@@ -934,7 +932,7 @@ Current gaps surfaced while mapping each subsystem (the self-improvement plan ab
 - Status freshness is bounded by the 2s UI poll plus the service's broadcast cadence; the UI cannot request an on-demand refresh from the service (it only re-reads the local cache) (main.js:636-637).
 - mpsc command channels are bounded (service 8, UI 16); a stalled writer could in principle apply backpressure, though commands are low-volume (pipe_server.rs:60, main.rs:244).
 - Byte-mode pipe relies entirely on the newline delimiter for framing; a payload containing a literal newline would break framing, but serde_json::to_string emits single-line JSON so this is not currently reachable.
-- tauri.conf.json (CSP, updater public key, frontendDist/beforeBuildCommand) was not read in this pass; the main.js comment that inline handlers are CSP-blocked (main.js:452-453) was not independently verified against the config.
+- The app has two Tauri config files in the repo; protocol/UI references in this doc assume the canonical `eir-ui/tauri.conf.json`.
 
 **Service decision loop, state & off-loop executor**
 
