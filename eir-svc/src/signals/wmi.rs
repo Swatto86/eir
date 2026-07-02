@@ -424,13 +424,27 @@ fn snapshot_state() -> SystemState {
     }
 }
 
-pub fn spawn(poll_interval_secs: u64) -> (SharedState, watch::Sender<()>) {
+/// Compact key of a snapshot's actionable faults (shared definition:
+/// [`SystemState::fault_parts`]). Used to wake the decision loop only when the
+/// fault state *changes* — a persistent fault must not re-trigger a reaction on
+/// every poll.
+fn fault_key(s: &SystemState) -> String {
+    let mut parts = s.fault_parts();
+    parts.sort();
+    parts.join("\n")
+}
+
+pub fn spawn(
+    poll_interval_secs: u64,
+    trigger: super::TriggerTx,
+) -> (SharedState, watch::Sender<()>) {
     let shared: SharedState = Arc::new(Mutex::new(None));
     let shared_clone = shared.clone();
     let (shutdown_tx, mut shutdown_rx) = watch::channel(());
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(poll_interval_secs));
+        let mut last_fault_key = String::new();
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -444,8 +458,16 @@ pub fn spawn(poll_interval_secs: u64) -> (SharedState, watch::Sender<()>) {
                                 update = %s.windows_update_status,
                                 "WMI snapshot"
                             );
+                            // Wake the decision loop when a NEW fault appears
+                            // (a changed, non-empty fault set).
+                            let key = fault_key(&s);
+                            let changed = key != last_fault_key && !key.is_empty();
+                            last_fault_key = key;
                             if let Ok(mut guard) = shared_clone.lock() {
                                 *guard = Some(s);
+                            }
+                            if changed {
+                                let _ = trigger.try_send(());
                             }
                         }
                         Err(e) => warn!("WMI snapshot task panicked: {e}"),

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -8,480 +8,537 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --bg:        #0f172a;
-      --surface:   #1e293b;
-      --border:    #334155;
-      --text:      #e2e8f0;
-      --muted:     #94a3b8;
+      --bg:        #0b1120;
+      --surface:   #141c2e;
+      --surface-2: #1b2437;
+      --border:    #283349;
+      --text:      #e5eaf2;
+      --muted:     #8b97ab;
       --green:     #22c55e;
       --yellow:    #eab308;
       --orange:    #f97316;
       --red:       #ef4444;
       --blue:      #3b82f6;
       --gray:      #6b7280;
-      --radius:    8px;
+      --accent:    #34d399;
+      --radius:    10px;
+      --shadow:    0 8px 30px rgba(0,0,0,.35);
+    }
+    :root[data-theme="light"] {
+      --bg:        #eef1f6;
+      --surface:   #ffffff;
+      --surface-2: #f4f6fa;
+      --border:    #d9dfe9;
+      --text:      #1c2534;
+      --muted:     #5c6775;
+      --accent:    #059669;
+      --shadow:    0 8px 30px rgba(30,41,59,.12);
     }
 
+    html, body { height: 100%; }
     body {
       background: var(--bg);
       color: var(--text);
-      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-family: 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
       font-size: 14px;
       line-height: 1.5;
-      display: flex;
-      flex-direction: column;
-      height: 100vh;
       overflow: hidden;
+      user-select: none;
+      cursor: default;
     }
+    input, textarea { user-select: text; cursor: text; }
 
-    /* ── Header ── */
-    header {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 12px 20px;
+    .app { display: flex; height: 100vh; }
+
+    /* ── Sidebar ── */
+    .side {
+      width: 168px; flex-shrink: 0;
       background: var(--surface);
-      border-bottom: 1px solid var(--border);
-      flex-shrink: 0;
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column;
+      padding: 14px 10px 10px;
+      gap: 12px;
     }
-    header h1 { font-size: 16px; font-weight: 600; letter-spacing: .04em; }
+    .brand { display: flex; align-items: center; gap: 9px; padding: 2px 8px 10px; border-bottom: 1px solid var(--border); }
+    .brand h1 { font-size: 17px; font-weight: 700; letter-spacing: .05em; }
     #status-dot {
-      width: 12px; height: 12px; border-radius: 50%;
+      width: 11px; height: 11px; border-radius: 50%;
       background: var(--gray); flex-shrink: 0;
+      box-shadow: 0 0 8px color-mix(in srgb, currentColor 50%, transparent);
       transition: background .4s;
     }
-    #status-text { font-size: 13px; color: var(--muted); }
+    nav { display: flex; flex-direction: column; gap: 2px; flex: 1; }
+    .nav-btn {
+      display: flex; align-items: center; gap: 9px;
+      padding: 8px 10px; border: none; background: transparent;
+      color: var(--muted); border-radius: 8px; cursor: pointer;
+      font-size: 13.5px; font-family: inherit; text-align: left;
+      transition: background .12s, color .12s;
+    }
+    .nav-btn:hover { background: var(--surface-2); color: var(--text); }
+    .nav-btn.active { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); font-weight: 600; }
+    .nav-ico { width: 17px; text-align: center; font-size: 14px; flex-shrink: 0; }
+    .badge {
+      margin-left: auto; min-width: 18px; padding: 0 5px; border-radius: 9px;
+      background: var(--orange); color: #fff; font-size: 11px; font-weight: 700;
+      text-align: center; line-height: 18px; display: none;
+    }
+    .badge.on { display: inline-block; }
+    .side-foot { display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px solid var(--border); }
+    .foot-btn {
+      display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+      border: 1px solid var(--border); background: transparent; color: var(--text);
+      border-radius: 8px; cursor: pointer; font-size: 12.5px; font-family: inherit;
+    }
+    .foot-btn:hover { background: var(--surface-2); }
+
+    /* ── Main column ── */
+    main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+    header {
+      display: flex; align-items: center; gap: 12px;
+      padding: 12px 22px; border-bottom: 1px solid var(--border);
+      background: var(--surface); flex-shrink: 0;
+    }
+    #view-title { font-size: 15px; font-weight: 650; }
+    #status-text { font-size: 12.5px; color: var(--muted); }
     header .spacer { flex: 1; }
-    .btn {
-      padding: 5px 14px; border: 1px solid var(--border);
-      background: transparent; color: var(--text);
-      border-radius: var(--radius); cursor: pointer;
-      font-size: 13px; transition: background .15s;
-    }
-    .btn:hover { background: var(--border); }
-    .btn.danger { border-color: var(--red); color: var(--red); }
-    .btn.danger:hover { background: color-mix(in srgb, var(--red) 15%, transparent); }
+    .model-label { font-size: 10.5px; color: var(--muted); max-width: 440px; display: flex; flex-direction: column; align-items: flex-end; line-height: 1.45; }
+    .model-label .ml-line { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .model-label .ml-key { text-transform: uppercase; letter-spacing: .05em; font-size: 9px; margin-right: 5px; opacity: .8; }
 
-    /* ── Metrics bar ── */
-    .metrics {
-      display: flex; gap: 1px;
-      background: var(--border);
-      border-bottom: 1px solid var(--border);
-      flex-shrink: 0;
-    }
-    .metric {
-      flex: 1; background: var(--surface);
-      padding: 10px 16px; display: flex; flex-direction: column; gap: 4px;
-    }
-    .metric-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
-    .metric-value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
-    .bar-track { height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; }
-    .bar-fill  { height: 100%; border-radius: 2px; transition: width .4s; }
-
-    /* ── Body scroll area ── */
-    /* min-height:0 lets this flex child shrink below its content height so its
-       own overflow-y actually scrolls; without it the column grows past the
-       viewport and the bottom (e.g. the Settings save button) is clipped. */
-    .body { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 16px; }
-    /* The cards are flex children of this column. Without this, a short window
-       lets them flex-shrink to fit; combined with .card{overflow:hidden} that
-       clips their content AND removes the body's overflow, so the scrollbar
-       never appears and the cut text is unreachable. Pin their natural height
-       so the body overflows and scrolls instead. */
-    .body > * { flex-shrink: 0; }
-
-    /* ── Approval cards (one per queued action) ── */
-    #approvals { display: flex; flex-direction: column; gap: 12px; }
-    #approvals:empty { display: none; }
-    .approval-card {
-      background: color-mix(in srgb, var(--orange) 10%, var(--surface));
-      border: 1px solid var(--orange);
-      border-radius: var(--radius); padding: 16px;
-    }
-    .approval-card h2 { font-size: 14px; color: var(--orange); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
-    .appr-age { margin-left: auto; font-size: 11px; color: var(--muted); font-weight: 400; }
-    /* "What this does" — the trustworthy, code-generated summary of the action. */
-    .appr-what { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; }
-    .appr-what-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 4px; }
-    .appr-what-text { font-size: 13px; color: var(--text); line-height: 1.5; }
-    .appr-flags { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
-    .appr-target { margin-bottom: 12px; font-size: 13px; }
-    .appr-target-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-right: 8px; }
-    .appr-target-val { font-family: 'Cascadia Code', Consolas, monospace; font-size: 12px; color: var(--text); word-break: break-all; }
-    .appr-details { margin-top: 8px; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; font-family: 'Cascadia Code', Consolas, monospace; font-size: 11.5px; color: var(--muted); white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
-    .approval-grid { display: grid; grid-template-columns: 110px 1fr; gap: 4px 12px; font-size: 13px; margin-bottom: 14px; }
-    .approval-grid .label { color: var(--muted); }
-    .approval-grid .val  { color: var(--text); }
-    .approval-actions { display: flex; gap: 8px; }
-    .btn-approve { padding: 6px 20px; background: var(--green); border: none; border-radius: var(--radius); color: #fff; cursor: pointer; font-size: 13px; }
-    .btn-approve:hover { filter: brightness(1.1); }
-    .btn-approve:disabled, .btn-reject:disabled { opacity: .5; cursor: default; }
-    .btn-reject  { padding: 6px 20px; background: transparent; border: 1px solid var(--red); border-radius: var(--radius); color: var(--red); cursor: pointer; font-size: 13px; }
-    .btn-reject:hover { background: color-mix(in srgb, var(--red) 12%, transparent); }
-
-    /* ── Two-column grid ── */
-    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .view { flex: 1; min-height: 0; overflow-y: auto; padding: 18px 22px 26px; display: none; flex-direction: column; gap: 14px; }
+    .view.active { display: flex; }
+    .view > * { flex-shrink: 0; }
 
     /* ── Cards ── */
     .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-    .card-header { padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
-    .card-body { padding: 0; }
+    .card-header { padding: 10px 15px; border-bottom: 1px solid var(--border); font-size: 11.5px; font-weight: 650; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+    .card-header .hspacer { flex: 1; }
+    .empty { padding: 22px 15px; text-align: center; color: var(--muted); font-size: 13px; }
 
-    /* ── Problem / execution rows ── */
-    .row { padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 13px; }
-    .row:last-child { border-bottom: none; }
-    .row-title { display: flex; align-items: center; gap: 8px; margin-bottom: 3px; }
-    .tag { font-size: 11px; padding: 1px 7px; border-radius: 20px; font-weight: 600; }
+    .btn {
+      padding: 5px 14px; border: 1px solid var(--border);
+      background: transparent; color: var(--text);
+      border-radius: 8px; cursor: pointer; font-size: 12.5px; font-family: inherit;
+      transition: background .12s;
+    }
+    .btn:hover { background: var(--surface-2); }
+    .btn:disabled { opacity: .45; cursor: default; }
+    .btn.small { padding: 3px 10px; font-size: 11.5px; border-radius: 6px; }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #08130d; font-weight: 650; }
+    .btn.primary:hover { filter: brightness(1.08); }
+
+    /* ── Dashboard ── */
+    .hero {
+      display: flex; align-items: center; gap: 16px;
+      background: linear-gradient(135deg, var(--surface), var(--surface-2));
+      border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 18px 20px;
+    }
+    .hero-dot { width: 40px; height: 40px; border-radius: 50%; flex-shrink: 0; display:flex; align-items:center; justify-content:center;
+      background: color-mix(in srgb, var(--hero-color, var(--gray)) 15%, transparent); }
+    .hero-dot::after { content: ""; width: 16px; height: 16px; border-radius: 50%; background: var(--hero-color, var(--gray));
+      box-shadow: 0 0 14px var(--hero-color, var(--gray)); }
+    .hero-main { min-width: 0; flex: 1; }
+    .hero-status { font-size: 19px; font-weight: 700; }
+    .hero-sub { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+    .hero-err { font-size: 12.5px; color: var(--red); margin-top: 4px; user-select: text; }
+
+    .metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+    .metric-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
+    .metric-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .07em; }
+    .metric-value { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 2px 0 8px; }
+    .bar-track { height: 5px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 3px; overflow: hidden; }
+    .bar-fill  { height: 100%; border-radius: 3px; transition: width .5s; }
+
+    .dash-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+    .ai-now-text { padding: 13px 15px; font-size: 13px; line-height: 1.65; white-space: pre-wrap; color: var(--text); user-select: text; }
+    .ai-now-meta { padding: 0 15px 12px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 11px; color: var(--muted); }
+
+    .services-list { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 15px; }
+    .svc-chip { font-size: 11px; padding: 2px 9px; border-radius: 5px; background: color-mix(in srgb, var(--red) 12%, var(--surface)); border: 1px solid color-mix(in srgb, var(--red) 30%, transparent); color: var(--red); }
+
+    .usage-grid { display: grid; grid-template-columns: 1fr auto auto; gap: 6px 22px; padding: 13px 15px; font-size: 13px; font-variant-numeric: tabular-nums; }
+    .usage-grid .usage-h { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; text-align: right; }
+    .usage-grid .usage-l { color: var(--muted); }
+    .usage-grid .usage-v { text-align: right; }
+    .usage-note { padding: 0 15px 12px; font-size: 11px; color: var(--muted); }
+
+    .mini-cta { display: flex; align-items: center; gap: 12px; padding: 13px 15px; }
+    .mini-cta .big { font-size: 24px; font-weight: 700; color: var(--orange); }
+
+    /* ── Tags ── */
+    .tag { font-size: 11px; padding: 1px 8px; border-radius: 20px; font-weight: 600; }
     .tag-ok     { background: color-mix(in srgb, var(--green)  15%, transparent); color: var(--green); }
     .tag-warn   { background: color-mix(in srgb, var(--yellow) 15%, transparent); color: var(--yellow); }
     .tag-block  { background: color-mix(in srgb, var(--red)    15%, transparent); color: var(--red); }
     .tag-auto   { background: color-mix(in srgb, var(--blue)   15%, transparent); color: var(--blue); }
-    .row-sub { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-    /* ── Analysis ── */
-    .analysis-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
-    .analysis-text { padding: 12px 14px; font-size: 13px; color: var(--muted); line-height: 1.7; }
+    /* ── Approvals ── */
+    .approval-card {
+      background: color-mix(in srgb, var(--orange) 8%, var(--surface));
+      border: 1px solid color-mix(in srgb, var(--orange) 55%, transparent);
+      border-radius: var(--radius); padding: 16px;
+    }
+    .approval-card h2 { font-size: 14px; color: var(--orange); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+    .appr-age { margin-left: auto; font-size: 11px; color: var(--muted); font-weight: 400; }
+    .appr-what { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
+    .appr-what-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 4px; }
+    .appr-what-text { font-size: 13px; line-height: 1.5; user-select: text; }
+    .appr-flags { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+    .appr-target { margin-bottom: 12px; font-size: 13px; }
+    .appr-target-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-right: 8px; }
+    .appr-target-val { font-family: 'Cascadia Code', Consolas, monospace; font-size: 12px; word-break: break-all; user-select: text; }
+    .appr-details { margin-top: 8px; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; font-family: 'Cascadia Code', Consolas, monospace; font-size: 11.5px; color: var(--muted); white-space: pre-wrap; word-break: break-word; line-height: 1.5; user-select: text; }
+    .approval-grid { display: grid; grid-template-columns: 110px 1fr; gap: 4px 12px; font-size: 13px; margin-bottom: 14px; user-select: text; }
+    .approval-grid .label { color: var(--muted); }
+    .approval-actions { display: flex; gap: 8px; }
+    .btn-approve { padding: 6px 20px; background: var(--green); border: none; border-radius: 8px; color: #fff; cursor: pointer; font-size: 13px; font-family: inherit; }
+    .btn-approve:hover { filter: brightness(1.1); }
+    .btn-approve:disabled, .btn-reject:disabled { opacity: .5; cursor: default; }
+    .btn-reject  { padding: 6px 20px; background: transparent; border: 1px solid var(--red); border-radius: 8px; color: var(--red); cursor: pointer; font-size: 13px; font-family: inherit; }
+    .btn-reject:hover { background: color-mix(in srgb, var(--red) 12%, transparent); }
 
-    /* ── Empty state ── */
-    .empty { padding: 24px 14px; text-align: center; color: var(--muted); font-size: 13px; }
-
-    /* ── Failed services ── */
-    .services-list { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 14px; }
-    .svc-chip { font-size: 11px; padding: 2px 8px; border-radius: 4px; background: color-mix(in srgb, var(--red) 12%, var(--surface)); border: 1px solid color-mix(in srgb, var(--red) 30%, transparent); color: var(--red); }
-
-    /* ── Available updates ── */
-    /* The card clips to its rounded corners (overflow:hidden); the trailing AI
-       note / result line carries no bottom padding, so without this it sits flush
-       against the clip edge and gets cut off. Give the body bottom breathing room. */
-    #updates-card .card-body { padding-bottom: 8px; }
-    #updates-card .card-header { display: flex; align-items: center; gap: 8px; }
-    .upd-count { color: var(--blue); font-weight: 600; }
-    .card-header .hspacer { flex: 1; }
-    .upd-btn { padding: 3px 10px; border: 1px solid var(--border); background: transparent; color: var(--text); border-radius: 6px; cursor: pointer; font-size: 11px; text-transform: none; letter-spacing: 0; }
-    .upd-btn:hover { background: var(--border); }
-    .upd-btn:disabled { opacity: .5; cursor: default; }
-    .upd-all { border-color: var(--green); color: var(--green); }
-    .upd-row { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--border); font-size: 13px; }
-    .upd-row:last-child { border-bottom: none; }
-    .upd-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .upd-ver { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .upd-update { padding: 3px 12px; border: 1px solid var(--blue); background: transparent; color: var(--blue); border-radius: 6px; cursor: pointer; font-size: 11px; }
-    .upd-update:hover { background: color-mix(in srgb, var(--blue) 14%, transparent); }
-    .upd-update:disabled { opacity: .5; cursor: default; }
-
-    .upd-note { padding: 6px 14px 0; font-size: 11px; color: var(--muted); }
-    .upd-dl { padding: 3px 12px; border: 1px solid var(--green); background: transparent; color: var(--green); border-radius: 6px; cursor: pointer; font-size: 11px; }
-    .upd-dl:hover { background: color-mix(in srgb, var(--green) 14%, transparent); }
-
-    /* ── Update actions, results, live phase ── */
-    .upd-everything { border-color: var(--green); color: var(--green); font-weight: 600; }
-    .upd-everything:disabled { opacity: .5; cursor: default; }
-    .upd-install { padding: 3px 12px; border: 1px solid var(--blue); background: transparent; color: var(--blue); border-radius: 6px; cursor: pointer; font-size: 11px; }
-    .upd-install:hover { background: color-mix(in srgb, var(--blue) 14%, transparent); }
-    .upd-install:disabled { opacity: .5; cursor: default; }
-    .upd-status { margin-left: 6px; font-size: 11px; color: var(--muted); white-space: nowrap; }
-    .upd-badge { font-size: 11px; padding: 1px 7px; border-radius: 20px; font-weight: 600; margin-left: 6px; white-space: nowrap; }
-    .upd-result { flex-basis: 100%; padding: 2px 0 0; font-size: 11px; color: var(--muted); white-space: normal; }
-    .upd-row { flex-wrap: wrap; }
-    .upd-summary { display: block; padding: 8px 14px; font-size: 12px; color: var(--text); border-bottom: 1px solid var(--border); }
-
-    /* ── Settings ── */
-    #settings-card .card-header { display: flex; align-items: center; gap: 8px; cursor: pointer; }
-    .set-grid { display: grid; grid-template-columns: 150px 1fr; gap: 8px 12px; padding: 14px; align-items: center; }
-    .set-grid label { color: var(--muted); font-size: 12px; }
-    .set-grid input, .set-grid select { width: 100%; padding: 5px 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 13px; font-family: inherit; }
-    .set-grid input:focus, .set-grid select:focus { outline: none; border-color: var(--blue); }
-    .set-actions { display: flex; align-items: center; gap: 12px; padding: 0 14px 14px; }
-    .set-save { padding: 6px 16px; background: var(--green); border: none; border-radius: 6px; color: #fff; cursor: pointer; font-size: 13px; }
-    .set-save:hover { filter: brightness(1.1); }
-
-    /* ── Usage ── */
-    .usage-grid { display: grid; grid-template-columns: 1fr auto auto; gap: 6px 20px; padding: 12px 14px; font-size: 13px; font-variant-numeric: tabular-nums; }
-    .usage-grid .usage-h { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; text-align: right; }
-    .usage-grid .usage-l { color: var(--muted); }
-    .usage-grid .usage-v { text-align: right; }
-    .usage-note { padding: 0 14px 12px; font-size: 11px; color: var(--muted); }
-
-    .model-label { font-size: 10.5px; color: var(--muted); margin-right: 10px; max-width: 460px; display: flex; flex-direction: column; align-items: flex-end; line-height: 1.4; }
-    .model-label .ml-line { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .model-label .ml-key { color: var(--muted); text-transform: uppercase; letter-spacing: .04em; font-size: 9.5px; margin-right: 5px; opacity: .85; }
-
-    /* ── Collapsible cards ── */
-    .card-header.collapsible, .analysis-card .card-header { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px; }
-    .row-age { margin-left: auto; padding-left: 8px; color: var(--muted); font-size: 11px; white-space: nowrap; }
-    .chev { display: inline-block; width: 10px; margin-right: 6px; color: var(--muted); font-size: 10px; transition: transform .15s; }
-    .card.collapsed .chev, .analysis-card.collapsed .chev { transform: rotate(-90deg); }
-    .card.collapsed > :not(.card-header), .analysis-card.collapsed > :not(.card-header) { display: none; }
-    .empty { padding: 16px 14px; }
-    .two-col { align-items: start; }
-
-    /* ── Per-app note editor ── */
-    .upd-mini { padding: 2px 8px; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 6px; cursor: pointer; font-size: 11px; }
-    .upd-mini:hover { background: var(--border); color: var(--text); }
-    .note-edit { display: flex; gap: 6px; flex: 1; align-items: center; }
-    .note-edit input { flex: 1; padding: 4px 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 12px; font-family: inherit; }
-    .note-edit input:focus { outline: none; border-color: var(--blue); }
-
-    /* ── AI-now panel ── */
-    #ai-now .card-body { padding: 12px 14px; }
-    .ai-now-text { font-size: 13px; color: var(--text); line-height: 1.6; white-space: pre-wrap; }
-    .ai-now-meta { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 11px; color: var(--muted); }
-    .ai-badge { font-size: 11px; padding: 1px 8px; border-radius: 20px; font-weight: 600; }
-    .ai-escalated { background: color-mix(in srgb, var(--blue) 18%, transparent); color: var(--blue); }
-    .gear { font-size: 15px; line-height: 1; }
-
-    /* ── Activity feed ── */
-    .act-item { display: flex; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 13px; }
+    /* ── Activity ── */
+    .act-item { display: flex; gap: 10px; padding: 10px 15px; border-bottom: 1px solid var(--border); font-size: 13px; }
     .act-item:last-child { border-bottom: none; }
     .act-icon { flex-shrink: 0; width: 18px; text-align: center; }
-    .act-main { flex: 1; min-width: 0; }
+    .act-main { flex: 1; min-width: 0; user-select: text; }
     .act-head { display: flex; align-items: center; gap: 8px; }
     .act-head .act-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .act-why { color: var(--muted); font-size: 12px; margin-top: 3px; line-height: 1.5; }
     .act-when { margin-left: auto; padding-left: 8px; color: var(--muted); font-size: 11px; white-space: nowrap; }
 
-    /* ── Settings modal ── */
-    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; padding: 28px 20px; z-index: 100; }
-    .modal-overlay.open { display: flex; }
-    /* Flex column capped at the viewport so the header/footer stay put and only
-       the field area scrolls. A position:sticky header inside a scrolling
-       overlay drifts down with the content — this avoids that entirely. */
-    .modal { display: flex; flex-direction: column; max-height: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); width: 100%; max-width: 640px; box-shadow: 0 20px 60px rgba(0,0,0,.5); overflow: hidden; }
-    .modal-header { flex-shrink: 0; display: flex; align-items: center; gap: 8px; padding: 14px 18px; border-bottom: 1px solid var(--border); font-size: 14px; font-weight: 600; background: var(--surface); }
-    .modal-header .hspacer { flex: 1; }
-    .modal-close { background: transparent; border: none; color: var(--muted); font-size: 22px; cursor: pointer; line-height: 1; padding: 0 4px; }
-    .modal-close:hover { color: var(--text); }
-    .modal-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0 0 8px; }
-    .set-section { border-top: 1px solid var(--border); }
-    .set-section:first-child { border-top: none; }
-    .set-section-title { padding: 16px 18px 2px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
-    .set-section-desc { padding: 2px 18px 4px; font-size: 12px; color: var(--muted); line-height: 1.5; }
-    .set-note { padding: 8px 18px 0; font-size: 11.5px; color: var(--muted); line-height: 1.5; }
-    .set-note code { font-family: 'Cascadia Code', Consolas, monospace; font-size: 11px; color: var(--text); }
+    /* ── Updates / Learned rows ── */
+    .upd-row { display: flex; align-items: center; gap: 10px; padding: 9px 15px; border-bottom: 1px solid var(--border); font-size: 13px; flex-wrap: wrap; }
+    .upd-row:last-child { border-bottom: none; }
+    .upd-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
+    .upd-ver { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .upd-status { margin-left: 6px; font-size: 11px; color: var(--muted); white-space: nowrap; }
+    .upd-badge { font-size: 11px; padding: 1px 8px; border-radius: 20px; font-weight: 600; margin-left: 6px; white-space: nowrap; }
+    .upd-result { flex-basis: 100%; padding: 2px 0 0; font-size: 11px; color: var(--muted); white-space: normal; user-select: text; }
+    .upd-note { padding: 6px 15px; font-size: 11px; color: var(--muted); user-select: text; }
+    .upd-summary { display: block; padding: 8px 15px; font-size: 12px; border-bottom: 1px solid var(--border); }
+    .upd-mini { padding: 2px 9px; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 6px; cursor: pointer; font-size: 11px; font-family: inherit; }
+    .upd-mini:hover { background: var(--surface-2); color: var(--text); }
+    .row-age { margin-left: auto; padding-left: 8px; color: var(--muted); font-size: 11px; white-space: nowrap; }
 
-    ::-webkit-scrollbar { width: 6px; }
+    /* ── Settings ── */
+    .set-section-desc { padding: 10px 15px 2px; font-size: 12px; color: var(--muted); line-height: 1.5; }
+    .set-grid { display: grid; grid-template-columns: 170px 1fr; gap: 9px 12px; padding: 13px 15px; align-items: center; }
+    .set-grid label { color: var(--muted); font-size: 12px; }
+    .set-grid input, .set-grid select {
+      width: 100%; padding: 6px 9px; background: var(--bg);
+      border: 1px solid var(--border); border-radius: 7px; color: var(--text);
+      font-size: 13px; font-family: inherit;
+    }
+    .set-grid input:focus, .set-grid select:focus { outline: none; border-color: var(--accent); }
+    .set-grid input[type="checkbox"] { width: auto; justify-self: start; accent-color: var(--accent); }
+    .set-actions { display: flex; align-items: center; gap: 12px; padding: 4px 15px 14px; }
+    .set-status { font-size: 11.5px; color: var(--muted); }
+    .set-note { padding: 0 15px 10px; font-size: 11.5px; color: var(--muted); line-height: 1.5; }
+    .set-note code { font-family: 'Cascadia Code', Consolas, monospace; font-size: 11px; color: var(--text); }
+    .set-hint { grid-column: 2; font-size: 11px; color: var(--muted); line-height: 1.45; }
+    .methods-row { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; }
+    .methods-row label { color: var(--text); display: flex; align-items: center; gap: 5px; }
+
+    /* ── About ── */
+    .about-hero { display: flex; align-items: center; gap: 16px; padding: 20px; }
+    .about-logo { width: 56px; height: 56px; border-radius: 14px; background: color-mix(in srgb, var(--accent) 15%, transparent);
+      display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: 800; color: var(--accent); }
+    .about-name { font-size: 20px; font-weight: 700; }
+    .about-ver { font-size: 12.5px; color: var(--muted); }
+    .about-body { padding: 0 20px 18px; font-size: 13px; color: var(--muted); line-height: 1.65; max-width: 640px; }
+    .about-actions { display: flex; gap: 8px; padding: 0 20px 20px; align-items: center; }
+
+    ::-webkit-scrollbar { width: 8px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
   </style>
 </head>
 <body>
 
-<header>
-  <div id="status-dot"></div>
-  <h1>Eir</h1>
-  <span id="status-text">Initializing…</span>
-  <div class="spacer"></div>
-  <span id="model-label" class="model-label"></span>
-  <button class="btn" id="pause-btn">Pause</button>
-  <button class="btn" id="open-settings" title="Settings"><span class="gear">⚙</span></button>
-</header>
+<div class="app">
 
-<div class="metrics">
-  <div class="metric">
-    <span class="metric-label">CPU</span>
-    <span class="metric-value" id="cpu">—</span>
-    <div class="bar-track"><div class="bar-fill" id="cpu-bar" style="width:0;background:var(--blue)"></div></div>
-  </div>
-  <div class="metric">
-    <span class="metric-label">Memory</span>
-    <span class="metric-value" id="memory">—</span>
-    <div class="bar-track"><div class="bar-fill" id="mem-bar" style="width:0;background:var(--blue)"></div></div>
-  </div>
-  <div class="metric">
-    <span class="metric-label">Disk</span>
-    <span class="metric-value" id="disk">—</span>
-    <div class="bar-track"><div class="bar-fill" id="disk-bar" style="width:0;background:var(--blue)"></div></div>
-  </div>
-</div>
-
-<div class="body">
-
-  <!-- Pending approvals — one card per queued action; stays until acted on -->
-  <div id="approvals"></div>
-
-  <!-- What the agent is currently thinking (the AI's analysis + advisor state) -->
-  <div class="card" id="ai-now">
-    <div class="card-header collapsible"><span class="chev">▾</span>What the agent is thinking</div>
-    <div class="card-body">
-      <div class="ai-now-text" id="ai-now-text">Waiting for the first analysis cycle…</div>
-      <div class="ai-now-meta" id="ai-now-meta"></div>
+  <aside class="side">
+    <div class="brand"><div id="status-dot"></div><h1>Eir</h1></div>
+    <nav id="nav">
+      <button class="nav-btn active" data-view="dashboard"><span class="nav-ico">⌂</span>Dashboard</button>
+      <button class="nav-btn" data-view="approvals"><span class="nav-ico">✋</span>Approvals<span class="badge" id="nav-approvals"></span></button>
+      <button class="nav-btn" data-view="activity"><span class="nav-ico">☰</span>Activity</button>
+      <button class="nav-btn" data-view="updates"><span class="nav-ico">⭳</span>App Updates</button>
+      <button class="nav-btn" data-view="learned"><span class="nav-ico">◎</span>Learned</button>
+      <button class="nav-btn" data-view="settings"><span class="nav-ico">⚙</span>Settings</button>
+      <button class="nav-btn" data-view="about"><span class="nav-ico">ⓘ</span>About</button>
+    </nav>
+    <div class="side-foot">
+      <button class="foot-btn" id="theme-btn" title="Cycle theme (system / light / dark)"><span id="theme-ico">◐</span><span id="theme-label">System</span></button>
+      <button class="foot-btn" id="pause-btn"><span>⏸</span><span id="pause-label">Pause</span></button>
     </div>
-  </div>
+  </aside>
 
-  <!-- Activity feed — diagnoses + fixes, newest first -->
-  <div class="card" id="activity-card">
-    <div class="card-header collapsible"><span class="chev">▾</span>Activity<span class="hspacer"></span><button class="upd-btn" id="clear-activity">Clear</button></div>
-    <div class="card-body" id="activity-list"><div class="empty">No activity yet</div></div>
-  </div>
+  <main>
+    <header>
+      <span id="view-title">Dashboard</span>
+      <span id="status-text">Initializing…</span>
+      <div class="spacer"></div>
+      <span id="model-label" class="model-label"></span>
+    </header>
 
-  <!-- Autonomous updates — driven by the LocalSystem service (no UAC) -->
-  <div class="card" id="updates-card">
-    <div class="card-header collapsible">
-      <span class="chev">▾</span>App Updates <span class="upd-count" id="updater-state"></span>
-      <span class="hspacer"></span>
-      <button class="upd-btn upd-everything" id="upd-now">⬆ Update now</button>
-      <button class="upd-btn" id="clear-updates">Clear</button>
-    </div>
-    <div class="card-body">
-      <div id="updater-meta" class="upd-summary" style="display:none"></div>
-      <div id="updater-apps"><div class="empty">Enable auto-updates in Settings, or click “Update now”.</div></div>
-      <div id="updater-notes"></div>
-      <div id="updater-history-wrap" style="display:none">
-        <div class="upd-note" style="border-top:1px solid var(--border); margin-top:6px; padding-top:8px;">Recent attempts</div>
-        <div id="updater-history"></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- What Eir has learned about this machine (self-improvement) -->
-  <div class="card" id="learned-card" style="display:none">
-    <div class="card-header collapsible"><span class="chev">▾</span>What Eir Has Learned</div>
-    <div class="card-body" id="learned-list"></div>
-  </div>
-
-  <!-- Failed services -->
-  <div class="card" id="services-card" style="display:none">
-    <div class="card-header collapsible"><span class="chev">▾</span>Failed Services</div>
-    <div class="services-list" id="services-list"></div>
-  </div>
-
-  <!-- AI usage -->
-  <div class="card" id="usage-card" style="display:none">
-    <div class="card-header collapsible"><span class="chev">▾</span>AI Usage</div>
-    <div class="card-body" id="usage-body"></div>
-  </div>
-
-</div><!-- /.body -->
-
-<!-- Settings modal (opened from the header gear) -->
-<div class="modal-overlay" id="settings-modal">
-  <div class="modal">
-    <div class="modal-header">⚙ Settings<span class="hspacer"></span><button class="modal-close" id="close-settings" title="Close">×</button></div>
-    <div class="modal-body">
-
-      <div class="set-section">
-      <div class="set-section-title">Windows startup</div>
-      <div class="set-section-desc">Launch Eir automatically when you sign in. Startup launches stay hidden in the tray; manual launches open the status window.</div>
-      <div class="set-grid">
-        <label for="set-autostart">Start with Windows</label>
-        <input id="set-autostart" type="checkbox" style="width:auto; justify-self:start;">
-      </div>
-      <div class="set-actions">
-        <button class="set-save" id="set-autostart-save" style="background:var(--blue)">Save startup setting</button>
-        <span class="upd-note" id="set-autostart-status"></span>
-      </div>
-      </div>
-
-      <div class="set-section">
-      <div class="set-section-title">AI provider &amp; monitoring</div>
-      <div class="set-section-desc">Which AI model Eir uses to diagnose problems, plus how often it polls Windows for signals. Saving these restarts the service (~15&nbsp;s).</div>
-      <div class="set-grid">
-        <label for="set-provider">AI provider</label>
-        <select id="set-provider">
-          <option value="openrouter">OpenRouter (free models — no Claude usage)</option>
-          <option value="claude_cli">Claude CLI (your subscription)</option>
-          <option value="anthropic">Anthropic API (key)</option>
-          <option value="openai_compatible">OpenAI-compatible</option>
-        </select>
-        <label for="set-model">Model</label>
-        <input id="set-model" type="text" placeholder="openrouter/free (auto-routes to a free model)">
-        <label for="set-effort">Reasoning effort</label>
-        <select id="set-effort">
-          <option value="">Default (Claude CLI only)</option>
-          <option value="low">Low</option>
-          <option value="medium">Medium</option>
-          <option value="high">High</option>
-          <option value="xhigh">XHigh</option>
-          <option value="max">Max</option>
-        </select>
-        <label for="set-upd-model">App-update model</label>
-        <input id="set-upd-model" type="text" placeholder="Claude CLI only (blank = haiku); OpenRouter uses the main model + web">
-        <label for="set-or-key">OpenRouter key</label>
-        <input id="set-or-key" type="password" autocomplete="off">
-        <label for="set-an-key">Anthropic key</label>
-        <input id="set-an-key" type="password" autocomplete="off">
-        <label for="set-base">Base URL</label>
-        <input id="set-base" type="text" placeholder="(openai_compatible only)">
-        <label for="set-conf">Auto-fix confidence (%)</label>
-        <input id="set-conf" type="number" min="50" max="95" step="5" placeholder="80">
-        <label for="set-decint">Decision interval (s)</label>
-        <input id="set-decint" type="number" min="10">
-        <label for="set-elpoll">Event-log poll (s)</label>
-        <input id="set-elpoll" type="number" min="5">
-        <label for="set-wmipoll">System poll (s)</label>
-        <input id="set-wmipoll" type="number" min="30">
-        <label for="set-channels">Event-log channels</label>
-        <input id="set-channels" type="text" placeholder="System, Application, Security">
-        <label for="set-dirs">Extra log directories</label>
-        <input id="set-dirs" type="text" placeholder="C:\Logs, D:\App\Logs">
-      </div>
-      <div class="set-actions">
-        <button class="set-save" id="set-save">Save &amp; restart service</button>
-        <span class="upd-note" id="set-status"></span>
-      </div>
-      </div>
-
-      <div class="set-section">
-      <div class="set-section-title">Advisor mode</div>
-      <div class="set-section-desc">When the agent is unsure, it re-analyses the problem once at a stronger model or higher effort, then acts on the better answer. Off by default; applies live.</div>
-      <div class="set-grid">
-        <label for="set-adv-enabled">Enable advisor mode</label>
-        <input id="set-adv-enabled" type="checkbox" style="width:auto; justify-self:start;">
-        <label for="set-adv-model">Escalation model</label>
-        <input id="set-adv-model" type="text" placeholder="e.g. opus, or a stronger model id (blank = keep base)">
-        <label for="set-adv-effort">Escalation effort</label>
-        <select id="set-adv-effort">
-          <option value="">Keep base (Claude CLI only)</option>
-          <option value="low">Low</option>
-          <option value="medium">Medium</option>
-          <option value="high">High</option>
-          <option value="xhigh">XHigh</option>
-          <option value="max">Max</option>
-        </select>
-        <label for="set-adv-conf">Escalate below confidence (%)</label>
-        <input id="set-adv-conf" type="number" min="0" max="95" step="5" placeholder="60">
-        <label for="set-adv-budget">Daily escalation budget (USD)</label>
-        <input id="set-adv-budget" type="number" min="0" step="0.1" placeholder="0.50">
-      </div>
-      <div class="set-note">The daily budget caps spend only on metered API providers (Anthropic key or OpenAI-compatible). Claude&nbsp;CLI and OpenRouter report no per-call cost, so escalations there are capped at <code>24/day</code> instead.</div>
-      <div class="set-actions">
-        <button class="set-save" id="set-adv-save" style="background:var(--blue)">Save advisor settings</button>
-        <span class="upd-note" id="set-adv-status"></span>
-      </div>
-      </div>
-
-      <div class="set-section">
-      <div class="set-section-title">App updates</div>
-      <div class="set-section-desc">Eir updates your apps unattended — no UAC prompts — through the methods you allow below. Applies live.</div>
-      <div class="set-grid">
-        <label for="set-upd-enabled">Auto-update apps</label>
-        <input id="set-upd-enabled" type="checkbox" style="width:auto; justify-self:start;">
-        <label for="set-upd-interval">Check interval (hours)</label>
-        <input id="set-upd-interval" type="number" min="1" placeholder="24">
-        <label>Update via</label>
-        <div id="set-methods" style="display:flex; gap:14px; flex-wrap:wrap; font-size:12px;">
-          <label style="color:var(--text)"><input type="checkbox" id="m-winget" style="width:auto"> winget</label>
-          <label style="color:var(--text)"><input type="checkbox" id="m-choco" style="width:auto"> Chocolatey</label>
-          <label style="color:var(--text)"><input type="checkbox" id="m-scoop" style="width:auto"> Scoop</label>
-          <label style="color:var(--text)"><input type="checkbox" id="m-msstore" style="width:auto"> Store</label>
+    <!-- ── Dashboard ── -->
+    <section class="view active" id="view-dashboard">
+      <div class="hero" id="hero">
+        <div class="hero-dot"></div>
+        <div class="hero-main">
+          <div class="hero-status" id="hero-status">Initializing…</div>
+          <div class="hero-sub">System guardian — watching Windows and reacting to errors as they happen.</div>
+          <div class="hero-err" id="hero-err" style="display:none"></div>
         </div>
-        <label for="set-native-enabled">AI-found installers</label>
-        <input id="set-native-enabled" type="checkbox" style="width:auto; justify-self:start;">
-        <label for="set-sigpol">AI-installer signature</label>
-        <select id="set-sigpol">
-          <option value="require_publisher_match">Strictest — valid signature + matching publisher</option>
-          <option value="require_valid">Require a valid signature (default)</option>
-          <option value="allow_unsigned">Allow unsigned — least safe</option>
-        </select>
       </div>
-      <div class="set-note">Strictest → least-safe. This gates only <em>AI-found installers</em>; winget/Chocolatey/Store packages are trusted by their source. “Publisher match” needs a valid signature first, so unsigned installers (e.g. AutoHotkey and some open-source tools) are blocked under both signature options — update those via Chocolatey instead, or choose “Allow unsigned” (not recommended for unattended installs).</div>
-      <div class="set-actions">
-        <button class="set-save" id="set-upd-save" style="background:var(--blue)">Save updater settings</button>
-        <span class="upd-note" id="set-upd-status"></span>
+
+      <div class="metric-grid">
+        <div class="metric-card">
+          <div class="metric-label">CPU</div>
+          <div class="metric-value" id="cpu">—</div>
+          <div class="bar-track"><div class="bar-fill" id="cpu-bar" style="width:0;background:var(--blue)"></div></div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Memory</div>
+          <div class="metric-value" id="memory">—</div>
+          <div class="bar-track"><div class="bar-fill" id="mem-bar" style="width:0;background:var(--blue)"></div></div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Disk</div>
+          <div class="metric-value" id="disk">—</div>
+          <div class="bar-track"><div class="bar-fill" id="disk-bar" style="width:0;background:var(--blue)"></div></div>
+        </div>
       </div>
+
+      <div class="card" id="dash-approvals-card" style="display:none">
+        <div class="mini-cta">
+          <span class="big" id="dash-approvals-count">0</span>
+          <div style="flex:1">
+            <div style="font-weight:650">Fixes waiting for your approval</div>
+            <div style="font-size:12px;color:var(--muted)">Eir found problems it can fix but needs your sign-off first.</div>
+          </div>
+          <button class="btn primary" id="dash-approvals-go">Review</button>
+        </div>
       </div>
-    </div>
-  </div>
+
+      <div class="dash-grid">
+        <div class="card" id="ai-now">
+          <div class="card-header">What the agent is thinking</div>
+          <div class="ai-now-text" id="ai-now-text">Waiting for the first analysis cycle…</div>
+          <div class="ai-now-meta" id="ai-now-meta"></div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:14px">
+          <div class="card" id="usage-card" style="display:none">
+            <div class="card-header">AI Usage</div>
+            <div id="usage-body"></div>
+          </div>
+          <div class="card" id="services-card" style="display:none">
+            <div class="card-header">Failed Services</div>
+            <div class="services-list" id="services-list"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Approvals ── -->
+    <section class="view" id="view-approvals">
+      <div id="approvals"><div class="empty">Nothing needs your approval right now.</div></div>
+    </section>
+
+    <!-- ── Activity ── -->
+    <section class="view" id="view-activity">
+      <div class="card">
+        <div class="card-header">Diagnoses &amp; fixes<span class="hspacer"></span><button class="btn small" id="clear-activity">Clear</button></div>
+        <div id="activity-list"><div class="empty">No activity yet</div></div>
+      </div>
+    </section>
+
+    <!-- ── App Updates ── -->
+    <section class="view" id="view-updates">
+      <div class="card">
+        <div class="card-header">
+          App Updates <span id="updater-state" style="text-transform:none;letter-spacing:0"></span>
+          <span class="hspacer"></span>
+          <button class="btn small primary" id="upd-now">⬆ Update now</button>
+          <button class="btn small" id="clear-updates">Clear</button>
+        </div>
+        <div id="updater-meta" class="upd-summary" style="display:none"></div>
+        <div id="updater-apps"><div class="empty">Enable auto-updates in Settings, or click “Update now”.</div></div>
+        <div id="updater-notes"></div>
+        <div id="updater-history-wrap" style="display:none">
+          <div class="upd-note" style="border-top:1px solid var(--border); margin-top:6px; padding-top:8px;">Recent attempts</div>
+          <div id="updater-history"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Learned ── -->
+    <section class="view" id="view-learned">
+      <div class="card">
+        <div class="card-header">What Eir has learned about this machine</div>
+        <div id="learned-list"><div class="empty">Nothing learned yet — Eir records patterns (like apps that update themselves) as it works.</div></div>
+      </div>
+    </section>
+
+    <!-- ── Settings ── -->
+    <section class="view" id="view-settings">
+
+      <div class="card">
+        <div class="card-header">Windows startup</div>
+        <div class="set-section-desc">Launch Eir automatically when you sign in. Startup launches stay hidden in the tray; manual launches open this window.</div>
+        <div class="set-grid">
+          <label for="set-autostart">Start with Windows</label>
+          <input id="set-autostart" type="checkbox">
+        </div>
+        <div class="set-actions">
+          <button class="btn" id="set-autostart-save">Save startup setting</button>
+          <span class="set-status" id="set-autostart-status"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">AI provider &amp; monitoring</div>
+        <div class="set-section-desc">Which AI model Eir uses to diagnose problems, plus how often it polls Windows for signals. Saving these restarts the service (~15&nbsp;s).</div>
+        <div class="set-grid">
+          <label for="set-provider">AI provider</label>
+          <select id="set-provider">
+            <option value="openrouter">OpenRouter (free models available)</option>
+            <option value="anthropic">Claude — Anthropic API</option>
+            <option value="kilocode">Kilo Code gateway</option>
+          </select>
+          <span class="set-hint" id="provider-hint"></span>
+          <label for="set-model">Model</label>
+          <input id="set-model" type="text" placeholder="openrouter/free (auto-routes to a free model)">
+          <label for="set-effort">Reasoning effort</label>
+          <select id="set-effort">
+            <option value="">Provider default</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+            <option value="xhigh">XHigh</option>
+            <option value="max">Max</option>
+          </select>
+          <label for="set-upd-model">App-update model</label>
+          <input id="set-upd-model" type="text" placeholder="blank = a cheap default with web search where supported">
+          <label for="set-or-key">OpenRouter key</label>
+          <input id="set-or-key" type="password" autocomplete="off">
+          <label for="set-an-key">Anthropic key</label>
+          <input id="set-an-key" type="password" autocomplete="off">
+          <label for="set-kilo-key">Kilo Code key</label>
+          <input id="set-kilo-key" type="password" autocomplete="off">
+          <label for="set-conf">Auto-fix confidence (%)</label>
+          <input id="set-conf" type="number" min="50" max="95" step="5" placeholder="80">
+          <label for="set-decint">Decision interval (s)</label>
+          <input id="set-decint" type="number" min="10">
+          <label for="set-elpoll">Event-log poll (s)</label>
+          <input id="set-elpoll" type="number" min="5">
+          <label for="set-wmipoll">System poll (s)</label>
+          <input id="set-wmipoll" type="number" min="30">
+          <label for="set-channels">Event-log channels</label>
+          <input id="set-channels" type="text" placeholder="System, Application, Security">
+          <label for="set-dirs">Extra log directories</label>
+          <input id="set-dirs" type="text" placeholder="C:\Logs, D:\App\Logs">
+        </div>
+        <div class="set-note">Eir reacts to errors the moment they land (debounced ~10&nbsp;s); the decision interval is just the background sweep.</div>
+        <div class="set-actions">
+          <button class="btn primary" id="set-save">Save &amp; restart service</button>
+          <span class="set-status" id="set-status"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">Advisor mode</div>
+        <div class="set-section-desc">When the agent is unsure, it re-analyses the problem once at a stronger model or higher effort, then acts on the better answer. Off by default; applies live.</div>
+        <div class="set-grid">
+          <label for="set-adv-enabled">Enable advisor mode</label>
+          <input id="set-adv-enabled" type="checkbox">
+          <label for="set-adv-model">Escalation model</label>
+          <input id="set-adv-model" type="text" placeholder="e.g. claude-opus-4-8, or a stronger model id (blank = keep base)">
+          <label for="set-adv-effort">Escalation effort</label>
+          <select id="set-adv-effort">
+            <option value="">Keep base</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+            <option value="xhigh">XHigh</option>
+            <option value="max">Max</option>
+          </select>
+          <label for="set-adv-conf">Escalate below confidence (%)</label>
+          <input id="set-adv-conf" type="number" min="0" max="95" step="5" placeholder="60">
+          <label for="set-adv-budget">Daily escalation budget (USD)</label>
+          <input id="set-adv-budget" type="number" min="0" step="0.1" placeholder="0.50">
+        </div>
+        <div class="set-note">The daily budget caps spend where cost is reported or estimated (OpenRouter, Anthropic). Where no cost is available, escalations are capped at <code>24/day</code> instead.</div>
+        <div class="set-actions">
+          <button class="btn" id="set-adv-save">Save advisor settings</button>
+          <span class="set-status" id="set-adv-status"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">App updates</div>
+        <div class="set-section-desc">Eir updates your apps unattended — no UAC prompts — through the methods you allow below. Applies live.</div>
+        <div class="set-grid">
+          <label for="set-upd-enabled">Auto-update apps</label>
+          <input id="set-upd-enabled" type="checkbox">
+          <label for="set-upd-interval">Check interval (hours)</label>
+          <input id="set-upd-interval" type="number" min="1" placeholder="24">
+          <label>Update via</label>
+          <div class="methods-row" id="set-methods">
+            <label><input type="checkbox" id="m-winget"> winget</label>
+            <label><input type="checkbox" id="m-choco"> Chocolatey</label>
+            <label><input type="checkbox" id="m-scoop"> Scoop</label>
+            <label><input type="checkbox" id="m-msstore"> Store</label>
+          </div>
+          <label for="set-native-enabled">AI-found installers</label>
+          <input id="set-native-enabled" type="checkbox">
+          <label for="set-sigpol">AI-installer signature</label>
+          <select id="set-sigpol">
+            <option value="require_publisher_match">Strictest — valid signature + matching publisher</option>
+            <option value="require_valid">Require a valid signature (default)</option>
+            <option value="allow_unsigned">Allow unsigned — least safe</option>
+          </select>
+        </div>
+        <div class="set-note">Strictest → least-safe. This gates only <em>AI-found installers</em>; winget/Chocolatey/Store packages are trusted by their source. “Publisher match” needs a valid signature first, so unsigned installers (e.g. AutoHotkey and some open-source tools) are blocked under both signature options — update those via Chocolatey instead, or choose “Allow unsigned” (not recommended for unattended installs).</div>
+        <div class="set-actions">
+          <button class="btn" id="set-upd-save">Save updater settings</button>
+          <span class="set-status" id="set-upd-status"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── About ── -->
+    <section class="view" id="view-about">
+      <div class="card">
+        <div class="about-hero">
+          <div class="about-logo">E</div>
+          <div>
+            <div class="about-name">Eir</div>
+            <div class="about-ver" id="about-version">Version —</div>
+          </div>
+        </div>
+        <div class="about-body">
+          Eir is an autonomous Windows system guardian. A LocalSystem service watches the
+          event log, application logs, services and security posture; an AI model diagnoses
+          problems the moment they appear; reversible whitelisted fixes run automatically and
+          anything disruptive waits here for your approval. It also keeps your installed apps
+          up to date unattended, and learns this machine's quirks as it goes.
+        </div>
+        <div class="about-actions">
+          <button class="btn" id="about-updates">Check for updates</button>
+          <button class="btn" id="about-github">GitHub</button>
+          <span class="set-status" id="about-status"></span>
+        </div>
+        <div class="about-body" style="padding-top:0">Named for the Norse goddess of healing. © Swatto — MIT licence.</div>
+      </div>
+    </section>
+
+  </main>
 </div>
 
 <script src="main.js"></script>

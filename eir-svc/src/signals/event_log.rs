@@ -11,6 +11,9 @@ use windows::Win32::System::EventLog::{
 };
 
 const RING_SIZE: usize = 20;
+/// Cap on the accumulate-until-drained buffer (multiple polls can land between
+/// decision cycles); oldest entries are dropped first.
+const BUFFER_CAP: usize = 100;
 
 // READ_EVENT_LOG_READ_FLAGS values
 const SEQUENTIAL_BACKWARDS: READ_EVENT_LOG_READ_FLAGS = READ_EVENT_LOG_READ_FLAGS(0x0008 | 0x0001);
@@ -137,7 +140,11 @@ fn read_channel_since(channel: &str, last_record: u32) -> (Vec<EventLogEntry>, u
     (entries, new_max_record)
 }
 
-pub fn spawn(channels: Vec<String>, poll_interval_secs: u64) -> (SharedEntries, watch::Sender<()>) {
+pub fn spawn(
+    channels: Vec<String>,
+    poll_interval_secs: u64,
+    trigger: super::TriggerTx,
+) -> (SharedEntries, watch::Sender<()>) {
     let shared: SharedEntries = Arc::new(Mutex::new(VecDeque::new()));
     let shared_clone = shared.clone();
     let (shutdown_tx, mut shutdown_rx) = watch::channel(());
@@ -176,8 +183,25 @@ pub fn spawn(channels: Vec<String>, poll_interval_secs: u64) -> (SharedEntries, 
 
                     cursors = updated_cursors;
                     let count = new_entries.len();
+                    // A fresh Error wakes the decision loop immediately.
+                    // Warnings deliberately don't trigger (Windows emits them
+                    // near-continuously — the scheduled sweep still sees them);
+                    // reacting to each would burn AI calls on noise.
+                    let actionable = new_entries.iter().any(|e| e.level == "Error");
                     if let Ok(mut guard) = shared_clone.lock() {
-                        *guard = new_entries;
+                        // Accumulate into a rolling buffer the decision loop
+                        // DRAINS (one-shot delivery). Replacing wholesale would
+                        // let a quieter follow-up poll wipe entries before the
+                        // (debounced) reactive cycle ever reads them.
+                        for e in new_entries {
+                            if guard.len() >= BUFFER_CAP {
+                                guard.pop_front();
+                            }
+                            guard.push_back(e);
+                        }
+                    }
+                    if actionable {
+                        let _ = trigger.try_send(());
                     }
                     info!(entries = count, "Event log polled");
                 }
@@ -189,9 +213,11 @@ pub fn spawn(channels: Vec<String>, poll_interval_secs: u64) -> (SharedEntries, 
     (shared, shutdown_tx)
 }
 
-pub fn snapshot(shared: &SharedEntries) -> Vec<EventLogEntry> {
+/// Take (and clear) everything collected since the last drain — each entry is
+/// delivered to the decision loop exactly once, like the file-watch buffer.
+pub fn drain(shared: &SharedEntries) -> Vec<EventLogEntry> {
     shared
         .lock()
-        .map(|g| g.iter().cloned().collect())
+        .map(|mut g| g.drain(..).collect())
         .unwrap_or_default()
 }

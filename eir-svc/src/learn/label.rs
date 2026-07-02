@@ -45,7 +45,9 @@ pub async fn label_one(pool: &SqlitePool, ai: &AiClient, model: &str) -> bool {
          Learned-fact kind: {kind}\nSubject: {subject}\nEvidence: {evidence}"
     );
 
-    let content = match ai.complete(&prompt, model).await {
+    // Text-only completion — the labeller never needs (and shouldn't pay for)
+    // web search.
+    let content = match ai.complete_text(&prompt, model).await {
         Ok((c, _usage)) => c,
         Err(e) => {
             warn!("self-improvement: AI labelling failed: {e}");

@@ -263,10 +263,10 @@ fn build_status(st: &SvcState) -> StatusPayload {
     }
 }
 
-/// Hard backstop on escalations per UTC day. The USD budget can only bound providers
-/// that report cost (OpenRouter, and the Claude CLI when it does); for the Anthropic
-/// native and OpenAI-compatible providers — which return no usage — this count is the
-/// only ceiling. Always applied so the cap holds regardless of provider.
+/// Hard backstop on escalations per UTC day. The USD budget bounds providers
+/// that report or estimate cost (OpenRouter's usage chunk, Anthropic's estimated
+/// pricing); Kilo Code may report tokens without cost, so this count is the
+/// floor guarantee. Always applied so the cap holds regardless of provider.
 const MAX_ESCALATIONS_PER_DAY: u32 = 24;
 
 /// Decide whether the advisor should re-analyse at a higher tier, and why. Pure.
@@ -471,7 +471,7 @@ fn actionable_fingerprint(snap: &SignalSnapshot) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for fc in &snap.file_changes {
         if let Some(le) = &fc.log_event {
-            if le.severity != "INFO" || !le.error_snippets.is_empty() {
+            if le.is_actionable() {
                 parts.push(format!(
                     "F|{}|{}|{}",
                     le.log_path,
@@ -482,14 +482,14 @@ fn actionable_fingerprint(snap: &SignalSnapshot) -> Option<String> {
         }
     }
     for e in &snap.event_log {
-        if e.level == "Error" || e.level == "Warning" {
+        if e.is_actionable() {
             parts.push(format!("E|{}|{}|{}", e.level, e.source, e.event_id));
         }
     }
     let sys = &snap.system_state;
-    for s in &sys.failed_services {
-        parts.push(format!("S|{s}"));
-    }
+    // Faults (failed services, firewall off, Defender faults) share their
+    // definition with the WMI reactive trigger — see SystemState::fault_parts.
+    parts.extend(sys.fault_parts());
     if sys.cpu_usage_percent > 90.0 {
         parts.push("CPU>90".into());
     }
@@ -498,29 +498,6 @@ fn actionable_fingerprint(snap: &SignalSnapshot) -> Option<String> {
     }
     if sys.disk_usage_percent > 90.0 {
         parts.push("DISK>90".into());
-    }
-    // Security posture — a concrete, fixable exposure makes the cycle actionable.
-    // Only Some(false)/stale counts; unknown (None) and healthy (true) do not, so a
-    // secure machine stays idle and doesn't burn AI calls.
-    let sec = &sys.security;
-    for (name, on) in [
-        ("domain", sec.firewall.domain),
-        ("private", sec.firewall.private),
-        ("public", sec.firewall.public),
-    ] {
-        if on == Some(false) {
-            parts.push(format!("FW|{name}"));
-        }
-    }
-    // Defender faults only matter when Defender is the active AV — if a third-party
-    // AV has taken over (antivirus_enabled == false) its passive state is normal.
-    if sec.defender.antivirus_enabled != Some(false) {
-        if sec.defender.realtime_enabled == Some(false) {
-            parts.push("DEF|realtime_off".into());
-        }
-        if sec.defender.signature_age_days.is_some_and(|d| d > 3) {
-            parts.push("DEF|sig_stale".into());
-        }
     }
     if parts.is_empty() {
         return None;
@@ -660,9 +637,15 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         }
     };
 
+    // Reactive-guardian trigger: collectors ping this the moment they capture
+    // something actionable, so fixes start within seconds of an error landing
+    // instead of on the next scheduled tick. Capacity 1 + try_send coalesces
+    // bursts.
+    let (trigger_tx, mut trigger_rx) = tokio::sync::mpsc::channel::<()>(1);
     let (event_log_shared, _el_shutdown) = signals::event_log::spawn(
         cfg.monitoring.event_log_channels.clone(),
         cfg.monitoring.event_log_poll_interval_secs,
+        trigger_tx.clone(),
     );
     let extra_log_dirs = cfg.monitoring.log_directories.clone();
     let initial_watch_dirs = tokio::task::spawn_blocking(move || {
@@ -676,8 +659,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     );
     let mut known_watch_dirs: HashSet<PathBuf> = initial_watch_dirs.iter().cloned().collect();
     let (file_watch_shared, _fw_shutdown, dir_update_tx) =
-        signals::file_watch::spawn(initial_watch_dirs);
-    let (wmi_shared, _wmi_shutdown) = signals::wmi::spawn(cfg.monitoring.wmi_poll_interval_secs);
+        signals::file_watch::spawn(initial_watch_dirs, trigger_tx.clone());
+    let (wmi_shared, _wmi_shutdown) =
+        signals::wmi::spawn(cfg.monitoring.wmi_poll_interval_secs, trigger_tx);
 
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -722,6 +706,16 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     let (exec_done_tx, mut exec_done_rx) = tokio::sync::mpsc::unbounded_channel::<ExecOutcome>();
     spawn_executor(&db, exec_rx, exec_done_tx);
     let mut cycle_count = 0u64;
+    // Reactive-trigger pacing: a trigger *schedules* a reaction (react_at)
+    // rather than running one inline — the debounce lets an error burst
+    // coalesce into one analysis, the min-gap keeps reactions at most once a
+    // minute, and because it's a deadline (not a sleep inside the select arm)
+    // UI commands and executor outcomes stay responsive throughout, and a
+    // trigger landing inside the gap is deferred, never dropped.
+    const REACTIVE_DEBOUNCE: Duration = Duration::from_secs(10);
+    const REACTIVE_MIN_GAP: Duration = Duration::from_secs(60);
+    let mut last_cycle_at = tokio::time::Instant::now();
+    let mut react_at: Option<tokio::time::Instant> = None;
     // Last analysed actionable-signal fingerprint; identical states are skipped.
     let mut last_fingerprint: Option<String> = None;
     // When we last ran an analysis. None = never (forces a baseline run). Even on
@@ -737,8 +731,30 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                 // Wait for either the next decision tick or a UI command. Commands
                 // are handled as they arrive — not once per decision interval — so
                 // Pause and settings changes respond promptly.
+                // (Evaluated even when react_at is None; the branch below is
+                // disabled by its precondition in that case.)
+                let react_deadline = react_at
+                    .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
                 tokio::select! {
                     _ = ticker.tick() => {}
+                    Some(()) = trigger_rx.recv() => {
+                        // A collector saw something actionable — schedule a
+                        // reaction after the debounce, but no sooner than the
+                        // min-gap since the last cycle. See the pacing note at
+                        // the react_at declaration.
+                        if react_at.is_none() {
+                            let due = tokio::time::Instant::now() + REACTIVE_DEBOUNCE;
+                            react_at = Some(due.max(last_cycle_at + REACTIVE_MIN_GAP));
+                        }
+                        continue;
+                    }
+                    _ = tokio::time::sleep_until(react_deadline), if react_at.is_some() => {
+                        // Coalesce any pings that arrived while waiting. The
+                        // decision body below clears react_at.
+                        while trigger_rx.try_recv().is_ok() {}
+                        info!("Reacting to fresh actionable signals");
+                        // fall through to the decision body below
+                    }
                     Some(summary) = update_done_rx.recv() => {
                         // An update cycle finished — fold its result into the status.
                         st.updater_running = false;
@@ -1000,6 +1016,10 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                     }
                 }
                 cycle_count += 1;
+                last_cycle_at = tokio::time::Instant::now();
+                // A scheduled tick covers any pending reaction — cancel it so the
+                // same signals aren't analysed twice back-to-back.
+                react_at = None;
 
                 // Re-discover log directories every 20 cycles
                 if cycle_count.is_multiple_of(20) {
@@ -1054,7 +1074,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
 
                 let snapshot = SignalSnapshot {
                     timestamp:        chrono::Utc::now(),
-                    event_log:        signals::event_log::snapshot(&event_log_shared),
+                    event_log:        signals::event_log::drain(&event_log_shared),
                     file_changes:     signals::file_watch::drain(&file_watch_shared),
                     system_state:     signals::wmi::current(&wmi_shared),
                     decision_history: history.clone(),

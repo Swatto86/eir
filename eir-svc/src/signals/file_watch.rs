@@ -136,7 +136,10 @@ fn has_recent_log_files(dir: &Path, cutoff: SystemTime, max_depth: usize) -> boo
 ///
 /// Returns a `ShutdownHandle` — dropping it signals the thread to exit — and a
 /// `DirUpdateSender` for adding new directories at runtime.
-pub fn spawn(directories: Vec<PathBuf>) -> (SharedChanges, ShutdownHandle, DirUpdateSender) {
+pub fn spawn(
+    directories: Vec<PathBuf>,
+    trigger: super::TriggerTx,
+) -> (SharedChanges, ShutdownHandle, DirUpdateSender) {
     let shared: SharedChanges = Arc::new(Mutex::new(VecDeque::new()));
     let shared_clone = shared.clone();
     // SyncSender with cap 0: never blocks on send; drops when caller drops the handle,
@@ -200,6 +203,9 @@ pub fn spawn(directories: Vec<PathBuf>) -> (SharedChanges, ShutdownHandle, DirUp
                     for path in event.paths {
                         let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                         let log_event = try_parse_log(&path, size_bytes);
+                        // Error-bearing log writes are actionable — wake the
+                        // decision loop (try_send is fine off the runtime).
+                        let actionable = log_event.as_ref().is_some_and(|le| le.is_actionable());
                         let change = FileChange {
                             path,
                             kind: kind.to_string(),
@@ -212,6 +218,9 @@ pub fn spawn(directories: Vec<PathBuf>) -> (SharedChanges, ShutdownHandle, DirUp
                                 guard.pop_front();
                             }
                             guard.push_back(change);
+                        }
+                        if actionable {
+                            let _ = trigger.try_send(());
                         }
                     }
                 }

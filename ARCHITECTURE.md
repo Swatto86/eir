@@ -7,12 +7,13 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-06-26 · **Release:** v0.16.0
+**Last updated:** 2026-07-02 · **Release:** v0.17.0
 
-Eir is an autonomous Windows system-repair agent: it watches a machine's health,
-uses an AI model to diagnose problems, and applies least-destructive fixes —
-auto-running reversible whitelisted repairs and queuing anything disruptive for
-approval. It also keeps installed apps up to date unattended.
+Eir is an autonomous Windows system guardian: it watches a machine's health,
+uses an AI model to diagnose problems **as they happen** (event-driven, not just
+polled), and applies least-destructive fixes — auto-running reversible
+whitelisted repairs and queuing anything disruptive for approval. It also keeps
+installed apps up to date unattended.
 
 ## Overview
 
@@ -30,15 +31,21 @@ wire contract (newline-delimited JSON) over the secured local named pipe
 `\\.\pipe\EirSvc`. Layering points inward: `eir-proto` (pure contract types) ←
 `eir-svc` / `eir-ui` (each depends only on `eir-proto`).
 
-**The decision cycle** (default every 10 min, `decision_interval_secs`): collect
-signals → compute an *actionable fingerprint* and only call the AI when something
-actionable changed (plus a periodic heartbeat) → AI returns structured problems each
-with a confidence and a proposed `FixAction` → policy gates each (auto-execute /
-require-approval / block) → reversible whitelisted fixes at/above the confidence
-threshold run on an **off-loop executor worker**; disruptive/irreversible ones queue
-for approval. Every decision, execution, approval, and update attempt is persisted to
-the audit DB — which is the substrate the self-improvement layer learns from (Phase 1
-shipped; see [Self-improvement](#self-improvement-machine-pattern-learning)).
+**The decision cycle** runs on two triggers: a scheduled sweep (default every
+10 min, `decision_interval_secs`) and a **reactive path** — each signal collector
+pings a capacity-1 trigger channel the moment it captures something actionable
+(an Error event-log entry, an error-bearing log write, a new failed service or
+security fault), and the loop *schedules* a reaction ~10 s later (debounce, so a
+burst coalesces into one analysis) with a 60 s minimum gap between reactions.
+The cycle itself: collect signals → compute an *actionable fingerprint* and only
+call the AI when something actionable changed (plus a periodic heartbeat) → AI
+returns structured problems each with a confidence and a proposed `FixAction` →
+policy gates each (auto-execute / require-approval / block) → reversible
+whitelisted fixes at/above the confidence threshold run on an **off-loop
+executor worker**; disruptive/irreversible ones queue for approval. Every
+decision, execution, approval, and update attempt is persisted to the audit DB —
+which is the substrate the self-improvement layer learns from (see
+[Self-improvement](#self-improvement-machine-pattern-learning)).
 
 ## Table of contents
 
@@ -183,11 +190,11 @@ Supporting types:
 - **`UpdaterStatus`** (`lib.rs:92-114`): `enabled`, `running`, `phase`, `last_run`/`next_run` (unix secs), `last_cost_usd`, `notes: Vec<String>`, `apps: Vec<UpdaterAppRow>`, `recent: Vec<UpdateAttemptRow>`, `settings: UpdaterSettingsView`. `UpdaterAppRow` carries per-app `state` ("verified"|"installed"|"failed"|"skipped"), `method`, `signature`; `UpdateAttemptRow` is history.
 - **`LearnedFactView`** (`lib.rs:42-60`): `id`, `summary`, `detail`, `status`, `source` for the UI's "What Eir has learned" card.
 - **`AdvisorStatus`** (`lib.rs:64-77`): `enabled`, `escalated`, `escalation_model`, `reason`, `spent_today_usd`, `settings: AdvisorSettingsView`.
-- **`UiSettings`** / **`UsageSummary`** plus the `*Update` mirrors (`SettingsUpdate`, `UpdaterSettingsUpdate`, `AdvisorSettingsUpdate`) that flow back as `UiMsg` payloads.
+- **`UiSettings`** / **`UsageSummary`** plus the `*Update` mirrors (`SettingsUpdate`, `UpdaterSettingsUpdate`, `AdvisorSettingsUpdate`) that flow back as `UiMsg` payloads. As of v0.17 the provider settings carry `openrouter`/`anthropic`/`kilocode` key flags and secrets; the removed OpenAI-compatible provider's `base_url`/`api_key_set` remain on `UiSettings` as always-empty **deprecated wire fields** so a not-yet-updated v0.16 tray app (which requires them) can still decode the payload during an update's skew window.
 
 **Backward-compat invariant**: every field added after the original protocol is annotated `#[serde(default)]` (e.g. `pending_approvals`, `updater`, `advisor`, `learned_facts`, `effort`, the deterministic `ApprovalInfo` fields, all `at` timestamps). This lets an older service or UI decode a newer payload without error — a deliberate forward/backward-compatibility design across version skew.
 
-**Secret-handling invariant**: `UiSettings` never carries secret values, only booleans (`openrouter_key_set`, `anthropic_key_set`, `api_key_set`) so the UI shows "configured" without exposing keys (`lib.rs:163-189`). Inbound `SettingsUpdate` uses `Option<String>` for secrets where `None` = "unchanged" and a non-empty value replaces the stored secret (`lib.rs:191-211`); the JS sends `null` to preserve (`main.js:552-554`).
+**Secret-handling invariant**: `UiSettings` never carries secret values, only booleans (`openrouter_key_set`, `anthropic_key_set`, `kilocode_key_set`) so the UI shows "configured" without exposing keys. Inbound `SettingsUpdate` uses `Option<String>` for secrets where `None` = "unchanged" and a non-empty value replaces the stored secret; the JS sends `null` to preserve.
 
 ### Named-pipe security / ACL model (`pipe_server.rs:16-48`)
 
@@ -234,6 +241,7 @@ Commands (`main.rs:28-112`, plus `util.rs`):
 - `set_app_ignore { id, ignore, note }` → `SetAppIgnore`.
 - `set_advisor_settings(AdvisorSettingsUpdate)` → `SetAdvisorSettings`.
 - `get_autostart_enabled` / `set_autostart_enabled { enabled }` — UI-local commands backed by `tauri-plugin-autostart`; they never cross the service pipe.
+- `get_app_version` (About view; reads the package version from the build) and `check_updates_now` (About view's on-demand update check — installs and relaunches when a newer signed release exists; guarded by a shared `UPDATE_IN_PROGRESS` AtomicBool so it can't race the 6-hourly background checker into two concurrent installers) — UI-local.
 - `util::gbp_per_usd` (USD→GBP rate via a hidden PowerShell `Invoke-RestMethod`, with a `0.79` offline fallback) and `util::open_url` (validates `http(s)://` then `Start-Process`) — UI-local helpers, not pipe traffic (`util.rs`).
 
 Every service-facing command is `async`, sends one `UiMsg` on `UiCmdTx`, and maps a send error to `Err(String)`. Those commands are **fire-and-forget**: success means "queued to the pipe writer," not "applied by the service." The UI observes the effect only on the next polled snapshot. `get_status`, the autostart commands, and `util::*` are UI-local and do not use the pipe.
@@ -247,14 +255,19 @@ Every service-facing command is `async`, sends one `UiMsg` on `UiCmdTx`, and map
 - **Close-to-tray**: `WindowEvent::CloseRequested` hides the window and `prevent_close()`s; the service keeps running; Quit fully exits (`main.rs:327-334`). The JS also redundantly intercepts `onCloseRequested` (`main.js:54-57`).
 - Self-update: `tauri-plugin-updater` checks 15s after launch then every 6h, and on a newer signed release downloads/installs (NSIS, which elevates and updates the service too) and relaunches (`main.rs:203-232`).
 
-### Polling & rendering (`ui/index.html`, `ui/main.js`)
+### Layout, theming & rendering (`ui/index.html`, `ui/main.js`)
 
-- **Poll cadence**: `refresh()` calls `get_status` and re-renders, on `setInterval(..., 2000)` — a 2s poll of the *local cache* (no pipe round-trip per poll). `gbp_per_usd` is fetched once at load (`main.js:636-640`).
-- `refresh()` (`main.js:202-264`) maps `status.status` to a header dot colour (`STATUS_COLORS`), renders the metric bars (colour-coded by threshold in `barColor`), failed-services chips, the model labels (`analysisLabel`/`updateCheckLabel`), then delegates to `renderApprovals`, `renderAiNow`, `renderActivity`, `renderUsage`, `renderUpdater`.
-- **XSS hygiene**: all service-supplied strings go through `esc()` / `escAttr()` before insertion into `innerHTML` (`main.js:155-163`); applied consistently across approvals, activity, updater rows, and service chips.
-- **Activity feed** merges `recent_problems` + `recent_executions` into one list sorted by `at` descending, with emoji/tag per kind (`activityItems`, `main.js:301-329`).
-- **Settings** are a modal populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. Independent save buttons map to `set_autostart_enabled` (applies immediately, no service pipe), `update_settings` (warns it restarts the service ~15s), `set_updater_settings`, and `set_advisor_settings` (both apply live). Inputs are converted (e.g. confidence % → 0–1 float, hours → seconds) before sending (`main.js`).
-- Collapsed-card state is persisted in `localStorage` (`main.js:606-633`).
+The frontend was fully rebuilt in v0.17 (still hand-written vanilla HTML/CSS/JS, committed, no build step):
+
+- **Sidebar navigation** replaces the single card stack: Dashboard, Approvals (with a pending-count badge), Activity, App Updates, Learned, Settings, About — each a `.view` section toggled client-side. The sidebar footer holds the theme cycler and Pause/Resume.
+- **Dashboard** shows a status hero (colour-keyed to the service state, with a plain-English headline from `STATUS_META` and the error line), CPU/memory/disk gauge cards, a pending-approvals call-to-action, "What the agent is thinking" (analysis + advisor badges), AI usage, and failed-services chips.
+- **Theming**: dark / light / **system** (follows `prefers-color-scheme` live), persisted in `localStorage`, applied via `data-theme` on `<html>` with CSS-variable palettes.
+- **Native feel**: the webview context menu is suppressed globally (`contextmenu` → `preventDefault`), chrome is `user-select: none` with content opted back in, and there are no native browser dialogs.
+- **About view**: version from `get_app_version`, GitHub link via `util::open_url`, and an on-demand `check_updates_now`.
+- **Poll cadence**: `refresh()` calls `get_status` and re-renders on `setInterval(..., 2000)` — a 2s poll of the *local cache* (no pipe round-trip per poll). `gbp_per_usd` is fetched once at load.
+- **XSS hygiene**: all service-supplied strings go through `esc()` / `escAttr()` before insertion into `innerHTML`; applied consistently across approvals, activity, updater rows, and service chips.
+- **Activity feed** merges `recent_problems` + `recent_executions` into one list sorted by `at` descending, with emoji/tag per kind (`activityItems`).
+- **Settings** is a full view (no modal) populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. The provider select offers OpenRouter / Claude (Anthropic) / Kilo Code with per-provider hints and key fields; JS pre-validates the provider's key+model requirements before sending (the service's `AiClient::new` remains the authoritative validator). Independent save buttons map to `set_autostart_enabled` (applies immediately), `update_settings` (warns it restarts the service ~15s), `set_updater_settings`, and `set_advisor_settings` (both apply live).
 
 ### Clear / Approve / Ignore / Update-now flows
 
@@ -304,14 +317,15 @@ Not shared/locked — it lives on the loop task and is mutated inline; the UI se
 
 ### The `tokio::select!` decision loop (lines 729-1378)
 
-The outer `tokio::select!` races the main loop future against the `shutdown` future (1375-1377 logs and exits). Inside the `loop {}`, an inner `tokio::select!` (735-974) multiplexes six sources; the first five `continue` immediately so commands/outcomes are serviced without waiting for a decision tick:
+The outer `tokio::select!` races the main loop future against the `shutdown` future. Inside the `loop {}`, an inner `tokio::select!` multiplexes the sources; command/outcome arms `continue` immediately so they are serviced without waiting for a decision tick:
 
 1. `ticker.tick()` — falls through to the decision body below.
-2. `update_done_rx` (737-757) — an update cycle finished: clears `updater_running`/`updater.running`, records `last_run`/`last_cost_usd`/`notes`/`apps`, sets `phase="idle"`, refreshes history, recomputes `next_run`.
-3. `update_progress_rx` (758-767) — coarse live phase label; **guarded on `updater_running`** so a straggling message can't overwrite the `idle` a just-finished cycle set.
-4. `exec_done_rx` (768-786) — a fix finished on the worker: removes label from `in_flight`, pushes an execution + a `auto_executed=true` problem entry, settles `resting_status`. Explicitly **does not touch `st.error`** so an execution outcome can't wipe an unrelated AI/connection error.
-5. `ui_rx` (787-973) — UI commands (see below).
-6. (no match / tick) — proceeds to the per-cycle body.
+2. `trigger_rx` — a collector saw something actionable. The arm only *schedules* a reaction: `react_at = now + REACTIVE_DEBOUNCE (10s)`, floored to `last_cycle_at + REACTIVE_MIN_GAP (60s)`, then `continue`s. Scheduling a deadline (instead of sleeping inline) keeps every other arm responsive during the debounce, and a trigger landing inside the min-gap is **deferred, never dropped**.
+3. `sleep_until(react_at)` (enabled only while a reaction is scheduled) — drains any coalesced pings and falls through to the decision body, exactly like a tick. The body clears `react_at` (a scheduled tick that fires first also cancels the pending reaction so the same signals aren't analysed twice).
+4. `update_done_rx` — an update cycle finished: clears `updater_running`/`updater.running`, records `last_run`/`last_cost_usd`/`notes`/`apps`, sets `phase="idle"`, refreshes history, recomputes `next_run`.
+5. `update_progress_rx` — coarse live phase label; **guarded on `updater_running`** so a straggling message can't overwrite the `idle` a just-finished cycle set.
+6. `exec_done_rx` — a fix finished on the worker: removes label from `in_flight`, pushes an execution + a `auto_executed=true` problem entry, settles `resting_status`. Explicitly **does not touch `st.error`** so an execution outcome can't wipe an unrelated AI/connection error.
+7. `ui_rx` — UI commands (see below).
 
 #### Per-cycle body (after a tick, lines 975-1372)
 
@@ -381,7 +395,8 @@ Eir's signal layer is three independent background collectors that each maintain
 - **Collects:** Error/Warning/Information records from configured channels (default `["System", "Application"]`, `config.rs:282`) via the legacy Win32 EventLog API (`OpenEventLogW`/`ReadEventLogW` reading `SEQUENTIAL_BACKWARDS` = newest-first, line 16).
 - **Cadence:** `event_log_poll_interval_secs`, default 45 (struct default `config.rs:280`; embedded sample uses 30; clamped to a 5 s floor on update, `config.rs:210`).
 - **Cursor logic:** per-channel `HashMap<String,u32>` of the highest `RecordNumber` delivered (lines 149, 160–164). First poll primes from 0; subsequent polls return only records with `RecordNumber > last` (lines 90–94). Newest-first read stops at the first already-seen record.
-- **Bounding:** `RING_SIZE = 20` (line 13) caps entries **per poll across all channels combined** (lines 167, 170, 127–130). On each tick the shared buffer is **replaced wholesale** with the new batch (`*guard = new_entries`, line 181) — so the event-log slice is "new events since last poll," not a rolling history.
+- **Bounding & delivery:** `RING_SIZE = 20` caps entries **per poll across all channels combined**. Each poll **appends** into a shared rolling buffer capped at `BUFFER_CAP = 100` (oldest dropped), and the decision loop **drains** it (`event_log::drain`) — one-shot delivery, like the file-watch buffer. Accumulate-and-drain (rather than the previous replace-wholesale) means a quiet follow-up poll can't wipe an Error before the debounced reactive cycle reads it.
+- **Reactive trigger:** a poll containing a fresh **Error**-level entry pings the decision-loop trigger channel. Warnings deliberately don't trigger (Windows emits them near-continuously; the scheduled sweep still analyses them) — reacting to each would burn AI calls on noise.
 - **Message extraction is intentionally shallow:** `message` is just `format!("EventID {}", id & 0xFFFF)` (line 120); full text would require loading provider DLLs ("sufficient for Phase 1"). `event_id` is masked to the low 16 bits (line 121). The blocking Win32 work runs in `spawn_blocking` (line 157).
 
 ### Source 2 — File / log watcher (`signals/file_watch.rs` + `signals/log_parser.rs`)
@@ -390,7 +405,8 @@ Eir's signal layer is three independent background collectors that each maintain
 - **Watching:** `notify` `RecommendedWatcher`, `RecursiveMode::Recursive`, on a dedicated OS thread (line 173). Reacts to `Create`/`Modify` only (lines 195–199). Shutdown is via dropping a `SyncSender(0)` handle (`TryRecv::Disconnected` → exit, lines 142–144, 177).
 - **Per-event parse:** for each changed path it reads `size_bytes` and calls `try_parse_log` (lines 200–209). `try_parse_log` (27–42) skips empty files and files `> MAX_READ_BYTES = 65_536` (line 11), requires one of `TEXT_EXTENSIONS` (log/txt/csv/json/xml/ini/cfg/conf/err/out/trace/debug/warn/error/info, lines 14–17), reads the whole file, and runs `log_parser::parse`. A result that is INFO with no error snippets is dropped to `None` (line 37) — only "interesting" log events attach to the `FileChange`.
 - **`log_parser::parse`** (`log_parser.rs:38–48): infers `program` from path shape (Program Files / ProgramData / Windows\Logs\<Subsystem> / AppData\(Local|Roaming|LocalLow), lines 64–125, falling back to parent dir name); `extract_errors` (129–171) walks lines, classifies against `ERROR_KEYWORDS`/`WARN_KEYWORDS` (lines 4–30), raises a severity ceiling (FATAL > ERROR > WARN > INFO), and collects up to 5 non-overlapping snippets (1 line before + 2 after, lines 161–167); `excerpt` caps raw content at `MAX_EXCERPT_CHARS = 2500` with a truncation marker (lines 35, 52–60).
-- **Bounding:** `RING_SIZE = 50` (line 10), a true rolling ring buffer (`pop_front` when full, lines 211–214). Unlike the event log, file changes are **drained** (`drain(..)`, lines 228–233), so each `FileChange` is delivered to the AI at most once.
+- **Bounding:** `RING_SIZE = 50`, a true rolling ring buffer (`pop_front` when full). File changes are **drained**, so each `FileChange` is delivered to the AI at most once.
+- **Reactive trigger:** a change whose parsed `LogEvent::is_actionable()` (severity ≠ INFO, or error snippets present — the shared predicate in `models.rs`) pings the decision-loop trigger channel from the watcher thread (`try_send`, never blocks).
 
 ### Source 3 — System state / WMI (`signals/wmi.rs`)
 
@@ -410,9 +426,10 @@ Eir's signal layer is three independent background collectors that each maintain
 
 ### Aggregation and the actionable fingerprint (`eir-svc/src/main.rs`)
 
-- **Wiring:** all three spawn at startup (`event_log::spawn` 658, `file_watch::spawn` 673 after `discover_watch_dirs`, `wmi::spawn` 675); a 5 s settle sleep follows before status flips to "Active" (677).
-- **Per cycle:** the decision loop builds the snapshot from `event_log::snapshot` (replace-semantics read), `file_watch::drain` (one-shot read), `wmi::current` (clone of latest), plus DB decision history (`main.rs:1028–1034`).
-- **`actionable_fingerprint` (lines 465–525)** decides whether a cycle is even worth an AI call and dedups unchanged states. It includes: file `log_event`s where severity ≠ INFO or snippets exist (`F|path|sev|count`); Error/Warning event-log entries (`E|level|source|id`); each `failed_service` (`S|name`); CPU/MEM/DISK `>90` flags; firewall profiles that are explicitly `Some(false)` (`FW|name`) — `None`/`true` are excluded so a secure box stays idle; and Defender faults (`DEF|realtime_off`, `DEF|sig_stale` for age `>3`) **only when `antivirus_enabled != Some(false)`** (a third-party AV having taken over makes Defender's passive state normal). Parts are sorted and joined; **empty → `None` → skip the Claude call.** Identical fingerprint across cycles means nothing changed, so it's skipped (`main.rs:1071–1116`).
+- **Wiring:** all three spawn at startup (`event_log::spawn`, `file_watch::spawn` after `discover_watch_dirs`, `wmi::spawn`), each holding a clone of the reactive `TriggerTx` (`signals/mod.rs` — capacity-1 tokio mpsc, `try_send` so a burst coalesces and a send never blocks); a 5 s settle sleep follows before status flips to "Active".
+- **WMI trigger:** each snapshot computes `fault_key` from the shared `SystemState::fault_parts()` (failed services, firewall explicitly off, Defender faults while Defender is the active AV) and pings the trigger only when the key **changed and is non-empty** — a persistent fault never re-triggers on every poll.
+- **Per cycle:** the decision loop builds the snapshot from `event_log::drain` and `file_watch::drain` (both one-shot reads), `wmi::current` (clone of latest), plus DB decision history.
+- **`actionable_fingerprint`** decides whether a cycle is even worth an AI call and dedups unchanged states. It is built from **shared predicates in `models.rs`** so the fingerprint and the reactive triggers can't drift: `LogEvent::is_actionable()` (`F|path|sev|count`), `EventLogEntry::is_actionable()` (`E|level|source|id`), and `SystemState::fault_parts()` (`S|name`, `FW|name` only when explicitly `Some(false)`, `DEF|realtime_off`/`DEF|sig_stale` for age `>3` only when Defender is the active AV), plus CPU/MEM/DISK `>90` flags. Parts are sorted and joined; **empty → `None` → skip the Claude call.** Identical fingerprint across cycles means nothing changed, so it's skipped.
 
 ## AI layer & prompts
 
@@ -420,22 +437,23 @@ The AI layer lives in `eir-svc/src/ai/` (`mod.rs` re-exports `client` and `promp
 
 ### Provider abstraction (`ai/client.rs`)
 
-`AiClient` (`ai/client.rs:115`) wraps a single `reqwest::Client` (300s timeout, set for slow free OpenRouter models, `client.rs:209-212`) plus an internal `enum AiClientConfig` (`client.rs:120-141`) with one variant per provider:
+`AiClient` (`ai/client.rs`) wraps a single `reqwest::Client` (300s timeout, set for slow free OpenRouter models), the normalised reasoning `effort` string, and an internal `enum AiClientConfig` with one variant per provider. As of v0.17 there are exactly **three native HTTP providers** (the Claude CLI subprocess and OpenAI-compatible proxy paths were removed; legacy `claude_cli`/`openai_compatible` config values alias to Anthropic on load and then need a key set in Settings):
 
-- **`Anthropic`** — native `/v1/messages`, streaming SSE, `x-api-key` + `anthropic-version: 2023-06-01`. Requires `anthropic_api_key` and a non-empty model or `new()` bails (`client.rs:146-158`).
-- **`OpenAiCompatible`** — a configured `base_url` (trailing slash trimmed) + bearer key (defaults to `"not-needed"`), `/chat/completions` streaming. Built for a local `claude-max-api-proxy` (`client.rs:159-170`).
-- **`OpenRouter`** — OpenAI-compatible against `https://openrouter.ai/api/v1`. Key comes from config or is auto-detected from `~/.openrouter/config.json` under any `C:\Users` profile (`resolve_openrouter_key`, `client.rs:781-797`); blank model defaults to `"openrouter/free"` (`client.rs:183-188`). Adds `HTTP-Referer`/`X-Title` attribution and requests a final usage chunk.
-- **`ClaudeCli`** — spawns the local `claude` binary (`--print --output-format json`, optional `--model`, optional `--effort`), no API key — it borrows a logged-in user session. `resolve_user_profile` (`client.rs:764-776`) uses the configured profile or scans `C:\Users\*\.claude\.credentials.json`; `resolve_claude_binary` (`client.rs:802-813`) tries the configured path, then `<profile>\.local\bin\claude.exe`, then PATH. When running as LocalSystem it injects `USERPROFILE`/`APPDATA`/etc. so the CLI finds the user's session (`client.rs:500-509`). `kill_on_drop(true)` reaps the ~245 MB process on timeout (`client.rs:496`, 300s wait at `client.rs:526-532`).
+- **`Anthropic`** — native `/v1/messages`, streaming SSE, `x-api-key` + `anthropic-version: 2023-06-01`. Requires `anthropic_api_key` and a non-empty model or `new()` bails. Sends `output_config.effort` when an effort is configured — except for Haiku models, which don't support the dial and would 400. Parses per-call usage from the stream (`message_start` input/cache tokens, `message_delta` output tokens) and **estimates** cost from a small list-price table (`anthropic_price_per_mtok` / `estimate_anthropic_cost` — prices drift; it's an estimate) so the usage card and advisor budget work on this provider.
+- **`OpenRouter`** — OpenAI-compatible streaming against `https://openrouter.ai/api/v1`. Key comes from config or is auto-detected from `~/.openrouter/config.json` under any `C:\Users` profile (`resolve_openrouter_key`); blank model defaults to `"openrouter/free"`. Adds `HTTP-Referer`/`X-Title` attribution and requests a final usage chunk (tokens + provider-reported cost). Effort maps to `reasoning.effort` (`xhigh`/`max` collapse to `high`).
+- **`KiloCode`** — the Kilo Code AI gateway, OpenAI-compatible streaming against `https://api.kilo.ai/api/gateway/chat/completions` with a Bearer key from app.kilo.ai. Requires `kilocode_api_key` and a model in `provider/model` format (e.g. `anthropic/claude-sonnet-4.6`). Same effort mapping as OpenRouter; usage is read from the final chunk when the gateway reports it (cost may be absent → 0).
 
-`AiClient::new` (`client.rs:144`) is the construction seam; it's rebuilt per update cycle from the live `ApiConfig` (`spawn_update_cycle`, `main.rs:313`).
+Both SSE readers share `SseLineBuf`, a byte-based line accumulator (unit-tested), so a multi-byte UTF-8 character split across network chunks can never drop data.
+
+`AiClient::new` is the construction seam; it's rebuilt per update cycle from the live `ApiConfig` (`spawn_update_cycle`).
 
 ### Analysis entry points & response parsing
 
-`analyze` (`client.rs:217`) delegates to `analyze_with` (`client.rs:232`) with no overrides. `analyze_with` is the single dispatch point:
-1. Builds the prompt via `prompt::build` (`client.rs:242`).
-2. Applies a `model_override` to **every** provider, and an `effort_override` to the **Claude CLI only** (other providers have no effort dial; both overrides are trimmed and ignored if empty — `client.rs:240-241`). This is the advisor escalation lever.
-3. Dispatches to the per-provider call (`client.rs:243-273`), returning raw text + `Option<CallUsage>` (Anthropic native always returns `None` usage).
-4. Parses: `strip_fences` removes ```` ```json ````/`~~~` fences (`client.rs:824-842`), then `serde_json::from_str::<ClaudeDecision>`; on failure it falls back to `extract_json_object` (first `{` … last `}`, `client.rs:817-822`) to handle reasoning models that wrap JSON in prose (`client.rs:283-291`). A hard parse failure propagates an error with the raw text attached.
+`analyze` delegates to `analyze_with` with no overrides. `analyze_with` is the single dispatch point:
+1. Builds the prompt via `prompt::build`.
+2. Applies a `model_override` and an `effort_override` to **every** provider (both trimmed and ignored if empty). This is the advisor escalation lever.
+3. Dispatches to the per-provider call, returning raw text + `Option<CallUsage>` (every provider now reports usage where available; Anthropic's cost is estimated, OpenRouter's is provider-reported, Kilo's may be token-only).
+4. Parses: `strip_fences` removes ```` ```json ````/`~~~` fences, then `serde_json::from_str::<ClaudeDecision>`; on failure it falls back to `extract_json_object` (first `{` … last `}`) to handle reasoning models that wrap JSON in prose. A hard parse failure propagates an error with the raw text attached.
 
 Each streaming path surfaces mid-stream provider errors instead of returning empty: OpenAI-style bails on a streamed `error` object and on an empty final body (`client.rs:445-448`, `469-471`); Anthropic only accumulates `content_block_delta`/`text_delta` events.
 
@@ -468,11 +486,13 @@ Escalation flow (`main.rs:1122-1179`): runs the base `analyze` first, then at mo
 
 ### Usage / cost accounting
 
-Per-provider usage extraction in `client.rs`: OpenRouter/OpenAI-style read a streamed final usage chunk (prompt/completion tokens + OpenRouter `cost` USD, `client.rs:449-457`); Claude CLI parses its JSON envelope `{ result, total_cost_usd, usage:{...} }` including cache token fields (`client.rs:550-563`); Anthropic native returns no usage. Both base and escalation calls log via `audit::log_usage` into the `usage_log` table (`audit.rs:123-139`) and refresh `audit::usage_summary` (24h + 7d aggregate of calls/tokens/cost, `audit.rs:142-173`) into broadcast status. Escalation cost additionally accrues to `advisor_spent_today` (`main.rs:1160`), which is what the budget cap reads.
+Per-provider usage extraction in `client.rs`: OpenRouter/Kilo read a streamed final usage chunk (prompt/completion tokens + `cost` USD where the gateway reports it); Anthropic native parses token counts from the SSE events and **estimates** cost from list pricing (see the provider list above). Both base and escalation calls log via `audit::log_usage` into the `usage_log` table and refresh `audit::usage_summary` (24h + 7d aggregate of calls/tokens/cost) into broadcast status. Escalation cost additionally accrues to `advisor_spent_today`, which is what the budget cap reads — meaning the USD budget now bounds Anthropic (estimated) and OpenRouter (reported); Kilo without cost data falls back to the 24/day count cap.
 
 ### Web-search path (used by the updater, not monitoring)
 
-`AiClient::complete` (`client.rs:633-667`) is a separate entry point for the app-updater to resolve installer URLs / read failures with live web search. OpenRouter uses its `web` plugin (`call_openrouter_web`, non-streaming, `client.rs:671-725`); Claude CLI uses its built-in search; Anthropic/OpenAI-compatible have no web path and **fall back to spawning the Claude CLI** (`client.rs:659-665`). `claude_model_or_haiku` (`client.rs:732-742`) coerces any non-Claude/blank model to `haiku` since only Claude models provide web search here.
+`AiClient::complete` is a separate entry point for the app-updater to resolve installer URLs / read failures with live web search where the provider supports it. **OpenRouter** uses its `web` plugin (`call_openrouter_web`, non-streaming). **Anthropic** uses the native `web_search_20250305` server tool (`call_anthropic_web`, non-streaming, max 5 searches at ~$0.01 each folded into the cost estimate; bails clearly if the turn produced no text); the model is resolved by `anthropic_web_model` — blank/bare-alias/non-Claude ids fall back to `claude-haiku-4-5`. **Kilo Code** has no verified web path, so it answers from model knowledge — the updater's plan validator, download gates, and signature policy still bound anything it returns, but its update check is ungrounded (a documented trade-off of that provider).
+
+`AiClient::complete_text` is the no-web sibling used by the learned-fact labeller (`learn/label.rs`) — a plain completion so a one-sentence label can't spend budget on searches.
 
 ## Executor, policy, safety & explanations
 
@@ -553,9 +573,12 @@ Ordering is the key invariant: blocklist beats whitelist (a tested property — 
 
 ### Safety: rate-limiting & success rate
 
-`safety.rs`. `rate_limited(pool, action, window_mins)` (`safety.rs:8`) counts `execution_log` rows where `action = format!("{action:?}")` AND `executed_at > cutoff` AND **`success = 1`**. Returns `count > 0`.
+`safety.rs`. `rate_limited(pool, action, window_mins)` sums successes and counts rows in `execution_log` where `action = format!("{action:?}")` AND `executed_at > cutoff`, and suppresses the action when **either**:
 
-**Critical, deliberate behaviour: rate-limiting is success-only.** A *failed* execution does **not** count, so a failing auto-action can be retried every cycle with no backoff — only a *successful* identical action suppresses re-runs within the window. This prevents pointless re-running of an already-applied fix while still allowing retries of failures; the cost is that a persistently-failing action loops unbounded (there is no failure-based circuit breaker). The match key is the exact Debug string, so two actions differing only in a field value are distinct keys.
+- it already **succeeded** in the window (no point re-running an applied fix), or
+- it **failed ≥ 3 times** in the window (`FAILURE_BREAKER_THRESHOLD` — the circuit breaker added in v0.17: a persistently failing auto-action backs off until the window rolls over instead of retrying every cycle).
+
+Both behaviours are covered by unit tests against the real migrations. The match key is the exact Debug string, so two actions differing only in a field value are distinct keys.
 
 `success_rate(pool)` (`safety.rs:24`) = `SUM(success)/COUNT(*)` across all of `execution_log`, returning `1.0` when empty. Used only for logging/warning in the loop (`main.rs:1195`, warns under 85%) — it does **not** feed back into any verdict.
 
@@ -567,8 +590,7 @@ Ordering is the key invariant: blocklist beats whitelist (a tested property — 
 
 ### Current gaps / dead code
 
-- `max_retries_per_issue` and `auto_approve_on_success_rate` (`ExecutionConfig`, `mod.rs:17/19`) are **dead** — deserialized and referenced only inside `policy/mod.rs` tests; no production code reads them (confirmed by crate-wide grep). The `#[allow(dead_code)]` comment claims "used in Phase 4" but they are not. There is consequently **no retry cap** and **no success-rate-driven auto-approval promotion**.
-- No failure-based backoff/circuit breaker (see success-only rate-limiting above).
+- `max_retries_per_issue` and `auto_approve_on_success_rate` (`ExecutionConfig`, `mod.rs:17/19`) are **dead** — deserialized and referenced only inside `policy/mod.rs` tests; no production code reads them (confirmed by crate-wide grep). The `#[allow(dead_code)]` comment claims "used in Phase 4" but they are not. There is consequently **no success-rate-driven auto-approval promotion** (the retry problem itself is now bounded by the failure breaker in `safety.rs`).
 - `registry.rs` / `tasks.rs` bypass the timeout helper (no execution timeout).
 - `RegistryReset.reversible = false` because the prior value is never snapshotted (`explain.rs:92`); there is no generic undo mechanism for any action.
 
@@ -677,7 +699,7 @@ Written by `audit::log_decision` (`audit.rs:21`); `executed` flipped by `audit::
 - `recorded_at TEXT`
 - Written by `feedback::record` (`feedback/mod.rs:7`, right after `log_execution` at `main.rs:431`); after-states + score filled by `feedback::update_after_states` (`feedback/mod.rs:35`); read by `feedback::recent_summary` (`feedback/mod.rs:112`).
 
-**`usage_log`** (`migrations/0005_usage.sql`) — per-call AI token/cost accounting (populated when the provider returns usage, primarily `claude_cli`).
+**`usage_log`** (`migrations/0005_usage.sql`) — per-call AI token/cost accounting (populated for every provider as of v0.17: OpenRouter reports cost, Anthropic's is estimated, Kilo may be token-only).
 - `id`, `timestamp TEXT`, `input_tokens`, `output_tokens`, `cache_creation`, `cache_read` (all INTEGER), `cost_usd REAL`.
 - Written by `audit::log_usage` (`audit.rs:123`); aggregated by `audit::usage_summary` (`audit.rs:142`) over 24h / 7d windows into `UsageSummary { calls, tokens, cost }` shown in the UI.
 
@@ -713,8 +735,8 @@ So the entire closed loop is: execute → record before → next-cycle record af
 
 - **`load(path)`** (`config.rs:242`) resolves the path relative to the **executable directory** (`resolve`, `config.rs:231` — absolute paths pass through, since LocalSystem's cwd is unreliable), reads the file, and `toml::from_str`s it with context errors.
 - **`save(config, path)`** (`config.rs:221`) serialises with `toml::to_string_pretty` and writes to the resolved path.
-- **`to_ui_settings`** (`config.rs:170`) projects `Config` into `eir_proto::UiSettings` for the tray app. Crucially it **never sends secrets** — API keys are reduced to `*_key_set: bool` flags via the local `set` closure (true iff present and non-empty). It surfaces provider, model, update-check model, effort, base URL, the three poll/decision intervals, channels/dirs, and `confidence_threshold`.
-- **`apply_update(SettingsUpdate)`** (`config.rs:191`) applies a UI edit: blank/None secret fields **keep the stored value** (the `keep` closure), so the UI never needs to re-send keys it can't read back. Intervals are floored (`decision ≥10`, event-log `≥5`, wmi `≥30`); `confidence_threshold` is clamped to `0.50–0.95`; `effort` is `normalize_effort`'d to one of low|medium|high|xhigh|max or empty. `ApiProvider::parse` accepts legacy aliases (`open_router`, `open_ai_compatible`).
+- **`to_ui_settings`** projects `Config` into `eir_proto::UiSettings` for the tray app. Crucially it **never sends secrets** — API keys are reduced to `*_key_set: bool` flags via the local `set` closure (true iff present and non-empty). It surfaces provider, model, update-check model, effort, the three poll/decision intervals, channels/dirs, and `confidence_threshold` (plus the deprecated always-empty `base_url`/`api_key_set` wire-compat fields).
+- **`apply_update(SettingsUpdate)`** applies a UI edit: blank/None secret fields **keep the stored value** (the `keep` closure), so the UI never needs to re-send keys it can't read back. Intervals are floored (`decision ≥10`, event-log `≥5`, wmi `≥30`); `confidence_threshold` is clamped to `0.50–0.95`; `effort` is `normalize_effort`'d to one of low|medium|high|xhigh|max or empty. `ApiProvider::parse` maps `openrouter`/`kilocode` (plus legacy aliases) and defaults anything else to Anthropic; the serde attributes on `ApiProvider` alias the removed `claude_cli`/`openai_compatible` tokens to Anthropic so a pre-0.17 config.toml still loads (its now-unknown extra keys are ignored by the toml loader — covered by `removed_providers_alias_to_anthropic`).
 - **Settings save triggers a self-restart.** In the loop (`main.rs:802`), an `UpdateSettings` message is validated by constructing an `AiClient` first (rejecting e.g. a keyless provider, reloading the prior config on failure so the service isn't bricked), then `config::save` + `restart_self()`. Config is reloaded from disk on next boot; it is not hot-reloaded.
 
 `AdvisorConfig` (`config.rs:26`) has its own `to_view`/`apply_view` with the same clamping discipline (threshold clamped `0.0–0.95`, budget `≥0`). It is config-only and not stored in the DB.
@@ -946,7 +968,7 @@ Current gaps surfaced while mapping each subsystem (the self-improvement plan ab
 **Signal sources**
 
 - Event log captures only Error/Warning/Information levels and no message body (just 'EventID <n>'); Critical/Verbose levels and event descriptions are not collected. event_id is truncated to 16 bits.
-- Event-log buffer is replaced each poll, so events arriving faster than RING_SIZE=20 per channel-batch (or older than the last poll) can be missed; there is no durable history of events beyond the most recent poll.
+- Event-log entries accumulate in a 100-entry drain buffer, but each poll still returns at most RING_SIZE=20 entries across all channels — a burst larger than that within one poll interval loses the overflow, and there is no durable event history beyond the buffer.
 - CPU usage depends on a PowerShell WMI call; if powershell.exe is unavailable, slow, or wedged past 15s, cpu_usage_percent silently becomes 0.0 (indistinguishable from an idle CPU). Same single-point dependency for Defender.
 - network_errors is hardcoded 0 and disk_health is hardcoded 'unknown' — neither is actually measured; disk metrics only cover the C: volume.
 - File discovery only scans fixed roots + a small env-var root set, one subdirectory level deep, with a 30-day recency window; logs outside those roots/age or deeper than one level are not auto-watched (only explicit config log_directories extras bypass this).
@@ -957,11 +979,13 @@ Current gaps surfaced while mapping each subsystem (the self-improvement plan ab
 
 **AI layer & prompts**
 
-- Anthropic native and OpenAI-compatible providers return no usage/cost (CallUsage None), so for those the USD budget cannot bound escalation spend — only the MAX_ESCALATIONS_PER_DAY=24 count cap applies (documented in code at main.rs:261-265).
+- Anthropic cost is an **estimate** from a hardcoded list-price table (`anthropic_price_per_mtok`) — prices drift over time and new model tiers default to Opus pricing; the Kilo gateway may report tokens without cost, in which case only the MAX_ESCALATIONS_PER_DAY=24 count cap bounds escalation spend there.
+- Kilo Code has no verified web-search path: the app-update AI check on that provider answers from model knowledge (validated and signature-gated downstream, but ungrounded — stale/hallucinated versions surface as failed download attempts rather than being caught up front).
+- The `effort` setting is model-dependent: Anthropic skips it for Haiku models (no effort support), but other unsupported model/effort combinations (e.g. xhigh on older Sonnets, reasoning on non-reasoning OpenRouter models) surface as per-call API errors rather than being validated up front.
 - FixAction still contains a `SoftwareUninstall` variant (models.rs:181) even though the prompt explicitly forbids uninstalling software ('there is no reinstall path'); the variant is reachable if a model emits it, gated only downstream by policy/parse, not by the type.
 - JSON parsing relies on first-{ to last-} extraction as a fallback (extract_json_object); a model that emits multiple JSON objects or stray braces in prose could be mis-parsed, and a hard parse failure aborts the whole cycle (main.rs:1105-1111).
 - The prompt is a single monolithic format! string mixing schema, action catalogue, and ~110 lines of guardrail prose (prompt.rs:28-186); there is no prompt-level test verifying the action examples stay in sync with the FixAction enum tags.
-- No prompt caching is used on the Anthropic native path (cache_creation/cache_read are only populated from the Claude CLI envelope), so the large static guardrail prose is re-sent uncached every cycle on that provider.
+- No prompt caching is requested on the Anthropic native path (no cache_control breakpoints), so the large static guardrail prose is re-sent uncached every cycle on that provider — a cost-optimisation opportunity.
 - needs_deeper_analysis and the confidence threshold are the only escalation triggers; there is no escalation on outright AI-call failure or on a parse failure — those just error the cycle.
 - Advisor day-counters (spent_today / escalations_today) are in-memory process state reset only on a UTC date flip; they are not persisted, so a service restart resets the daily budget/count ceiling.
 - The 'last 5 decision history' (prompt) and 'feedback last 10' windows are hard-coded at the call sites (main.rs:1023, feedback recent_summary(db,10)) rather than configurable.
@@ -969,8 +993,8 @@ Current gaps surfaced while mapping each subsystem (the self-improvement plan ab
 **Executor, policy, safety & explanations**
 
 - max_retries_per_issue and auto_approve_on_success_rate (policy/mod.rs:17,19) are dead code — deserialized and used only in policy tests; no production code reads them. The #[allow(dead_code)] comment's 'used in Phase 4' claim is inaccurate.
-- No retry cap and no failure-based circuit breaker: combined with success-only rate-limiting, a persistently failing auto-action loops every cycle indefinitely.
-- No success-rate-driven auto-approval promotion is implemented; success_rate() only feeds a log/warning at main.rs:1195, never a verdict.
+- The failure circuit breaker (3 failures/window in safety.rs) is window-scoped: a persistently failing action still retries once per rate-limit window rather than backing off exponentially or alerting.
+- No success-rate-driven auto-approval promotion is implemented; success_rate() only feeds a log/warning, never a verdict.
 - registry.rs and tasks.rs spawn powershell.exe via std::process::Command with no timeout, bypassing the powershell.rs timeout helper (bounded only by running on a spawn_blocking thread).
 - No generic undo: RegistryReset is marked reversible=false because the prior value is never snapshotted (explain.rs:92).
 - Rate-limit and dedupe correctness depend on the action's Debug format being stable; any change to FixAction's derived Debug silently breaks both.
@@ -998,4 +1022,4 @@ Current gaps surfaced while mapping each subsystem (the self-improvement plan ab
 - recent_summary/get_recent_decisions are small fixed windows (10 and 5); long-horizon patterns across the full history are not mined.
 - improvement_score / feedback math have no unit tests in feedback/mod.rs (only updater::history has a round-trip test); scoring correctness is unverified.
 - config has no schema versioning/migration mechanism; forward-compat relies on per-field serde(default) and would silently drop unknown keys on save (toml round-trips only known fields).
-- All AI usage cost is recorded in usage_log only when the provider returns usage (chiefly claude_cli); other providers may leave cost/token data empty, skewing usage_summary.
+- usage_log cost mixes provider-reported (OpenRouter), estimated (Anthropic list pricing) and possibly-zero (Kilo) figures, so usage_summary totals are indicative rather than exact billing.

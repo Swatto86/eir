@@ -201,6 +201,40 @@ async fn set_advisor_settings(
 }
 
 #[tauri::command]
+fn get_app_version(handle: AppHandle) -> String {
+    handle.package_info().version.to_string()
+}
+
+/// On-demand update check for the About view. Installs and relaunches when a
+/// newer signed release exists (mirroring the background checker), otherwise
+/// reports the current state as a string for the UI to display.
+#[tauri::command]
+async fn check_updates_now(handle: AppHandle) -> Result<String, String> {
+    use std::sync::atomic::Ordering;
+    if UPDATE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+        return Ok("An update is already downloading.".to_string());
+    }
+    let result = check_updates_inner(&handle).await;
+    UPDATE_IN_PROGRESS.store(false, Ordering::SeqCst);
+    result
+}
+
+async fn check_updates_inner(handle: &AppHandle) -> Result<String, String> {
+    let updater = handle.updater().map_err(|e| e.to_string())?;
+    match updater.check().await {
+        Ok(Some(update)) => {
+            update
+                .download_and_install(|_, _| {}, || {})
+                .await
+                .map_err(|e| e.to_string())?;
+            handle.restart();
+        }
+        Ok(None) => Ok("You're on the latest version.".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
 fn get_autostart_enabled(handle: AppHandle) -> Result<bool, String> {
     handle.autolaunch().is_enabled().map_err(|e| e.to_string())
 }
@@ -300,6 +334,11 @@ fn update_tray(tray: &TrayIcon<tauri::Wry>, base: &IconBase, status: &str) {
 
 // ── Auto-update ─────────────────────────────────────────────────────────────────
 
+/// Guards against the background checker and the About view's manual check
+/// running download_and_install concurrently (two installers racing).
+static UPDATE_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Check for updates shortly after startup and every 6 hours thereafter. When a
 /// newer signed release is published, download, install (runs the NSIS installer,
 /// which prompts for elevation and updates the service too), and relaunch.
@@ -314,10 +353,15 @@ fn spawn_update_checker(handle: tauri::AppHandle) {
 }
 
 async fn check_for_update(handle: &tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    if UPDATE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+        return; // a manual check is already installing
+    }
     let updater = match handle.updater() {
         Ok(u) => u,
         Err(e) => {
             error!("Updater unavailable: {e}");
+            UPDATE_IN_PROGRESS.store(false, Ordering::SeqCst);
             return;
         }
     };
@@ -332,6 +376,7 @@ async fn check_for_update(handle: &tauri::AppHandle) {
         Ok(None) => {}
         Err(e) => error!("Update check failed: {e}"),
     }
+    UPDATE_IN_PROGRESS.store(false, Ordering::SeqCst);
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -464,6 +509,8 @@ fn main() {
             set_app_ignore,
             set_learned_fact,
             set_advisor_settings,
+            get_app_version,
+            check_updates_now,
             get_autostart_enabled,
             set_autostart_enabled,
             util::gbp_per_usd,

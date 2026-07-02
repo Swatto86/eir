@@ -1,40 +1,37 @@
 [api]
-# ── Option A (default): OpenRouter — free models, no Claude usage ──────────────
+# Three native providers: "openrouter", "anthropic", "kilocode".
+# Everything here is editable in the app's Settings panel — no need to touch
+# this file after install.
+
+# ── Option A (default): OpenRouter — free models available ─────────────────────
 # Lowest-cost option. The `openrouter/free` meta-model auto-routes to a current
-# free model, so you don't have to track model names. Add your OpenRouter key in
-# the app's Settings panel (or here) — everything else is editable in Settings,
-# no need to touch this file. Get a key at https://openrouter.ai/keys
+# free model, so you don't have to track model names. Get a key at
+# https://openrouter.ai/keys
 provider = "openrouter"
 openrouter_api_key = ""   # required — paste your sk-or-v1-... key (or set it in Settings)
 model = "openrouter/free" # auto-routes to a free model; or pin one from https://openrouter.ai/models
 
-# Model for the on-demand "Other Updates" app check (which uses live web search).
-# It follows your main provider: OpenRouter uses the main model + OpenRouter's web
-# plugin; Claude CLI uses this model (blank = haiku). For OpenRouter this field is
-# ignored. Editable in Settings.
-update_check_model = "haiku"
+# Model for the on-demand app-update check. OpenRouter/Kilo: blank = the main
+# model (OpenRouter adds live web search via its web plugin). Anthropic: blank =
+# claude-haiku-4-5 with native web search. Editable in Settings.
+update_check_model = ""
 
-# ── Option B: Claude CLI (no API key — uses your logged-in `claude` session) ──
-# The service runs as LocalSystem. Leave user_profile and claude_cli_path blank
-# and it auto-detects: it scans C:\Users for the profile that holds a logged-in
-# Claude session (~/.claude/.credentials.json) and finds claude.exe under it.
-# provider = "claude_cli"
-# user_profile = "C:\\Users\\YourName"
-# claude_cli_path = "C:\\Users\\YourName\\.local\\bin\\claude.exe"
-# model = ""   # leave empty to use the CLI's configured default, or e.g. "sonnet" / "claude-opus-4-8"
-# effort = ""  # Claude CLI reasoning effort: low|medium|high|xhigh|max (blank = CLI default)
+# Reasoning effort: low|medium|high|xhigh|max (blank = provider default).
+# Anthropic → output_config.effort; OpenRouter/Kilo → reasoning.effort.
+effort = ""
 
-# ── Option C: Anthropic native API ────────────────────────────────────────────
+# ── Option B: Anthropic native API ────────────────────────────────────────────
+# Key from https://console.anthropic.com — token usage is tracked and cost is
+# estimated from list pricing.
 # provider = "anthropic"
 # anthropic_api_key = "sk-ant-..."
-# model = "claude-opus-4-8"
+# model = "claude-opus-4-8"   # or claude-sonnet-4-6 / claude-haiku-4-5
 
-# ── Option D: claude-max-api-proxy (OpenAI-compatible local proxy) ────────────
-# Run first: npx claude-max-api-proxy
-# provider = "openai_compatible"
-# base_url = "http://localhost:3456/v1"
-# api_key = "not-needed"
-# model = "claude-opus-4-8"
+# ── Option C: Kilo Code gateway ───────────────────────────────────────────────
+# One key for 500+ models via api.kilo.ai. Create a key at https://app.kilo.ai
+# provider = "kilocode"
+# kilocode_api_key = "..."
+# model = "anthropic/claude-sonnet-4.6"   # provider/model format
 
 [monitoring]
 # Windows Event Log channels to tail
@@ -54,10 +51,10 @@ wmi_poll_interval_secs = 300
 # How often to check the event log for new entries
 event_log_poll_interval_secs = 30
 
-# How often to run a full decision cycle (collect signals → analyse → act).
-# Eir only calls the AI model when there's an actionable change, so idle cycles are
-# cheap; this interval mainly bounds how often it re-checks. 600s (10 min) keeps
-# subscription usage low. Lower it if you want faster reaction to new problems.
+# How often the scheduled decision cycle runs (collect signals → analyse → act).
+# Eir also reacts EVENT-DRIVEN: the moment a collector captures an error it wakes
+# the loop (debounced ~10s, at most once a minute), so this interval is just the
+# background sweep — 600s (10 min) keeps usage low without slowing reactions.
 decision_interval_secs = 600
 
 # Minimum AI confidence (0.0–1.0) for a whitelisted, reversible fix to
@@ -127,11 +124,10 @@ ignored = []
 [advisor]
 enabled = false
 
-# The stronger model to switch to for the deeper pass (empty = keep the base model).
-# e.g. Claude CLI: "opus"; OpenRouter: a paid model id. Effort applies to Claude CLI
-# only (other providers have no effort dial — the model switch still works).
+# The stronger model to switch to for the deeper pass (empty = keep the base
+# model), e.g. Anthropic: "claude-opus-4-8"; OpenRouter/Kilo: a paid model id.
 escalation_model = ""
-escalation_effort = ""              # low|medium|high|xhigh|max (Claude CLI only)
+escalation_effort = ""              # low|medium|high|xhigh|max (blank = keep base)
 
 # Escalate when the best reported confidence is below this (0.0–1.0).
 low_confidence_threshold = 0.6

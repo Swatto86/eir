@@ -20,6 +20,14 @@ pub struct EventLogEntry {
     pub event_id: u32,
 }
 
+impl EventLogEntry {
+    /// Worth analysing — the single definition shared by the actionable
+    /// fingerprint and the reactive trigger, so the two can't drift.
+    pub fn is_actionable(&self) -> bool {
+        self.level == "Error" || self.level == "Warning"
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileChange {
     pub path: PathBuf,
@@ -47,6 +55,14 @@ pub struct LogEvent {
     pub content_excerpt: String,
 }
 
+impl LogEvent {
+    /// Worth analysing — shared by the actionable fingerprint and the
+    /// file-watch reactive trigger.
+    pub fn is_actionable(&self) -> bool {
+        self.severity != "INFO" || !self.error_snippets.is_empty()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SystemState {
     pub uptime_secs: u64,
@@ -65,6 +81,44 @@ pub struct SystemState {
     /// snapshot without the field still deserialises.
     #[serde(default)]
     pub security: SecurityPosture,
+}
+
+impl SystemState {
+    /// Stable string parts for each actionable fault: failed services, firewall
+    /// profiles explicitly off, and Defender faults while Defender is the active
+    /// AV. The single definition shared by the actionable fingerprint and the
+    /// WMI reactive trigger, so the two can't drift. `None`/healthy states are
+    /// excluded so a secure, healthy machine produces no parts.
+    pub fn fault_parts(&self) -> Vec<String> {
+        let mut parts: Vec<String> = self
+            .failed_services
+            .iter()
+            .map(|s| format!("S|{s}"))
+            .collect();
+        let fw = &self.security.firewall;
+        for (name, on) in [
+            ("domain", fw.domain),
+            ("private", fw.private),
+            ("public", fw.public),
+        ] {
+            if on == Some(false) {
+                parts.push(format!("FW|{name}"));
+            }
+        }
+        // Defender faults only matter when Defender is the active AV — if a
+        // third-party AV has taken over (antivirus_enabled == false) its
+        // passive state is normal.
+        let def = &self.security.defender;
+        if def.antivirus_enabled != Some(false) {
+            if def.realtime_enabled == Some(false) {
+                parts.push("DEF|realtime_off".into());
+            }
+            if def.signature_age_days.is_some_and(|d| d > 3) {
+                parts.push("DEF|sig_stale".into());
+            }
+        }
+        parts
+    }
 }
 
 /// Security-relevant machine state the AI can diagnose and (with the matching
@@ -241,7 +295,8 @@ pub struct ClaudeDecision {
     pub needs_deeper_analysis: bool,
 }
 
-/// Token + cost usage for a single Claude call (claude_cli provider).
+/// Token + cost usage for a single AI call. Cost is provider-reported
+/// (OpenRouter) or estimated from list pricing (Anthropic); 0 when unknown.
 #[derive(Debug, Clone, Default)]
 pub struct CallUsage {
     pub input_tokens: u64,

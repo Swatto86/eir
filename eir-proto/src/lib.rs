@@ -166,14 +166,14 @@ pub struct UpdaterSettingsUpdate {
 pub struct UiSettings {
     pub provider: String,
     pub model: String,
-    /// Claude model used for the on-demand "Other Updates" AI check (it needs
-    /// web search). Empty = the CLI's default model.
+    /// Model used for the app-update AI check (web search where the provider
+    /// supports it). Empty = a provider-appropriate default.
     pub update_check_model: String,
-    /// Reasoning effort for the Claude CLI provider (`--effort`): one of low,
-    /// medium, high, xhigh, max. Empty = the CLI's default. Ignored by other providers.
+    /// Reasoning effort: one of low, medium, high, xhigh, max. Empty = the
+    /// provider default. Maps to `output_config.effort` (Anthropic) or
+    /// `reasoning.effort` (OpenRouter / Kilo Code).
     #[serde(default)]
     pub effort: String,
-    pub base_url: String,
     pub decision_interval_secs: u64,
     pub event_log_poll_interval_secs: u64,
     pub wmi_poll_interval_secs: u64,
@@ -185,6 +185,16 @@ pub struct UiSettings {
     pub confidence_threshold: f32,
     pub openrouter_key_set: bool,
     pub anthropic_key_set: bool,
+    /// Whether a Kilo Code gateway API key is configured. `#[serde(default)]`
+    /// keeps an older payload (without this field) decodable.
+    #[serde(default)]
+    pub kilocode_key_set: bool,
+    /// Deprecated (pre-0.17 OpenAI-compatible provider). Always empty/false —
+    /// kept on the wire so a not-yet-updated tray app, which requires these
+    /// fields, can still decode the payload during an update's skew window.
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
     pub api_key_set: bool,
 }
 
@@ -197,10 +207,11 @@ pub struct SettingsUpdate {
     pub update_check_model: String,
     #[serde(default)]
     pub effort: String,
-    pub base_url: Option<String>,
     pub openrouter_api_key: Option<String>,
     pub anthropic_api_key: Option<String>,
-    pub api_key: Option<String>,
+    /// Kilo Code gateway API key (app.kilo.ai). `None` = unchanged.
+    #[serde(default)]
+    pub kilocode_api_key: Option<String>,
     pub decision_interval_secs: u64,
     pub event_log_poll_interval_secs: u64,
     pub wmi_poll_interval_secs: u64,

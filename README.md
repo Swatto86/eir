@@ -86,17 +86,19 @@ Each decision cycle (default every 10 minutes):
 
 Everything is configurable in the **Settings** panel — no file editing required.
 
+Three native providers:
+
 | Provider | Cost | Web search | Notes |
 |----------|------|------------|-------|
-| **OpenRouter** *(default)* | Free models | Yes — web plugin | Recommended. `openrouter/free` auto-routes to a current free model; needs an API key. Doesn't touch your Claude plan. |
-| **Claude CLI** | Uses your Claude plan | Yes | No API key — reuses your logged-in `claude` session. |
-| **Anthropic API** | Pay-as-you-go | Yes | Direct API key from console.anthropic.com. |
-| **OpenAI-compatible** | Depends | No | Any OpenAI-style endpoint (e.g. a local proxy). |
+| **OpenRouter** *(default)* | Free models | Yes — web plugin | Recommended. `openrouter/free` auto-routes to a current free model; needs an API key. |
+| **Claude (Anthropic API)** | Pay-as-you-go | Yes — native web_search tool | API key from console.anthropic.com; token usage tracked, cost estimated from list pricing. |
+| **Kilo Code** | Depends on model | No | One key for 500+ models via the Kilo gateway (app.kilo.ai); models in `provider/model` format. |
 
 The monitoring loop and the **app-update check** both use your configured provider.
-The app-update check needs live web search: on OpenRouter it uses the web plugin
-(works with free models — about £0.004 per check for the search), and on the Claude
-CLI it uses the CLI's built-in search (`update_check_model`, default **Haiku**).
+The app-update check uses live web search where the provider supports it: OpenRouter's
+web plugin (works with free models — about £0.004 per check for the search) or
+Anthropic's native web-search tool (`update_check_model`, default **claude-haiku-4-5**).
+On Kilo Code the check runs from model knowledge and Eir's validation gates.
 
 ## Features
 
@@ -115,8 +117,11 @@ CLI it uses the CLI's built-in search (`update_check_model`, default **Haiku**).
 - **Machine-pattern learning** — repeated local evidence teaches Eir which app-update
   paths, signals, or fixes are not useful on this machine. Learning is conservative,
   decays/rechecks over time, and is fully user-overridable from the tray UI.
+- **Reacts as errors land** — signal collectors wake the decision loop the moment an
+  error appears (debounced ~10 s, at most once a minute), so fixes start in seconds
+  instead of on the next scheduled sweep.
 - **Advisor mode** — optional bounded escalation that lets Eir re-run one analysis at
-  a stronger model or higher Claude CLI effort when the base model flags ambiguity or
+  a stronger model or higher reasoning effort when the base model flags ambiguity or
   reports low confidence. Daily spend and attempt caps keep it bounded.
 - **App updates, applied for you** — one panel updates everything. `winget`-managed
   apps update in a single batch; apps no package manager tracks are handled by the
@@ -142,8 +147,9 @@ CLI it uses the CLI's built-in search (`update_check_model`, default **Haiku**).
    connects.
 4. The default provider is **OpenRouter**. Open **Settings**, paste your
    [OpenRouter API key](https://openrouter.ai/keys), and Save — that's all it needs
-   (the `openrouter/free` model is preset). Prefer Claude? Switch the provider to
-   **Claude CLI**, which uses your logged-in `claude` session and needs no key.
+   (the `openrouter/free` model is preset). Prefer Claude or Kilo Code? Switch the
+   provider in Settings and paste the matching key (console.anthropic.com /
+   app.kilo.ai) plus a model.
 
 Already installed? Eir updates itself automatically.
 

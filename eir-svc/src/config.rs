@@ -29,7 +29,7 @@ pub struct AdvisorConfig {
     pub enabled: bool,
     /// Stronger model to switch to for the deeper pass (empty = keep the base model).
     pub escalation_model: String,
-    /// Higher reasoning effort for the deeper pass (Claude CLI only; empty = keep base).
+    /// Higher reasoning effort for the deeper pass (empty = keep base).
     pub escalation_effort: String,
     /// Escalate when the best reported confidence is below this (0.0–1.0).
     pub low_confidence_threshold: f32,
@@ -69,37 +69,41 @@ impl AdvisorConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone, Copy)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ApiProvider {
+    /// Anthropic native API (`/v1/messages`). Legacy `claude_cli` /
+    /// `openai_compatible` configs alias here so an old config.toml still loads
+    /// (they then need a key set in Settings before analysis resumes).
     #[default]
-    #[serde(rename = "anthropic")]
+    #[serde(
+        rename = "anthropic",
+        alias = "claude_cli",
+        alias = "openai_compatible",
+        alias = "open_ai_compatible"
+    )]
     Anthropic,
-    #[serde(rename = "openai_compatible", alias = "open_ai_compatible")]
-    OpenAiCompatible,
     /// OpenRouter (openrouter.ai) — OpenAI-compatible; supports free models.
     #[serde(rename = "openrouter", alias = "open_router")]
     OpenRouter,
-    /// Spawn the local `claude` CLI binary (no API key required).
-    #[serde(rename = "claude_cli")]
-    ClaudeCli,
+    /// Kilo Code gateway (api.kilo.ai) — OpenAI-compatible, 500+ models.
+    #[serde(rename = "kilocode", alias = "kilo")]
+    KiloCode,
 }
 
 impl ApiProvider {
     pub fn as_str(&self) -> &'static str {
         match self {
             ApiProvider::Anthropic => "anthropic",
-            ApiProvider::OpenAiCompatible => "openai_compatible",
             ApiProvider::OpenRouter => "openrouter",
-            ApiProvider::ClaudeCli => "claude_cli",
+            ApiProvider::KiloCode => "kilocode",
         }
     }
 
     fn parse(s: &str) -> ApiProvider {
         match s {
-            "anthropic" => ApiProvider::Anthropic,
-            "openai_compatible" => ApiProvider::OpenAiCompatible,
-            "openrouter" => ApiProvider::OpenRouter,
-            _ => ApiProvider::ClaudeCli,
+            "openrouter" | "open_router" => ApiProvider::OpenRouter,
+            "kilocode" | "kilo" => ApiProvider::KiloCode,
+            _ => ApiProvider::Anthropic,
         }
     }
 }
@@ -110,27 +114,22 @@ pub struct ApiConfig {
     pub provider: ApiProvider,
     /// Anthropic native: API key from console.anthropic.com
     pub anthropic_api_key: Option<String>,
-    /// OpenAI-compatible proxy: base URL
-    pub base_url: Option<String>,
-    /// OpenAI-compatible proxy: Bearer token ("not-needed" for claude-max-api-proxy)
-    pub api_key: Option<String>,
     /// OpenRouter API key (provider = "openrouter").
     pub openrouter_api_key: Option<String>,
-    /// Model name. Leave empty for claude_cli to use the CLI's configured default.
+    /// Kilo Code gateway API key from app.kilo.ai (provider = "kilocode").
+    #[serde(default)]
+    pub kilocode_api_key: Option<String>,
+    /// Model name. Empty = a provider default (OpenRouter: openrouter/free).
     #[serde(default)]
     pub model: String,
-    /// Claude model for the on-demand app-update check (empty = Haiku).
+    /// Model for the on-demand app-update check (empty = a cheap provider default).
     #[serde(default)]
     pub update_check_model: String,
-    /// Reasoning effort passed to the Claude CLI (`--effort`): low|medium|high|
-    /// xhigh|max. Empty = the CLI default. Only used by the claude_cli provider.
+    /// Reasoning effort: low|medium|high|xhigh|max, empty = provider default.
+    /// Maps to `output_config.effort` (Anthropic) / `reasoning.effort`
+    /// (OpenRouter, Kilo Code); models without a reasoning dial may reject it.
     #[serde(default)]
     pub effort: String,
-    /// claude_cli: path to the claude binary. Defaults to "claude" (must be in PATH).
-    pub claude_cli_path: Option<String>,
-    /// claude_cli: your Windows user profile root (e.g. C:\Users\Swatto).
-    /// Required when the service runs as LocalSystem so the CLI can find your login session.
-    pub user_profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -150,9 +149,9 @@ fn default_confidence() -> f32 {
     0.80
 }
 
-/// Accept only the Claude CLI's documented effort levels; anything else (incl.
-/// blank) becomes empty, i.e. the CLI default. Keeps an invalid value from being
-/// passed straight to `--effort`.
+/// Accept only the known reasoning-effort levels; anything else (incl. blank)
+/// becomes empty, i.e. the provider default. Keeps an invalid value from being
+/// sent straight to a provider API.
 fn normalize_effort(value: &str) -> String {
     match value.trim().to_lowercase().as_str() {
         e @ ("low" | "medium" | "high" | "xhigh" | "max") => e.to_string(),
@@ -174,7 +173,6 @@ impl Config {
             model: self.api.model.clone(),
             update_check_model: self.api.update_check_model.clone(),
             effort: self.api.effort.clone(),
-            base_url: self.api.base_url.clone().unwrap_or_default(),
             decision_interval_secs: self.monitoring.decision_interval_secs,
             event_log_poll_interval_secs: self.monitoring.event_log_poll_interval_secs,
             wmi_poll_interval_secs: self.monitoring.wmi_poll_interval_secs,
@@ -183,7 +181,10 @@ impl Config {
             confidence_threshold: self.monitoring.confidence_threshold,
             openrouter_key_set: set(&self.api.openrouter_api_key),
             anthropic_key_set: set(&self.api.anthropic_api_key),
-            api_key_set: set(&self.api.api_key),
+            kilocode_key_set: set(&self.api.kilocode_api_key),
+            // Deprecated wire fields (see eir_proto::UiSettings).
+            base_url: String::new(),
+            api_key_set: false,
         }
     }
 
@@ -200,12 +201,9 @@ impl Config {
                 }
             }
         };
-        if let Some(b) = u.base_url {
-            self.api.base_url = if b.trim().is_empty() { None } else { Some(b) };
-        }
         keep(&mut self.api.openrouter_api_key, u.openrouter_api_key);
         keep(&mut self.api.anthropic_api_key, u.anthropic_api_key);
-        keep(&mut self.api.api_key, u.api_key);
+        keep(&mut self.api.kilocode_api_key, u.kilocode_api_key);
         self.monitoring.decision_interval_secs = u.decision_interval_secs.max(10);
         self.monitoring.event_log_poll_interval_secs = u.event_log_poll_interval_secs.max(5);
         self.monitoring.wmi_poll_interval_secs = u.wmi_poll_interval_secs.max(30);
@@ -252,7 +250,7 @@ mod tests {
 
     const SAMPLE: &str = r#"
 [api]
-provider = "claude_cli"
+provider = "anthropic"
 model = ""
 [monitoring]
 event_log_channels = ["System"]
@@ -272,10 +270,9 @@ audit_db = "./eir.db"
             model: "nvidia/nemotron-3-super-120b-a12b:free".into(),
             update_check_model: "claude-haiku-4-5".into(),
             effort: "High".into(),
-            base_url: Some(String::new()),
             openrouter_api_key: Some("sk-or-test".into()),
             anthropic_api_key: None,
-            api_key: None,
+            kilocode_api_key: None,
             decision_interval_secs: 900,
             event_log_poll_interval_secs: 45,
             wmi_poll_interval_secs: 300,
@@ -325,8 +322,45 @@ audit_db = "./eir.db"
     #[test]
     fn legacy_open_router_provider_alias_still_parses() {
         // Older configs serialized OpenRouter as "open_router"; must still load.
-        let toml = SAMPLE.replace("\"claude_cli\"", "\"open_router\"");
+        let toml = SAMPLE.replace("\"anthropic\"", "\"open_router\"");
         let cfg: Config = toml::from_str(&toml).unwrap();
         assert_eq!(cfg.api.provider.as_str(), "openrouter");
+    }
+
+    #[test]
+    fn removed_providers_alias_to_anthropic() {
+        // A config written by an older build (claude_cli / openai_compatible,
+        // possibly with now-removed extra fields like base_url/user_profile)
+        // must still load — those providers alias to Anthropic and unknown
+        // keys are ignored by the toml loader.
+        for legacy in ["claude_cli", "openai_compatible"] {
+            let src = SAMPLE.replace(
+                "provider = \"anthropic\"",
+                &format!(
+                    "provider = \"{legacy}\"\nbase_url = \"http://localhost:8080/v1\"\nuser_profile = 'C:\\Users\\X'"
+                ),
+            );
+            let cfg: Config = toml::from_str(&src).unwrap();
+            assert_eq!(cfg.api.provider.as_str(), "anthropic");
+        }
+    }
+
+    #[test]
+    fn kilocode_provider_round_trips() {
+        let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
+        cfg.apply_update(SettingsUpdate {
+            provider: "kilocode".into(),
+            model: "anthropic/claude-sonnet-4.6".into(),
+            kilocode_api_key: Some("kilo-test-key".into()),
+            ..Default::default()
+        });
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.api.provider, ApiProvider::KiloCode);
+        assert_eq!(
+            reparsed.api.kilocode_api_key.as_deref(),
+            Some("kilo-test-key")
+        );
+        assert!(reparsed.to_ui_settings().kilocode_key_set);
     }
 }
