@@ -1,14 +1,16 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.16.0. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.23.0. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
 - `eir-ui`: Tauri tray app using committed static frontend files in `ui/`; no npm/Vite build step.
 
-Canonical build config is `eir-ui/tauri.conf.json`. The root `tauri.conf.json` still exists but is not the documented build path.
+Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-03 | Eir | v0.23.0 bug-fix + feature sweep | Fixed the registry allowlist to component-boundary matching (a sibling key sharing a name prefix could bypass it), scoped LogCleanup so it can't recurse into system dirs, fixed a CLI-provider stdin/stdout pipe deadlock, and enabled SQLite WAL. Added: Anthropic prompt caching (static system prompt sent once as a cached block), registry-reset undo (prior value snapshotted → one-click revert), approval + weekly-digest OS notifications, SMART disk-health signal, DISM/SFC repair actions (approval-gated, never whitelisted, own long timeout), a resource-trend signal from the previously-unused system_state_history, and a weekly plain-English health digest. A CI step now fails on version drift across the four manifests.
 
 2026-06-26 | Eir | Keep UI and service as separate processes joined only by newline-delimited JSON over `\\.\pipe\EirSvc` | This keeps LocalSystem repair authority in the service while the medium-integrity tray app remains a thin renderer/command surface.
 
@@ -26,11 +28,13 @@ For this repo, release versions must stay synchronized across `eir-proto/Cargo.t
 
 ## Open questions / deferred decisions
 
-Decide whether to remove or convert the stale root `tauri.conf.json` into an explicit shim so contributors do not build with the wrong config.
-
-Add an automated version-sync check for the three crate manifests and `eir-ui/tauri.conf.json`.
-
 Consider moving learning thresholds/windows/half-lives from constants into config once the current detector behavior has more real-world history.
+
+The resource-trend thresholds (audit `summarise_trend`) and disk-health/SMART wording are heuristic — tune against real machine history.
+
+`network_errors` is now collected defensively (falls back to 0 on any query failure) rather than dropped; confirm the CIM class/properties resolve on the target machines or drop the field.
+
+(Resolved in v0.23.0: stale root `tauri.conf.json`/`build.rs` removed; automated version-sync CI check added — `scripts/check-versions.ps1`.)
 
 ## Environment constraints
 

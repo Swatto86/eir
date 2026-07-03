@@ -1424,7 +1424,12 @@ async fn wait_capped(
         if let Some(mut sin) = sin {
             if let Some(bytes) = stdin_payload {
                 use tokio::io::AsyncWriteExt as _;
-                let _ = sin.write_all(&bytes).await;
+                // A write error usually means the child closed stdin early (it will then
+                // exit non-zero and be caught by the status check). Log it so a partial
+                // write that a child tolerates with a success exit isn't wholly silent.
+                if let Err(e) = sin.write_all(&bytes).await {
+                    warn!("{what}: failed to write full prompt to stdin: {e}");
+                }
             }
             // `sin` drops here → stdin closes → EOF.
         }

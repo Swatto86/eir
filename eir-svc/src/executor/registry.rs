@@ -5,69 +5,88 @@ use anyhow::{bail, Result};
 /// Registry subtrees Claude is allowed to modify. Anything outside this list is
 /// rejected. Matched on component boundaries (see [`registry_key_allowed`]), so a
 /// sibling key that merely shares a name prefix (e.g. `…\MicrosoftEvil`) is NOT
-/// treated as being under `…\Microsoft`.
+/// treated as being under `…\Microsoft`. `Session Manager` was deliberately dropped:
+/// it holds boot-time SYSTEM primitives (`PendingFileRenameOperations`, `SubSystems`).
 const ALLOWED_KEY_PREFIXES: &[&str] = &[
     "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip",
-    "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager",
     "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia",
     "HKCU:\\SOFTWARE\\Microsoft",
 ];
 
 /// Persistence / process-hijack subkeys that are NEVER writable even though they sit
 /// under an allowed prefix (the broad `HKCU:\SOFTWARE\Microsoft` grant would otherwise
-/// expose them). A registry reset here could plant an autostart entry or a debugger
-/// hijack, so they are denied outright — the deny list wins over the allow list.
+/// expose them). A registry reset here could plant an autostart entry or a shell/
+/// debugger hijack, so they are denied outright — the deny list wins over the allow
+/// list. This is defence in depth: `registry_reset` also always requires approval
+/// (it is off the auto-execute whitelist), so a human sees every registry write.
 const DENIED_KEY_PREFIXES: &[&str] = &[
     "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
     "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
     "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunServices",
+    "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run",
+    "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders",
+    "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders",
+    "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ShellServiceObjectDelayLoad",
     "HKCU:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
     "HKCU:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options",
+    "HKCU:\\SOFTWARE\\Microsoft\\Command Processor",
 ];
 
-/// Whether `key` is safe to modify: under an allowed subtree, and not under any
-/// denied persistence subkey. Uses component-boundary matching (via the shared
-/// policy `is_within`) rather than raw string prefixes, so `…\MicrosoftEvil` can't
-/// masquerade as a child of `…\Microsoft`.
+/// PowerShell registry cmdlets glob-expand `*?[]` in `-Path`/`-Name` against real keys
+/// at execution time, so a wildcard in a model-supplied key/value would bypass the
+/// literal-string gate and hit siblings the deny list protects. Reject any such
+/// metacharacter (legitimate registry key paths never contain them) — belt to the
+/// `-LiteralPath` braces below.
+fn has_glob_meta(s: &str) -> bool {
+    s.contains(['*', '?', '[', ']'])
+}
+
+/// Whether `key` is safe to modify: contains no glob metacharacters, is under an
+/// allowed subtree, and not under any denied persistence subkey. Uses component-
+/// boundary matching (via the shared policy `is_within`) rather than raw string
+/// prefixes, so `…\MicrosoftEvil` can't masquerade as a child of `…\Microsoft`.
 fn registry_key_allowed(key: &str) -> bool {
+    if has_glob_meta(key) {
+        return false;
+    }
     if DENIED_KEY_PREFIXES.iter().any(|d| is_within(key, d)) {
         return false;
     }
     ALLOWED_KEY_PREFIXES.iter().any(|p| is_within(key, p))
 }
 
-/// Read the current data of a registry value, or `None` if the key/value does not
-/// exist. Used to snapshot the prior state before an overwrite so the change is
-/// reversible. The key is assumed already normalised + gated by the caller.
-async fn read_current_value(normalised_key: &str, value_name: &str) -> Option<String> {
+/// Read the current data of a registry value: `Ok(Some(v))` = present, `Ok(None)` =
+/// confirmed absent, `Err` = couldn't determine (transient failure / locked hive).
+/// The caller must NOT treat `Err` as "absent" — that would make a later undo DELETE a
+/// value that actually existed. `-LiteralPath` stops glob expansion; the property is
+/// indexed by the QUOTED name, never interpolated raw.
+async fn read_current_value(normalised_key: &str, value_name: &str) -> Result<Option<String>> {
     let path_q = super::powershell::ps_single_quote(normalised_key);
     let name_q = super::powershell::ps_single_quote(value_name);
-    // Index the property by the QUOTED name (never interpolate value_name raw — it is
-    // model-controlled). Emit the value, or the sentinel __EIR_NO_VALUE__ when the
-    // property/key doesn't exist, so we can tell "absent" from "empty string".
+    // Emit the value, or the sentinel __EIR_NO_VALUE__ when the property/key doesn't
+    // exist (so we can tell "absent" from "empty string"); a real read error propagates
+    // as a non-zero exit → Err.
     let script = format!(
-        "$ErrorActionPreference='Stop'; try {{ \
-           $p = Get-ItemProperty -Path {path_q} -Name {name_q}; \
+        "$ErrorActionPreference='Stop'; \
+         if (-not (Test-Path -LiteralPath {path_q})) {{ '__EIR_NO_VALUE__' }} else {{ \
+           $p = Get-ItemProperty -LiteralPath {path_q}; \
            $v = $p.PSObject.Properties[{name_q}].Value; \
            if ($null -eq $v) {{ '__EIR_NO_VALUE__' }} else {{ [string]$v }} \
-         }} catch {{ '__EIR_NO_VALUE__' }}"
+         }}"
     );
-    match super::powershell::run_diagnostic(&script).await {
-        Ok(out) => {
-            let t = out.trim();
-            if t == "__EIR_NO_VALUE__" || t.is_empty() {
-                None
-            } else {
-                Some(t.to_string())
-            }
-        }
-        Err(_) => None,
+    let out = super::powershell::run_diagnostic(&script).await?;
+    let t = out.trim();
+    if t == "__EIR_NO_VALUE__" {
+        Ok(None)
+    } else {
+        Ok(Some(t.to_string()))
     }
 }
 
-/// Reset a registry value to the given data, returning a human message and a
-/// [`RegistryUndo`] snapshot of the value BEFORE the write so the change can be
-/// reverted (see [`restore_value`]).
+/// Reset a registry value to the given data, returning a human message and — when the
+/// prior value could be snapshotted — a [`RegistryUndo`] for a one-click revert (see
+/// [`restore_value`]). `None` undo means the prior value couldn't be read, so no
+/// (potentially destructive) undo is offered.
 /// `key_path` must use PowerShell-style drive prefix (e.g. `HKLM:\...`).
 /// `value_data` is always written as a string; PowerShell coerces DWORD automatically
 /// when the existing value is DWORD type.
@@ -75,7 +94,7 @@ pub async fn reset_value(
     key_path: &str,
     value_name: &str,
     value_data: &str,
-) -> Result<(String, RegistryUndo)> {
+) -> Result<(String, Option<RegistryUndo>)> {
     let normalised = normalise_key(key_path);
 
     if !registry_key_allowed(&normalised) {
@@ -84,14 +103,24 @@ pub async fn reset_value(
             key_path
         );
     }
+    // A wildcard in the value name would let -Name fan a write/read across many values.
+    if has_glob_meta(value_name) {
+        bail!("Registry value name '{value_name}' contains wildcard characters — refusing");
+    }
 
-    // Snapshot the prior value first so the write is reversible.
-    let prior = read_current_value(&normalised, value_name).await;
-    let undo = RegistryUndo {
-        key_path: normalised.clone(),
-        value_name: value_name.to_string(),
-        prior_existed: prior.is_some(),
-        prior_data: prior,
+    // Snapshot the prior value first so the write is reversible. If it can't be read,
+    // proceed with the fix but offer no undo (rather than a wrong one).
+    let undo = match read_current_value(&normalised, value_name).await {
+        Ok(prior) => Some(RegistryUndo {
+            key_path: normalised.clone(),
+            value_name: value_name.to_string(),
+            prior_existed: prior.is_some(),
+            prior_data: prior,
+        }),
+        Err(e) => {
+            tracing::warn!("Could not snapshot prior registry value (undo disabled): {e}");
+            None
+        }
     };
 
     let script = build_reset_script(&normalised, value_name, value_data);
@@ -103,10 +132,11 @@ pub async fn reset_value(
 
 /// Revert a prior [`reset_value`] using its captured snapshot: restore the previous
 /// data if the value existed, otherwise delete the value we created. Re-checks the
-/// same allow/deny gate so an undo can't reach a key a reset couldn't.
+/// same allow/deny gate (incl. glob rejection) so an undo can't reach a key a reset
+/// couldn't, and uses `-LiteralPath`.
 pub async fn restore_value(undo: &RegistryUndo) -> Result<String> {
     let normalised = normalise_key(&undo.key_path);
-    if !registry_key_allowed(&normalised) {
+    if !registry_key_allowed(&normalised) || has_glob_meta(&undo.value_name) {
         bail!(
             "Registry path '{}' is not on the safe list — refusing to restore",
             undo.key_path
@@ -119,12 +149,12 @@ pub async fn restore_value(undo: &RegistryUndo) -> Result<String> {
         (true, Some(data)) => {
             let data_q = super::powershell::ps_single_quote(data);
             format!(
-                "Set-ItemProperty -Path {path_q} -Name {name_q} -Value {data_q} -ErrorAction Stop; \
+                "Set-ItemProperty -LiteralPath {path_q} -Name {name_q} -Value {data_q} -ErrorAction Stop; \
                  Write-Output 'Restored registry value {safe_name}'"
             )
         }
         _ => format!(
-            "Remove-ItemProperty -Path {path_q} -Name {name_q} -ErrorAction SilentlyContinue; \
+            "Remove-ItemProperty -LiteralPath {path_q} -Name {name_q} -ErrorAction SilentlyContinue; \
              Write-Output 'Removed registry value {safe_name} (it did not exist before)'"
         ),
     };
@@ -162,7 +192,7 @@ fn build_reset_script(normalised_path: &str, value_name: &str, value_data: &str)
     // single-quoted literal (never a double-quoted string).
     let safe_name = value_name.replace('\'', "''");
     format!(
-        "Set-ItemProperty -Path {path_q} -Name {name_q} -Value {data_q} -ErrorAction Stop; \
+        "Set-ItemProperty -LiteralPath {path_q} -Name {name_q} -Value {data_q} -ErrorAction Stop; \
          Write-Output 'Set registry value {safe_name}'"
     )
 }
@@ -215,6 +245,35 @@ mod tests {
         ));
         // Entirely outside any allowed subtree.
         assert!(!registry_key_allowed("HKLM:\\SOFTWARE\\Classes\\x"));
+        // Session Manager was removed from the allowlist (boot-time SYSTEM primitives).
+        assert!(!registry_key_allowed(
+            "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager"
+        ));
+    }
+
+    #[test]
+    fn glob_metacharacters_are_rejected() {
+        // A wildcard segment would glob-expand under -Path/-Name against real keys,
+        // bypassing the literal allow/deny check — reject outright.
+        assert!(!registry_key_allowed(
+            "HKCU:\\SOFTWARE\\Microsoft*\\Windows\\CurrentVersion\\Run"
+        ));
+        assert!(!registry_key_allowed("HKCU:\\SOFTWARE\\Microsoft\\*"));
+        assert!(!registry_key_allowed("HKCU:\\SOFTWARE\\Microsoft\\Off?ce"));
+        assert!(!registry_key_allowed("HKCU:\\SOFTWARE\\Microsoft\\Item[1]"));
+        assert!(has_glob_meta("*"));
+        assert!(!has_glob_meta("PlainName"));
+    }
+
+    #[test]
+    fn additional_hkcu_autostart_locations_are_denied() {
+        for k in [
+            "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run\\x",
+            "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders",
+            "HKCU:\\SOFTWARE\\Microsoft\\Command Processor",
+        ] {
+            assert!(!registry_key_allowed(k), "should be denied: {k}");
+        }
     }
 
     #[test]

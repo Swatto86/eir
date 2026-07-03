@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-03 · **Release:** v0.22.1
+**Last updated:** 2026-07-03 · **Release:** v0.23.0
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -939,6 +939,19 @@ one app already known to behave this way.
 ---
 
 ## Known limitations & backlog
+
+**Resolved in v0.23.0** (bullets below may still describe the pre-fix state):
+- Registry `registry_reset` gate now uses component-boundary matching (a sibling key sharing a name prefix could bypass the old `starts_with` allowlist), denies persistence subkeys (Run/RunOnce/Winlogon/IFEO), and the policy layer has real registry blocklist entries. Registry resets are now **reversible**: the prior value is snapshotted and can be reverted with one click (`registry_undo` table).
+- `LogCleanup` refuses a drive-root/Windows-tree scan root and `days_old == 0`, and skips files under protected system dirs (it previously recursed past the policy-checked root).
+- The CLI providers no longer deadlock on a large prompt — stdin is written concurrently with draining stdout/stderr (in `wait_capped`).
+- Audit DB opens with **WAL + busy_timeout** so concurrent writers don't silently drop rows.
+- Choco `Force`/`ClearManagerLock` remedy is now actually applied (`--force`).
+- Anthropic path sends the static system prompt as a **cached** block (prompt caching); text-only completions (labeller, digest) correctly omit it.
+- `disk_health` (SMART, via `Get-PhysicalDisk`) and `network_errors` are now measured, not hardcoded; a Warning/Unhealthy disk feeds the actionable fingerprint.
+- New **`sfc_scan`** / **`dism_restore_health`** actions (approval-gated, never whitelisted, own long timeout).
+- `system_state_history` is now read: a resource-**trend** note (disk filling, sustained CPU/mem rise) is folded into the prompt context.
+- New **weekly health digest** (one bounded AI call over aggregated audit counts; UI card + OS notification), and an **approval OS notification**.
+- Advisor day-counters are persisted (`advisor_daily_spend`), a **version-sync CI check** was added, and the stale root `tauri.conf.json`/`build.rs` were removed.
 
 Current gaps surfaced while mapping each subsystem (the self-improvement plan above addresses several).
 

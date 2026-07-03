@@ -19,7 +19,6 @@ actions = [
     "disk_cleanup",
     "task_disable",
     "task_enable",
-    "registry_reset",
     "network_diagnostic",
     # Phase 4 — lower-risk actions auto-approved
     "driver_enable",
@@ -27,9 +26,12 @@ actions = [
     "firewall_enable",
     "defender_signature_update",
     # Always require approval (disruptive, irreversible, or user-sensitive — never auto-run):
+    # registry_reset (a registry write can plant boot persistence / shell hijacks that no
+    # static allowlist can fully enumerate, so a human sees every one — the executor still
+    # applies a component-boundary allow/deny gate and now snapshots the prior value for undo),
     # file_delete (deletes a file, e.g. an app's config), process_kill (can close a
     # foreground app/game), powershell_diagnostic, driver_disable,
-    # software_uninstall (also hard-blocked), bcd_edit,
+    # software_uninstall (also hard-blocked), bcd_edit, sfc_scan, dism_restore_health,
     # defender_realtime_enable (reversible but could conflict with a user's AV choice)
 ]
 

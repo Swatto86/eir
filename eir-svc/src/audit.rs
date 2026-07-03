@@ -356,12 +356,23 @@ pub async fn save_registry_undo(
     Ok(id)
 }
 
-/// Load a not-yet-undone registry-undo snapshot by id, or `None` if it doesn't exist
-/// or was already reverted.
-pub async fn load_registry_undo(pool: &SqlitePool, id: i64) -> Result<Option<RegistryUndo>> {
+/// Atomically CLAIM a not-yet-undone registry-undo record for reverting: flip
+/// `undone` 0→1 and, only if this call is the one that flipped it, return the
+/// snapshot. Two concurrent undo requests for the same id can't both win (SQLite
+/// serialises writers), so this closes the check-then-act double-undo race. Returns
+/// `None` if the record doesn't exist or was already claimed/reverted. On a restore
+/// failure the caller should [`unclaim_registry_undo`] so the user can retry.
+pub async fn claim_registry_undo(pool: &SqlitePool, id: i64) -> Result<Option<RegistryUndo>> {
+    let flipped = sqlx::query("UPDATE registry_undo SET undone = 1 WHERE id = ? AND undone = 0")
+        .bind(id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    if flipped == 0 {
+        return Ok(None);
+    }
     let row = sqlx::query(
-        "SELECT key_path, value_name, prior_existed, prior_data
-         FROM registry_undo WHERE id = ? AND undone = 0",
+        "SELECT key_path, value_name, prior_existed, prior_data FROM registry_undo WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -377,9 +388,10 @@ pub async fn load_registry_undo(pool: &SqlitePool, id: i64) -> Result<Option<Reg
     }
 }
 
-/// Mark a registry-undo record as reverted so it can't be applied twice.
-pub async fn mark_registry_undo_done(pool: &SqlitePool, id: i64) -> Result<()> {
-    sqlx::query("UPDATE registry_undo SET undone = 1 WHERE id = ?")
+/// Release a claim made by [`claim_registry_undo`] (restore failed) so a later attempt
+/// can retry it.
+pub async fn unclaim_registry_undo(pool: &SqlitePool, id: i64) -> Result<()> {
+    sqlx::query("UPDATE registry_undo SET undone = 0 WHERE id = ?")
         .bind(id)
         .execute(pool)
         .await?;

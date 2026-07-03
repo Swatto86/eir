@@ -61,7 +61,7 @@ pub async fn execute(action: &FixAction) -> ExecutionResult {
         } => match registry::reset_value(key_path, value_name, value_data).await {
             Ok((msg, undo)) => {
                 let mut res = make_result(action, Ok(msg));
-                res.undo = Some(undo);
+                res.undo = undo;
                 res
             }
             Err(e) => make_result(action, Err(e)),

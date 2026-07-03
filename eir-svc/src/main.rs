@@ -431,6 +431,9 @@ struct ExecOutcome {
     /// For a successful registry reset, the persisted undo-record id so the UI can
     /// offer a one-click revert. None for everything else.
     undo_id: Option<i64>,
+    /// Set to an undo-record id when a user-triggered undo SUCCEEDED, so the loop can
+    /// clear that id from the original activity row (its "Undo" button disappears).
+    cleared_undo_id: Option<i64>,
 }
 
 /// Slow AI work for one decision-loop pass, run off-loop (mirrors ExecJob/ExecOutcome
@@ -562,6 +565,7 @@ fn spawn_executor(
                 confidence,
                 reason,
                 undo_id,
+                cleared_undo_id: None,
             });
         }
     });
@@ -964,6 +968,15 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                     Some(outcome) = exec_done_rx.recv() => {
                         // A fix action finished on the worker — fold its result in.
                         st.in_flight.remove(&outcome.label);
+                        // If this was a successful undo, retire the original row's Undo
+                        // button so it can't be clicked again (it would no-op).
+                        if let Some(cid) = outcome.cleared_undo_id {
+                            for ex in st.recent_executions.iter_mut() {
+                                if ex.undo_id == Some(cid) {
+                                    ex.undo_id = None;
+                                }
+                            }
+                        }
                         push_execution(
                             &mut st,
                             &outcome.exec_action,
@@ -1508,7 +1521,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             let db_u = db.clone();
                             let done = undo_done_tx.clone();
                             tokio::spawn(async move {
-                                match audit::load_registry_undo(&db_u, id).await {
+                                // CLAIM atomically so two concurrent undo clicks can't both
+                                // run (the second sees the record already claimed).
+                                match audit::claim_registry_undo(&db_u, id).await {
                                     Ok(Some(undo)) => {
                                         let label = format!(
                                             "Undo registry {}\\{}",
@@ -1519,11 +1534,13 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                                 Ok(m) => (true, m),
                                                 Err(e) => (false, e.to_string()),
                                             };
-                                        if success {
+                                        // Restore failed → release the claim so it can be
+                                        // retried rather than latched as done.
+                                        if !success {
                                             if let Err(e) =
-                                                audit::mark_registry_undo_done(&db_u, id).await
+                                                audit::unclaim_registry_undo(&db_u, id).await
                                             {
-                                                error!("Failed to mark registry undo done: {e}");
+                                                error!("Failed to release registry undo claim: {e}");
                                             }
                                         }
                                         let _ = done.send(ExecOutcome {
@@ -1536,6 +1553,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                             confidence: 1.0,
                                             reason: Some("undo by user".to_string()),
                                             undo_id: None,
+                                            // On success, clear this undo_id from the original
+                                            // activity row so its "Undo" button disappears.
+                                            cleared_undo_id: success.then_some(id),
                                         });
                                     }
                                     Ok(None) => {
@@ -1648,10 +1668,27 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                     let ai_d = ai.clone();
                     let model_d = cfg.api.update_check_model.clone();
                     let done_d = digest_done_tx.clone();
+                    let db_save = db_d.clone();
                     tokio::spawn(async move {
-                        match digest::generate(&db_d, &ai_d, &model_d).await {
+                        // Bound the whole generation in a nested task + timeout, mirroring
+                        // the analysis/label/exec tasks, so a wedged AI call can't latch
+                        // digest_running for the process lifetime.
+                        const DIGEST_MAX: Duration = Duration::from_secs(6 * 60);
+                        let mut inner =
+                            tokio::spawn(
+                                async move { digest::generate(&db_d, &ai_d, &model_d).await },
+                            );
+                        let result = match tokio::time::timeout(DIGEST_MAX, &mut inner).await {
+                            Ok(Ok(r)) => r,
+                            Ok(Err(_join)) => Err(anyhow::anyhow!("digest task panicked")),
+                            Err(_elapsed) => {
+                                inner.abort();
+                                Err(anyhow::anyhow!("digest generation timed out"))
+                            }
+                        };
+                        match result {
                             Ok((text, usage)) => {
-                                if let Err(e) = audit::save_digest(&db_d, &text).await {
+                                if let Err(e) = audit::save_digest(&db_save, &text).await {
                                     warn!("Failed to save health digest: {e}");
                                 }
                                 let view = eir_proto::DigestView {
