@@ -265,6 +265,23 @@ pub struct ExecutionResult {
     pub action: String,
     pub success: bool,
     pub output: String,
+    /// For a `RegistryReset`, the snapshot of the value BEFORE it was overwritten, so
+    /// the change can be reverted with one click. `None` for every other action.
+    #[serde(default)]
+    pub undo: Option<RegistryUndo>,
+}
+
+/// The prior state of a registry value captured before a `RegistryReset`, enough to
+/// restore it: put `prior_data` back if it existed, or delete the value we created if
+/// it did not.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RegistryUndo {
+    pub key_path: String,
+    pub value_name: String,
+    /// True if the value existed before we wrote it (restore = set back to prior_data);
+    /// false if we created it (restore = delete the value).
+    pub prior_existed: bool,
+    pub prior_data: Option<String>,
 }
 
 /// A fix awaiting the user's decision. Carries everything needed to execute it

@@ -129,6 +129,12 @@ async fn toggle_pause(tx: State<'_, UiCmdTx>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn undo_registry(id: i64, tx: State<'_, UiCmdTx>) -> Result<(), String> {
+    tx.0.try_send(UiMsg::UndoRegistry { id })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn clear_problems(tx: State<'_, UiCmdTx>) -> Result<(), String> {
     tx.0.try_send(UiMsg::ClearProblems)
         .map_err(|e| e.to_string())
@@ -335,6 +341,66 @@ fn update_tray(tray: &TrayIcon<tauri::Wry>, base: &IconBase, status: &str) {
     let _ = tray.set_tooltip(Some(&format!("Eir — {status}")));
 }
 
+// ── Approval notifications ──────────────────────────────────────────────────────
+
+/// Poll the cached status and fire an OS notification the first time each pending
+/// approval id appears. Approvals already pending when the UI starts are primed into
+/// the seen-set without alerting (no stale burst on launch); ids that leave the queue
+/// are forgotten so a genuinely new proposal always notifies.
+async fn notify_on_new_approvals(status: SharedStatus, handle: AppHandle) {
+    use std::collections::HashSet;
+    use tauri_plugin_notification::NotificationExt;
+
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut primed = false;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let pending: Vec<(u64, String)> = {
+            let s = status.lock().unwrap();
+            s.pending_approvals
+                .iter()
+                .map(|a| {
+                    let text = if a.action_summary.is_empty() {
+                        a.diagnosis.clone()
+                    } else {
+                        a.action_summary.clone()
+                    };
+                    (a.id, text)
+                })
+                .collect()
+        };
+
+        let current: HashSet<u64> = pending.iter().map(|(id, _)| *id).collect();
+        if !primed {
+            seen = current;
+            primed = true;
+            continue;
+        }
+
+        for (id, text) in &pending {
+            if seen.insert(*id) {
+                let body = if text.trim().is_empty() {
+                    "A fix needs your approval.".to_string()
+                } else {
+                    text.clone()
+                };
+                if let Err(e) = handle
+                    .notification()
+                    .builder()
+                    .title("Eir — approval needed")
+                    .body(&body)
+                    .show()
+                {
+                    warn!("Failed to show approval notification: {e}");
+                }
+            }
+        }
+        // Drop ids no longer pending so the set can't grow without bound and a later
+        // re-proposal would notify again.
+        seen.retain(|id| current.contains(id));
+    }
+}
+
 // ── Auto-update ─────────────────────────────────────────────────────────────────
 
 /// Guards against the background checker and the About view's manual check
@@ -412,6 +478,7 @@ fn main() {
                 .build(),
         )
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .manage(status)
         .manage(UiCmdTx(ui_cmd_tx))
         .setup(move |app| {
@@ -497,6 +564,15 @@ fn main() {
                 }
             });
 
+            // Background: OS notification when a NEW fix needs approval, so an
+            // unattended, tray-resident Eir surfaces the ask instead of it only being
+            // visible if the window is open.
+            let status_notify = status_for_loop.clone();
+            let notify_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                notify_on_new_approvals(status_notify, notify_handle).await;
+            });
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -511,6 +587,7 @@ fn main() {
             get_status,
             decide_approval,
             toggle_pause,
+            undo_registry,
             update_settings,
             clear_problems,
             clear_executions,

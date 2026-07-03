@@ -57,10 +57,14 @@ pub async fn execute(action: &FixAction) -> ExecutionResult {
             key_path,
             value_name,
             value_data,
-        } => make_result(
-            action,
-            registry::reset_value(key_path, value_name, value_data).await,
-        ),
+        } => match registry::reset_value(key_path, value_name, value_data).await {
+            Ok((msg, undo)) => {
+                let mut res = make_result(action, Ok(msg));
+                res.undo = Some(undo);
+                res
+            }
+            Err(e) => make_result(action, Err(e)),
+        },
         FixAction::NetworkDiagnostic { command } => {
             let script = match command.to_lowercase().as_str() {
                 "flush_dns" => "ipconfig /flushdns",
@@ -74,6 +78,7 @@ pub async fn execute(action: &FixAction) -> ExecutionResult {
                         action: format!("{action:?}"),
                         success: false,
                         output: msg,
+                        undo: None,
                     };
                 }
             };
@@ -142,6 +147,7 @@ fn make_result(action: &FixAction, r: anyhow::Result<String>) -> ExecutionResult
                 action: label,
                 success: true,
                 output: msg,
+                undo: None,
             }
         }
         Err(e) => {
@@ -150,6 +156,7 @@ fn make_result(action: &FixAction, r: anyhow::Result<String>) -> ExecutionResult
                 action: label,
                 success: false,
                 output: e.to_string(),
+                undo: None,
             }
         }
     }

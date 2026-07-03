@@ -15,6 +15,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # The release version lives in four manifests that must move together; nothing
+      # else enforces it, so a partial bump would ship a mismatched installer/updater.
+      - name: Check version sync
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-versions.ps1
+
       # Pinned to match rust-toolchain.toml (and local dev) so a stable bump can't
       # introduce new clippy/rustfmt behaviour that diverges from local verify.
       - name: Install Rust toolchain

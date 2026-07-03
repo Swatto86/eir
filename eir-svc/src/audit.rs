@@ -1,6 +1,6 @@
 use crate::models::{
     CallUsage, ClaudeDecision, ExecutionResult, FixAction, PastDecision, PendingApproval,
-    SignalSnapshot, SystemState,
+    RegistryUndo, SignalSnapshot, SystemState,
 };
 use anyhow::Result;
 use chrono::Utc;
@@ -165,6 +165,60 @@ pub async fn save_advisor_day(
     .bind(escalations as i64)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Persist a registry-undo snapshot linked to its execution; returns the row id the
+/// UI uses to trigger a one-click revert.
+pub async fn save_registry_undo(
+    pool: &SqlitePool,
+    execution_id: i64,
+    undo: &RegistryUndo,
+) -> Result<i64> {
+    let id = sqlx::query(
+        "INSERT INTO registry_undo
+           (execution_id, key_path, value_name, prior_existed, prior_data, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(execution_id)
+    .bind(&undo.key_path)
+    .bind(&undo.value_name)
+    .bind(undo.prior_existed as i64)
+    .bind(&undo.prior_data)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?
+    .last_insert_rowid();
+    Ok(id)
+}
+
+/// Load a not-yet-undone registry-undo snapshot by id, or `None` if it doesn't exist
+/// or was already reverted.
+pub async fn load_registry_undo(pool: &SqlitePool, id: i64) -> Result<Option<RegistryUndo>> {
+    let row = sqlx::query(
+        "SELECT key_path, value_name, prior_existed, prior_data
+         FROM registry_undo WHERE id = ? AND undone = 0",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(r) => Ok(Some(RegistryUndo {
+            key_path: r.try_get(0)?,
+            value_name: r.try_get(1)?,
+            prior_existed: r.try_get::<i64, _>(2)? != 0,
+            prior_data: r.try_get(3)?,
+        })),
+        None => Ok(None),
+    }
+}
+
+/// Mark a registry-undo record as reverted so it can't be applied twice.
+pub async fn mark_registry_undo_done(pool: &SqlitePool, id: i64) -> Result<()> {
+    sqlx::query("UPDATE registry_undo SET undone = 1 WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

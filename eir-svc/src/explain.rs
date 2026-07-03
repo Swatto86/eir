@@ -89,8 +89,9 @@ pub fn explain(action: &FixAction) -> ActionExplanation {
                  overwriting whatever is there now."
             ),
             target: format!("{key_path}\\{value_name}"),
-            // The prior value is not snapshotted, so this cannot be auto-undone.
-            reversible: false,
+            // The prior value is snapshotted before the write (see registry::reset_value),
+            // so this can be auto-undone with one click from the activity feed.
+            reversible: true,
         },
         FixAction::NetworkDiagnostic { command } => explain_network(command),
         FixAction::DriverDisable { driver_name } => ActionExplanation {
@@ -121,7 +122,7 @@ pub fn explain(action: &FixAction) -> ActionExplanation {
             ),
             target: element.clone(),
             // The prior BCD value is not snapshotted, so this cannot be auto-undone
-            // (same rationale as RegistryReset above).
+            // (unlike RegistryReset, which now captures its prior value).
             reversible: false,
         },
         FixAction::ProcessKill { process_name } => ActionExplanation {

@@ -386,7 +386,10 @@ function activityItems(status) {
   }
   for (const e of (status.recent_executions || [])) {
     const icon = e.success ? '✅' : '❌';
-    items.push({ at: e.at || 0, icon, head: `${exTag(e)}<span class="act-text" title="${escAttr(e.action)}">${esc(e.action)}</span>`, why: esc(e.preview || '') });
+    // A registry reset that captured its prior value carries an undo_id → offer a
+    // one-click revert.
+    const undoId = (e.undo_id === 0 || e.undo_id) ? e.undo_id : null;
+    items.push({ at: e.at || 0, icon, undoId, head: `${exTag(e)}<span class="act-text" title="${escAttr(e.action)}">${esc(e.action)}</span>`, why: esc(e.preview || '') });
   }
   items.sort((a, b) => (b.at || 0) - (a.at || 0));
   return items;
@@ -396,15 +399,31 @@ function renderActivity(status) {
   const el = document.getElementById('activity-list');
   const items = activityItems(status);
   if (!items.length) { el.innerHTML = '<div class="empty">No activity yet</div>'; return; }
-  el.innerHTML = items.map((it) => `
+  el.innerHTML = items.map((it) => {
+    const undo = (it.undoId === 0 || it.undoId)
+      ? `<button class="act-undo" data-undo="${escAttr(String(it.undoId))}" title="Restore the previous registry value">↩ Undo</button>`
+      : '';
+    return `
     <div class="act-item">
       <div class="act-icon">${it.icon}</div>
       <div class="act-main">
-        <div class="act-head">${it.head}<span class="act-when">${ago(it.at)}</span></div>
+        <div class="act-head">${it.head}<span class="act-when">${ago(it.at)}</span>${undo}</div>
         ${it.why ? `<div class="act-why">${it.why}</div>` : ''}
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
+
+// One-click registry undo (delegated from the activity list).
+document.getElementById('activity-list').addEventListener('click', (e) => {
+  const btn = e.target.closest('.act-undo');
+  if (!btn) return;
+  const id = parseInt(btn.dataset.undo, 10);
+  if (!Number.isFinite(id)) return;
+  btn.disabled = true;
+  invoke('undo_registry', { id })
+    .catch((err) => { btn.disabled = false; console.error('undo_registry failed', err); });
+});
 
 document.getElementById('clear-activity').addEventListener('click', async () => {
   try { await invoke('clear_problems'); await invoke('clear_executions'); } catch (e) { console.error(e); }

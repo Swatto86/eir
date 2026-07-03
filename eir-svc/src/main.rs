@@ -417,6 +417,9 @@ struct ExecOutcome {
     diagnosis: String,
     confidence: f32,
     reason: Option<String>,
+    /// For a successful registry reset, the persisted undo-record id so the UI can
+    /// offer a one-click revert. None for everything else.
+    undo_id: Option<i64>,
 }
 
 /// Slow AI work for one decision-loop pass, run off-loop (mirrors ExecJob/ExecOutcome
@@ -467,6 +470,7 @@ fn spawn_executor(
             let label2 = label.clone();
             let mut handle = tokio::spawn(async move {
                 let result = executor::execute(&action).await;
+                let mut undo_id = None;
                 match audit::log_execution(&db2, decision_id, &result).await {
                     Ok(exec_id) => {
                         if let Err(e) = audit::mark_decision_executed(&db2, decision_id).await {
@@ -483,28 +487,46 @@ fn spawn_executor(
                         {
                             error!("Failed to record feedback: {e}");
                         }
+                        // Persist the registry-undo snapshot for a successful reset so
+                        // the UI can offer a one-click revert.
+                        if result.success {
+                            if let Some(undo) = &result.undo {
+                                match audit::save_registry_undo(&db2, exec_id, undo).await {
+                                    Ok(id) => undo_id = Some(id),
+                                    Err(e) => error!("Failed to persist registry undo: {e}"),
+                                }
+                            }
+                        }
                     }
                     Err(e) => error!("Failed to log execution: {e}"),
                 }
-                result
+                (result, undo_id)
             });
-            let result = match tokio::time::timeout(EXEC_MAX, &mut handle).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(_join)) => ExecutionResult {
-                    action: label2.clone(),
-                    success: false,
-                    output: "execution task panicked".to_string(),
-                },
-                Err(_elapsed) => {
-                    handle.abort();
+            let (result, undo_id) = match tokio::time::timeout(EXEC_MAX, &mut handle).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(_join)) => (
                     ExecutionResult {
                         action: label2.clone(),
                         success: false,
-                        output: format!(
-                            "execution exceeded {}m and was abandoned",
-                            EXEC_MAX.as_secs() / 60
-                        ),
-                    }
+                        output: "execution task panicked".to_string(),
+                        undo: None,
+                    },
+                    None,
+                ),
+                Err(_elapsed) => {
+                    handle.abort();
+                    (
+                        ExecutionResult {
+                            action: label2.clone(),
+                            success: false,
+                            output: format!(
+                                "execution exceeded {}m and was abandoned",
+                                EXEC_MAX.as_secs() / 60
+                            ),
+                            undo: None,
+                        },
+                        None,
+                    )
                 }
             };
 
@@ -519,6 +541,7 @@ fn spawn_executor(
                 diagnosis,
                 confidence,
                 reason,
+                undo_id,
             });
         }
     });
@@ -591,7 +614,13 @@ fn push_problem(
     });
 }
 
-fn push_execution(st: &mut SvcState, action: &str, success: bool, output: &str) {
+fn push_execution(
+    st: &mut SvcState,
+    action: &str,
+    success: bool,
+    output: &str,
+    undo_id: Option<i64>,
+) {
     let preview = output.chars().take(120).collect::<String>();
     if st.recent_executions.len() >= 20 {
         st.recent_executions.pop_front();
@@ -601,6 +630,7 @@ fn push_execution(st: &mut SvcState, action: &str, success: bool, output: &str) 
         success,
         preview,
         at: chrono::Utc::now().timestamp(),
+        undo_id,
     });
 }
 
@@ -779,6 +809,10 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     // block the loop (job volume is bounded by problems-per-cycle plus approvals).
     let (exec_tx, exec_rx) = tokio::sync::mpsc::unbounded_channel::<ExecJob>();
     let (exec_done_tx, mut exec_done_rx) = tokio::sync::mpsc::unbounded_channel::<ExecOutcome>();
+    // A clone for the user-triggered registry undo, which reports its outcome back
+    // through the same exec_done arm (so it shows in the activity feed) instead of
+    // blocking ui_rx on the restore's PowerShell call.
+    let undo_done_tx = exec_done_tx.clone();
     spawn_executor(&db, exec_rx, exec_done_tx);
     // AI analysis (and its optional advisor escalation) runs off the loop too — see
     // the analysis_done_rx arm below — so a multi-minute call never delays ui_rx.
@@ -877,7 +911,13 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                     Some(outcome) = exec_done_rx.recv() => {
                         // A fix action finished on the worker — fold its result in.
                         st.in_flight.remove(&outcome.label);
-                        push_execution(&mut st, &outcome.exec_action, outcome.success, &outcome.output);
+                        push_execution(
+                            &mut st,
+                            &outcome.exec_action,
+                            outcome.success,
+                            &outcome.output,
+                            outcome.undo_id,
+                        );
                         push_problem(
                             &mut st,
                             &outcome.diagnosis,
@@ -1407,6 +1447,50 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 warn!("Failed to save advisor settings: {e}");
                             }
                             pipe.broadcast_status(build_status(&st));
+                        }
+                        UiMsg::UndoRegistry { id } => {
+                            // Restore a prior registry value off the loop, reporting the
+                            // outcome through the exec_done arm so it appears in the
+                            // activity feed and never blocks ui_rx on the PowerShell call.
+                            let db_u = db.clone();
+                            let done = undo_done_tx.clone();
+                            tokio::spawn(async move {
+                                match audit::load_registry_undo(&db_u, id).await {
+                                    Ok(Some(undo)) => {
+                                        let label = format!(
+                                            "Undo registry {}\\{}",
+                                            undo.key_path, undo.value_name
+                                        );
+                                        let (success, output) =
+                                            match executor::registry::restore_value(&undo).await {
+                                                Ok(m) => (true, m),
+                                                Err(e) => (false, e.to_string()),
+                                            };
+                                        if success {
+                                            if let Err(e) =
+                                                audit::mark_registry_undo_done(&db_u, id).await
+                                            {
+                                                error!("Failed to mark registry undo done: {e}");
+                                            }
+                                        }
+                                        let _ = done.send(ExecOutcome {
+                                            label: label.clone(),
+                                            exec_action: label,
+                                            success,
+                                            output,
+                                            diagnosis: "User-requested undo of a registry change"
+                                                .to_string(),
+                                            confidence: 1.0,
+                                            reason: Some("undo by user".to_string()),
+                                            undo_id: None,
+                                        });
+                                    }
+                                    Ok(None) => {
+                                        warn!("Registry undo {id} not found or already undone");
+                                    }
+                                    Err(e) => error!("Failed to load registry undo {id}: {e}"),
+                                }
+                            });
                         }
                         }
                         continue;

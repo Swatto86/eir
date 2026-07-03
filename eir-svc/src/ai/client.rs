@@ -281,7 +281,12 @@ impl AiClient {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.effort);
-        let prompt = crate::ai::prompt::build(snapshot, history, feedback_summary, learned);
+        // The per-cycle context is the changing half; the static SYSTEM_PROMPT is
+        // prepended for the single-blob providers, or sent as a cached system prompt on
+        // the Anthropic path.
+        let context =
+            crate::ai::prompt::build_context(snapshot, history, feedback_summary, learned);
+        let prompt = format!("{}\n\n{}", crate::ai::prompt::SYSTEM_PROMPT, context);
         // Bounded retry on TRANSIENT failures only. Each call returns Err before
         // yielding any text, so retrying the whole call is safe (no partial output to
         // corrupt). This runs off the decision loop, so the backoff doesn't stall the
@@ -291,7 +296,7 @@ impl AiClient {
             let result = match &self.config {
                 AiClientConfig::Anthropic { api_key, model } => {
                     let m = model_ov.unwrap_or(model);
-                    self.call_anthropic(api_key, m, effort, &prompt).await
+                    self.call_anthropic(api_key, m, effort, &context).await
                 }
                 AiClientConfig::ClaudeCli {
                     binary,
@@ -364,13 +369,22 @@ impl AiClient {
         api_key: &str,
         model: &str,
         effort: &str,
-        prompt: &str,
+        context: &str,
     ) -> Result<(String, Option<CallUsage>)> {
+        // Send the static instructions as a cached `system` prompt so the large,
+        // unchanging guardrail block is billed at the cheap cache-read rate after the
+        // first cycle instead of full input price every time. The per-cycle context is
+        // the (uncached) user turn. Prompt caching is GA, so no beta header is needed.
         let mut body = json!({
             "model": model,
             "max_tokens": MAX_TOKENS,
             "stream": true,
-            "messages": [{"role": "user", "content": prompt}],
+            "system": [{
+                "type": "text",
+                "text": crate::ai::prompt::SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            "messages": [{"role": "user", "content": context}],
         });
         // GA effort dial (low..max). Haiku models have no effort support and
         // reject the parameter outright, so skip it there rather than turning

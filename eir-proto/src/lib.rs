@@ -310,6 +310,11 @@ pub struct ExecutionSummary {
     /// Unix timestamp (seconds) when this execution ran; 0 if unknown.
     #[serde(default)]
     pub at: i64,
+    /// When this was a registry reset whose prior value was captured, the id of the
+    /// undo record — the UI shows a one-click "Undo" for it. `None` for any other
+    /// execution (or once already undone). `#[serde(default)]` for wire-compat.
+    #[serde(default)]
+    pub undo_id: Option<i64>,
 }
 
 /// Messages sent FROM the service TO the UI.
@@ -354,4 +359,9 @@ pub enum UiMsg {
     },
     /// Apply advisor settings live (no service restart).
     SetAdvisorSettings(Box<AdvisorSettingsUpdate>),
+    /// Undo a completed registry reset, restoring the captured prior value. `id` is
+    /// the `ExecutionSummary.undo_id`.
+    UndoRegistry {
+        id: i64,
+    },
 }

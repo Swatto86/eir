@@ -1,3 +1,4 @@
+use crate::models::RegistryUndo;
 use crate::policy::is_within;
 use anyhow::{bail, Result};
 
@@ -35,11 +36,46 @@ fn registry_key_allowed(key: &str) -> bool {
     ALLOWED_KEY_PREFIXES.iter().any(|p| is_within(key, p))
 }
 
-/// Reset a registry value to the given data.
+/// Read the current data of a registry value, or `None` if the key/value does not
+/// exist. Used to snapshot the prior state before an overwrite so the change is
+/// reversible. The key is assumed already normalised + gated by the caller.
+async fn read_current_value(normalised_key: &str, value_name: &str) -> Option<String> {
+    let path_q = super::powershell::ps_single_quote(normalised_key);
+    let name_q = super::powershell::ps_single_quote(value_name);
+    // Index the property by the QUOTED name (never interpolate value_name raw — it is
+    // model-controlled). Emit the value, or the sentinel __EIR_NO_VALUE__ when the
+    // property/key doesn't exist, so we can tell "absent" from "empty string".
+    let script = format!(
+        "$ErrorActionPreference='Stop'; try {{ \
+           $p = Get-ItemProperty -Path {path_q} -Name {name_q}; \
+           $v = $p.PSObject.Properties[{name_q}].Value; \
+           if ($null -eq $v) {{ '__EIR_NO_VALUE__' }} else {{ [string]$v }} \
+         }} catch {{ '__EIR_NO_VALUE__' }}"
+    );
+    match super::powershell::run_diagnostic(&script).await {
+        Ok(out) => {
+            let t = out.trim();
+            if t == "__EIR_NO_VALUE__" || t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+/// Reset a registry value to the given data, returning a human message and a
+/// [`RegistryUndo`] snapshot of the value BEFORE the write so the change can be
+/// reverted (see [`restore_value`]).
 /// `key_path` must use PowerShell-style drive prefix (e.g. `HKLM:\...`).
 /// `value_data` is always written as a string; PowerShell coerces DWORD automatically
 /// when the existing value is DWORD type.
-pub async fn reset_value(key_path: &str, value_name: &str, value_data: &str) -> Result<String> {
+pub async fn reset_value(
+    key_path: &str,
+    value_name: &str,
+    value_data: &str,
+) -> Result<(String, RegistryUndo)> {
     let normalised = normalise_key(key_path);
 
     if !registry_key_allowed(&normalised) {
@@ -49,9 +85,49 @@ pub async fn reset_value(key_path: &str, value_name: &str, value_data: &str) -> 
         );
     }
 
+    // Snapshot the prior value first so the write is reversible.
+    let prior = read_current_value(&normalised, value_name).await;
+    let undo = RegistryUndo {
+        key_path: normalised.clone(),
+        value_name: value_name.to_string(),
+        prior_existed: prior.is_some(),
+        prior_data: prior,
+    };
+
     let script = build_reset_script(&normalised, value_name, value_data);
     // Timed, kill_on_drop PowerShell — a bare synchronous `Command::output()` had no
     // timeout, so a locked registry hive could pin a blocking-pool thread forever.
+    let msg = super::powershell::run_diagnostic(&script).await?;
+    Ok((msg, undo))
+}
+
+/// Revert a prior [`reset_value`] using its captured snapshot: restore the previous
+/// data if the value existed, otherwise delete the value we created. Re-checks the
+/// same allow/deny gate so an undo can't reach a key a reset couldn't.
+pub async fn restore_value(undo: &RegistryUndo) -> Result<String> {
+    let normalised = normalise_key(&undo.key_path);
+    if !registry_key_allowed(&normalised) {
+        bail!(
+            "Registry path '{}' is not on the safe list — refusing to restore",
+            undo.key_path
+        );
+    }
+    let path_q = super::powershell::ps_single_quote(&normalised);
+    let name_q = super::powershell::ps_single_quote(&undo.value_name);
+    let safe_name = undo.value_name.replace('\'', "''");
+    let script = match (undo.prior_existed, &undo.prior_data) {
+        (true, Some(data)) => {
+            let data_q = super::powershell::ps_single_quote(data);
+            format!(
+                "Set-ItemProperty -Path {path_q} -Name {name_q} -Value {data_q} -ErrorAction Stop; \
+                 Write-Output 'Restored registry value {safe_name}'"
+            )
+        }
+        _ => format!(
+            "Remove-ItemProperty -Path {path_q} -Name {name_q} -ErrorAction SilentlyContinue; \
+             Write-Output 'Removed registry value {safe_name} (it did not exist before)'"
+        ),
+    };
     super::powershell::run_diagnostic(&script).await
 }
 
