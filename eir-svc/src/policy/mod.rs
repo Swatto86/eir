@@ -112,12 +112,46 @@ impl ExecutionPolicy {
     }
 
     fn path_blocked(&self, path: &str) -> bool {
-        let lower = path.to_lowercase();
-        self.blocklist
-            .paths
-            .iter()
-            .any(|b| lower.starts_with(&b.to_lowercase()))
+        let cand = normalize_path_lexical(path);
+        self.blocklist.paths.iter().any(|b| {
+            let bl = normalize_path_lexical(b);
+            // Component-boundary prefix match: `C:\Windows` blocks `C:\Windows\...`
+            // but not `C:\WindowsApps`, and a raw substring can't sneak past.
+            !bl.is_empty() && cand.len() >= bl.len() && cand[..bl.len()] == bl[..]
+        })
     }
+}
+
+/// Lexically normalise a path (or registry key) into lowercased components for a
+/// robust blocklist comparison, WITHOUT touching the filesystem (the target may not
+/// exist yet). Folds registry hive aliases (`HKEY_LOCAL_MACHINE` → `HKLM:`) so the
+/// gate and the executor agree, strips a `\\?\` prefix, accepts both `\` and `/`
+/// separators, and resolves `.`/`..` — all the forms a raw `starts_with` missed,
+/// letting `C:/Windows/...`, `\\?\C:\Windows\...`, or `C:\Windows\..\Windows\...`
+/// slip past a `C:\Windows` block.
+fn normalize_path_lexical(path: &str) -> Vec<String> {
+    let mut p = path.trim().to_string();
+    for (from, to) in [
+        ("HKEY_LOCAL_MACHINE", "HKLM:"),
+        ("HKEY_CURRENT_USER", "HKCU:"),
+    ] {
+        if p.len() >= from.len() && p[..from.len()].eq_ignore_ascii_case(from) {
+            p = format!("{to}{}", &p[from.len()..]);
+            break;
+        }
+    }
+    let p = p.strip_prefix(r"\\?\").unwrap_or(&p);
+    let mut comps: Vec<String> = Vec::new();
+    for raw in p.split(['\\', '/']) {
+        match raw {
+            "" | "." => {}
+            ".." => {
+                comps.pop();
+            }
+            c => comps.push(c.to_lowercase()),
+        }
+    }
+    comps
 }
 
 fn action_type_name(action: &FixAction) -> &'static str {
@@ -211,5 +245,56 @@ mod tests {
             pol.evaluate(&FixAction::DefenderRealtimeEnable, 0.99),
             Verdict::RequireApproval(_)
         ));
+    }
+
+    fn policy_blocking_path(path: &str) -> ExecutionPolicy {
+        ExecutionPolicy {
+            execution: ExecutionConfig {
+                confidence_threshold: 0.80,
+                max_retries_per_issue: 3,
+                rate_limit_mins: 30,
+                auto_approve_on_success_rate: 0.95,
+            },
+            whitelist: WhitelistConfig {
+                actions: vec!["file_delete".into()],
+            },
+            blocklist: BlocklistConfig {
+                services: vec![],
+                paths: vec![path.into()],
+                actions: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn path_blocklist_resists_separator_and_traversal_bypasses() {
+        let pol = policy_blocking_path("C:\\Windows");
+        let blocked = |p: &str| {
+            matches!(
+                pol.evaluate(&FixAction::FileDelete { path: p.into() }, 0.99),
+                Verdict::Block(_)
+            )
+        };
+        // Straight match and all the evasions that beat a raw `starts_with`.
+        assert!(blocked("C:\\Windows\\System32\\x.dll"));
+        assert!(blocked("c:\\windows\\system32\\x.dll")); // case
+        assert!(blocked("C:/Windows/System32/x.dll")); // forward slashes
+        assert!(blocked("\\\\?\\C:\\Windows\\System32\\x.dll")); // \\?\ prefix
+        assert!(blocked("C:\\Windows\\..\\Windows\\System32\\x.dll")); // traversal
+                                                                       // A sibling directory that only shares a name prefix is NOT blocked.
+        assert!(!blocked("C:\\WindowsApps\\ok.txt"));
+    }
+
+    #[test]
+    fn registry_hive_alias_is_blocked_like_the_drive_form() {
+        // A blocklist written in HKLM: form must also catch the HKEY_* form the AI
+        // might emit (and vice-versa) — they normalise to the same components.
+        let pol = policy_blocking_path("HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Critical");
+        let action = FixAction::RegistryReset {
+            key_path: "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Critical".into(),
+            value_name: "Start".into(),
+            value_data: "4".into(),
+        };
+        assert!(matches!(pol.evaluate(&action, 0.99), Verdict::Block(_)));
     }
 }

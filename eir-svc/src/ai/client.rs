@@ -601,25 +601,15 @@ impl AiClient {
         }
 
         // The claude CLI is a large binary with a cold Node start plus full
-        // model inference and no streaming, so allow a generous window.
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            child.wait_with_output(),
-        )
-        .await
-        .context("claude CLI timed out after 300s")?
-        .context("claude CLI process error")?;
+        // model inference and no streaming, so allow a generous window. Output is
+        // read with a memory cap so a runaway CLI can't OOM the service.
+        let (status, stdout_raw, stderr_raw) = wait_capped(child, "claude CLI").await?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "claude CLI exited with {}: {}",
-                output.status,
-                stderr.trim()
-            );
+        if !status.success() {
+            bail!("claude CLI exited with {}: {}", status, stderr_raw.trim());
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stdout = stdout_raw.trim().to_string();
         if stdout.is_empty() {
             bail!("claude CLI returned empty output");
         }
@@ -716,24 +706,17 @@ impl AiClient {
         }
 
         // The kilo CLI is a Node binary with a cold start plus agent loop
-        // (--auto) and JSON event emission, so allow a generous window.
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            child.wait_with_output(),
-        )
-        .await
-        .context("kilo CLI timed out after 300s")?
-        .context("kilo CLI process error")?;
+        // (--auto) and JSON event emission, so allow a generous window. Output is
+        // read with a memory cap so a runaway agent loop can't OOM the service.
+        let (status, stdout, stderr_raw) = wait_capped(child, "kilo CLI").await?;
 
-        if !output.status.success() {
+        if !status.success() {
             // Exit 124 = kilo's own timeout (treat like ours); 1 = init/runtime
             // error. Surface stderr so the user can diagnose (e.g. "Not
             // authenticated — run `kilo` once interactively to log in").
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("kilo CLI exited with {}: {}", output.status, stderr.trim());
+            bail!("kilo CLI exited with {}: {}", status, stderr_raw.trim());
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let (text, usage) = parse_kilo_ndjson(&stdout)?;
         if text.trim().is_empty() {
             bail!("kilo CLI returned no assistant text");
@@ -1318,6 +1301,70 @@ fn parse_kilo_ndjson(stdout: &str) -> Result<(String, Option<CallUsage>)> {
 /// multi-byte UTF-8 codepoint straddling the limit can't panic (`&s[..n]` would).
 fn char_preview(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
+}
+
+/// Per-stream memory cap for a CLI subprocess. Bounds RAM against a looping/
+/// misbehaving CLI that emits huge output within the time budget.
+const CLI_OUTPUT_CAP: usize = 16 * 1024 * 1024;
+
+/// Read an optional child stream to at most `cap` bytes, then drain-and-discard the
+/// rest (so the child never blocks on a full pipe while memory stays bounded).
+async fn read_stream_capped<R: tokio::io::AsyncRead + Unpin>(
+    stream: Option<R>,
+    cap: usize,
+) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut out = Vec::new();
+    let Some(mut r) = stream else {
+        return out;
+    };
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if out.len() < cap {
+                    let take = n.min(cap - out.len());
+                    out.extend_from_slice(&chunk[..take]);
+                }
+                // Beyond the cap the bytes are discarded, not buffered.
+            }
+        }
+    }
+    out
+}
+
+/// Wait for a spawned CLI child with a 300s timeout and a per-stream memory cap.
+/// stdout and stderr are read concurrently (a sequential read could deadlock if the
+/// child fills the other pipe's buffer). On timeout the child is killed.
+async fn wait_capped(
+    mut child: tokio::process::Child,
+    what: &str,
+) -> Result<(std::process::ExitStatus, String, String)> {
+    let so = child.stdout.take();
+    let se = child.stderr.take();
+    let combined = async {
+        let (o, e, s) = tokio::join!(
+            read_stream_capped(so, CLI_OUTPUT_CAP),
+            read_stream_capped(se, CLI_OUTPUT_CAP),
+            child.wait(),
+        );
+        (o, e, s)
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(300), combined).await {
+        Ok((o, e, s)) => {
+            let status = s.with_context(|| format!("{what} process error"))?;
+            Ok((
+                status,
+                String::from_utf8_lossy(&o).into_owned(),
+                String::from_utf8_lossy(&e).into_owned(),
+            ))
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            bail!("{what} timed out after 300s")
+        }
+    }
 }
 
 fn strip_fences(s: &str) -> &str {

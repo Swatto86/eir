@@ -1393,6 +1393,17 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                 {
                     warn!("Feedback update failed: {e}");
                 }
+
+                // Retention: the detectors only look back ~30 days, so keep the
+                // feedback/rejection tables from growing without bound (cheap once
+                // they're pruned — later cycles match nothing).
+                const RETENTION_DAYS: i64 = 90;
+                if let Err(e) = feedback::prune_old(&db, RETENTION_DAYS).await {
+                    warn!("Feedback prune failed: {e}");
+                }
+                if let Err(e) = learn::prune_old_rejections(&db, RETENTION_DAYS).await {
+                    warn!("Rejection prune failed: {e}");
+                }
                 let feedback_summary =
                     feedback::recent_summary(&db, 10).await.unwrap_or_default();
 

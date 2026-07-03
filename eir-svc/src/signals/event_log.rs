@@ -44,9 +44,15 @@ fn level_name(event_type: REPORT_EVENT_TYPE) -> Option<&'static str> {
 
 /// Read entries newer than `last_record` from a single event log channel.
 /// Returns the new entries (newest first) and the highest record number seen.
-/// On first call pass `last_record = 0` to prime the cursor without returning entries,
-/// or any prior max to receive only genuinely new events.
-fn read_channel_since(channel: &str, last_record: u32) -> (Vec<EventLogEntry>, u32) {
+///
+/// When `prime` is true (the channel's first poll), the cursor is seeded to the
+/// current newest record WITHOUT returning any entries — otherwise startup would
+/// dump up to `RING_SIZE` possibly days-old, already-resolved errors and fire the
+/// reactive trigger on stale data. A `RecordNumber` reset (log cleared / retention
+/// rollover / u32 wrap — the newest record is now *below* the stored cursor) is
+/// detected and treated like a re-prime, so post-clear events aren't silently
+/// dropped forever by the "already delivered" guard.
+fn read_channel_since(channel: &str, last_record: u32, prime: bool) -> (Vec<EventLogEntry>, u32) {
     let channel_w = wide(channel);
     let handle = match unsafe { OpenEventLogW(PCWSTR::null(), PCWSTR(channel_w.as_ptr())) } {
         Ok(h) => h,
@@ -59,6 +65,9 @@ fn read_channel_since(channel: &str, last_record: u32) -> (Vec<EventLogEntry>, u
     let mut entries = Vec::new();
     let mut buf = vec![0u8; 65536];
     let mut new_max_record = last_record;
+    let mut first_seen = false;
+    // Set once we know we should deliver nothing this pass and only reseed the cursor.
+    let mut reseed_only = prime;
     let mut done = false;
 
     while !done {
@@ -86,6 +95,24 @@ fn read_channel_since(channel: &str, last_record: u32) -> (Vec<EventLogEntry>, u
             let record = unsafe { &*(buf.as_ptr().add(offset) as *const EVENTLOGRECORD) };
 
             if record.Length == 0 {
+                done = true;
+                break;
+            }
+
+            // The first record is the newest (we read backwards): it defines the
+            // channel's current high-water mark and reveals a log reset.
+            if !first_seen {
+                first_seen = true;
+                new_max_record = record.RecordNumber;
+                if !prime && last_record > 0 && record.RecordNumber < last_record {
+                    // Cursor is ahead of the newest record — the log was cleared or
+                    // wrapped. Reseed to the new max and deliver nothing this pass.
+                    reseed_only = true;
+                }
+            }
+
+            // Priming or reseeding: we only needed the newest record number.
+            if reseed_only {
                 done = true;
                 break;
             }
@@ -165,9 +192,15 @@ pub fn spawn(
                         let mut all = VecDeque::new();
                         let mut c = cursors_in;
                         for channel in &channels_clone {
-                            let last = *c.get(channel.as_str()).unwrap_or(&0);
-                            let (entries, new_last) = read_channel_since(channel, last);
-                            if new_last > last {
+                            // Absent cursor == first poll for this channel → prime
+                            // (seed the high-water mark, deliver nothing).
+                            let known = c.get(channel.as_str()).copied();
+                            let last = known.unwrap_or(0);
+                            let prime = known.is_none();
+                            let (entries, new_last) = read_channel_since(channel, last, prime);
+                            // Always record the cursor on a prime (even if it didn't
+                            // advance) so the channel isn't re-primed every poll.
+                            if prime || new_last != last {
                                 c.insert(channel.clone(), new_last);
                             }
                             for e in entries {
