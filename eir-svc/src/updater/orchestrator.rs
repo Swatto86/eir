@@ -58,7 +58,16 @@ async fn dispatch(
     if let Some(Remedy::KillProcess { name }) = remedy {
         kill_process(name).await;
     }
-    let force = matches!(remedy, Some(Remedy::Force));
+    // A stale manager lock is almost always transient (a prior operation releasing).
+    // We can't safely delete a package manager's lock file, and killing the holder is
+    // the KillProcess remedy's job — so give the lock a moment to clear, then retry
+    // with force where the method supports it. Previously this remedy was validated
+    // and accepted but never applied, silently burning one capped attempt.
+    if matches!(remedy, Some(Remedy::ClearManagerLock)) {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    let force = matches!(remedy, Some(Remedy::Force))
+        || (matches!(remedy, Some(Remedy::ClearManagerLock)) && method.supports_force());
     match method {
         Method::Winget => winget::attempt_with(candidate, force).await,
         Method::Choco => choco::attempt(candidate).await,
@@ -95,9 +104,11 @@ fn next_method(order: &[Method], tried: &[Method], last: &AttemptOutcome) -> Opt
     if last.success {
         return None;
     }
+    // A terminal integrity failure, or "already current" (the app is up to date, so
+    // switching to another method would needlessly reinstall it), stops the ladder.
     if last
         .category
-        .map(ErrorCategory::is_terminal)
+        .map(|c| c.is_terminal() || c == ErrorCategory::AlreadyCurrent)
         .unwrap_or(false)
     {
         return None;
@@ -169,11 +180,12 @@ pub async fn heal(
         app_spent += outcome.cost_usd;
         tried.push(method);
 
-        // Stop on success, a terminal integrity failure, or the last allowed attempt.
+        // Stop on success, a terminal integrity failure, "already current" (no work
+        // to do), or the last allowed attempt.
         let done = outcome.success
             || outcome
                 .category
-                .map(ErrorCategory::is_terminal)
+                .map(|c| c.is_terminal() || c == ErrorCategory::AlreadyCurrent)
                 .unwrap_or(false)
             || attempts.len() + 1 >= max;
         if done {
