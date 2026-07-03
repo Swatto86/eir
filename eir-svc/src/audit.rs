@@ -168,6 +168,170 @@ pub async fn save_advisor_day(
     Ok(())
 }
 
+/// One row of the per-cycle resource history used for trend detection.
+pub struct MetricSample {
+    pub cpu: f64,
+    pub mem: f64,
+    pub disk: f64,
+}
+
+/// Read the last `limit` resource samples (chronological order) from the
+/// `system_state_history` — a rich per-cycle series that was previously written but
+/// never read.
+pub async fn recent_metrics(pool: &SqlitePool, limit: i64) -> Result<Vec<MetricSample>> {
+    let rows = sqlx::query(
+        "SELECT cpu_usage, memory_usage, disk_usage
+         FROM system_state_history ORDER BY id DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    // Query is newest-first; reverse to chronological so trends read left→right.
+    Ok(rows
+        .iter()
+        .rev()
+        .map(|r| MetricSample {
+            cpu: r.try_get::<Option<f64>, _>(0).ok().flatten().unwrap_or(0.0),
+            mem: r.try_get::<Option<f64>, _>(1).ok().flatten().unwrap_or(0.0),
+            disk: r.try_get::<Option<f64>, _>(2).ok().flatten().unwrap_or(0.0),
+        })
+        .collect())
+}
+
+/// A one-line resource-trend note for the AI prompt, or `None` when nothing is worth
+/// flagging. Reads the recent history and compares the first vs second half of the
+/// window — a slow climb (disk filling, sustained CPU/memory rise) that a single
+/// snapshot can't show. Thresholds are heuristic and deliberately conservative to
+/// avoid noise on a healthy machine.
+pub async fn metric_trend(pool: &SqlitePool) -> Result<Option<String>> {
+    let samples = recent_metrics(pool, 12).await?;
+    Ok(summarise_trend(&samples))
+}
+
+/// Pure trend summariser (unit-tested). Needs at least 6 samples; compares the mean of
+/// the older half to the newer half and flags a metric only when it is both rising and
+/// already elevated.
+fn summarise_trend(samples: &[MetricSample]) -> Option<String> {
+    if samples.len() < 6 {
+        return None;
+    }
+    let half = |get: fn(&MetricSample) -> f64| -> (f64, f64) {
+        let mid = samples.len() / 2;
+        let first: f64 = samples[..mid].iter().map(get).sum::<f64>() / mid as f64;
+        let last: f64 = samples[mid..].iter().map(get).sum::<f64>() / (samples.len() - mid) as f64;
+        (first, last)
+    };
+    let mut notes = Vec::new();
+    let (df, dl) = half(|s| s.disk);
+    if dl - df >= 3.0 && dl >= 75.0 {
+        notes.push(format!("disk usage trending up ({df:.0}% → {dl:.0}%)"));
+    }
+    let (cf, cl) = half(|s| s.cpu);
+    if cl - cf >= 15.0 && cl >= 70.0 {
+        notes.push(format!("CPU load trending up ({cf:.0}% → {cl:.0}%)"));
+    }
+    let (mf, ml) = half(|s| s.mem);
+    if ml - mf >= 15.0 && ml >= 80.0 {
+        notes.push(format!("memory usage trending up ({mf:.0}% → {ml:.0}%)"));
+    }
+    if notes.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "RESOURCE TREND (last {} cycles — a slow climb a single snapshot can't show): {}. \
+             Treat as a fault only if it is heading toward exhaustion (disk under ~10% free, OOM); \
+             otherwise note it, don't act.",
+            samples.len(),
+            notes.join("; ")
+        ))
+    }
+}
+
+/// Aggregated audit counts over a window, for the weekly health digest.
+#[derive(Debug, Default, Clone)]
+pub struct DigestStats {
+    pub decisions: i64,
+    pub exec_total: i64,
+    pub exec_success: i64,
+    pub updates_total: i64,
+    pub updates_success: i64,
+    pub learned_facts: i64,
+    pub spend_usd: f64,
+}
+
+/// Roll up the audit tables since `cutoff_rfc3339` (a UTC RFC3339 string; timestamps
+/// are stored in the same format so a lexical `>=` compares chronologically). Feeds the
+/// digest generator — summary counts only, never raw snapshots.
+pub async fn digest_stats(pool: &SqlitePool, cutoff_rfc3339: &str) -> Result<DigestStats> {
+    let mut s = DigestStats::default();
+
+    let d: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM decisions WHERE timestamp >= ?")
+        .bind(cutoff_rfc3339)
+        .fetch_one(pool)
+        .await?;
+    s.decisions = d.0;
+
+    let e: (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(success), 0) FROM execution_log WHERE executed_at >= ?",
+    )
+    .bind(cutoff_rfc3339)
+    .fetch_one(pool)
+    .await?;
+    s.exec_total = e.0;
+    s.exec_success = e.1;
+
+    let u: (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(success), 0) FROM update_attempts WHERE created_at >= ?",
+    )
+    .bind(cutoff_rfc3339)
+    .fetch_one(pool)
+    .await?;
+    s.updates_total = u.0;
+    s.updates_success = u.1;
+
+    let c: (f64,) =
+        sqlx::query_as("SELECT COALESCE(SUM(cost_usd), 0) FROM usage_log WHERE timestamp >= ?")
+            .bind(cutoff_rfc3339)
+            .fetch_one(pool)
+            .await?;
+    s.spend_usd = c.0;
+
+    let f: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM learned_facts")
+        .fetch_one(pool)
+        .await?;
+    s.learned_facts = f.0;
+
+    Ok(s)
+}
+
+/// Persist a generated health digest.
+pub async fn save_digest(pool: &SqlitePool, text: &str) -> Result<()> {
+    sqlx::query("INSERT INTO health_digest (text, generated_at) VALUES (?, ?)")
+        .bind(text)
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The most recent health digest as (text, unix-seconds), or `None` if none exists.
+pub async fn latest_digest(pool: &SqlitePool) -> Result<Option<(String, i64)>> {
+    let row = sqlx::query("SELECT text, generated_at FROM health_digest ORDER BY id DESC LIMIT 1")
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        Some(r) => {
+            let text: String = r.try_get(0)?;
+            let ts: String = r.try_get(1)?;
+            let at = chrono::DateTime::parse_from_rfc3339(&ts)
+                .map(|d| d.timestamp())
+                .unwrap_or(0);
+            Ok(Some((text, at)))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Persist a registry-undo snapshot linked to its execution; returns the row id the
 /// UI uses to trigger a one-click revert.
 pub async fn save_registry_undo(
@@ -379,4 +543,57 @@ pub async fn log_execution(
     .await?
     .last_insert_rowid();
     Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn samples(vals: &[(f64, f64, f64)]) -> Vec<MetricSample> {
+        vals.iter()
+            .map(|&(cpu, mem, disk)| MetricSample { cpu, mem, disk })
+            .collect()
+    }
+
+    #[test]
+    fn trend_needs_a_full_window() {
+        // Fewer than 6 samples → no trend, however steep.
+        let s = samples(&[(10.0, 10.0, 10.0), (90.0, 90.0, 90.0)]);
+        assert!(summarise_trend(&s).is_none());
+    }
+
+    #[test]
+    fn steady_healthy_metrics_are_not_a_trend() {
+        let s = samples(&[(20.0, 40.0, 50.0); 8]);
+        assert!(summarise_trend(&s).is_none());
+    }
+
+    #[test]
+    fn a_filling_disk_is_flagged() {
+        // Disk climbs from ~74 to ~80 and is elevated → flagged.
+        let s = samples(&[
+            (10.0, 40.0, 73.0),
+            (10.0, 40.0, 74.0),
+            (10.0, 40.0, 75.0),
+            (10.0, 40.0, 79.0),
+            (10.0, 40.0, 80.0),
+            (10.0, 40.0, 81.0),
+        ]);
+        let out = summarise_trend(&s).expect("should flag a filling disk");
+        assert!(out.contains("disk usage trending up"));
+    }
+
+    #[test]
+    fn a_rising_but_low_disk_is_not_flagged() {
+        // Climbing, but nowhere near full → not flagged (avoids noise).
+        let s = samples(&[
+            (10.0, 40.0, 20.0),
+            (10.0, 40.0, 22.0),
+            (10.0, 40.0, 24.0),
+            (10.0, 40.0, 26.0),
+            (10.0, 40.0, 28.0),
+            (10.0, 40.0, 30.0),
+        ]);
+        assert!(summarise_trend(&s).is_none());
+    }
 }

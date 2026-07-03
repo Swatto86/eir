@@ -115,6 +115,54 @@ fn get_disk() -> (f32, f32) {
     (usage, free_gb)
 }
 
+/// Aggregate SMART health across the machine's physical disks: the worst
+/// `HealthStatus` reported by `Get-PhysicalDisk` ("Healthy" | "Warning" |
+/// "Unhealthy"), or "unknown" if the query fails or returns nothing. A disk
+/// predicting failure is exactly the early warning a guardian should surface, so this
+/// feeds the actionable fingerprint via `SystemState::fault_parts`.
+fn get_disk_health() -> String {
+    let out = ps_capped(
+        "$h = Get-PhysicalDisk -ErrorAction SilentlyContinue | \
+           Select-Object -ExpandProperty HealthStatus; \
+         if (-not $h) { 'unknown' } \
+         elseif ($h -contains 'Unhealthy') { 'Unhealthy' } \
+         elseif ($h -contains 'Warning') { 'Warning' } \
+         else { 'Healthy' }",
+        std::time::Duration::from_secs(15),
+    );
+    match out {
+        Some(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                "unknown".to_string()
+            } else {
+                t.to_string()
+            }
+        }
+        None => "unknown".to_string(),
+    }
+}
+
+/// Total NIC packet errors (received + outbound) across adapters, via the standard
+/// CIM statistics class. Defensive: any missing property or a failed query yields 0
+/// (same as the old hardcoded value), so a wrong environment can't inject noise.
+fn get_network_errors() -> u32 {
+    let out = ps_capped(
+        "try { \
+           $s = Get-CimInstance -Namespace root/StandardCimv2 \
+                -ClassName MSFT_NetAdapterStatisticsSettingData -ErrorAction Stop; \
+           $e = 0; \
+           foreach ($a in $s) { \
+             $e += [int64]$a.ReceivedPacketErrors + [int64]$a.OutboundPacketErrors } \
+           $e \
+         } catch { 0 }",
+        std::time::Duration::from_secs(15),
+    );
+    out.and_then(|s| s.trim().parse::<i64>().ok())
+        .map(|n| n.clamp(0, u32::MAX as i64) as u32)
+        .unwrap_or(0)
+}
+
 /// Enumerate services and return (running_count, failed_names).
 ///
 /// A "failed" service is one that is fully STOPPED with an *abnormal* exit code.
@@ -427,6 +475,8 @@ fn snapshot_state() -> SystemState {
     let (disk_usage_percent, disk_free_gb) = get_disk();
     let (running_services_count, failed_services) = get_services();
     let network_interfaces = get_network_interfaces();
+    let network_errors = get_network_errors();
+    let disk_health = get_disk_health();
     let windows_update_status = get_windows_update_status();
     let security = SecurityPosture {
         firewall: get_firewall(),
@@ -443,8 +493,8 @@ fn snapshot_state() -> SystemState {
         running_services_count,
         failed_services,
         network_interfaces,
-        network_errors: 0,
-        disk_health: "unknown".to_string(),
+        network_errors,
+        disk_health,
         windows_update_status,
         security,
     }

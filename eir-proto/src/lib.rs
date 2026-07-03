@@ -35,6 +35,18 @@ pub struct StatusPayload {
     /// transparency card. `#[serde(default)]` keeps an older payload decodable.
     #[serde(default)]
     pub learned_facts: Vec<LearnedFactView>,
+    /// The latest weekly plain-English health digest, if one has been generated.
+    /// `#[serde(default)]` keeps an older payload decodable.
+    #[serde(default)]
+    pub digest: Option<DigestView>,
+}
+
+/// The latest weekly health digest, rendered on the dashboard.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct DigestView {
+    pub text: String,
+    /// Unix seconds when it was generated.
+    pub generated_at: i64,
 }
 
 /// One learned fact, rendered in the UI's "What Eir has learned" card.

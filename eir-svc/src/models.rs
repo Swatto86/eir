@@ -117,6 +117,12 @@ impl SystemState {
                 parts.push("DEF|sig_stale".into());
             }
         }
+        // A SMART disk health of Warning/Unhealthy is a real early warning worth an
+        // analysis. "Healthy"/"unknown" (and the empty default) are not faults.
+        let dh = self.disk_health.to_lowercase();
+        if dh == "warning" || dh == "unhealthy" {
+            parts.push(format!("DISK_HEALTH|{dh}"));
+        }
         parts
     }
 }
@@ -258,6 +264,13 @@ pub enum FixAction {
     /// Turn Windows Defender real-time (on-access) protection back on. Reversible,
     /// but security-sensitive, so it is approval-gated, not auto-run.
     DefenderRealtimeEnable,
+    /// Run `sfc /scannow` to verify and repair protected system files. Long-running
+    /// and writes to the component store, so it is approval-gated, never whitelisted.
+    SfcScan,
+    /// Run `DISM /Online /Cleanup-Image /RestoreHealth` to repair the Windows component
+    /// store (often a prerequisite for SFC). Long-running, approval-gated, never
+    /// whitelisted.
+    DismRestoreHealth,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -321,4 +334,45 @@ pub struct CallUsage {
     pub cache_creation: u64,
     pub cache_read: u64,
     pub cost_usd: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with_disk_health(dh: &str) -> SystemState {
+        SystemState {
+            uptime_secs: 0,
+            cpu_usage_percent: 0.0,
+            memory_usage_percent: 0.0,
+            memory_available_gb: 0.0,
+            disk_usage_percent: 0.0,
+            disk_free_gb: 0.0,
+            running_services_count: 0,
+            failed_services: vec![],
+            network_interfaces: vec![],
+            network_errors: 0,
+            disk_health: dh.to_string(),
+            windows_update_status: "ok".into(),
+            security: SecurityPosture::default(),
+        }
+    }
+
+    #[test]
+    fn disk_health_is_a_fault_only_when_degraded() {
+        // Healthy / unknown / empty are NOT faults (no spurious analysis).
+        for ok in ["Healthy", "unknown", ""] {
+            assert!(state_with_disk_health(ok)
+                .fault_parts()
+                .iter()
+                .all(|p| !p.starts_with("DISK_HEALTH")));
+        }
+        // Warning / Unhealthy ARE faults (case-insensitive).
+        for bad in ["Warning", "Unhealthy", "UNHEALTHY"] {
+            assert!(state_with_disk_health(bad)
+                .fault_parts()
+                .iter()
+                .any(|p| p.starts_with("DISK_HEALTH")));
+        }
+    }
 }

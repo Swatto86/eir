@@ -165,6 +165,22 @@ pub fn explain(action: &FixAction) -> ActionExplanation {
             target: "Windows Defender real-time protection".to_string(),
             reversible: true,
         },
+        FixAction::SfcScan => ActionExplanation {
+            summary: "Runs System File Checker (sfc /scannow) to verify and repair protected \
+                      Windows system files. It only repairs corruption from Windows' own cache; \
+                      it takes several minutes and cannot be interrupted cleanly."
+                .to_string(),
+            target: "Protected system files".to_string(),
+            reversible: false,
+        },
+        FixAction::DismRestoreHealth => ActionExplanation {
+            summary: "Runs DISM /Online /Cleanup-Image /RestoreHealth to repair the Windows \
+                      component store (the source SFC repairs from). It can take many minutes and \
+                      may download replacement files from Windows Update."
+                .to_string(),
+            target: "Windows component store".to_string(),
+            reversible: false,
+        },
     }
 }
 

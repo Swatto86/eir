@@ -1,6 +1,7 @@
 mod ai;
 mod audit;
 mod config;
+mod digest;
 mod executor;
 mod explain;
 mod feedback;
@@ -200,6 +201,12 @@ struct SvcState {
     advisor_escalations_today: u32,
     /// The UTC date (YYYY-MM-DD) that the advisor day-counters belong to.
     advisor_spend_date: String,
+    /// The latest weekly health digest broadcast to the UI (None until generated).
+    digest: Option<eir_proto::DigestView>,
+    /// Unix seconds the last digest was generated (0 = never), for the weekly gate.
+    last_digest_at: i64,
+    /// True while a digest generation is in flight (prevents overlap).
+    digest_running: bool,
 }
 
 impl Default for SvcState {
@@ -226,6 +233,9 @@ impl Default for SvcState {
             advisor_spent_today: 0.0,
             advisor_escalations_today: 0,
             advisor_spend_date: String::new(),
+            digest: None,
+            last_digest_at: 0,
+            digest_running: false,
         }
     }
 }
@@ -275,6 +285,7 @@ fn build_status(st: &SvcState) -> StatusPayload {
         updater: Some(st.updater.clone()),
         advisor: st.advisor.clone(),
         learned_facts: st.learned_facts.clone(),
+        digest: st.digest.clone(),
     }
 }
 
@@ -435,6 +446,16 @@ struct AnalysisSuccess {
     advisor_escalations_today: u32,
 }
 
+/// Per-job backstop timeout for the executor worker. Defaults to 10 minutes, but the
+/// system-file repairs (`sfc /scannow`, DISM RestoreHealth) are legitimately long and
+/// get a much larger cap so the backstop doesn't kill a healthy repair mid-run.
+fn exec_timeout(action: &FixAction) -> Duration {
+    match action {
+        FixAction::SfcScan | FixAction::DismRestoreHealth => executor::repair::REPAIR_TIMEOUT,
+        _ => Duration::from_secs(10 * 60),
+    }
+}
+
 /// Spawn the single executor worker. It serialises fix-action execution off the
 /// decision loop: each job runs `executor::execute` (panic-isolated) and writes the
 /// audit/feedback records, then reports an [`ExecOutcome`] back over `done_tx` for the
@@ -446,12 +467,6 @@ fn spawn_executor(
     done_tx: tokio::sync::mpsc::UnboundedSender<ExecOutcome>,
 ) {
     let db = db.clone();
-    // Backstop only — every real action already carries its own timeout (powershell
-    // DEFAULT_TIMEOUT, driver/security calls, etc.). This bounds the one that doesn't
-    // (registry's raw blocking powershell) and any future gap, so one wedged action
-    // can't stall the single serial queue forever and latch every later action on
-    // "Executing".
-    const EXEC_MAX: Duration = Duration::from_secs(10 * 60);
     tokio::spawn(async move {
         while let Some(job) = job_rx.recv().await {
             let ExecJob {
@@ -463,6 +478,11 @@ fn spawn_executor(
                 confidence,
                 reason,
             } = job;
+            // Per-job backstop timeout. Most actions carry their own timeout (powershell
+            // DEFAULT_TIMEOUT, driver/security calls, etc.); this bounds the queue so one
+            // wedged action can't latch every later action on "Executing". SFC/DISM are
+            // legitimately long, so they get a longer cap than the default.
+            let exec_max = exec_timeout(&action);
             // Run the whole job body (execute + audit + feedback) inside an isolated,
             // timeout-bounded task: a panic anywhere is contained to this job (the
             // worker survives to run the next), and a hang can't wedge the queue.
@@ -502,7 +522,7 @@ fn spawn_executor(
                 }
                 (result, undo_id)
             });
-            let (result, undo_id) = match tokio::time::timeout(EXEC_MAX, &mut handle).await {
+            let (result, undo_id) = match tokio::time::timeout(exec_max, &mut handle).await {
                 Ok(Ok(pair)) => pair,
                 Ok(Err(_join)) => (
                     ExecutionResult {
@@ -521,7 +541,7 @@ fn spawn_executor(
                             success: false,
                             output: format!(
                                 "execution exceeded {}m and was abandoned",
-                                EXEC_MAX.as_secs() / 60
+                                exec_max.as_secs() / 60
                             ),
                             undo: None,
                         },
@@ -727,6 +747,15 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         st.advisor_escalations_today = escalations;
     }
     st.advisor_spend_date = today;
+    // Load the latest weekly health digest so the UI shows it immediately and the
+    // weekly gate knows when the last one ran (survives restarts).
+    if let Ok(Some((text, at))) = audit::latest_digest(&db).await {
+        st.last_digest_at = at;
+        st.digest = Some(eir_proto::DigestView {
+            text,
+            generated_at: at,
+        });
+    }
     // A bad AI config must NOT kill the service — degrade instead, so the pipe
     // and UI stay alive and the user can fix it in Settings.
     let ai: Option<std::sync::Arc<ai::client::AiClient>> = match ai::client::AiClient::new(&cfg.api)
@@ -818,6 +847,12 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     // the analysis_done_rx arm below — so a multi-minute call never delays ui_rx.
     let (analysis_done_tx, mut analysis_done_rx) =
         tokio::sync::mpsc::channel::<Result<AnalysisSuccess, String>>(2);
+    // The weekly health digest is one bounded AI call; it runs off-loop and reports the
+    // rendered digest (plus its usage) back through this channel.
+    let (digest_done_tx, mut digest_done_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(eir_proto::DigestView, Option<CallUsage>)>();
+    /// Regenerate the digest weekly.
+    const DIGEST_INTERVAL_SECS: i64 = 7 * 24 * 3600;
     let mut analysis_running = false;
     const ANALYSIS_MAX: Duration = Duration::from_secs(10 * 60);
     // The labeller is a small text-only call; bound it well under the analysis cap so
@@ -896,6 +931,24 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         };
                         info!(apps = st.updater.apps.len(), "Update cycle complete");
                         pipe.broadcast_status(build_status(&st));
+                        continue;
+                    }
+                    Some((view, usage)) = digest_done_rx.recv() => {
+                        // A weekly digest task finished. Empty text == failure: clear the
+                        // flag and push the next attempt out a week, but keep any prior
+                        // digest and don't bill. Otherwise persist, bill, and show it.
+                        st.digest_running = false;
+                        st.last_digest_at = view.generated_at;
+                        if !view.text.is_empty() {
+                            if let Some(u) = usage {
+                                if let Err(e) = audit::log_usage(&db, &u).await {
+                                    warn!("Failed to log digest usage: {e}");
+                                }
+                            }
+                            info!("Weekly health digest generated");
+                            st.digest = Some(view);
+                            pipe.broadcast_status(build_status(&st));
+                        }
                         continue;
                     }
                     Some(phase) = update_progress_rx.recv() => {
@@ -1583,6 +1636,47 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                     continue;
                 };
 
+                // Weekly health digest: time-based (checked here, before the idle-skip
+                // gate, so a quiet week still gets one), off-loop so the AI call never
+                // blocks the loop. One at a time.
+                let now_ts = chrono::Utc::now().timestamp();
+                if !st.digest_running
+                    && (st.last_digest_at == 0 || now_ts - st.last_digest_at >= DIGEST_INTERVAL_SECS)
+                {
+                    st.digest_running = true;
+                    let db_d = db.clone();
+                    let ai_d = ai.clone();
+                    let model_d = cfg.api.update_check_model.clone();
+                    let done_d = digest_done_tx.clone();
+                    tokio::spawn(async move {
+                        match digest::generate(&db_d, &ai_d, &model_d).await {
+                            Ok((text, usage)) => {
+                                if let Err(e) = audit::save_digest(&db_d, &text).await {
+                                    warn!("Failed to save health digest: {e}");
+                                }
+                                let view = eir_proto::DigestView {
+                                    text,
+                                    generated_at: chrono::Utc::now().timestamp(),
+                                };
+                                let _ = done_d.send((view, usage));
+                            }
+                            Err(e) => {
+                                // Report failure with an empty text + a real timestamp: the
+                                // arm clears digest_running and pushes the next attempt out a
+                                // week (no retry storm), without overwriting a prior digest.
+                                warn!("Health digest generation failed: {e}");
+                                let _ = done_d.send((
+                                    eir_proto::DigestView {
+                                        text: String::new(),
+                                        generated_at: chrono::Utc::now().timestamp(),
+                                    },
+                                    None,
+                                ));
+                            }
+                        }
+                    });
+                }
+
                 if analysis_running {
                     info!("Analysis already in flight - skipping this pass");
                     st.status = resting_status(&st);
@@ -1695,7 +1789,19 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                 // confidence gate accounts for them (per-problem routing below).
                 learn::analyse_issues(&db).await;
                 let learned_facts = learn::LearnedFacts::load(&db).await;
-                let learned_section = learned_facts.prompt_section();
+                // Fold a resource-trend note (from the previously-unused
+                // system_state_history series) into the read-only context so the AI can
+                // see a slow climb — disk filling, sustained CPU/memory rise — that a
+                // single snapshot can't reveal.
+                let learned_section = match (
+                    learned_facts.prompt_section(),
+                    audit::metric_trend(&db).await.ok().flatten(),
+                ) {
+                    (Some(l), Some(t)) => Some(format!("{l}\n\n{t}")),
+                    (Some(l), None) => Some(l),
+                    (None, Some(t)) => Some(t),
+                    (None, None) => None,
+                };
 
                 // ── Claude analysis (off-loop) ────────────────────────────────
                 // Day-rollover reset for the advisor's daily counters - must happen

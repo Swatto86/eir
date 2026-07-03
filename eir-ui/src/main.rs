@@ -353,11 +353,13 @@ async fn notify_on_new_approvals(status: SharedStatus, handle: AppHandle) {
 
     let mut seen: HashSet<u64> = HashSet::new();
     let mut primed = false;
+    let mut last_digest_at: i64 = 0;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let pending: Vec<(u64, String)> = {
+        let (pending, digest_at): (Vec<(u64, String)>, i64) = {
             let s = status.lock().unwrap();
-            s.pending_approvals
+            let pending = s
+                .pending_approvals
                 .iter()
                 .map(|a| {
                     let text = if a.action_summary.is_empty() {
@@ -367,8 +369,25 @@ async fn notify_on_new_approvals(status: SharedStatus, handle: AppHandle) {
                     };
                     (a.id, text)
                 })
-                .collect()
+                .collect();
+            let digest_at = s.digest.as_ref().map(|d| d.generated_at).unwrap_or(0);
+            (pending, digest_at)
         };
+
+        // Notify once when a new weekly digest lands (after priming, so an existing
+        // one on launch doesn't alert).
+        if primed && digest_at > last_digest_at && last_digest_at != 0 {
+            if let Err(e) = handle
+                .notification()
+                .builder()
+                .title("Eir — weekly health digest")
+                .body("Your weekly system summary is ready in Eir.")
+                .show()
+            {
+                warn!("Failed to show digest notification: {e}");
+            }
+        }
+        last_digest_at = digest_at;
 
         let current: HashSet<u64> = pending.iter().map(|(id, _)| *id).collect();
         if !primed {

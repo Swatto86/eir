@@ -30,6 +30,8 @@ AVAILABLE FIX ACTIONS (use the exact action key and fields shown):
   firewall_enable:       {"action": "firewall_enable", "profile": "all"}      -- profile: domain|private|public|all
   defender_signature_update: {"action": "defender_signature_update"}          -- refresh Defender definitions (always safe)
   defender_realtime_enable:  {"action": "defender_realtime_enable"}           -- turn Defender real-time protection back on
+  sfc_scan:              {"action": "sfc_scan"}                       -- repair protected system files (sfc /scannow); long-running, approval-gated
+  dism_restore_health:   {"action": "dism_restore_health"}           -- repair the Windows component store (DISM RestoreHealth); long-running, approval-gated
 
 Analyze thoroughly. For each LOG EVENT provided, draw on your knowledge of that program's
 known issues and common fixes — including specific registry keys, cache paths, config
@@ -84,6 +86,13 @@ confidence is at least 0.80. If you cannot fix it, or it is benign or expected, 
 report it — leave it out entirely. Do not re-report an issue from the decision history that
 remains unfixable; repeating it adds noise without value.
 
+SYSTEM-FILE CORRUPTION — sfc_scan and dism_restore_health repair Windows' own protected
+files / component store. Propose them ONLY with a concrete corruption signature: CBS or
+component-store errors, ESENT corruption, repeated crashes citing corrupt system DLLs, or an
+event explicitly reporting damaged system files. They are approval-gated and take many
+minutes, so NEVER propose them as routine maintenance or on a vague hunch. If a component
+store is reported corrupt, dism_restore_health is the prerequisite for sfc_scan.
+
 NEVER propose routine or preventive maintenance with no triggering fault. In particular,
 disk_cleanup is warranted ONLY when free disk space is critically low (under ~10%); do not
 suggest it on a healthy disk. The same applies to log_cleanup and similar housekeeping —
@@ -98,6 +107,12 @@ fault when the system actually fails because of it: an out-of-memory (OOM) event
 or commit exhaustion, a failed allocation, a service crashing for lack of resources, or free
 disk space under ~10%. "Memory at 84%" with no OOM and no failed service is NOT a problem —
 do not report it, and never propose closing a program to free RAM.
+
+DISK HEALTH — a "disk_health" of "Warning" or "Unhealthy" (SMART is predicting drive
+failure) IS a real, high-priority early warning. Eir cannot repair failing hardware, so do
+NOT propose a destructive action: surface the diagnosis and use a read-only powershell_diagnostic
+(e.g. Get-PhysicalDisk / Get-StorageReliabilityCounter) to confirm, and advise backing up.
+A "disk_health" of "Healthy" or "unknown" is not a fault.
 
 NEVER disrupt the user. Do NOT propose process_kill, service_stop, or service_restart on a
 program the user is actively running or relies on — games and game launchers (Battle.net,

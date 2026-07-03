@@ -259,11 +259,24 @@ async function refreshInner() {
   renderUsage(status.usage);
   renderUpdater(status.updater);
   renderLearned(status.learned_facts);
+  renderDigest(status.digest);
 
   if (status.error && /settings|not applied/i.test(status.error)) {
     const ss = document.getElementById('set-status');
     if (ss) ss.textContent = status.error;
   }
+}
+
+// ── Weekly health digest ───────────────────────────────────────────────────────
+
+function renderDigest(d) {
+  const card = document.getElementById('digest-card');
+  if (!card) return;
+  if (!d || !d.text) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+  document.getElementById('digest-text').textContent = d.text;
+  document.getElementById('digest-when').textContent =
+    d.generated_at ? ago(d.generated_at) : '';
 }
 
 // ── Approvals ────────────────────────────────────────────────────────────────

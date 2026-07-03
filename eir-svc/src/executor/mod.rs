@@ -4,6 +4,7 @@ pub mod logs;
 pub mod powershell;
 pub mod process;
 pub mod registry;
+pub mod repair;
 pub mod security;
 pub mod services;
 pub mod software;
@@ -114,6 +115,8 @@ pub async fn execute(action: &FixAction) -> ExecutionResult {
         FixAction::DefenderRealtimeEnable => {
             make_result(action, security::defender_realtime_enable().await)
         }
+        FixAction::SfcScan => make_result(action, repair::sfc_scan().await),
+        FixAction::DismRestoreHealth => make_result(action, repair::dism_restore_health().await),
         FixAction::FileDelete { path } => {
             let safe = path.replace('\'', "''");
             // Guard: refuse if path is a directory, and require the item to exist.

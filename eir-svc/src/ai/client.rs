@@ -296,7 +296,14 @@ impl AiClient {
             let result = match &self.config {
                 AiClientConfig::Anthropic { api_key, model } => {
                     let m = model_ov.unwrap_or(model);
-                    self.call_anthropic(api_key, m, effort, &context).await
+                    self.call_anthropic(
+                        api_key,
+                        m,
+                        effort,
+                        Some(crate::ai::prompt::SYSTEM_PROMPT),
+                        &context,
+                    )
+                    .await
                 }
                 AiClientConfig::ClaudeCli {
                     binary,
@@ -369,23 +376,28 @@ impl AiClient {
         api_key: &str,
         model: &str,
         effort: &str,
-        context: &str,
+        system: Option<&str>,
+        user: &str,
     ) -> Result<(String, Option<CallUsage>)> {
-        // Send the static instructions as a cached `system` prompt so the large,
-        // unchanging guardrail block is billed at the cheap cache-read rate after the
-        // first cycle instead of full input price every time. The per-cycle context is
-        // the (uncached) user turn. Prompt caching is GA, so no beta header is needed.
+        // For the analysis path, `system` carries the static instructions and is sent
+        // as a CACHED system prompt so the large, unchanging guardrail block is billed
+        // at the cheap cache-read rate after the first cycle instead of full input
+        // price every time; the per-cycle context is the (uncached) user turn. Prompt
+        // caching is GA, so no beta header is needed. Text-only completions (labeller,
+        // digest) pass `system: None` and must NOT get the diagnosis system prompt.
         let mut body = json!({
             "model": model,
             "max_tokens": MAX_TOKENS,
             "stream": true,
-            "system": [{
-                "type": "text",
-                "text": crate::ai::prompt::SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }],
-            "messages": [{"role": "user", "content": context}],
+            "messages": [{"role": "user", "content": user}],
         });
+        if let Some(sys) = system {
+            body["system"] = json!([{
+                "type": "text",
+                "text": sys,
+                "cache_control": {"type": "ephemeral"},
+            }]);
+        }
         // GA effort dial (low..max). Haiku models have no effort support and
         // reject the parameter outright, so skip it there rather than turning
         // every analysis cycle into a 400.
@@ -874,7 +886,8 @@ impl AiClient {
         match &self.config {
             AiClientConfig::Anthropic { api_key, .. } => {
                 let m = anthropic_web_model(ov);
-                self.call_anthropic(api_key, &m, "", prompt).await
+                // No diagnosis system prompt — this is a plain text completion.
+                self.call_anthropic(api_key, &m, "", None, prompt).await
             }
             AiClientConfig::ClaudeCli {
                 binary,

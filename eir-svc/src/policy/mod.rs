@@ -187,6 +187,8 @@ fn action_type_name(action: &FixAction) -> &'static str {
         FixAction::FirewallEnable { .. } => "firewall_enable",
         FixAction::DefenderSignatureUpdate => "defender_signature_update",
         FixAction::DefenderRealtimeEnable => "defender_realtime_enable",
+        FixAction::SfcScan => "sfc_scan",
+        FixAction::DismRestoreHealth => "dism_restore_health",
     }
 }
 
@@ -255,6 +257,21 @@ mod tests {
         // Not whitelisted → approval required even at high confidence.
         assert!(matches!(
             pol.evaluate(&FixAction::DefenderRealtimeEnable, 0.99),
+            Verdict::RequireApproval(_)
+        ));
+    }
+
+    /// SFC/DISM are long-running system-file repairs and must NEVER auto-execute, even
+    /// at max confidence — they are approval-gated by being off the whitelist.
+    #[test]
+    fn system_file_repairs_always_require_approval() {
+        let pol = policy_with(&["service_restart", "firewall_enable"]);
+        assert!(matches!(
+            pol.evaluate(&FixAction::SfcScan, 0.99),
+            Verdict::RequireApproval(_)
+        ));
+        assert!(matches!(
+            pol.evaluate(&FixAction::DismRestoreHealth, 0.99),
             Verdict::RequireApproval(_)
         ));
     }
