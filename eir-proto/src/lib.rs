@@ -127,6 +127,12 @@ pub struct UpdaterAppRow {
     pub detail: String,
     /// Authenticode result for a native install (empty otherwise).
     pub signature: String,
+    /// True when the user has this app on the updater ignore list. Set live by the
+    /// SetAppIgnore handler so the UI can reflect the toggle immediately (a fresh
+    /// cycle simply drops ignored apps from the list). `#[serde(default)]` for
+    /// forward/backward wire-compat with a peer that predates the field.
+    #[serde(default)]
+    pub ignored: bool,
 }
 
 /// One persisted attempt, for the history view.

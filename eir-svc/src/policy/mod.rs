@@ -112,14 +112,20 @@ impl ExecutionPolicy {
     }
 
     fn path_blocked(&self, path: &str) -> bool {
-        let cand = normalize_path_lexical(path);
-        self.blocklist.paths.iter().any(|b| {
-            let bl = normalize_path_lexical(b);
-            // Component-boundary prefix match: `C:\Windows` blocks `C:\Windows\...`
-            // but not `C:\WindowsApps`, and a raw substring can't sneak past.
-            !bl.is_empty() && cand.len() >= bl.len() && cand[..bl.len()] == bl[..]
-        })
+        self.blocklist.paths.iter().any(|b| is_within(path, b))
     }
+}
+
+/// True if `path` equals or is a descendant of `ancestor`, compared on normalised
+/// path/registry components — so separators, case, `\\?\`, `.`/`..`, and hive
+/// aliases can't evade it. An empty `ancestor` never matches. Shared by the policy
+/// blocklist and the registry executor's allow/deny lists so both agree on what
+/// "under this key" means (`C:\Windows` matches `C:\Windows\...` but not
+/// `C:\WindowsApps`).
+pub(crate) fn is_within(path: &str, ancestor: &str) -> bool {
+    let cand = normalize_path_lexical(path);
+    let anc = normalize_path_lexical(ancestor);
+    !anc.is_empty() && cand.len() >= anc.len() && cand[..anc.len()] == anc[..]
 }
 
 /// Lexically normalise a path (or registry key) into lowercased components for a
@@ -129,7 +135,7 @@ impl ExecutionPolicy {
 /// separators, and resolves `.`/`..` — all the forms a raw `starts_with` missed,
 /// letting `C:/Windows/...`, `\\?\C:\Windows\...`, or `C:\Windows\..\Windows\...`
 /// slip past a `C:\Windows` block.
-fn normalize_path_lexical(path: &str) -> Vec<String> {
+pub(crate) fn normalize_path_lexical(path: &str) -> Vec<String> {
     let mut p = path.trim().to_string();
     for (from, to) in [
         ("HKEY_LOCAL_MACHINE", "HKLM:"),

@@ -59,4 +59,11 @@ paths = [
     "C:\\Windows\\WinSxS",
     "C:\\Windows\\Boot",
     "C:\\Windows\\Fonts",
+    # Registry persistence / hijack locations. These entries make the policy layer's
+    # registry_reset gate real (it normalises hive aliases, so HKLM:/HKEY_* both match)
+    # and give the user a clear "on the blocklist" reason. The executor's own
+    # registry allow/deny list is the hard backstop even if these are edited out.
+    "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+    "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+    "HKCU:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
 ]

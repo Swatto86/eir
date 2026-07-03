@@ -70,7 +70,7 @@ async fn dispatch(
         || (matches!(remedy, Some(Remedy::ClearManagerLock)) && method.supports_force());
     match method {
         Method::Winget => winget::attempt_with(candidate, force).await,
-        Method::Choco => choco::attempt(candidate).await,
+        Method::Choco => choco::attempt_with(candidate, force).await,
         Method::Scoop => scoop::attempt(candidate).await,
         Method::MsStore => msstore::attempt(candidate).await,
         Method::Native => match ctx.ai {
@@ -310,6 +310,7 @@ pub fn app_rows(summary: &CycleSummary) -> Vec<eir_proto::UpdaterAppRow> {
                 state,
                 detail,
                 signature,
+                ignored: false,
             }
         })
         .collect()

@@ -462,13 +462,23 @@ function updaterAppRow(a) {
   const meth = a.method ? `<span class="upd-status">via ${esc(methodLabel(a.method))}</span>` : '';
   const detailText = [a.detail, a.signature].filter(Boolean).join(' · ');
   const detail = detailText ? `<span class="upd-result">${esc(detailText)}</span>` : '';
-  return `<div class="upd-row" data-id="${escAttr(a.id)}">
+  // Ignore state comes from the service (a.ignored), so the toggle survives the 2s
+  // poll instead of relying on a client-side style that the next render clobbers.
+  const ign = !!a.ignored;
+  const btn = ign
+    ? `<button class="upd-mini upd-ignore" data-id="${escAttr(a.id)}" data-ignore="0" title="Resume checking this app">Unignore</button>`
+    : `<button class="upd-mini upd-ignore" data-id="${escAttr(a.id)}" data-ignore="1" title="Don't check this app again">Ignore</button>`;
+  return `<div class="upd-row${ign ? ' upd-ignored' : ''}" data-id="${escAttr(a.id)}"${ign ? ' style="opacity:.5"' : ''}>
     <span class="upd-name" title="${escAttr(a.name)}">${esc(a.name)}</span>
     <span class="upd-ver">${ver}</span>${meth}${badge}
-    <button class="upd-mini upd-ignore" data-id="${escAttr(a.id)}" title="Don't check this app again">Ignore</button>
+    ${btn}
     ${detail}
   </div>`;
 }
+
+let lastAppsSig = null;
+let lastNotesSig = null;
+let lastHistSig = null;
 
 function renderUpdater(u) {
   const stateEl = document.getElementById('updater-state');
@@ -494,31 +504,44 @@ function renderUpdater(u) {
   metaEl.style.display = bits.length ? 'block' : 'none';
   metaEl.textContent = bits.join(' · ');
 
-  if (u.apps && u.apps.length) {
-    appsEl.innerHTML = u.apps.map(updaterAppRow).join('');
-  } else if (u.running) {
-    // Show the live stage ("checking…", "updating {app}…") so the card visibly
-    // progresses instead of looking frozen.
-    const phase = (u.phase && u.phase !== 'idle') ? u.phase : 'Checking for updates…';
-    appsEl.innerHTML = `<div class="empty">${esc(phase)}</div>`;
-  } else if (u.last_run) {
-    appsEl.innerHTML = '<div class="empty">Everything up to date.</div>';
-  } else {
-    appsEl.innerHTML = '<div class="empty">Enable auto-updates in Settings, or click “Update now”.</div>';
+  // Only rebuild the apps list when its content changes, so the 2s poll doesn't wipe
+  // a text selection or the toggle you just clicked. The time-based meta above still
+  // refreshes every poll. Phase/running are in the sig so the live stage still moves.
+  const appsSig = JSON.stringify({ a: u.apps || [], r: u.running, p: u.phase, lr: u.last_run, en: u.enabled });
+  if (appsSig !== lastAppsSig) {
+    lastAppsSig = appsSig;
+    if (u.apps && u.apps.length) {
+      appsEl.innerHTML = u.apps.map(updaterAppRow).join('');
+    } else if (u.running) {
+      const phase = (u.phase && u.phase !== 'idle') ? u.phase : 'Checking for updates…';
+      appsEl.innerHTML = `<div class="empty">${esc(phase)}</div>`;
+    } else if (u.last_run) {
+      appsEl.innerHTML = '<div class="empty">Everything up to date.</div>';
+    } else {
+      appsEl.innerHTML = '<div class="empty">Enable auto-updates in Settings, or click “Update now”.</div>';
+    }
   }
 
-  notesEl.innerHTML = (u.notes && u.notes.length)
-    ? u.notes.map((n) => `<div class="upd-note">• ${esc(n)}</div>`).join('') : '';
+  const notesSig = JSON.stringify(u.notes || []);
+  if (notesSig !== lastNotesSig) {
+    lastNotesSig = notesSig;
+    notesEl.innerHTML = (u.notes && u.notes.length)
+      ? u.notes.map((n) => `<div class="upd-note">• ${esc(n)}</div>`).join('') : '';
+  }
 
-  if (u.recent && u.recent.length) {
-    histWrap.style.display = 'block';
-    histEl.innerHTML = u.recent.slice(0, 15).map((r) =>
-      `<div class="upd-note">${r.success ? '✓' : '✗'} ${esc(r.name)} ` +
-      `<span style="opacity:.7">(${esc(methodLabel(r.method))})</span>` +
-      `${r.detail ? ' — ' + esc(r.detail) : ''} <span class="row-age">${ago(r.at)}</span></div>`
-    ).join('');
-  } else {
-    histWrap.style.display = 'none';
+  const histSig = JSON.stringify(u.recent || []);
+  if (histSig !== lastHistSig) {
+    lastHistSig = histSig;
+    if (u.recent && u.recent.length) {
+      histWrap.style.display = 'block';
+      histEl.innerHTML = u.recent.slice(0, 15).map((r) =>
+        `<div class="upd-note">${r.success ? '✓' : '✗'} ${esc(r.name)} ` +
+        `<span style="opacity:.7">(${esc(methodLabel(r.method))})</span>` +
+        `${r.detail ? ' — ' + esc(r.detail) : ''} <span class="row-age">${ago(r.at)}</span></div>`
+      ).join('');
+    } else {
+      histWrap.style.display = 'none';
+    }
   }
 }
 
@@ -530,12 +553,15 @@ document.getElementById('clear-updates').addEventListener('click', async () => {
   refresh();
 });
 
-// Per-app "Ignore" — stop checking this app (delegated from the list).
+// Per-app "Ignore" / "Unignore" — toggle checking this app (delegated from the list).
+// The service echoes the ignored flag on the row, so the next poll re-renders the
+// correct state; the immediate opacity nudge just avoids a 2s lag before that.
 document.getElementById('updater-apps').addEventListener('click', (e) => {
   const ig = e.target.closest('.upd-ignore');
   if (!ig) return;
-  invoke('set_app_ignore', { id: ig.dataset.id, ignore: true, note: '' })
-    .then(() => { const row = ig.closest('.upd-row'); if (row) row.style.opacity = '.5'; })
+  const ignore = ig.dataset.ignore !== '0';
+  invoke('set_app_ignore', { id: ig.dataset.id, ignore, note: '' })
+    .then(() => { const row = ig.closest('.upd-row'); if (row) row.style.opacity = ignore ? '.5' : ''; })
     .catch((err) => console.error('set_app_ignore failed', err));
 });
 
@@ -559,8 +585,15 @@ function learnedRow(f) {
   </div>`;
 }
 
+let lastLearnedSig = null;
+
 function renderLearned(facts) {
   const list = document.getElementById('learned-list');
+  // Skip the innerHTML rebuild when nothing changed, so the 2s poll doesn't wipe a
+  // text selection in the list (same guard as renderApprovals).
+  const sig = JSON.stringify(facts || []);
+  if (sig === lastLearnedSig) return;
+  lastLearnedSig = sig;
   if (!facts || facts.length === 0) {
     list.innerHTML = '<div class="empty">Nothing learned yet — Eir records patterns (like apps that update themselves) as it works.</div>';
     return;

@@ -1,12 +1,39 @@
+use crate::policy::is_within;
 use anyhow::{bail, Result};
 
-/// Registry paths Claude is allowed to modify. Anything outside this list is rejected.
+/// Registry subtrees Claude is allowed to modify. Anything outside this list is
+/// rejected. Matched on component boundaries (see [`registry_key_allowed`]), so a
+/// sibling key that merely shares a name prefix (e.g. `…\MicrosoftEvil`) is NOT
+/// treated as being under `…\Microsoft`.
 const ALLOWED_KEY_PREFIXES: &[&str] = &[
     "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip",
     "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager",
     "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia",
     "HKCU:\\SOFTWARE\\Microsoft",
 ];
+
+/// Persistence / process-hijack subkeys that are NEVER writable even though they sit
+/// under an allowed prefix (the broad `HKCU:\SOFTWARE\Microsoft` grant would otherwise
+/// expose them). A registry reset here could plant an autostart entry or a debugger
+/// hijack, so they are denied outright — the deny list wins over the allow list.
+const DENIED_KEY_PREFIXES: &[&str] = &[
+    "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+    "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+    "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunServices",
+    "HKCU:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+    "HKCU:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options",
+];
+
+/// Whether `key` is safe to modify: under an allowed subtree, and not under any
+/// denied persistence subkey. Uses component-boundary matching (via the shared
+/// policy `is_within`) rather than raw string prefixes, so `…\MicrosoftEvil` can't
+/// masquerade as a child of `…\Microsoft`.
+fn registry_key_allowed(key: &str) -> bool {
+    if DENIED_KEY_PREFIXES.iter().any(|d| is_within(key, d)) {
+        return false;
+    }
+    ALLOWED_KEY_PREFIXES.iter().any(|p| is_within(key, p))
+}
 
 /// Reset a registry value to the given data.
 /// `key_path` must use PowerShell-style drive prefix (e.g. `HKLM:\...`).
@@ -15,13 +42,7 @@ const ALLOWED_KEY_PREFIXES: &[&str] = &[
 pub async fn reset_value(key_path: &str, value_name: &str, value_data: &str) -> Result<String> {
     let normalised = normalise_key(key_path);
 
-    // Registry paths are case-insensitive, so compare case-folded — otherwise a
-    // legitimate `hklm:\system\...` would be wrongly rejected.
-    let lower = normalised.to_lowercase();
-    if !ALLOWED_KEY_PREFIXES
-        .iter()
-        .any(|p| lower.starts_with(&p.to_lowercase()))
-    {
+    if !registry_key_allowed(&normalised) {
         bail!(
             "Registry path '{}' is not on the safe list — refusing to modify",
             key_path
@@ -94,6 +115,53 @@ mod tests {
         assert!(script.contains("it''s"));
         assert!(script.contains("va''lue"));
         assert!(!script.contains('"'));
+    }
+
+    #[test]
+    fn allowlist_matches_on_component_boundaries_not_string_prefix() {
+        // Genuine children of an allowed subtree pass.
+        assert!(registry_key_allowed(
+            "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer"
+        ));
+        assert!(registry_key_allowed(
+            "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters"
+        ));
+        // Case / hive-alias forms still resolve.
+        assert!(registry_key_allowed(
+            "hkey_current_user\\software\\microsoft\\office"
+        ));
+
+        // Sibling keys that merely share a NAME prefix must be rejected — this is
+        // the B1 bug: raw `starts_with` accepted these.
+        assert!(!registry_key_allowed("HKCU:\\SOFTWARE\\MicrosoftEvil\\x"));
+        assert!(!registry_key_allowed(
+            "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\TcpipRogue\\x"
+        ));
+        // Entirely outside any allowed subtree.
+        assert!(!registry_key_allowed("HKLM:\\SOFTWARE\\Classes\\x"));
+    }
+
+    #[test]
+    fn allowlist_denies_persistence_subkeys_under_a_broad_grant() {
+        // Run / RunOnce / Winlogon / IFEO sit under the broad HKCU:\SOFTWARE\Microsoft
+        // grant but must be denied — the deny list wins over the allow list.
+        assert!(!registry_key_allowed(
+            "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
+        ));
+        assert!(!registry_key_allowed(
+            "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\Evil"
+        ));
+        assert!(!registry_key_allowed(
+            "HKCU:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon"
+        ));
+        assert!(!registry_key_allowed(
+            "HKCU:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\x.exe"
+        ));
+        // But a sibling that only shares a name prefix with a denied key is still
+        // allowed (it isn't actually a persistence location).
+        assert!(registry_key_allowed(
+            "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Runtime"
+        ));
     }
 
     #[test]

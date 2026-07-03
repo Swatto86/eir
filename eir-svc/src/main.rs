@@ -786,6 +786,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         tokio::sync::mpsc::channel::<Result<AnalysisSuccess, String>>(2);
     let mut analysis_running = false;
     const ANALYSIS_MAX: Duration = Duration::from_secs(10 * 60);
+    // The labeller is a small text-only call; bound it well under the analysis cap so
+    // a wedged CLI subprocess can't hold the labelling flag for long.
+    const LABEL_MAX: Duration = Duration::from_secs(3 * 60);
     // The Tier-2 learned-fact labeller is also an AI call, so it runs off the loop
     // (fire-and-forget). This flag stops it stacking; the stored explanation is
     // surfaced by the next facts_for_view refresh.
@@ -1019,10 +1022,13 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             match pol.evaluate(&action, confidence) {
                                 policy::Verdict::Block(reason) => {
                                     info!(reason = %reason, "Blocked by policy");
+                                    // Show the gate-evaluated (penalty-adjusted) confidence, not
+                                    // the raw AI value, so the card doesn't contradict a reason
+                                    // like "Confidence 72% below threshold 80%".
                                     push_problem(
                                         &mut st,
                                         &problem.diagnosis,
-                                        problem.confidence,
+                                        confidence,
                                         &format!("{action:?}"),
                                         true,
                                         false,
@@ -1364,10 +1370,19 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             if n.is_empty() {
                                 cfg.updater.notes.remove(&key);
                             } else {
-                                cfg.updater.notes.insert(key, n.to_string());
+                                cfg.updater.notes.insert(key.clone(), n.to_string());
                             }
                             if let Err(e) = config::save(&cfg, "config.toml") {
                                 warn!("Failed to save app note: {e}");
+                            }
+                            // Reflect the toggle on the live row so the UI shows it
+                            // immediately — the broadcast below carries the unchanged
+                            // apps list from the last cycle, so without this the
+                            // optimistic dim would revert on the next poll.
+                            for a in st.updater.apps.iter_mut() {
+                                if a.id.eq_ignore_ascii_case(&key) {
+                                    a.ignored = ignore;
+                                }
                             }
                             pipe.broadcast_status(build_status(&st));
                         }
@@ -1537,7 +1552,21 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             }
                         }
                         let _reset = ResetOnDrop(flag_l);
-                        learn::label_one(&db_l, &ai_l, &model_l).await;
+                        // A hang (not a panic) never drops the guard on its own, so bound
+                        // it: run label_one in a nested task under a timeout and abort on
+                        // elapse — mirrors the analysis task, so a wedged AI call can't
+                        // latch the labeller off for the rest of the process lifetime.
+                        let (db_i, ai_i, model_i) = (db_l.clone(), ai_l.clone(), model_l.clone());
+                        let mut inner = tokio::spawn(async move {
+                            learn::label_one(&db_i, &ai_i, &model_i).await;
+                        });
+                        if tokio::time::timeout(LABEL_MAX, &mut inner).await.is_err() {
+                            inner.abort();
+                            warn!(
+                                "labeller exceeded {}m and was stopped",
+                                LABEL_MAX.as_secs() / 60
+                            );
+                        }
                     });
                 }
 

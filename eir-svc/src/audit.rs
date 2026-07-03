@@ -5,13 +5,22 @@ use crate::models::{
 use anyhow::Result;
 use chrono::Utc;
 use eir_proto::{ApprovalInfo, UsageSummary};
-use sqlx::{sqlite::SqliteConnectOptions, Row, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
+use std::time::Duration;
 use tracing::{info, warn};
 
 pub async fn init_db(path: &str) -> Result<SqlitePool> {
-    let opts =
-        SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=rwc"))?.create_if_missing(true);
+    // WAL lets the concurrent writers (decision loop, executor worker, update-cycle
+    // task, labeller) proceed with a reader without serialising on a rollback
+    // journal; a generous busy_timeout absorbs the remaining writer contention so a
+    // burst doesn't drop audit rows (which would break the rate-limit circuit
+    // breaker and NULL effectiveness feedback).
+    let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=rwc"))?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(15));
     let pool = SqlitePool::connect_with(opts).await?;
     sqlx::migrate!("../migrations").run(&pool).await?;
     info!("Audit database initialised at {path}");

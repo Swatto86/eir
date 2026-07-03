@@ -145,8 +145,16 @@ fn read_channel_since(channel: &str, last_record: u32, prime: bool) -> (Vec<Even
                         as *const u16
                 };
                 let source = unsafe {
+                    // Bound the NUL scan to the record's own extent (clamped to the
+                    // bytes actually read): a malformed record whose source field is
+                    // not NUL-terminated within itself must not walk past the buffer.
+                    let header = std::mem::size_of::<EVENTLOGRECORD>();
+                    let rec_end = offset
+                        .saturating_add(record.Length as usize)
+                        .min(bytes_read as usize);
+                    let avail_u16 = rec_end.saturating_sub(offset + header) / 2;
                     let mut len = 0usize;
-                    while *source_ptr.add(len) != 0 {
+                    while len < avail_u16 && *source_ptr.add(len) != 0 {
                         len += 1;
                     }
                     String::from_utf16_lossy(std::slice::from_raw_parts(source_ptr, len))

@@ -580,8 +580,6 @@ impl AiClient {
         user_profile: Option<&str>,
         prompt: &str,
     ) -> Result<(String, Option<CallUsage>)> {
-        use tokio::io::AsyncWriteExt as _;
-
         let mut cmd = tokio::process::Command::new(binary);
         // JSON output gives us the response text plus token/cost usage.
         cmd.args(["--print", "--output-format", "json"]);
@@ -612,21 +610,17 @@ impl AiClient {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let mut child = cmd.spawn().context(
+        let child = cmd.spawn().context(
             "Failed to spawn the claude CLI — is it installed and logged in on this machine?",
         )?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(prompt.as_bytes())
-                .await
-                .context("Failed to write prompt to claude CLI stdin")?;
-        }
-
         // The claude CLI is a large binary with a cold Node start plus full
-        // model inference and no streaming, so allow a generous window. Output is
-        // read with a memory cap so a runaway CLI can't OOM the service.
-        let (status, stdout_raw, stderr_raw) = wait_capped(child, "claude CLI").await?;
+        // model inference and no streaming, so allow a generous window. The prompt is
+        // written to stdin concurrently with draining stdout/stderr (inside
+        // wait_capped) so a large prompt can't deadlock the pipes. Output is read with
+        // a memory cap so a runaway CLI can't OOM the service.
+        let (status, stdout_raw, stderr_raw) =
+            wait_capped(child, "claude CLI", Some(prompt.as_bytes().to_vec())).await?;
 
         if !status.success() {
             bail!("claude CLI exited with {}: {}", status, stderr_raw.trim());
@@ -675,12 +669,16 @@ impl AiClient {
         user_profile: Option<&str>,
         prompt: &str,
     ) -> Result<(String, Option<CallUsage>)> {
-        use tokio::io::AsyncWriteExt as _;
-
         // Give the agent a writable workspace so it doesn't refuse to start.
         // Each call gets a fresh empty dir — the agent has nothing to operate
-        // on, so it just answers the prompt.
-        let workspace = std::env::temp_dir().join(format!("eir-kilo-{}", std::process::id()));
+        // on, so it just answers the prompt. Key it per-call (pid + a monotonic
+        // sequence), not just per-process, so a concurrent analysis and labeller call
+        // don't point two `kilo` processes at the same workspace; cleaned up after the
+        // call so it doesn't litter %TEMP%.
+        static KILO_CALL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = KILO_CALL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let workspace =
+            std::env::temp_dir().join(format!("eir-kilo-{}-{}", std::process::id(), seq));
         let _ = std::fs::create_dir_all(&workspace);
 
         let mut cmd = tokio::process::Command::new(binary);
@@ -716,22 +714,20 @@ impl AiClient {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let mut child = cmd.spawn().context(
+        let child = cmd.spawn().context(
             "Failed to spawn the kilo CLI — is it installed (`npm install -g @kilocode/cli`) and logged in on this machine?",
         )?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(prompt.as_bytes())
-                .await
-                .context("Failed to write prompt to kilo CLI stdin")?;
-            // Dropping stdin closes it, signalling EOF so kilo exits.
-        }
-
         // The kilo CLI is a Node binary with a cold start plus agent loop
-        // (--auto) and JSON event emission, so allow a generous window. Output is
-        // read with a memory cap so a runaway agent loop can't OOM the service.
-        let (status, stdout, stderr_raw) = wait_capped(child, "kilo CLI").await?;
+        // (--auto) and JSON event emission, so allow a generous window. The prompt is
+        // written to stdin concurrently with draining stdout/stderr (inside
+        // wait_capped) so a large prompt can't deadlock the pipes; dropping stdin
+        // afterwards signals EOF so kilo exits. Output is read with a memory cap so a
+        // runaway agent loop can't OOM the service.
+        let waited = wait_capped(child, "kilo CLI", Some(prompt.as_bytes().to_vec())).await;
+        // Reclaim the scratch workspace whether the call succeeded or errored.
+        let _ = std::fs::remove_dir_all(&workspace);
+        let (status, stdout, stderr_raw) = waited?;
 
         if !status.success() {
             // Exit 124 = kilo's own timeout (treat like ours); 1 = init/runtime
@@ -1387,14 +1383,31 @@ async fn read_stream_capped<R: tokio::io::AsyncRead + Unpin>(
 async fn wait_capped(
     mut child: tokio::process::Child,
     what: &str,
+    stdin_payload: Option<Vec<u8>>,
 ) -> Result<(std::process::ExitStatus, String, String)> {
     let so = child.stdout.take();
     let se = child.stderr.take();
+    let sin = child.stdin.take();
+    // Feed stdin CONCURRENTLY with draining stdout/stderr. Writing the whole prompt
+    // first (as the callers used to) deadlocks when the prompt exceeds the OS pipe
+    // buffer (~64 KB) and the child emits output before consuming all of stdin: the
+    // child blocks on a full stdout pipe while we block on a full stdin pipe. Dropping
+    // stdin after the write signals EOF so the child proceeds.
+    let write_fut = async move {
+        if let Some(mut sin) = sin {
+            if let Some(bytes) = stdin_payload {
+                use tokio::io::AsyncWriteExt as _;
+                let _ = sin.write_all(&bytes).await;
+            }
+            // `sin` drops here → stdin closes → EOF.
+        }
+    };
     let combined = async {
-        let (o, e, s) = tokio::join!(
+        let (o, e, s, _w) = tokio::join!(
             read_stream_capped(so, CLI_OUTPUT_CAP),
             read_stream_capped(se, CLI_OUTPUT_CAP),
             child.wait(),
+            write_fut,
         );
         (o, e, s)
     };
