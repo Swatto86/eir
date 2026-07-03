@@ -12,10 +12,22 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $RepoRoot = (Split-Path -Parent $PSScriptRoot)
+    [string] $RepoRoot
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Resolve the repo root in the body, not a param default: $PSScriptRoot is not reliably
+# populated during param-default binding under `powershell -File` in CI, which made
+# `Split-Path -Parent ''` throw. Prefer the script's own dir; fall back to the current
+# directory (CI runs this from the repo root).
+if (-not $RepoRoot) {
+    if ($PSScriptRoot) {
+        $RepoRoot = Split-Path -Parent $PSScriptRoot
+    } else {
+        $RepoRoot = (Get-Location).Path
+    }
+}
 
 function Get-CargoVersion {
     [CmdletBinding()]
