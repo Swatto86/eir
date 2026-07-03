@@ -308,10 +308,7 @@ impl AiClient {
         };
 
         let json_text = strip_fences(&raw);
-        debug!(
-            text = &json_text[..json_text.len().min(500)],
-            "Raw model response"
-        );
+        debug!(text = %char_preview(json_text, 500), "Raw model response");
 
         // Models occasionally wrap the JSON in prose; fall back to the
         // first {...last} object if a direct parse fails.
@@ -1314,6 +1311,12 @@ fn parse_kilo_ndjson(stdout: &str) -> Result<(String, Option<CallUsage>)> {
     Ok((text, usage))
 }
 
+/// First `max_chars` characters of `s`. Slices by char, never by byte, so a
+/// multi-byte UTF-8 codepoint straddling the limit can't panic (`&s[..n]` would).
+fn char_preview(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
 fn strip_fences(s: &str) -> &str {
     // Check ````json` before ```` to avoid matching the shorter fence first
     for (open, close) in [
@@ -1398,6 +1401,16 @@ mod tests {
         // Opus tier costs more than Haiku for the same tokens.
         let opus = estimate_anthropic_cost("claude-opus-4-8", 100_000, 10_000, 0, 0, 0);
         assert!(opus > c);
+    }
+
+    #[test]
+    fn char_preview_never_splits_a_codepoint() {
+        // 600 em-dashes = 1800 bytes; byte-slicing at 500 would panic mid-codepoint.
+        let s = "—".repeat(600);
+        let p = char_preview(&s, 500);
+        assert_eq!(p.chars().count(), 500);
+        // Shorter-than-limit input is returned whole.
+        assert_eq!(char_preview("hi", 500), "hi");
     }
 
     #[test]

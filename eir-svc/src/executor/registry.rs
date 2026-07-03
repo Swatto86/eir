@@ -30,15 +30,7 @@ pub fn reset_value(key_path: &str, value_name: &str, value_data: &str) -> Result
         );
     }
 
-    // Escape single-quotes in values to prevent injection
-    let safe_path = normalised.replace('\'', "''");
-    let safe_name = value_name.replace('\'', "''");
-    let safe_data = value_data.replace('\'', "''");
-
-    let script = format!(
-        "Set-ItemProperty -Path '{safe_path}' -Name '{safe_name}' -Value '{safe_data}' -ErrorAction Stop; \
-         Write-Output \"Set '{safe_path}/{safe_name}' = '{safe_data}'\""
-    );
+    let script = build_reset_script(&normalised, value_name, value_data);
 
     let out = std::process::Command::new("powershell.exe")
         .args([
@@ -58,5 +50,46 @@ pub fn reset_value(key_path: &str, value_name: &str, value_data: &str) -> Result
         Ok(stdout.trim().to_string())
     } else {
         bail!("Registry set failed: {stderr}")
+    }
+}
+
+/// Build the `Set-ItemProperty` script from an already-normalised key path plus the
+/// raw value name/data. Kept pure so the injection-safety of the escaping is
+/// unit-testable: values are only ever placed inside single-quoted PowerShell
+/// literals (with embedded `'` doubled), never a double-quoted string.
+fn build_reset_script(normalised_path: &str, value_name: &str, value_data: &str) -> String {
+    let safe_path = normalised_path.replace('\'', "''");
+    let safe_name = value_name.replace('\'', "''");
+    let safe_data = value_data.replace('\'', "''");
+    format!(
+        "Set-ItemProperty -Path '{safe_path}' -Name '{safe_name}' -Value '{safe_data}' -ErrorAction Stop; \
+         Write-Output 'Set registry value {safe_name} at {safe_path}'"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_script_never_double_quotes_untrusted_values() {
+        // `$(...)` in the value/name must stay a literal — no double-quoted string
+        // anywhere in the script (which is where PowerShell would evaluate it).
+        let script = build_reset_script(
+            "HKCU:\\SOFTWARE\\Microsoft\\Test",
+            "$(calc.exe)",
+            "$(rm -rf)",
+        );
+        assert!(!script.contains('"'), "no double-quoted strings: {script}");
+        assert!(script.contains("'$(calc.exe)'"));
+        assert!(script.contains("'$(rm -rf)'"));
+    }
+
+    #[test]
+    fn reset_script_doubles_embedded_single_quotes() {
+        let script = build_reset_script("HKCU:\\SOFTWARE\\X", "it's", "va'lue");
+        assert!(script.contains("it''s"));
+        assert!(script.contains("va''lue"));
+        assert!(!script.contains('"'));
     }
 }

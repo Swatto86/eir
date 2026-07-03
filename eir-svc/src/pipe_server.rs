@@ -1,7 +1,7 @@
 use eir_proto::{ServiceMsg, StatusPayload, UiMsg, PIPE_NAME};
 use std::ffi::c_void;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::windows::named_pipe::{PipeMode, ServerOptions},
     sync::{mpsc, watch},
     time::Duration,
@@ -12,6 +12,11 @@ use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+/// Largest UI→service line accepted before the connection is treated as hostile and
+/// dropped. The biggest real `UiMsg` (a settings update) is a few KiB; 64 KiB is a
+/// comfortable ceiling that still bounds memory against a misbehaving/malicious client.
+const MAX_UI_LINE_BYTES: u64 = 64 * 1024;
 
 /// Build a security descriptor that lets the interactive (non-elevated) UI reach
 /// the pipe. A pipe created by the LocalSystem service otherwise only grants
@@ -156,8 +161,17 @@ async fn listener_task(
         let mut buf = String::new();
         loop {
             buf.clear();
-            match reader.read_line(&mut buf).await {
+            // Cap each line: the pipe DACL grants Authenticated Users write access, so
+            // an unbounded read_line would let any local user stream bytes with no
+            // newline and OOM the LocalSystem service. The largest real UiMsg is a few
+            // KiB; anything past the cap is treated as hostile and drops the connection.
+            let mut limited = (&mut reader).take(MAX_UI_LINE_BYTES);
+            match limited.read_line(&mut buf).await {
                 Ok(0) => break, // EOF
+                Ok(n) if n as u64 == MAX_UI_LINE_BYTES && !buf.ends_with('\n') => {
+                    warn!("UI message exceeded {MAX_UI_LINE_BYTES} bytes — dropping connection");
+                    break;
+                }
                 Ok(_) => {
                     let trimmed = buf.trim();
                     if trimmed.is_empty() {

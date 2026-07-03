@@ -161,7 +161,7 @@ pub fn spawn(
                     let channels_clone = channels.clone();
                     let cursors_in = cursors.clone();
 
-                    let (new_entries, updated_cursors) = tokio::task::spawn_blocking(move || {
+                    let polled = tokio::task::spawn_blocking(move || {
                         let mut all = VecDeque::new();
                         let mut c = cursors_in;
                         for channel in &channels_clone {
@@ -178,8 +178,19 @@ pub fn spawn(
                         }
                         (all, c)
                     })
-                    .await
-                    .unwrap_or_default();
+                    .await;
+
+                    // Preserve the existing cursors on a join failure (a panic in the
+                    // raw-buffer parse). `unwrap_or_default()` here would reset every
+                    // channel's high-water mark to 0, re-delivering historical Errors
+                    // and re-firing the reactive trigger on every subsequent poll.
+                    let (new_entries, updated_cursors) = match polled {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("event-log poll task failed, keeping cursors: {e}");
+                            continue;
+                        }
+                    };
 
                     cursors = updated_cursors;
                     let count = new_entries.len();

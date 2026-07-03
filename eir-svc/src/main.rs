@@ -956,7 +956,13 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                             info!(action = ?action, "Rate-limited — skipping");
                                             continue;
                                         }
-                                        Err(e) => warn!("Rate limit check failed: {e}"),
+                                        // Fail CLOSED: this check is also the failure
+                                        // circuit breaker, so a DB error must skip the
+                                        // fix this cycle rather than let it auto-run.
+                                        Err(e) => {
+                                            warn!("Rate limit check failed — skipping to fail safe: {e}");
+                                            continue;
+                                        }
                                         Ok(false) => {}
                                     }
 
