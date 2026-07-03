@@ -5,11 +5,13 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
+/// Max retries for a transient AI failure before giving up on this cycle.
+const MAX_AI_RETRIES: u32 = 2;
 /// Output-token ceiling per analysis. A busy machine can produce many problems; at
 /// 4096 the structured JSON was truncated mid-object and the whole cycle failed to
 /// parse. Current models comfortably support this larger budget (billed on actual use).
@@ -280,33 +282,54 @@ impl AiClient {
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.effort);
         let prompt = crate::ai::prompt::build(snapshot, history, feedback_summary, learned);
-        let (raw, usage) = match &self.config {
-            AiClientConfig::Anthropic { api_key, model } => {
-                let m = model_ov.unwrap_or(model);
-                self.call_anthropic(api_key, m, effort, &prompt).await?
-            }
-            AiClientConfig::ClaudeCli {
-                binary,
-                model,
-                user_profile,
-            } => {
-                let m = model_ov.unwrap_or(model);
-                self.call_claude_cli(binary, m, effort, user_profile.as_deref(), &prompt)
-                    .await?
-            }
-            AiClientConfig::OpenRouter { api_key, model } => {
-                let m = model_ov.unwrap_or(model);
-                self.call_openai_style(OPENROUTER_BASE, api_key, m, effort, &prompt)
-                    .await?
-            }
-            AiClientConfig::KiloCli {
-                binary,
-                model,
-                user_profile,
-            } => {
-                let m = model_ov.unwrap_or(model);
-                self.call_kilo_cli(binary, m, effort, user_profile.as_deref(), &prompt)
-                    .await?
+        // Bounded retry on TRANSIENT failures only. Each call returns Err before
+        // yielding any text, so retrying the whole call is safe (no partial output to
+        // corrupt). This runs off the decision loop, so the backoff doesn't stall the
+        // UI; a permanent error (bad key, 400) is returned immediately without retry.
+        let mut attempt: u32 = 0;
+        let (raw, usage) = loop {
+            let result = match &self.config {
+                AiClientConfig::Anthropic { api_key, model } => {
+                    let m = model_ov.unwrap_or(model);
+                    self.call_anthropic(api_key, m, effort, &prompt).await
+                }
+                AiClientConfig::ClaudeCli {
+                    binary,
+                    model,
+                    user_profile,
+                } => {
+                    let m = model_ov.unwrap_or(model);
+                    self.call_claude_cli(binary, m, effort, user_profile.as_deref(), &prompt)
+                        .await
+                }
+                AiClientConfig::OpenRouter { api_key, model } => {
+                    let m = model_ov.unwrap_or(model);
+                    self.call_openai_style(OPENROUTER_BASE, api_key, m, effort, &prompt)
+                        .await
+                }
+                AiClientConfig::KiloCli {
+                    binary,
+                    model,
+                    user_profile,
+                } => {
+                    let m = model_ov.unwrap_or(model);
+                    self.call_kilo_cli(binary, m, effort, user_profile.as_deref(), &prompt)
+                        .await
+                }
+            };
+            match result {
+                Ok(v) => break v,
+                Err(e) if attempt < MAX_AI_RETRIES && is_transient_ai_error(&e) => {
+                    attempt += 1;
+                    let backoff = std::time::Duration::from_secs(2u64.pow(attempt));
+                    warn!(
+                        "AI call failed (transient, attempt {attempt}/{MAX_AI_RETRIES}), \
+                         retrying in {}s: {e}",
+                        backoff.as_secs()
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => return Err(e),
             }
         };
 
@@ -1303,6 +1326,30 @@ fn char_preview(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
+/// Whether an AI-call error looks transient (worth a retry) vs. permanent (bad key,
+/// 400, unknown model). Matches on the rendered error since the providers surface
+/// their status in the message text.
+fn is_transient_ai_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string().to_lowercase();
+    const MARKERS: &[&str] = &[
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "529",
+        "timed out",
+        "timeout",
+        "overloaded",
+        "temporarily",
+        "rate limit",
+        "connection",
+        "stream read error",
+        "stream error",
+    ];
+    MARKERS.iter().any(|m| s.contains(m))
+}
+
 /// Per-stream memory cap for a CLI subprocess. Bounds RAM against a looping/
 /// misbehaving CLI that emits huge output within the time budget.
 const CLI_OUTPUT_CAP: usize = 16 * 1024 * 1024;
@@ -1451,6 +1498,37 @@ mod tests {
         // Opus tier costs more than Haiku for the same tokens.
         let opus = estimate_anthropic_cost("claude-opus-4-8", 100_000, 10_000, 0, 0, 0);
         assert!(opus > c);
+    }
+
+    #[test]
+    fn transient_error_classification() {
+        use anyhow::anyhow;
+        // Retryable provider/network conditions.
+        assert!(is_transient_ai_error(&anyhow!(
+            "Anthropic API 429: rate limited"
+        )));
+        assert!(is_transient_ai_error(&anyhow!(
+            "model API 503: unavailable"
+        )));
+        assert!(is_transient_ai_error(&anyhow!(
+            "Anthropic API 529: overloaded"
+        )));
+        assert!(is_transient_ai_error(&anyhow!(
+            "claude CLI timed out after 300s"
+        )));
+        assert!(is_transient_ai_error(&anyhow!(
+            "Anthropic stream read error"
+        )));
+        // Permanent conditions must NOT be retried.
+        assert!(!is_transient_ai_error(&anyhow!(
+            "Anthropic API 401: invalid x-api-key"
+        )));
+        assert!(!is_transient_ai_error(&anyhow!(
+            "model API 400: unknown model"
+        )));
+        assert!(!is_transient_ai_error(&anyhow!(
+            "Failed to parse model response as JSON"
+        )));
     }
 
     #[test]

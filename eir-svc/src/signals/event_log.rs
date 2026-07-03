@@ -87,6 +87,12 @@ fn read_channel_since(channel: &str, last_record: u32, prime: bool) -> (Vec<Even
         }
         .is_err()
         {
+            // A single record larger than the buffer sets min_bytes_needed; grow and
+            // retry so one big record can't silently end the whole channel read.
+            if min_bytes_needed as usize > buf.len() {
+                buf.resize(min_bytes_needed as usize, 0);
+                continue;
+            }
             break;
         }
 
