@@ -644,9 +644,9 @@ function fillSettings() {
   document.getElementById('set-an-key').placeholder =
     s.anthropic_key_set ? '•••••• set — blank keeps it' : 'not set';
   document.getElementById('set-kilo-profile').placeholder =
-    s.kilo_cli_user_profile_set ? '•••••• set — blank clears it' : 'C:\\Users\\You  (blank = auto-detect)';
+    s.kilo_cli_user_profile_set ? '•••••• set — blank keeps it' : 'C:\\Users\\You  (blank = auto-detect)';
   document.getElementById('set-kilo-path').placeholder =
-    s.kilo_cli_path_set ? '•••••• set — blank clears it' : 'kilo  (blank = on PATH)';
+    s.kilo_cli_path_set ? '•••••• set — blank keeps it' : 'kilo  (blank = on PATH)';
   fillUpdaterSettings(lastStatus.updater && lastStatus.updater.settings);
   fillAdvisorSettings(lastStatus.advisor && lastStatus.advisor.settings);
 }
@@ -664,8 +664,8 @@ async function saveSettings() {
     update_check_model: document.getElementById('set-upd-model').value.trim(),
     openrouter_api_key: orKey || null,
     anthropic_api_key: anKey || null,
-    kilo_cli_user_profile: kiloProfile,
-    kilo_cli_path: kiloPath,
+    kilo_cli_user_profile: kiloProfile || null,
+    kilo_cli_path: kiloPath || null,
     confidence_threshold: (parseInt(document.getElementById('set-conf').value, 10) || 80) / 100,
     decision_interval_secs: parseInt(document.getElementById('set-decint').value, 10) || 600,
     event_log_poll_interval_secs: parseInt(document.getElementById('set-elpoll').value, 10) || 30,

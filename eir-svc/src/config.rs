@@ -249,26 +249,24 @@ impl Config {
         self.api.model = u.model;
         self.api.update_check_model = u.update_check_model;
         self.api.effort = normalize_effort(&u.effort);
+        // A blank/whitespace value means "unchanged" (the UI can't show a stored
+        // secret, so it sends the field blank on every save). Store the trimmed
+        // value so a pasted key with a trailing newline/space still authenticates.
         let keep = |cur: &mut Option<String>, new: Option<String>| {
             if let Some(v) = new {
-                if !v.trim().is_empty() {
-                    *cur = Some(v);
+                let v = v.trim();
+                if !v.is_empty() {
+                    *cur = Some(v.to_string());
                 }
             }
         };
         keep(&mut self.api.openrouter_api_key, u.openrouter_api_key);
         keep(&mut self.api.anthropic_api_key, u.anthropic_api_key);
-        // The kilo_cli overrides are hint-style — even an explicitly blank
-        // string clears the stored value, so the user can revert to
-        // auto-detect from Settings.
-        self.api.kilo_cli_user_profile = u
-            .kilo_cli_user_profile
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        self.api.kilo_cli_path = u
-            .kilo_cli_path
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        // Same "blank = unchanged" rule for the kilo_cli hint overrides: the field
+        // is always blank on load, so treating blank as "clear" wiped a configured
+        // override on every unrelated settings save.
+        keep(&mut self.api.kilo_cli_user_profile, u.kilo_cli_user_profile);
+        keep(&mut self.api.kilo_cli_path, u.kilo_cli_path);
         self.monitoring.decision_interval_secs = u.decision_interval_secs.max(10);
         self.monitoring.event_log_poll_interval_secs = u.event_log_poll_interval_secs.max(5);
         self.monitoring.wmi_poll_interval_secs = u.wmi_poll_interval_secs.max(30);
@@ -475,10 +473,11 @@ audit_db = "./eir.db"
     }
 
     #[test]
-    fn kilo_cli_blank_overrides_clear_stored_values() {
-        // The Settings panel treats blank kilo_cli fields as "auto-detect",
-        // not "keep current", so an explicit blank must overwrite the stored
-        // value (parity with the user expectation when they uncheck a box).
+    fn kilo_cli_blank_overrides_keep_stored_values() {
+        // The Settings panel can't render a stored hint override, so it sends the
+        // field blank on every save. Blank must therefore mean "unchanged" (like the
+        // API keys) — otherwise an unrelated save would silently wipe a configured
+        // kilo_cli override.
         let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
         cfg.api.kilo_cli_user_profile = Some("C:\\Users\\Old".into());
         cfg.api.kilo_cli_path = Some("C:\\old\\kilo.cmd".into());
@@ -488,7 +487,10 @@ audit_db = "./eir.db"
             kilo_cli_path: Some(String::new()),
             ..Default::default()
         });
-        assert!(cfg.api.kilo_cli_user_profile.is_none());
-        assert!(cfg.api.kilo_cli_path.is_none());
+        assert_eq!(
+            cfg.api.kilo_cli_user_profile.as_deref(),
+            Some("C:\\Users\\Old")
+        );
+        assert_eq!(cfg.api.kilo_cli_path.as_deref(), Some("C:\\old\\kilo.cmd"));
     }
 }

@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-02 · **Release:** v0.20.0
+**Last updated:** 2026-07-03 · **Release:** v0.22.1
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -77,7 +77,7 @@ Eir is a single Cargo workspace (`resolver = "2"`) with three crates, plus a sta
 | `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service: signal collection, AI client, policy, execution, autonomous updater, SQLite audit DB. Heavy `windows` 0.58 feature set. |
 | `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), tracing. `build-dependencies`: `tauri-build` 2. |
 
-All three crates are versioned in lockstep — currently `0.20.0` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`.
+All three crates are versioned in lockstep — currently `0.22.1` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`.
 
 The dependency graph is acyclic and points inward: `eir-proto` depends on nothing internal; `eir-svc` and `eir-ui` each depend only on `eir-proto`. The UI and service never link against each other — they are separate processes coupled solely through the `eir-proto` wire contract over `\\.\pipe\EirSvc`.
 
@@ -336,7 +336,7 @@ The outer `tokio::select!` races the main loop future against the `shutdown` fut
 - Collects `decision_history` (last 5), builds a `SignalSnapshot` (event log + file changes drain + wmi current), updates live metrics, broadcasts.
 - `let Some(ai) = ai.as_ref() else { continue }` — no provider configured: keep collecting/serving UI, skip analysis.
 - **`if analysis_running { continue; }`** — an off-loop analysis (below) is already in flight; resettle `resting_status`, clear error (unless paused), broadcast, and skip this pass entirely (including the feedback/label/idle-skip work below it), so a redundant tick or reaction never queues a second overlapping analysis.
-- Updates feedback after-states and pulls `feedback::recent_summary`; runs `learn::label_one` and refreshes `learned_facts` for the UI card.
+- Updates feedback after-states and pulls `feedback::recent_summary`; dispatches `learn::label_one` **off-loop** (it makes an AI call, so running it inline could stall `ui_rx` for up to the provider timeout — a fire-and-forget task, guarded by an `AtomicBool` so it never stacks, with a drop-guard reset) and refreshes `learned_facts` for the UI card.
 - **Idle-skip gate**: computes `actionable_fingerprint`; `changed = fingerprint.is_some() && != last_fingerprint`; `heartbeat_due` if `last_analysis_at` is `None` (forces baseline) or elapsed ≥ `ANALYSIS_HEARTBEAT` (6 h). If `!changed && !heartbeat_due`, settle `resting_status`, clear error (unless paused), broadcast, `continue` — saves AI spend on unchanged idle cycles.
 - `learn::analyse_issues` + `LearnedFacts::load` build `learned_section` for the prompt, then **the AI call is dispatched off-loop** (see "Off-loop analysis task" below) and the per-cycle body `continue`s immediately — `ai.analyze(...)`, the optional advisor escalation, `audit::log_decision`, the per-problem routing, and the tray-status broadcast all now run in the `analysis_done_rx` arm once the task reports back, not inline here.
 
@@ -398,7 +398,7 @@ Eir's signal layer is three independent background collectors that each maintain
 - **Collects:** Error/Warning/Information records from configured channels (default `["System", "Application"]`, `config.rs:282`) via the legacy Win32 EventLog API (`OpenEventLogW`/`ReadEventLogW` reading `SEQUENTIAL_BACKWARDS` = newest-first, line 16).
 - **Cadence:** `event_log_poll_interval_secs`, default 45 (struct default `config.rs:280`; embedded sample uses 30; clamped to a 5 s floor on update, `config.rs:210`).
 - **Cursor logic:** per-channel `HashMap<String,u32>` of the highest `RecordNumber` delivered (lines 149, 160–164). First poll primes from 0; subsequent polls return only records with `RecordNumber > last` (lines 90–94). Newest-first read stops at the first already-seen record.
-- **Bounding & delivery:** `RING_SIZE = 20` caps entries **per poll across all channels combined**. Each poll **appends** into a shared rolling buffer capped at `BUFFER_CAP = 100` (oldest dropped), and the decision loop **drains** it (`event_log::drain`) — one-shot delivery, like the file-watch buffer. Accumulate-and-drain (rather than the previous replace-wholesale) means a quiet follow-up poll can't wipe an Error before the debounced reactive cycle reads it.
+- **Bounding & delivery:** `MAX_PER_POLL = 100` caps entries **per channel** — but the cursor still advances to the true newest, so the freshest events are always kept and nothing below the cursor is re-read. Each poll **appends** into a shared rolling buffer capped at `BUFFER_CAP = 100`, pushed oldest-first so `pop_front` eviction drops the **oldest** (keeping the freshest errors); the decision loop **drains** it (`event_log::drain`) — one-shot delivery, like the file-watch buffer. (The former `RING_SIZE = 20` per-poll-across-all-channels cap silently and *permanently* dropped every record past the 20th in a burst and starved later channels — both fixed.)
 - **Reactive trigger:** a poll containing a fresh **Error**-level entry pings the decision-loop trigger channel. Warnings deliberately don't trigger (Windows emits them near-continuously; the scheduled sweep still analyses them) — reacting to each would burn AI calls on noise.
 - **Message extraction is intentionally shallow:** `message` is just `format!("EventID {}", id & 0xFFFF)` (line 120); full text would require loading provider DLLs ("sufficient for Phase 1"). `event_id` is masked to the low 16 bits (line 121). The blocking Win32 work runs in `spawn_blocking` (line 157).
 
@@ -406,7 +406,7 @@ Eir's signal layer is three independent background collectors that each maintain
 
 - **Discovery (`discover_watch_dirs`, lines 51–106):** scans fixed roots (`C:\Windows\Logs`, `C:\Windows\Temp`, `C:\Temp`, `C:\Logs`) plus env-var roots (`LOCALAPPDATA`, `APPDATA`, `PROGRAMDATA`, `TEMP`, `TMP`). A root/subdir (one level deep, `max_depth` 1–2) is watched only if it contains a recognised text file modified within `DISCOVERY_WINDOW_DAYS = 30` (lines 12, 110–131). Config `log_directories` extras are always included if they exist on disk, regardless of age. Runs in `spawn_blocking`; re-discovered every 20 decision cycles, new dirs pushed to the running watcher over an mpsc channel (`main.rs:977–995`, `file_watch.rs:179–190`).
 - **Watching:** `notify` `RecommendedWatcher`, `RecursiveMode::Recursive`, on a dedicated OS thread (line 173). Reacts to `Create`/`Modify` only (lines 195–199). Shutdown is via dropping a `SyncSender(0)` handle (`TryRecv::Disconnected` → exit, lines 142–144, 177).
-- **Per-event parse:** for each changed path it reads `size_bytes` and calls `try_parse_log` (lines 200–209). `try_parse_log` (27–42) skips empty files and files `> MAX_READ_BYTES = 65_536` (line 11), requires one of `TEXT_EXTENSIONS` (log/txt/csv/json/xml/ini/cfg/conf/err/out/trace/debug/warn/error/info, lines 14–17), reads the whole file, and runs `log_parser::parse`. A result that is INFO with no error snippets is dropped to `None` (line 37) — only "interesting" log events attach to the `FileChange`.
+- **Per-event parse:** for each changed path it reads `size_bytes` and calls `try_parse_log` (lines 200–209). `try_parse_log` (27–42) skips empty files, requires one of `TEXT_EXTENSIONS` (log/txt/csv/json/xml/ini/cfg/conf/err/out/trace/debug/warn/error/info, lines 14–17), reads at most the **last** `MAX_READ_BYTES = 65_536` of the file (`read_tail`, dropping the partial first line) so a rolling log that has grown past 64 KB still has its newest lines parsed, and runs `log_parser::parse`. A result that is INFO with no error snippets is dropped to `None` (line 37) — only "interesting" log events attach to the `FileChange`.
 - **`log_parser::parse`** (`log_parser.rs:38–48): infers `program` from path shape (Program Files / ProgramData / Windows\Logs\<Subsystem> / AppData\(Local|Roaming|LocalLow), lines 64–125, falling back to parent dir name); `extract_errors` (129–171) walks lines, classifies against `ERROR_KEYWORDS`/`WARN_KEYWORDS` (lines 4–30), raises a severity ceiling (FATAL > ERROR > WARN > INFO), and collects up to 5 non-overlapping snippets (1 line before + 2 after, lines 161–167); `excerpt` caps raw content at `MAX_EXCERPT_CHARS = 2500` with a truncation marker (lines 35, 52–60).
 - **Bounding:** `RING_SIZE = 50`, a true rolling ring buffer (`pop_front` when full). File changes are **drained**, so each `FileChange` is delivered to the AI at most once.
 - **Reactive trigger:** a change whose parsed `LogEvent::is_actionable()` (severity ≠ INFO, or error snippets present — the shared predicate in `models.rs`) pings the decision-loop trigger channel from the watcher thread (`try_send`, never blocks).
@@ -595,8 +595,8 @@ Both behaviours are covered by unit tests against the real migrations. The match
 ### Current gaps / dead code
 
 - `max_retries_per_issue` and `auto_approve_on_success_rate` (`ExecutionConfig`, `mod.rs:17/19`) are **dead** — deserialized and referenced only inside `policy/mod.rs` tests; no production code reads them (confirmed by crate-wide grep). The `#[allow(dead_code)]` comment claims "used in Phase 4" but they are not. There is consequently **no success-rate-driven auto-approval promotion** (the retry problem itself is now bounded by the failure breaker in `safety.rs`).
-- `registry.rs` / `tasks.rs` bypass the timeout helper (no execution timeout).
-- `RegistryReset.reversible = false` because the prior value is never snapshotted (`explain.rs:92`); there is no generic undo mechanism for any action.
+- `registry.rs` / `tasks.rs` bypass the per-action timeout helper, but the executor worker now wraps **every** job in a `tokio::time::timeout(EXEC_MAX = 10 min)` + panic isolation and always reports an outcome back, so a wedged action can't stall the serial queue or latch the tray on "Executing".
+- `RegistryReset.reversible` and `BcdEdit.reversible` are both `false` because the prior value is never snapshotted (`explain.rs`); there is no generic undo mechanism for any action.
 
 ## Autonomous app updater
 
@@ -972,11 +972,11 @@ Current gaps surfaced while mapping each subsystem (the self-improvement plan ab
 **Signal sources**
 
 - Event log captures only Error/Warning/Information levels and no message body (just 'EventID <n>'); Critical/Verbose levels and event descriptions are not collected. event_id is truncated to 16 bits.
-- Event-log entries accumulate in a 100-entry drain buffer, but each poll still returns at most RING_SIZE=20 entries across all channels — a burst larger than that within one poll interval loses the overflow, and there is no durable event history beyond the buffer.
+- Each event-log poll collects at most `MAX_PER_POLL = 100` records per channel and the shared drain buffer holds `BUFFER_CAP = 100`; a single-poll burst beyond that keeps the freshest 100 (the cursor still advances, so nothing below it is re-read), and there is no durable event history beyond the buffer.
 - CPU usage depends on a PowerShell WMI call; if powershell.exe is unavailable, slow, or wedged past 15s, cpu_usage_percent silently becomes 0.0 (indistinguishable from an idle CPU). Same single-point dependency for Defender.
 - network_errors is hardcoded 0 and disk_health is hardcoded 'unknown' — neither is actually measured; disk metrics only cover the C: volume.
 - File discovery only scans fixed roots + a small env-var root set, one subdirectory level deep, with a 30-day recency window; logs outside those roots/age or deeper than one level are not auto-watched (only explicit config log_directories extras bypass this).
-- File parsing skips files >64KB entirely, so errors near the tail of a large rolling log are invisible unless captured by the keyword snippets within the first read — but try_parse_log reads the whole file only when <=64KB, so large active logs are not parsed at all.
+- File parsing reads only the last 64KB (`MAX_READ_BYTES`) of each changed file, so an error written more than 64KB before the newest byte *within a single write burst* can be missed; ordinary append-and-watch sees new lines as they land.
 - Keyword-based severity classification (log_parser) is substring matching with no structured-log awareness, so it can over- or under-flag (the content_excerpt is provided to let the AI correct this downstream).
 - ps_capped uses sleep-poll at 100ms granularity rather than async wait; acceptable but each probe blocks a spawn_blocking thread for up to 15s.
 - Several Win32 calls (event log record parsing, service enum, adapter enum) use unsafe pointer walking; correctness depends on OS-supplied buffer layout and is not covered by tests (only firewall and Defender parsing are unit-tested).

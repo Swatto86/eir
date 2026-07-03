@@ -443,48 +443,82 @@ fn spawn_executor(
     done_tx: tokio::sync::mpsc::UnboundedSender<ExecOutcome>,
 ) {
     let db = db.clone();
+    // Backstop only — every real action already carries its own timeout (powershell
+    // DEFAULT_TIMEOUT, driver/security calls, etc.). This bounds the one that doesn't
+    // (registry's raw blocking powershell) and any future gap, so one wedged action
+    // can't stall the single serial queue forever and latch every later action on
+    // "Executing".
+    const EXEC_MAX: Duration = Duration::from_secs(10 * 60);
     tokio::spawn(async move {
         while let Some(job) = job_rx.recv().await {
-            let action = job.action;
-            // Isolate a panicking action so the worker survives to run the next job.
-            let result = match tokio::spawn(async move { executor::execute(&action).await }).await {
-                Ok(r) => r,
-                Err(_join) => ExecutionResult {
-                    action: job.label.clone(),
+            let ExecJob {
+                action,
+                decision_id,
+                baseline,
+                label,
+                diagnosis,
+                confidence,
+                reason,
+            } = job;
+            // Run the whole job body (execute + audit + feedback) inside an isolated,
+            // timeout-bounded task: a panic anywhere is contained to this job (the
+            // worker survives to run the next), and a hang can't wedge the queue.
+            let db2 = db.clone();
+            let label2 = label.clone();
+            let mut handle = tokio::spawn(async move {
+                let result = executor::execute(&action).await;
+                match audit::log_execution(&db2, decision_id, &result).await {
+                    Ok(exec_id) => {
+                        if let Err(e) = audit::mark_decision_executed(&db2, decision_id).await {
+                            error!("Failed to mark decision executed: {e}");
+                        }
+                        if let Err(e) = feedback::record(
+                            &db2,
+                            exec_id,
+                            &result.action,
+                            result.success,
+                            &baseline,
+                        )
+                        .await
+                        {
+                            error!("Failed to record feedback: {e}");
+                        }
+                    }
+                    Err(e) => error!("Failed to log execution: {e}"),
+                }
+                result
+            });
+            let result = match tokio::time::timeout(EXEC_MAX, &mut handle).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(_join)) => ExecutionResult {
+                    action: label2.clone(),
                     success: false,
                     output: "execution task panicked".to_string(),
                 },
-            };
-
-            match audit::log_execution(&db, job.decision_id, &result).await {
-                Ok(exec_id) => {
-                    if let Err(e) = audit::mark_decision_executed(&db, job.decision_id).await {
-                        error!("Failed to mark decision executed: {e}");
-                    }
-                    if let Err(e) = feedback::record(
-                        &db,
-                        exec_id,
-                        &result.action,
-                        result.success,
-                        &job.baseline,
-                    )
-                    .await
-                    {
-                        error!("Failed to record feedback: {e}");
+                Err(_elapsed) => {
+                    handle.abort();
+                    ExecutionResult {
+                        action: label2.clone(),
+                        success: false,
+                        output: format!(
+                            "execution exceeded {}m and was abandoned",
+                            EXEC_MAX.as_secs() / 60
+                        ),
                     }
                 }
-                Err(e) => error!("Failed to log execution: {e}"),
-            }
+            };
 
-            // If the loop has gone away the whole service is shutting down — ignore.
+            // Always report back — even on timeout/panic — so the loop clears the
+            // in_flight label and never latches the tray on "Executing". If the loop
+            // has gone away the whole service is shutting down, so ignore the error.
             let _ = done_tx.send(ExecOutcome {
-                label: job.label,
+                label,
                 exec_action: result.action,
                 success: result.success,
                 output: result.output,
-                diagnosis: job.diagnosis,
-                confidence: job.confidence,
-                reason: job.reason,
+                diagnosis,
+                confidence,
+                reason,
             });
         }
     });
@@ -752,6 +786,10 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         tokio::sync::mpsc::channel::<Result<AnalysisSuccess, String>>(2);
     let mut analysis_running = false;
     const ANALYSIS_MAX: Duration = Duration::from_secs(10 * 60);
+    // The Tier-2 learned-fact labeller is also an AI call, so it runs off the loop
+    // (fire-and-forget). This flag stops it stacking; the stored explanation is
+    // surfaced by the next facts_for_view refresh.
+    let labelling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut cycle_count = 0u64;
     // Reactive-trigger pacing: a trigger *schedules* a reaction (react_at)
     // rather than running one inline — the debounce lets an error burst
@@ -896,7 +934,20 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
 
                         st.advisor_spent_today = advisor_spent_today;
                         st.advisor_escalations_today = advisor_escalations_today;
-                        st.advisor = Some(advisor);
+                        // Merge only the escalation/spend fields the task computed. `advisor`
+                        // was built from the config captured at spawn time; a SetAdvisorSettings
+                        // that lands mid-analysis has already updated st.advisor.enabled/.settings
+                        // live, so a wholesale replace here would silently revert the user's change
+                        // in the UI until the next analysis (up to the 6h heartbeat).
+                        match st.advisor.as_mut() {
+                            Some(existing) => {
+                                existing.escalated = advisor.escalated;
+                                existing.escalation_model = advisor.escalation_model;
+                                existing.reason = advisor.reason;
+                                existing.spent_today_usd = advisor.spent_today_usd;
+                            }
+                            None => st.advisor = Some(advisor),
+                        }
                         // Persist the day's escalation spend so the budget/count caps
                         // survive a restart (see load at startup).
                         if let Err(e) = audit::save_advisor_day(
@@ -1464,9 +1515,31 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                     feedback::recent_summary(&db, 10).await.unwrap_or_default();
 
                 // Tier-2 (optional): give one not-yet-explained learned fact a one-sentence
-                // human-readable AI explanation (text only — never changes behaviour). Skips
-                // the AI call entirely when every fact is already labelled.
-                learn::label_one(&db, ai, &cfg.api.update_check_model).await;
+                // human-readable AI explanation (text only — never changes behaviour). It's
+                // an AI call, so run it OFF the loop like the analysis — inline it could block
+                // ui_rx (Approve/Reject/Pause) for up to the provider timeout. label_one skips
+                // the AI call entirely when every fact is already labelled, and the flag stops
+                // it stacking; the result is picked up by the next facts_for_view refresh.
+                if !labelling.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    let db_l = db.clone();
+                    let ai_l = ai.clone();
+                    let model_l = cfg.api.update_check_model.clone();
+                    let flag_l = labelling.clone();
+                    tokio::spawn(async move {
+                        // Reset via a drop-guard so an unlikely panic in label_one still
+                        // clears the flag (panic = unwind here) — otherwise the labeller
+                        // would latch off for the rest of the process, like the executor
+                        // and analysis tasks guard against their own failure paths.
+                        struct ResetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+                        impl Drop for ResetOnDrop {
+                            fn drop(&mut self) {
+                                self.0.store(false, std::sync::atomic::Ordering::Release);
+                            }
+                        }
+                        let _reset = ResetOnDrop(flag_l);
+                        learn::label_one(&db_l, &ai_l, &model_l).await;
+                    });
+                }
 
                 // Refresh the "what Eir has learned" card every cycle (incl. idle ones) so
                 // it reflects facts formed by both the decision loop and the updater.

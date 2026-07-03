@@ -25,36 +25,47 @@ pub type ShutdownHandle = std::sync::mpsc::SyncSender<()>;
 // ── Log parsing ───────────────────────────────────────────────────────────────
 
 fn try_parse_log(path: &Path, size_bytes: u64) -> Option<crate::models::LogEvent> {
-    if size_bytes == 0 || size_bytes > MAX_READ_BYTES {
+    if size_bytes == 0 {
         return None;
     }
     let ext = path.extension()?.to_str()?.to_lowercase();
     if !TEXT_EXTENSIONS.contains(&ext.as_str()) {
         return None;
     }
-    // Bound the ACTUAL read, not just the pre-read metadata size: the file may have
-    // grown between the metadata() sample and here (an actively-written log), and
-    // read_to_string would otherwise pull the whole current file into memory.
-    let content = {
-        use std::io::Read;
-        let file = std::fs::File::open(path).ok()?;
-        let mut buf = String::new();
-        // +1 so a file that grew to exactly the cap is detectable, but we still only
-        // ever hold at most MAX_READ_BYTES+1 bytes.
-        file.take(MAX_READ_BYTES + 1)
-            .read_to_string(&mut buf)
-            .ok()?;
-        if buf.len() as u64 > MAX_READ_BYTES {
-            return None;
-        }
-        buf
-    };
+    // Read at most the LAST MAX_READ_BYTES. A rolling log grows past 64KB and its
+    // newest (most relevant) lines are at the END — skipping any file over the cap
+    // (as before) meant that once a busy log crossed 64KB Eir went permanently blind
+    // to the errors still being written to it.
+    let content = read_tail(path, MAX_READ_BYTES)?;
     let event = super::log_parser::parse(path, &content);
     if event.error_snippets.is_empty() && event.severity == "INFO" {
         None
     } else {
         Some(event)
     }
+}
+
+/// Read up to the last `max_bytes` of a file as (lossy) UTF-8. If the file is
+/// larger, seeks to the tail and drops the first — likely partial — line so the
+/// parser never keys off a truncated leading record.
+fn read_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start)).ok()?;
+    }
+    let mut buf = Vec::new();
+    file.take(max_bytes).read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    if start > 0 {
+        // Skip the partial first line left by seeking into the middle of a record.
+        if let Some(nl) = text.find('\n') {
+            return Some(text[nl + 1..].to_string());
+        }
+    }
+    Some(text)
 }
 
 // ── Directory discovery ───────────────────────────────────────────────────────
@@ -264,4 +275,40 @@ pub fn drain(shared: &SharedChanges) -> Vec<FileChange> {
         .lock()
         .map(|mut g| g.drain(..).collect())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_tail_keeps_newest_content_and_drops_partial_first_line() {
+        // A file larger than the window: the newest line must survive and the far-older
+        // head line must not — the bug this replaced skipped >64KB files entirely.
+        let path = std::env::temp_dir().join(format!("eir-readtail-{}.log", std::process::id()));
+        let filler = "x".repeat(MAX_READ_BYTES as usize);
+        std::fs::write(
+            &path,
+            format!("HEAD-should-be-gone\n{filler}\nTAIL-ERROR-marker\n"),
+        )
+        .unwrap();
+
+        let tail = read_tail(&path, MAX_READ_BYTES).expect("tail");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(tail.len() as u64 <= MAX_READ_BYTES);
+        assert!(tail.contains("TAIL-ERROR-marker"));
+        assert!(!tail.contains("HEAD-should-be-gone"));
+    }
+
+    #[test]
+    fn read_tail_reads_a_small_file_whole() {
+        let path =
+            std::env::temp_dir().join(format!("eir-readtail-small-{}.log", std::process::id()));
+        std::fs::write(&path, "line1\nERROR boom\n").unwrap();
+        let tail = read_tail(&path, MAX_READ_BYTES).expect("tail");
+        let _ = std::fs::remove_file(&path);
+        assert!(tail.contains("line1"));
+        assert!(tail.contains("ERROR boom"));
+    }
 }

@@ -10,7 +10,12 @@ use windows::Win32::System::EventLog::{
     REPORT_EVENT_TYPE,
 };
 
-const RING_SIZE: usize = 20;
+/// Max records collected from one channel in a single poll. The per-channel cursor
+/// still advances to the true newest, so nothing below it is re-read — but a burst
+/// beyond this cap drops only its OLDEST records that poll (the newest are kept),
+/// instead of the former `RING_SIZE = 20` which permanently lost every record past
+/// the 20th (and, capping the cross-channel total, starved later channels entirely).
+const MAX_PER_POLL: usize = 100;
 /// Cap on the accumulate-until-drained buffer (multiple polls can land between
 /// decision cycles); oldest entries are dropped first.
 const BUFFER_CAP: usize = 100;
@@ -47,7 +52,7 @@ fn level_name(event_type: REPORT_EVENT_TYPE) -> Option<&'static str> {
 ///
 /// When `prime` is true (the channel's first poll), the cursor is seeded to the
 /// current newest record WITHOUT returning any entries — otherwise startup would
-/// dump up to `RING_SIZE` possibly days-old, already-resolved errors and fire the
+/// dump up to `MAX_PER_POLL` possibly days-old, already-resolved errors and fire the
 /// reactive trigger on stale data. A `RecordNumber` reset (log cleared / retention
 /// rollover / u32 wrap — the newest record is now *below* the stored cursor) is
 /// detected and treated like a re-prime, so post-clear events aren't silently
@@ -160,7 +165,7 @@ fn read_channel_since(channel: &str, last_record: u32, prime: bool) -> (Vec<Even
 
             offset += record.Length as usize;
 
-            if entries.len() >= RING_SIZE {
+            if entries.len() >= MAX_PER_POLL {
                 done = true;
                 break;
             }
@@ -209,11 +214,11 @@ pub fn spawn(
                             if prime || new_last != last {
                                 c.insert(channel.clone(), new_last);
                             }
-                            for e in entries {
-                                if all.len() >= RING_SIZE { break; }
-                                all.push_back(e);
-                            }
-                            if all.len() >= RING_SIZE { break; }
+                            // Keep every record read_channel_since returned — BUFFER_CAP
+                            // downstream is the only bound. The old RING_SIZE cap here
+                            // silently dropped a later channel's events entirely (and any
+                            // error past the 20th) once an earlier channel filled the budget.
+                            all.extend(entries);
                         }
                         (all, c)
                     })
@@ -243,7 +248,10 @@ pub fn spawn(
                         // DRAINS (one-shot delivery). Replacing wholesale would
                         // let a quieter follow-up poll wipe entries before the
                         // (debounced) reactive cycle ever reads them.
-                        for e in new_entries {
+                        // read_channel_since yields newest-first; push in reverse so
+                        // the buffer is oldest→newest and BUFFER_CAP's pop_front drops
+                        // the OLDEST (keeping the freshest errors), as its doc promises.
+                        for e in new_entries.into_iter().rev() {
                             if guard.len() >= BUFFER_CAP {
                                 guard.pop_front();
                             }

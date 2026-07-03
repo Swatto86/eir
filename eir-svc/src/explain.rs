@@ -120,7 +120,9 @@ pub fn explain(action: &FixAction) -> ActionExplanation {
                  how Windows starts up."
             ),
             target: element.clone(),
-            reversible: true,
+            // The prior BCD value is not snapshotted, so this cannot be auto-undone
+            // (same rationale as RegistryReset above).
+            reversible: false,
         },
         FixAction::ProcessKill { process_name } => ActionExplanation {
             summary: format!(
