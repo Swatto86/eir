@@ -146,7 +146,13 @@ fn normalize_path_lexical(path: &str) -> Vec<String> {
         match raw {
             "" | "." => {}
             ".." => {
-                comps.pop();
+                // Never pop past the drive/root component — Windows treats `..` at the
+                // root as a no-op, so `C:\Windows\..\..\Windows\System32` resolves back
+                // to `C:\Windows\System32`. Popping the drive would let such a path
+                // escape a `C:\Windows` block.
+                if comps.len() > 1 {
+                    comps.pop();
+                }
             }
             c => comps.push(c.to_lowercase()),
         }
@@ -281,7 +287,10 @@ mod tests {
         assert!(blocked("C:/Windows/System32/x.dll")); // forward slashes
         assert!(blocked("\\\\?\\C:\\Windows\\System32\\x.dll")); // \\?\ prefix
         assert!(blocked("C:\\Windows\\..\\Windows\\System32\\x.dll")); // traversal
-                                                                       // A sibling directory that only shares a name prefix is NOT blocked.
+        // Traversal that tries to escape past the drive root still resolves back into
+        // C:\Windows on Windows, so it must stay blocked (the drive is never popped).
+        assert!(blocked("C:\\Windows\\..\\..\\Windows\\System32\\x.dll"));
+        // A sibling directory that only shares a name prefix is NOT blocked.
         assert!(!blocked("C:\\WindowsApps\\ok.txt"));
     }
 
