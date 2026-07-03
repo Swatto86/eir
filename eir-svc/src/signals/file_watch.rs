@@ -32,7 +32,23 @@ fn try_parse_log(path: &Path, size_bytes: u64) -> Option<crate::models::LogEvent
     if !TEXT_EXTENSIONS.contains(&ext.as_str()) {
         return None;
     }
-    let content = std::fs::read_to_string(path).ok()?;
+    // Bound the ACTUAL read, not just the pre-read metadata size: the file may have
+    // grown between the metadata() sample and here (an actively-written log), and
+    // read_to_string would otherwise pull the whole current file into memory.
+    let content = {
+        use std::io::Read;
+        let file = std::fs::File::open(path).ok()?;
+        let mut buf = String::new();
+        // +1 so a file that grew to exactly the cap is detectable, but we still only
+        // ever hold at most MAX_READ_BYTES+1 bytes.
+        file.take(MAX_READ_BYTES + 1)
+            .read_to_string(&mut buf)
+            .ok()?;
+        if buf.len() as u64 > MAX_READ_BYTES {
+            return None;
+        }
+        buf
+    };
     let event = super::log_parser::parse(path, &content);
     if event.error_snippets.is_empty() && event.severity == "INFO" {
         None
@@ -203,15 +219,24 @@ pub fn spawn(
                     for path in event.paths {
                         let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                         let log_event = try_parse_log(&path, size_bytes);
+                        // Only KEEP a change that carries a parsed log event. The watch
+                        // trees (%TEMP%, %LOCALAPPDATA%, …) churn constantly with
+                        // browser-cache/temp writes; pushing those non-log changes into
+                        // the small ring evicts genuine error-log events before the
+                        // decision loop drains them, so a fired trigger would arrive with
+                        // no supporting evidence. Non-log noise is simply dropped.
+                        let Some(log_event) = log_event else {
+                            continue;
+                        };
                         // Error-bearing log writes are actionable — wake the
                         // decision loop (try_send is fine off the runtime).
-                        let actionable = log_event.as_ref().is_some_and(|le| le.is_actionable());
+                        let actionable = log_event.is_actionable();
                         let change = FileChange {
                             path,
                             kind: kind.to_string(),
                             size_bytes,
                             timestamp: Utc::now(),
-                            log_event,
+                            log_event: Some(log_event),
                         };
                         if let Ok(mut guard) = shared_clone.lock() {
                             if guard.len() >= RING_SIZE {

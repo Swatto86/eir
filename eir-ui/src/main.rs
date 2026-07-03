@@ -109,55 +109,52 @@ fn launched_hidden() -> bool {
 
 #[tauri::command]
 fn get_status(status: State<'_, SharedStatus>) -> StatusPayload {
-    status.lock().unwrap().clone()
+    // Recover from a poisoned lock instead of panicking: the guarded data is a plain
+    // snapshot, so a prior panic elsewhere shouldn't turn every 2s poll into a crash.
+    match status.lock() {
+        Ok(g) => g.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
 }
 
 #[tauri::command]
 async fn decide_approval(id: u64, approved: bool, tx: State<'_, UiCmdTx>) -> Result<(), String> {
-    tx.0.send(UiMsg::Approve { id, approved })
-        .await
+    tx.0.try_send(UiMsg::Approve { id, approved })
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn toggle_pause(tx: State<'_, UiCmdTx>) -> Result<(), String> {
-    tx.0.send(UiMsg::TogglePause)
-        .await
-        .map_err(|e| e.to_string())
+    tx.0.try_send(UiMsg::TogglePause).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn clear_problems(tx: State<'_, UiCmdTx>) -> Result<(), String> {
-    tx.0.send(UiMsg::ClearProblems)
-        .await
+    tx.0.try_send(UiMsg::ClearProblems)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn clear_executions(tx: State<'_, UiCmdTx>) -> Result<(), String> {
-    tx.0.send(UiMsg::ClearExecutions)
-        .await
+    tx.0.try_send(UiMsg::ClearExecutions)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn update_settings(settings: SettingsUpdate, tx: State<'_, UiCmdTx>) -> Result<(), String> {
-    tx.0.send(UiMsg::UpdateSettings(Box::new(settings)))
-        .await
+    tx.0.try_send(UiMsg::UpdateSettings(Box::new(settings)))
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn run_updates_now(tx: State<'_, UiCmdTx>) -> Result<(), String> {
-    tx.0.send(UiMsg::RunUpdatesNow)
-        .await
+    tx.0.try_send(UiMsg::RunUpdatesNow)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn clear_update_history(tx: State<'_, UiCmdTx>) -> Result<(), String> {
-    tx.0.send(UiMsg::ClearUpdateHistory)
-        .await
+    tx.0.try_send(UiMsg::ClearUpdateHistory)
         .map_err(|e| e.to_string())
 }
 
@@ -166,8 +163,7 @@ async fn set_updater_settings(
     settings: UpdaterSettingsUpdate,
     tx: State<'_, UiCmdTx>,
 ) -> Result<(), String> {
-    tx.0.send(UiMsg::UpdateUpdaterSettings(Box::new(settings)))
-        .await
+    tx.0.try_send(UiMsg::UpdateUpdaterSettings(Box::new(settings)))
         .map_err(|e| e.to_string())
 }
 
@@ -178,15 +174,13 @@ async fn set_app_ignore(
     note: String,
     tx: State<'_, UiCmdTx>,
 ) -> Result<(), String> {
-    tx.0.send(UiMsg::SetAppIgnore { id, ignore, note })
-        .await
+    tx.0.try_send(UiMsg::SetAppIgnore { id, ignore, note })
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn set_learned_fact(id: i64, op: String, tx: State<'_, UiCmdTx>) -> Result<(), String> {
-    tx.0.send(UiMsg::SetLearnedFact { id, op })
-        .await
+    tx.0.try_send(UiMsg::SetLearnedFact { id, op })
         .map_err(|e| e.to_string())
 }
 
@@ -195,8 +189,7 @@ async fn set_advisor_settings(
     settings: AdvisorSettingsUpdate,
     tx: State<'_, UiCmdTx>,
 ) -> Result<(), String> {
-    tx.0.send(UiMsg::SetAdvisorSettings(Box::new(settings)))
-        .await
+    tx.0.try_send(UiMsg::SetAdvisorSettings(Box::new(settings)))
         .map_err(|e| e.to_string())
 }
 
@@ -220,17 +213,27 @@ async fn check_updates_now(handle: AppHandle) -> Result<String, String> {
 }
 
 async fn check_updates_inner(handle: &AppHandle) -> Result<String, String> {
+    use std::time::Duration;
     let updater = handle.updater().map_err(|e| e.to_string())?;
-    match updater.check().await {
-        Ok(Some(update)) => {
-            update
-                .download_and_install(|_, _| {}, || {})
-                .await
-                .map_err(|e| e.to_string())?;
+    // Timeouts guarantee the future completes so UPDATE_IN_PROGRESS is always reset —
+    // a stalled network check/download would otherwise latch it true forever, killing
+    // both this command and the background checker until the app is restarted.
+    let found = tokio::time::timeout(Duration::from_secs(120), updater.check())
+        .await
+        .map_err(|_| "update check timed out".to_string())?
+        .map_err(|e| e.to_string())?;
+    match found {
+        Some(update) => {
+            tokio::time::timeout(
+                Duration::from_secs(600),
+                update.download_and_install(|_, _| {}, || {}),
+            )
+            .await
+            .map_err(|_| "update download timed out".to_string())?
+            .map_err(|e| e.to_string())?;
             handle.restart();
         }
-        Ok(None) => Ok("You're on the latest version.".to_string()),
-        Err(e) => Err(e.to_string()),
+        None => Ok("You're on the latest version.".to_string()),
     }
 }
 
@@ -365,16 +368,24 @@ async fn check_for_update(handle: &tauri::AppHandle) {
             return;
         }
     };
-    match updater.check().await {
-        Ok(Some(update)) => {
-            if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
-                error!("Update install failed: {e}");
-            } else {
-                handle.restart();
+    // Timeouts guarantee completion so UPDATE_IN_PROGRESS is reset even if the check
+    // or download stalls — otherwise the 6-hour loop wedges here and auto-update dies.
+    match tokio::time::timeout(std::time::Duration::from_secs(120), updater.check()).await {
+        Ok(Ok(Some(update))) => {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(600),
+                update.download_and_install(|_, _| {}, || {}),
+            )
+            .await
+            {
+                Ok(Ok(())) => handle.restart(),
+                Ok(Err(e)) => error!("Update install failed: {e}"),
+                Err(_) => error!("Update download timed out"),
             }
         }
-        Ok(None) => {}
-        Err(e) => error!("Update check failed: {e}"),
+        Ok(Ok(None)) => {}
+        Ok(Err(e)) => error!("Update check failed: {e}"),
+        Err(_) => error!("Update check timed out"),
     }
     UPDATE_IN_PROGRESS.store(false, Ordering::SeqCst);
 }

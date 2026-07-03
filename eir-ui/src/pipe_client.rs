@@ -40,6 +40,10 @@ async fn run_on(status: SharedStatus, mut cmd_rx: mpsc::Receiver<UiMsg>, pipe_na
                 );
             }
         }
+        // Drop commands that were queued for the connection that just ended — replaying
+        // a stale command (e.g. a TogglePause clicked before the drop) on the next
+        // connection would act against the user's current intent.
+        while cmd_rx.try_recv().is_ok() {}
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }

@@ -15,7 +15,10 @@ pub async fn gbp_per_usd() -> Result<f64, String> {
             .args([
                 "-NoProfile",
                 "-Command",
-                "try { (Invoke-RestMethod -Uri 'https://open.er-api.com/v6/latest/USD' -TimeoutSec 8).rates.GBP } catch { '' }",
+                // Format with the invariant culture so the decimal separator is always
+                // '.', otherwise a comma-decimal locale emits "0,79" which f64::parse
+                // rejects and the live rate is silently never used.
+                "try { ([double]((Invoke-RestMethod -Uri 'https://open.er-api.com/v6/latest/USD' -TimeoutSec 8).rates.GBP)).ToString([System.Globalization.CultureInfo]::InvariantCulture) } catch { '' }",
             ])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
