@@ -198,7 +198,7 @@ fn get_services() -> (usize, Vec<String>) {
 
         // Ok => all remaining services fit in this batch; ERROR_MORE_DATA => another
         // batch remains (resume_handle advanced); any other error => stop.
-        match &result {
+        match result {
             Ok(()) => break,
             Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => continue,
             Err(_) => break,
