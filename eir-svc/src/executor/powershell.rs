@@ -6,6 +6,28 @@ use tokio::process::Command;
 /// inline, so an unbounded script could otherwise wedge the loop forever.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Quote a value as a PowerShell **single-quoted** string literal: wrap in single
+/// quotes and double any embedded single quote. This is the only safe way to embed
+/// untrusted data (AI-supplied names/paths) in a PowerShell command — a double-quoted
+/// string would still evaluate `$(...)`, `$var`, and backtick escapes. Returns the
+/// value INCLUDING its surrounding quotes, e.g. `ps_single_quote("a'b") == "'a''b'"`.
+pub fn ps_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_quote_wraps_and_doubles_quotes() {
+        assert_eq!(ps_single_quote("plain"), "'plain'");
+        assert_eq!(ps_single_quote("O'Brien"), "'O''Brien'");
+        // A subexpression payload is inert inside a single-quoted literal.
+        assert_eq!(ps_single_quote("$(calc.exe)"), "'$(calc.exe)'");
+    }
+}
+
 /// Run a PowerShell script with the default timeout and return its output.
 /// Script is always run with -NonInteractive and Bypass execution policy.
 pub async fn run_diagnostic(script: &str) -> Result<String> {

@@ -58,12 +58,15 @@ fn normalise_key(key_path: &str) -> String {
 /// unit-testable: values are only ever placed inside single-quoted PowerShell
 /// literals (with embedded `'` doubled), never a double-quoted string.
 fn build_reset_script(normalised_path: &str, value_name: &str, value_data: &str) -> String {
-    let safe_path = normalised_path.replace('\'', "''");
+    let path_q = super::powershell::ps_single_quote(normalised_path);
+    let name_q = super::powershell::ps_single_quote(value_name);
+    let data_q = super::powershell::ps_single_quote(value_data);
+    // For the human-readable confirmation, embed the quote-doubled name inside a
+    // single-quoted literal (never a double-quoted string).
     let safe_name = value_name.replace('\'', "''");
-    let safe_data = value_data.replace('\'', "''");
     format!(
-        "Set-ItemProperty -Path '{safe_path}' -Name '{safe_name}' -Value '{safe_data}' -ErrorAction Stop; \
-         Write-Output 'Set registry value {safe_name} at {safe_path}'"
+        "Set-ItemProperty -Path {path_q} -Name {name_q} -Value {data_q} -ErrorAction Stop; \
+         Write-Output 'Set registry value {safe_name}'"
     )
 }
 

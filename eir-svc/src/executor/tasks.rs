@@ -11,12 +11,13 @@ pub async fn enable(task_name: &str) -> Result<String> {
 /// Build the PowerShell script for a scheduled-task cmdlet. Kept pure so the
 /// injection-safety of the escaping (single-quoted literals only) is unit-testable.
 fn build_task_script(cmdlet: &str, task_name: &str) -> String {
-    let safe_name = task_name.replace('\'', "''");
+    let name_q = super::powershell::ps_single_quote(task_name);
     // Confirmation is a SINGLE-quoted literal: a double-quoted string would evaluate
-    // `$(...)`/`$var`, and the escaping above only neutralises quote-breakout inside a
+    // `$(...)`/`$var`, and the escaping only neutralises quote-breakout inside a
     // single-quoted context — echoing the name back double-quoted would be injectable.
+    let safe_name = task_name.replace('\'', "''");
     format!(
-        "{cmdlet} -TaskName '{safe_name}' -ErrorAction Stop | Out-Null; \
+        "{cmdlet} -TaskName {name_q} -ErrorAction Stop | Out-Null; \
          Write-Output '{cmdlet} succeeded for {safe_name}'"
     )
 }
