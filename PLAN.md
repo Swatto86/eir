@@ -158,11 +158,11 @@ Ordering is by severity, then value/effort. Suggested sequencing is at the botto
 
 ---
 
-## Features (curated shortlist — ranked by value/effort)
+## Features (ranked by value/effort)
 
-Grounded in the project's own backlog (`ARCHITECTURE.md` "Known limitations", `CONTEXT.md`
-open questions), not speculative. Recommend the top three for this cycle; the rest are
-worthwhile but larger.
+F1–F6 are grounded in the project's own backlog (`ARCHITECTURE.md` "Known limitations",
+`CONTEXT.md` open questions); F7–F9 are net-new capability beyond the backlog. Recommend
+F1+F2+F3 first — small and independent; the rest are worthwhile but larger.
 
 ### F1 — Anthropic prompt caching (recommended)
 The ~110-line static guardrail prose is re-sent uncached every cycle on the Anthropic native
@@ -200,6 +200,35 @@ trend signal — "CPU climbing N cycles", "disk trending toward full" fed into t
 and/or a UI sparkline — would turn dead data into signal. Bigger scope and needs a design
 pass on what trends are actionable; recommend deferring to its own cycle rather than bundling.
 
+### F7 — SMART disk-health signal (net-new)
+`SystemState.disk_health` is hardcoded `"unknown"` and `network_errors` hardcoded `0`
+(`models.rs`, backlog "neither is actually measured"). Collect real SMART status via
+`Get-PhysicalDisk`/`Get-StorageReliabilityCounter` (or WMI `MSStorageDriver_FailurePredictStatus`)
+in the existing wmi collector cadence, bounded like the other probes (`ps_capped`). Feed it
+into `actionable_fingerprint` so a disk predicting failure triggers a reactive analysis —
+a failing disk is exactly the early warning a guardian exists for. While in there, wire
+`network_errors` from `GetIfEntry2` error counters or drop the field. Medium effort; new
+signal only, no new actions, so no policy surface change.
+
+### F8 — DISM/SFC system-file repair actions (net-new; revisit of a deliberate deferral)
+`sfc /scannow` and `DISM /Online /Cleanup-Image /RestoreHealth` were deferred when execution
+ran inline because they block for many minutes (see `eir-breadth-theme` memory / backlog).
+That blocker is gone: fixes now run on the off-loop executor worker with `EXEC_MAX` = 10 min.
+Add two `FixAction` variants (`SfcScan`, `DismRestoreHealth`) — **require-approval, never
+whitelisted** (long-running, writes to the component store), with a dedicated generous
+timeout (SFC can exceed 10 min; give these their own cap rather than EXEC_MAX), progress
+surfaced via the existing execution feed, and prompt guidance so the AI proposes them only
+for corruption-signature events (CBS/ESENT/WHEA errors). Medium–large; the highest-leverage
+"fix everything" breadth item.
+
+### F9 — Weekly plain-English health digest (net-new)
+The audit DB holds decisions, executions, feedback scores, update attempts, and (with F6)
+metric history — but there is no retrospective view. Once a week, generate a short digest —
+what Eir saw, fixed, blocked, learned, spent — as one bounded AI call over aggregated audit
+rows (counts/summaries, not raw snapshots), surfaced as a new UI card and an OS notification
+(reuses F5's plumbing). Costs one cheap call a week; makes the guardian's value visible
+instead of silent. Medium effort; natural after F5, benefits from F6.
+
 ---
 
 ## Suggested sequencing for implementation
@@ -210,7 +239,11 @@ pass on what trends are actionable; recommend deferring to its own cycle rather 
    against a throwaway key; log cleanup against a scratch tree) before tagging.
 2. **Correctness/UX bug pass:** B6, B7, and the L-notes worth taking (L3, L4, L6, L8).
 3. **Feature cycle:** F1 + F2 + F3 together (all small, independent), then F4 alongside the
-   B1 registry work if not already merged. F5 next. F6 as its own designed cycle.
+   B1 registry work if not already merged. F5 next.
+4. **Signal & breadth cycle (each its own release):** F7 (SMART/network signals), F8
+   (DISM/SFC actions — approval-gated, own timeout, live-test one run before tagging),
+   F6 (trend design pass), then F9 (digest — last, so it has F5's notification plumbing
+   and F6/F7's richer data to report on).
 
 Per repo policy: bump all four version locations + `Cargo.lock` together, `[release]` marker,
 CI green is the only pre-release gate, single rolling release. Live-run verification of any
