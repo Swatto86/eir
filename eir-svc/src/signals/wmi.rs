@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tracing::{info, warn};
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_MORE_DATA};
 use windows::Win32::NetworkManagement::IpHelper::{GetAdaptersInfo, IP_ADAPTER_INFO};
 use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows::Win32::System::Registry::{
@@ -15,8 +16,8 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::System::Services::{
     CloseServiceHandle, EnumServicesStatusExW, OpenSCManagerW, ENUM_SERVICE_STATUS_PROCESSW,
-    SC_ENUM_PROCESS_INFO, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_ACTIVE, SERVICE_RUNNING,
-    SERVICE_WIN32,
+    SC_ENUM_PROCESS_INFO, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_RUNNING, SERVICE_STATE_ALL,
+    SERVICE_STOPPED, SERVICE_WIN32,
 };
 use windows::Win32::System::SystemInformation::{
     GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX,
@@ -114,7 +115,17 @@ fn get_disk() -> (f32, f32) {
     (usage, free_gb)
 }
 
+/// Enumerate services and return (running_count, failed_names).
+///
+/// A "failed" service is one that is fully STOPPED with an *abnormal* exit code.
+/// The previous version enumerated only `SERVICE_ACTIVE` and flagged anything not
+/// RUNNING, which (a) missed the crashed-to-STOPPED services that matter most and
+/// (b) mislabelled transient PENDING/PAUSED states as failures. Exit code 0 (clean
+/// stop) and 1077 (`ERROR_SERVICE_NEVER_STARTED`, the normal state of Manual/Disabled
+/// services) are excluded so `failed_services` isn't flooded with services that are
+/// stopped by design.
 fn get_services() -> (usize, Vec<String>) {
+    const ERROR_SERVICE_NEVER_STARTED: u32 = 1077;
     let manager = match unsafe {
         OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ENUMERATE_SERVICE)
     } {
@@ -122,52 +133,39 @@ fn get_services() -> (usize, Vec<String>) {
         Err(_) => return (0, vec![]),
     };
 
-    let mut bytes_needed: u32 = 0;
-    let mut services_returned: u32 = 0;
-    let mut resume_handle: u32 = 0;
-
-    unsafe {
-        let _ = EnumServicesStatusExW(
-            manager,
-            SC_ENUM_PROCESS_INFO,
-            SERVICE_WIN32,
-            SERVICE_ACTIVE,
-            None,
-            &mut bytes_needed,
-            &mut services_returned,
-            Some(&mut resume_handle),
-            PCWSTR::null(),
-        );
-    }
-
-    if bytes_needed == 0 {
-        unsafe {
-            let _ = CloseServiceHandle(manager);
-        }
-        return (0, vec![]);
-    }
-
-    let mut buf = vec![0u8; bytes_needed as usize];
-    resume_handle = 0;
-
-    let result = unsafe {
-        EnumServicesStatusExW(
-            manager,
-            SC_ENUM_PROCESS_INFO,
-            SERVICE_WIN32,
-            SERVICE_ACTIVE,
-            Some(&mut buf),
-            &mut bytes_needed,
-            &mut services_returned,
-            Some(&mut resume_handle),
-            PCWSTR::null(),
-        )
-    };
-
     let mut running = 0usize;
     let mut failed: Vec<String> = Vec::new();
+    let mut resume_handle: u32 = 0;
+    let mut buf = vec![0u8; 256 * 1024];
 
-    if result.is_ok() {
+    // Bounded loop over resume batches (guards against a pathological non-advancing
+    // resume handle); SERVICE_STATE_ALL can span hundreds of services.
+    for _ in 0..64 {
+        let mut bytes_needed: u32 = 0;
+        let mut services_returned: u32 = 0;
+        let result = unsafe {
+            EnumServicesStatusExW(
+                manager,
+                SC_ENUM_PROCESS_INFO,
+                SERVICE_WIN32,
+                SERVICE_STATE_ALL,
+                Some(&mut buf),
+                &mut bytes_needed,
+                &mut services_returned,
+                Some(&mut resume_handle),
+                PCWSTR::null(),
+            )
+        };
+
+        if services_returned == 0 {
+            // Buffer too small for even one record — grow and retry; else nothing left.
+            if bytes_needed as usize > buf.len() {
+                buf.resize(bytes_needed as usize, 0);
+                continue;
+            }
+            break;
+        }
+
         let records = unsafe {
             std::slice::from_raw_parts(
                 buf.as_ptr() as *const ENUM_SERVICE_STATUS_PROCESSW,
@@ -175,8 +173,15 @@ fn get_services() -> (usize, Vec<String>) {
             )
         };
         for svc in records {
-            running += 1;
-            if svc.ServiceStatusProcess.dwCurrentState != SERVICE_RUNNING {
+            let ssp = &svc.ServiceStatusProcess;
+            if ssp.dwCurrentState == SERVICE_RUNNING {
+                running += 1;
+                continue;
+            }
+            if ssp.dwCurrentState == SERVICE_STOPPED
+                && ssp.dwWin32ExitCode != 0
+                && ssp.dwWin32ExitCode != ERROR_SERVICE_NEVER_STARTED
+            {
                 let name = unsafe {
                     let ptr = svc.lpServiceName.0;
                     let mut len = 0;
@@ -189,6 +194,14 @@ fn get_services() -> (usize, Vec<String>) {
                 };
                 failed.push(name);
             }
+        }
+
+        // Ok => all remaining services fit in this batch; ERROR_MORE_DATA => another
+        // batch remains (resume_handle advanced); any other error => stop.
+        match &result {
+            Ok(()) => break,
+            Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => continue,
+            Err(_) => break,
         }
     }
 
@@ -209,12 +222,25 @@ fn get_network_interfaces() -> Vec<NetworkInterface> {
     let mut buf_size: u32 = 16384;
     let mut buf = vec![0u8; buf_size as usize];
 
-    let result = unsafe {
+    let mut result = unsafe {
         GetAdaptersInfo(
             Some(buf.as_mut_ptr() as *mut IP_ADAPTER_INFO),
             &mut buf_size,
         )
     };
+
+    // On a machine with many adapters (VPN/Hyper-V/Docker) 16 KiB is too small;
+    // GetAdaptersInfo returns ERROR_BUFFER_OVERFLOW and writes the needed size into
+    // buf_size. Grow and retry once instead of reporting zero interfaces.
+    if result == ERROR_BUFFER_OVERFLOW.0 {
+        buf = vec![0u8; buf_size as usize];
+        result = unsafe {
+            GetAdaptersInfo(
+                Some(buf.as_mut_ptr() as *mut IP_ADAPTER_INFO),
+                &mut buf_size,
+            )
+        };
+    }
 
     if result != 0 {
         return interfaces;

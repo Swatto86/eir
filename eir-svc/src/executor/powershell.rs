@@ -15,19 +15,6 @@ pub fn ps_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn single_quote_wraps_and_doubles_quotes() {
-        assert_eq!(ps_single_quote("plain"), "'plain'");
-        assert_eq!(ps_single_quote("O'Brien"), "'O''Brien'");
-        // A subexpression payload is inert inside a single-quoted literal.
-        assert_eq!(ps_single_quote("$(calc.exe)"), "'$(calc.exe)'");
-    }
-}
-
 /// Run a PowerShell script with the default timeout and return its output.
 /// Script is always run with -NonInteractive and Bypass execution policy.
 pub async fn run_diagnostic(script: &str) -> Result<String> {
@@ -73,5 +60,18 @@ pub async fn run_diagnostic_with_timeout(script: &str, timeout: Duration) -> Res
             "Script exited with code {:?}\nstdout: {stdout}\nstderr: {stderr}",
             output.status.code()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_quote_wraps_and_doubles_quotes() {
+        assert_eq!(ps_single_quote("plain"), "'plain'");
+        assert_eq!(ps_single_quote("O'Brien"), "'O''Brien'");
+        // A subexpression payload is inert inside a single-quoted literal.
+        assert_eq!(ps_single_quote("$(calc.exe)"), "'$(calc.exe)'");
     }
 }
