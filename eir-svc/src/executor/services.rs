@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use std::time::{Duration, Instant};
 use tracing::info;
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::ERROR_SERVICE_NOT_ACTIVE;
 use windows::Win32::System::Services::{
     CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
     StartServiceW, SC_MANAGER_CONNECT, SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
@@ -36,9 +37,17 @@ pub fn stop(name: &str) -> Result<String> {
     let result = match svc {
         Ok(h) => {
             let mut status = SERVICE_STATUS::default();
-            let r = unsafe { ControlService(h, SERVICE_CONTROL_STOP, &mut status) }
-                .map(|_| format!("Stop signal sent to '{name}'"))
-                .map_err(|e| anyhow::anyhow!("ControlService failed: {e}"));
+            // A service that is already stopped — the usual state of a *failed*
+            // service — returns ERROR_SERVICE_NOT_ACTIVE. Treat that as success so
+            // `restart` (stop → wait → start) still proceeds to start it, instead of
+            // bailing at the `stop(name)?` and never restarting the thing.
+            let r = match unsafe { ControlService(h, SERVICE_CONTROL_STOP, &mut status) } {
+                Ok(_) => Ok(format!("Stop signal sent to '{name}'")),
+                Err(e) if e.code() == ERROR_SERVICE_NOT_ACTIVE.to_hresult() => {
+                    Ok(format!("Service '{name}' was already stopped"))
+                }
+                Err(e) => Err(anyhow::anyhow!("ControlService failed: {e}")),
+            };
             unsafe {
                 let _ = CloseServiceHandle(h);
             }
@@ -94,6 +103,7 @@ fn wait_for(name: &str, target: SERVICE_STATUS_CURRENT_STATE, timeout_secs: u64)
         }
     };
 
+    let mut consecutive_errs = 0u32;
     loop {
         if Instant::now() > deadline {
             unsafe {
@@ -103,11 +113,25 @@ fn wait_for(name: &str, target: SERVICE_STATUS_CURRENT_STATE, timeout_secs: u64)
             bail!("Timed out waiting for service '{name}' to reach state {target:?}");
         }
         let mut status = SERVICE_STATUS::default();
-        unsafe {
-            let _ = QueryServiceStatus(svc, &mut status);
-        }
-        if status.dwCurrentState == target {
-            break;
+        match unsafe { QueryServiceStatus(svc, &mut status) } {
+            Ok(()) => {
+                consecutive_errs = 0;
+                if status.dwCurrentState == target {
+                    break;
+                }
+            }
+            // Don't silently spin to the timeout on a persistent query failure —
+            // surface the real error after a few consecutive failures.
+            Err(e) => {
+                consecutive_errs += 1;
+                if consecutive_errs >= 5 {
+                    unsafe {
+                        let _ = CloseServiceHandle(svc);
+                        let _ = CloseServiceHandle(manager);
+                    }
+                    bail!("QueryServiceStatus failed for '{name}': {e}");
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(500));
     }

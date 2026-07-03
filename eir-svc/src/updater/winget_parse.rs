@@ -74,7 +74,10 @@ pub fn winget_table(text: &str) -> (Vec<(&'static str, usize)>, Vec<Vec<char>>) 
     let offsets = header_offsets(text);
     let mut rows = Vec::new();
     let mut in_table = false;
-    for line in text.lines() {
+    for raw_line in text.lines() {
+        // Strip spinner paint the same way the header does — otherwise a `\r` bleeding
+        // onto a data row would misalign it against the header's column offsets.
+        let line = raw_line.rsplit('\r').next().unwrap_or(raw_line);
         let trimmed = line.trim();
         if !in_table {
             if trimmed.contains("-----") {
@@ -85,8 +88,12 @@ pub fn winget_table(text: &str) -> (Vec<(&'static str, usize)>, Vec<Vec<char>>) 
         if trimmed.is_empty() {
             continue;
         }
+        // The footer is "N upgrades available." — a line that starts with a digit and
+        // contains "available". Matching "upgrade" + "available" loosely (as before)
+        // truncated the table at any app whose name happened to contain both words.
         let lower = trimmed.to_lowercase();
-        if lower.contains("upgrade") && lower.contains("available")
+        let starts_with_digit = trimmed.chars().next().is_some_and(|c| c.is_ascii_digit());
+        if (starts_with_digit && lower.contains("available"))
             || lower.starts_with("the following packages")
         {
             break;
@@ -365,6 +372,34 @@ mod tests {
         assert!(!names.contains(&"NVIDIA Graphics Driver"));
         assert!(!names.contains(&"AV1 Video Extension"));
         assert!(!names.contains(&"Microsoft .NET Runtime"));
+    }
+
+    #[test]
+    fn footer_heuristic_does_not_truncate_on_app_named_like_the_footer() {
+        // An app row whose NAME contains both "Upgrade" and "Available" must not be
+        // mistaken for the "N upgrades available." footer (it doesn't start with a digit).
+        let widths = [34, 24, 10, 9, 6];
+        let header = ["Name", "Id", "Version", "Available", "Source"];
+        let table = render(
+            &widths,
+            &header,
+            &[
+                &[
+                    "Available Upgrade Assistant",
+                    "Vendor.Assistant",
+                    "1.0",
+                    "1.1",
+                    "winget",
+                ],
+                &["7-Zip", "7zip.7zip", "25.01", "26.01", "winget"],
+            ],
+        );
+        let table = format!("{table}\n2 upgrades available.");
+        let ups = parse_upgrades(&table);
+        // Both rows survive; the digit-led footer still terminates the table.
+        assert_eq!(ups.len(), 2, "app named like the footer must not truncate");
+        assert_eq!(ups[0].name, "Available Upgrade Assistant");
+        assert_eq!(ups[1].name, "7-Zip");
     }
 
     #[test]

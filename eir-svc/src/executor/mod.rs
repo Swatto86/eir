@@ -50,21 +50,17 @@ pub async fn execute(action: &FixAction) -> ExecutionResult {
             make_result(action, powershell::run_diagnostic(script).await)
         }
         FixAction::TaskDisable { task_name } => {
-            let n = task_name.clone();
-            blocking(action, move || tasks::disable(&n)).await
+            make_result(action, tasks::disable(task_name).await)
         }
-        FixAction::TaskEnable { task_name } => {
-            let n = task_name.clone();
-            blocking(action, move || tasks::enable(&n)).await
-        }
+        FixAction::TaskEnable { task_name } => make_result(action, tasks::enable(task_name).await),
         FixAction::RegistryReset {
             key_path,
             value_name,
             value_data,
-        } => {
-            let (k, v, d) = (key_path.clone(), value_name.clone(), value_data.clone());
-            blocking(action, move || registry::reset_value(&k, &v, &d)).await
-        }
+        } => make_result(
+            action,
+            registry::reset_value(key_path, value_name, value_data).await,
+        ),
         FixAction::NetworkDiagnostic { command } => {
             let script = match command.to_lowercase().as_str() {
                 "flush_dns" => "ipconfig /flushdns",

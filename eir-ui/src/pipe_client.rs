@@ -19,7 +19,15 @@ pub async fn run(status: SharedStatus, cmd_rx: mpsc::Receiver<UiMsg>) {
 async fn run_on(status: SharedStatus, mut cmd_rx: mpsc::Receiver<UiMsg>, pipe_name: &str) {
     loop {
         match connect_and_run(&status, &mut cmd_rx, pipe_name).await {
-            Ok(()) => {}
+            Ok(()) => {
+                // A clean EOF means the service closed the pipe (typically a
+                // settings-save restart). Show "reconnecting" instead of leaving the
+                // last healthy snapshot on screen; if the service is genuinely down,
+                // the next connect attempt fails and surfaces the full error below.
+                let mut s = status.lock().unwrap();
+                s.status = "Connecting".to_string();
+                s.error = None;
+            }
             Err(e) => {
                 warn!("Pipe client disconnected: {e}");
                 let mut s = status.lock().unwrap();

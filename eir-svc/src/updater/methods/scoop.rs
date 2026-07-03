@@ -41,6 +41,15 @@ async fn run_scoop(
     proc::run_capped_cmd(cmd, dur).await
 }
 
+/// A Scoop app identifier is a slug: `app` or `bucket/app`, using only alphanumerics
+/// and `.`, `-`, `_`, `/`. Anything else is rejected before it reaches `cmd.exe`.
+fn is_safe_scoop_name(app: &str) -> bool {
+    !app.is_empty()
+        && app
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/'))
+}
+
 /// Parse `scoop status`: a whitespace-aligned table whose first three columns are
 /// Name, Installed Version, Latest Version. Only rows where a strictly newer Latest
 /// exists are kept. Scoop app names are slugs (no spaces), so splitting on whitespace
@@ -100,6 +109,18 @@ pub async fn attempt(candidate: &UpdateCandidate) -> AttemptOutcome {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| candidate.name.clone());
 
+    // Defense-in-depth: the shim runs via `cmd /c <shim> update <app>`, and because the
+    // program is `cmd` (not the .cmd shim itself) Rust's batch-argument escaping does not
+    // engage — so `&`, `|`, `^`, `"`, etc. in `app` would reach cmd.exe's re-parser.
+    // Real scoop names are slugs (`app` or `bucket/app`), so anything else is refused.
+    if !is_safe_scoop_name(&app) {
+        return AttemptOutcome::failed(
+            Method::Scoop,
+            ErrorCategory::NotFound,
+            format!("refusing scoop app name with unexpected characters: {app}"),
+        );
+    }
+
     let (code, output) = run_scoop(
         profile,
         shim,
@@ -151,5 +172,17 @@ mod tests {
         assert_eq!(names, vec!["git", "ripgrep"]);
         assert_eq!(ups[0].current, "2.43.0");
         assert_eq!(ups[0].available, "2.45.1");
+    }
+
+    #[test]
+    fn scoop_name_validation_allows_slugs_rejects_metacharacters() {
+        assert!(is_safe_scoop_name("git"));
+        assert!(is_safe_scoop_name("extras/vscode"));
+        assert!(is_safe_scoop_name("some-app_1.2"));
+        assert!(!is_safe_scoop_name(""));
+        assert!(!is_safe_scoop_name("git & calc"));
+        assert!(!is_safe_scoop_name("app|evil"));
+        assert!(!is_safe_scoop_name("a\"b"));
+        assert!(!is_safe_scoop_name("app^x"));
     }
 }

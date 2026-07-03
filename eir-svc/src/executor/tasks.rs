@@ -1,11 +1,11 @@
 use anyhow::Result;
 
-pub fn disable(task_name: &str) -> Result<String> {
-    run_task_cmd("Disable-ScheduledTask", task_name)
+pub async fn disable(task_name: &str) -> Result<String> {
+    run_task_cmd("Disable-ScheduledTask", task_name).await
 }
 
-pub fn enable(task_name: &str) -> Result<String> {
-    run_task_cmd("Enable-ScheduledTask", task_name)
+pub async fn enable(task_name: &str) -> Result<String> {
+    run_task_cmd("Enable-ScheduledTask", task_name).await
 }
 
 /// Build the PowerShell script for a scheduled-task cmdlet. Kept pure so the
@@ -21,28 +21,12 @@ fn build_task_script(cmdlet: &str, task_name: &str) -> String {
     )
 }
 
-fn run_task_cmd(cmdlet: &str, task_name: &str) -> Result<String> {
+async fn run_task_cmd(cmdlet: &str, task_name: &str) -> Result<String> {
     let script = build_task_script(cmdlet, task_name);
-
-    let out = std::process::Command::new("powershell.exe")
-        .args([
-            "-NonInteractive",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ])
-        .output()?;
-
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-
-    if out.status.success() {
-        Ok(stdout.trim().to_string())
-    } else {
-        anyhow::bail!("{cmdlet} failed for '{task_name}': {stderr}")
-    }
+    // Route through the timed, kill_on_drop PowerShell helper. A bare synchronous
+    // `Command::output()` here had no timeout, so a stuck Task Scheduler RPC would pin
+    // a Tokio blocking-pool thread indefinitely and starve other executor work.
+    super::powershell::run_diagnostic(&script).await
 }
 
 #[cfg(test)]

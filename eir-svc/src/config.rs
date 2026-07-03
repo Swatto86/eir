@@ -160,10 +160,15 @@ pub struct ApiConfig {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MonitoringConfig {
+    #[serde(default)]
     pub event_log_channels: Vec<String>,
+    #[serde(default)]
     pub log_directories: Vec<String>,
+    #[serde(default = "default_el_poll")]
     pub event_log_poll_interval_secs: u64,
+    #[serde(default = "default_wmi_poll")]
     pub wmi_poll_interval_secs: u64,
+    #[serde(default = "default_decision_interval")]
     pub decision_interval_secs: u64,
     /// Minimum AI confidence (0.0–1.0) for a whitelisted fix to auto-execute.
     /// Overrides the fallback in policy.toml; editable from the app's Settings.
@@ -173,6 +178,15 @@ pub struct MonitoringConfig {
 
 fn default_confidence() -> f32 {
     0.80
+}
+fn default_el_poll() -> u64 {
+    30
+}
+fn default_wmi_poll() -> u64 {
+    300
+}
+fn default_decision_interval() -> u64 {
+    600
 }
 
 /// Accept only the known reasoning-effort levels; anything else (incl. blank)
@@ -206,7 +220,9 @@ impl Config {
             provider: self.api.provider.as_str().to_string(),
             model: self.api.model.clone(),
             update_check_model: self.api.update_check_model.clone(),
-            effort: self.api.effort.clone(),
+            // Normalise on the way out too: a hand-edited `effort = "HIGH"` would
+            // otherwise be sent verbatim and render blank in the UI's <select>.
+            effort: normalize_effort(&self.api.effort),
             decision_interval_secs: self.monitoring.decision_interval_secs,
             event_log_poll_interval_secs: self.monitoring.event_log_poll_interval_secs,
             wmi_poll_interval_secs: self.monitoring.wmi_poll_interval_secs,

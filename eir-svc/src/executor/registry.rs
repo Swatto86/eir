@@ -12,17 +12,15 @@ const ALLOWED_KEY_PREFIXES: &[&str] = &[
 /// `key_path` must use PowerShell-style drive prefix (e.g. `HKLM:\...`).
 /// `value_data` is always written as a string; PowerShell coerces DWORD automatically
 /// when the existing value is DWORD type.
-pub fn reset_value(key_path: &str, value_name: &str, value_data: &str) -> Result<String> {
-    // Normalise alternate forms (registry editor uses HKEY_LOCAL_MACHINE\...)
-    let normalised = key_path
-        .replace("HKEY_LOCAL_MACHINE\\", "HKLM:\\")
-        .replace("HKEY_CURRENT_USER\\", "HKCU:\\")
-        .replace("HKEY_LOCAL_MACHINE/", "HKLM:\\")
-        .replace("HKEY_CURRENT_USER/", "HKCU:\\");
+pub async fn reset_value(key_path: &str, value_name: &str, value_data: &str) -> Result<String> {
+    let normalised = normalise_key(key_path);
 
+    // Registry paths are case-insensitive, so compare case-folded — otherwise a
+    // legitimate `hklm:\system\...` would be wrongly rejected.
+    let lower = normalised.to_lowercase();
     if !ALLOWED_KEY_PREFIXES
         .iter()
-        .any(|p| normalised.starts_with(p))
+        .any(|p| lower.starts_with(&p.to_lowercase()))
     {
         bail!(
             "Registry path '{}' is not on the safe list — refusing to modify",
@@ -31,26 +29,28 @@ pub fn reset_value(key_path: &str, value_name: &str, value_data: &str) -> Result
     }
 
     let script = build_reset_script(&normalised, value_name, value_data);
+    // Timed, kill_on_drop PowerShell — a bare synchronous `Command::output()` had no
+    // timeout, so a locked registry hive could pin a blocking-pool thread forever.
+    super::powershell::run_diagnostic(&script).await
+}
 
-    let out = std::process::Command::new("powershell.exe")
-        .args([
-            "-NonInteractive",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ])
-        .output()?;
-
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-
-    if out.status.success() {
-        Ok(stdout.trim().to_string())
-    } else {
-        bail!("Registry set failed: {stderr}")
+/// Normalise alternate key forms (the registry editor uses `HKEY_LOCAL_MACHINE\…`)
+/// to the PowerShell drive prefix. Case-insensitive on the hive name so
+/// `hkey_local_machine\…` normalises too.
+fn normalise_key(key_path: &str) -> String {
+    let mut out = key_path.to_string();
+    for (from, to) in [
+        ("HKEY_LOCAL_MACHINE\\", "HKLM:\\"),
+        ("HKEY_CURRENT_USER\\", "HKCU:\\"),
+        ("HKEY_LOCAL_MACHINE/", "HKLM:\\"),
+        ("HKEY_CURRENT_USER/", "HKCU:\\"),
+    ] {
+        if out.len() >= from.len() && out[..from.len()].eq_ignore_ascii_case(from) {
+            out = format!("{to}{}", &out[from.len()..]);
+            break;
+        }
     }
+    out
 }
 
 /// Build the `Set-ItemProperty` script from an already-normalised key path plus the
@@ -91,5 +91,20 @@ mod tests {
         assert!(script.contains("it''s"));
         assert!(script.contains("va''lue"));
         assert!(!script.contains('"'));
+    }
+
+    #[test]
+    fn normalise_key_folds_hive_case_and_slashes() {
+        assert_eq!(
+            normalise_key("HKEY_LOCAL_MACHINE\\SYSTEM\\X"),
+            "HKLM:\\SYSTEM\\X"
+        );
+        // Mixed-case hive name still normalises.
+        assert_eq!(
+            normalise_key("hkey_current_user/Software/Y"),
+            "HKCU:\\Software/Y"
+        );
+        // An already-normalised path is left untouched.
+        assert_eq!(normalise_key("HKLM:\\SYSTEM\\Z"), "HKLM:\\SYSTEM\\Z");
     }
 }
