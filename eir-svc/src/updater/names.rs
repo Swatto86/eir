@@ -131,10 +131,31 @@ pub fn clean_app_name(name: &str) -> String {
     }
 }
 
+/// Lowercased alphanumeric tokens of a name, e.g. "Revision Tool v2" -> [revision, tool, v2].
+fn name_tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether `small` appears as a contiguous whole-token run inside `big`.
+fn contiguous_sublist(small: &[String], big: &[String]) -> bool {
+    if small.is_empty() || small.len() > big.len() {
+        return false;
+    }
+    big.windows(small.len()).any(|w| w == small)
+}
+
 /// Resolve the installed version of an AI-returned app name against the apps we
 /// actually queried (keyed lowercased name -> version). Display names are fuzzy —
 /// the model may echo "Revision Tool" for a winget "Revision Tool version 2.9.0" —
-/// so fall back to a contains-either-way match after an exact hit fails.
+/// so after an exact hit fails, fall back to a WHOLE-TOKEN containment match (not a
+/// raw substring). A raw `contains` let a short AI name like "note" resolve to an
+/// unrelated "Notepad++", which — since the resolved candidate's name feeds the
+/// download host gate — could anchor a malicious vendor domain to a real installed
+/// app. Whole-token matching closes that, and the most specific (longest) match wins
+/// so a short query can't grab the wrong longer app.
 pub fn match_installed<'a>(
     installed: &'a HashMap<String, String>,
     name: &str,
@@ -143,15 +164,47 @@ pub fn match_installed<'a>(
     if let Some(v) = installed.get(&n) {
         return Some(v);
     }
+    let nt = name_tokens(name);
+    if nt.is_empty() {
+        return None;
+    }
     installed
         .iter()
-        .find(|(k, _)| !k.is_empty() && (k.contains(&n) || n.contains(k.as_str())))
+        .filter(|(k, _)| {
+            let kt = name_tokens(k);
+            !kt.is_empty() && (contiguous_sublist(&nt, &kt) || contiguous_sublist(&kt, &nt))
+        })
+        .max_by_key(|(k, _)| k.len())
         .map(|(_, v)| v)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn match_installed_uses_whole_token_matching() {
+        let mut m = HashMap::new();
+        m.insert("notepad++".to_string(), "8.6".to_string());
+        m.insert(
+            "revision tool version 2.9.0".to_string(),
+            "2.9.0".to_string(),
+        );
+        m.insert("brave".to_string(), "1.60".to_string());
+        // The attack: a short AI name must NOT substring-resolve to an unrelated app.
+        assert_eq!(match_installed(&m, "note"), None);
+        // Legit fuzzy display-name match still works (whole-token subset).
+        assert_eq!(
+            match_installed(&m, "Revision Tool").map(String::as_str),
+            Some("2.9.0")
+        );
+        // Exact match and a genuinely-unrelated name.
+        assert_eq!(
+            match_installed(&m, "Brave").map(String::as_str),
+            Some("1.60")
+        );
+        assert_eq!(match_installed(&m, "Firefox"), None);
+    }
 
     #[test]
     fn clean_app_name_strips_trailing_version() {

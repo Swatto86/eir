@@ -153,8 +153,19 @@ pub fn url_acceptable(u: &url::Url, name: &str) -> Result<(), &'static str> {
     if u.port().is_some() {
         return Err("non-default port");
     }
-    let host = u.host_str().ok_or("no host")?.to_lowercase();
-    if host.parse::<std::net::IpAddr>().is_ok() {
+    let mut host = u.host_str().ok_or("no host")?.to_lowercase();
+    // Normalise a rooted FQDN's single trailing dot (`github.com.` == `github.com`),
+    // otherwise the exact-match trusted-host check wrongly rejects a legit download.
+    if let Some(stripped) = host.strip_suffix('.') {
+        host = stripped.to_string();
+    }
+    // Reject raw IPs — including bracketed IPv6, since host_str() returns "[::1]"
+    // which IpAddr::parse would otherwise reject, silently bypassing this guard.
+    let bare_ip = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&host);
+    if bare_ip.parse::<std::net::IpAddr>().is_ok() {
         return Err("raw IP host");
     }
     if host.starts_with("xn--") || host.contains(".xn--") {
@@ -238,11 +249,18 @@ pub fn validate_plan(
     if parsed.port().is_some() {
         return Err("installer URL uses a non-default port".into());
     }
-    let host = parsed
+    let mut host = parsed
         .host_str()
         .ok_or("installer URL has no host")?
         .to_lowercase();
-    if host.parse::<std::net::IpAddr>().is_ok() {
+    if let Some(stripped) = host.strip_suffix('.') {
+        host = stripped.to_string();
+    }
+    let bare_ip = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&host);
+    if bare_ip.parse::<std::net::IpAddr>().is_ok() {
         return Err("installer URL host is a raw IP".into());
     }
     if host.starts_with("xn--") || host.contains(".xn--") {

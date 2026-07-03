@@ -28,22 +28,33 @@ pub async fn list_updates() -> Vec<AppUpdate> {
 }
 
 /// The full `winget upgrade` argument list for one id, optionally forcing past the
-/// portable-integrity check.
-fn upgrade_args(id: &str, force: bool) -> Vec<String> {
-    let mut a = vec![
-        "upgrade".to_string(),
-        "--id".to_string(),
-        id.to_string(),
-        "--exact".to_string(),
+/// portable-integrity check. `exact` adds `--exact`; it must be OFF when the id is a
+/// truncated prefix (winget truncates long ids in the `winget upgrade` listing), since
+/// `--exact` disables the prefix/substring matching that would otherwise resolve it.
+fn upgrade_args(id: &str, force: bool, exact: bool) -> Vec<String> {
+    let mut a = vec!["upgrade".to_string(), "--id".to_string(), id.to_string()];
+    if exact {
+        a.push("--exact".to_string());
+    }
+    a.extend([
         "--silent".to_string(),
         "--accept-package-agreements".to_string(),
         "--accept-source-agreements".to_string(),
         "--disable-interactivity".to_string(),
-    ];
+    ]);
     if force {
         a.push("--force".to_string());
     }
     a
+}
+
+/// winget could not resolve the id to an installed/available package — the signature
+/// of a truncated `--id` used with `--exact`.
+fn no_package_found(output: &str) -> bool {
+    let l = output.to_lowercase();
+    l.contains("no package found")
+        || l.contains("no installed package")
+        || l.contains("no available upgrade")
 }
 
 /// Run winget directly and capture its merged output. The service is SYSTEM, so no
@@ -78,10 +89,17 @@ pub async fn attempt_with(candidate: &UpdateCandidate, force_first: bool) -> Att
         }
     };
 
-    let (mut code, mut output) = run_winget(upgrade_args(&id, force_first), INSTALL).await;
+    let (mut code, mut output) = run_winget(upgrade_args(&id, force_first, true), INSTALL).await;
     // Only auto-escalate to --force when we didn't already start with it.
     if !force_first && code != 0 && portable_modified(&output) {
-        let (c, o) = run_winget(upgrade_args(&id, true), INSTALL).await;
+        let (c, o) = run_winget(upgrade_args(&id, true, true), INSTALL).await;
+        code = c;
+        output = o;
+    }
+    // If --exact found nothing, the id is likely a truncated prefix from the upgrade
+    // listing; retry with prefix matching (no --exact) so long-id apps still update.
+    if code != 0 && no_package_found(&output) {
+        let (c, o) = run_winget(upgrade_args(&id, force_first, false), INSTALL).await;
         code = c;
         output = o;
     }
@@ -235,13 +253,28 @@ mod tests {
 
     #[test]
     fn upgrade_args_appends_force_only_when_asked() {
-        let plain = upgrade_args("GitHub.Copilot", false);
+        let plain = upgrade_args("GitHub.Copilot", false, true);
         assert_eq!(plain.first().map(String::as_str), Some("upgrade"));
         assert!(plain.iter().any(|a| a == "GitHub.Copilot"));
         assert!(!plain.iter().any(|a| a == "--force"));
-        assert!(upgrade_args("GitHub.Copilot", true)
+        assert!(upgrade_args("GitHub.Copilot", true, true)
             .iter()
             .any(|a| a == "--force"));
+    }
+
+    #[test]
+    fn upgrade_args_exact_flag_is_optional() {
+        // A truncated-prefix id must be upgradable WITHOUT --exact (prefix matching).
+        assert!(
+            upgrade_args("Microsoft.VisualStudio.2022.Buil", false, true)
+                .iter()
+                .any(|a| a == "--exact")
+        );
+        assert!(
+            !upgrade_args("Microsoft.VisualStudio.2022.Buil", false, false)
+                .iter()
+                .any(|a| a == "--exact")
+        );
     }
 
     #[test]

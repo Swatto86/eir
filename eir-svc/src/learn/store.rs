@@ -93,6 +93,18 @@ pub async fn record_rejection(
     Ok(())
 }
 
+/// Delete rejection rows older than `days`. The RejectedSignal detector only looks
+/// back within its window, so older rows are dead weight; without this the table
+/// grows unbounded on a long-lived install.
+pub async fn prune_old_rejections(pool: &SqlitePool, days: i64) -> Result<u64> {
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let res = sqlx::query("DELETE FROM approval_rejections WHERE rejected_at < ?")
+        .bind(&cutoff)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 // ── Learned-fact writes ─────────────────────────────────────────────────────────
 
 /// Insert or reinforce a learned fact. Idempotent via UNIQUE(kind,subject); a user

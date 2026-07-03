@@ -12,17 +12,15 @@ const ALLOWED_KEY_PREFIXES: &[&str] = &[
 /// `key_path` must use PowerShell-style drive prefix (e.g. `HKLM:\...`).
 /// `value_data` is always written as a string; PowerShell coerces DWORD automatically
 /// when the existing value is DWORD type.
-pub fn reset_value(key_path: &str, value_name: &str, value_data: &str) -> Result<String> {
-    // Normalise alternate forms (registry editor uses HKEY_LOCAL_MACHINE\...)
-    let normalised = key_path
-        .replace("HKEY_LOCAL_MACHINE\\", "HKLM:\\")
-        .replace("HKEY_CURRENT_USER\\", "HKCU:\\")
-        .replace("HKEY_LOCAL_MACHINE/", "HKLM:\\")
-        .replace("HKEY_CURRENT_USER/", "HKCU:\\");
+pub async fn reset_value(key_path: &str, value_name: &str, value_data: &str) -> Result<String> {
+    let normalised = normalise_key(key_path);
 
+    // Registry paths are case-insensitive, so compare case-folded — otherwise a
+    // legitimate `hklm:\system\...` would be wrongly rejected.
+    let lower = normalised.to_lowercase();
     if !ALLOWED_KEY_PREFIXES
         .iter()
-        .any(|p| normalised.starts_with(p))
+        .any(|p| lower.starts_with(&p.to_lowercase()))
     {
         bail!(
             "Registry path '{}' is not on the safe list — refusing to modify",
@@ -30,33 +28,86 @@ pub fn reset_value(key_path: &str, value_name: &str, value_data: &str) -> Result
         );
     }
 
-    // Escape single-quotes in values to prevent injection
-    let safe_path = normalised.replace('\'', "''");
+    let script = build_reset_script(&normalised, value_name, value_data);
+    // Timed, kill_on_drop PowerShell — a bare synchronous `Command::output()` had no
+    // timeout, so a locked registry hive could pin a blocking-pool thread forever.
+    super::powershell::run_diagnostic(&script).await
+}
+
+/// Normalise alternate key forms (the registry editor uses `HKEY_LOCAL_MACHINE\…`)
+/// to the PowerShell drive prefix. Case-insensitive on the hive name so
+/// `hkey_local_machine\…` normalises too.
+fn normalise_key(key_path: &str) -> String {
+    let mut out = key_path.to_string();
+    for (from, to) in [
+        ("HKEY_LOCAL_MACHINE\\", "HKLM:\\"),
+        ("HKEY_CURRENT_USER\\", "HKCU:\\"),
+        ("HKEY_LOCAL_MACHINE/", "HKLM:\\"),
+        ("HKEY_CURRENT_USER/", "HKCU:\\"),
+    ] {
+        if out.len() >= from.len() && out[..from.len()].eq_ignore_ascii_case(from) {
+            out = format!("{to}{}", &out[from.len()..]);
+            break;
+        }
+    }
+    out
+}
+
+/// Build the `Set-ItemProperty` script from an already-normalised key path plus the
+/// raw value name/data. Kept pure so the injection-safety of the escaping is
+/// unit-testable: values are only ever placed inside single-quoted PowerShell
+/// literals (with embedded `'` doubled), never a double-quoted string.
+fn build_reset_script(normalised_path: &str, value_name: &str, value_data: &str) -> String {
+    let path_q = super::powershell::ps_single_quote(normalised_path);
+    let name_q = super::powershell::ps_single_quote(value_name);
+    let data_q = super::powershell::ps_single_quote(value_data);
+    // For the human-readable confirmation, embed the quote-doubled name inside a
+    // single-quoted literal (never a double-quoted string).
     let safe_name = value_name.replace('\'', "''");
-    let safe_data = value_data.replace('\'', "''");
+    format!(
+        "Set-ItemProperty -Path {path_q} -Name {name_q} -Value {data_q} -ErrorAction Stop; \
+         Write-Output 'Set registry value {safe_name}'"
+    )
+}
 
-    let script = format!(
-        "Set-ItemProperty -Path '{safe_path}' -Name '{safe_name}' -Value '{safe_data}' -ErrorAction Stop; \
-         Write-Output \"Set '{safe_path}/{safe_name}' = '{safe_data}'\""
-    );
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let out = std::process::Command::new("powershell.exe")
-        .args([
-            "-NonInteractive",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ])
-        .output()?;
+    #[test]
+    fn reset_script_never_double_quotes_untrusted_values() {
+        // `$(...)` in the value/name must stay a literal — no double-quoted string
+        // anywhere in the script (which is where PowerShell would evaluate it).
+        let script = build_reset_script(
+            "HKCU:\\SOFTWARE\\Microsoft\\Test",
+            "$(calc.exe)",
+            "$(rm -rf)",
+        );
+        assert!(!script.contains('"'), "no double-quoted strings: {script}");
+        assert!(script.contains("'$(calc.exe)'"));
+        assert!(script.contains("'$(rm -rf)'"));
+    }
 
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    #[test]
+    fn reset_script_doubles_embedded_single_quotes() {
+        let script = build_reset_script("HKCU:\\SOFTWARE\\X", "it's", "va'lue");
+        assert!(script.contains("it''s"));
+        assert!(script.contains("va''lue"));
+        assert!(!script.contains('"'));
+    }
 
-    if out.status.success() {
-        Ok(stdout.trim().to_string())
-    } else {
-        bail!("Registry set failed: {stderr}")
+    #[test]
+    fn normalise_key_folds_hive_case_and_slashes() {
+        assert_eq!(
+            normalise_key("HKEY_LOCAL_MACHINE\\SYSTEM\\X"),
+            "HKLM:\\SYSTEM\\X"
+        );
+        // Mixed-case hive name still normalises.
+        assert_eq!(
+            normalise_key("hkey_current_user/Software/Y"),
+            "HKCU:\\Software/Y"
+        );
+        // An already-normalised path is left untouched.
+        assert_eq!(normalise_key("HKLM:\\SYSTEM\\Z"), "HKLM:\\SYSTEM\\Z");
     }
 }

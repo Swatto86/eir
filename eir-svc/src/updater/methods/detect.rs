@@ -63,22 +63,22 @@ pub async fn bootstrap_choco() -> bool {
     const SCRIPT: &str = "Set-ExecutionPolicy Bypass -Scope Process -Force; \
          [System.Net.ServicePointManager]::SecurityProtocol = 3072; \
          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))";
-    let ran = tokio::task::spawn_blocking(|| {
-        std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                SCRIPT,
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-    })
-    .await;
-    let ok = matches!(ran, Ok(Ok(s)) if s.success()) && choco_available();
+    // Bounded, like every other external command in the updater: a stalled download or
+    // hung install script must NOT wedge the cycle (which would latch "running" forever).
+    // The bootstrap is a network install, so it gets the INSTALL budget rather than LIST.
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        SCRIPT,
+    ]);
+    let (code, _out) =
+        crate::updater::proc::run_capped_cmd(cmd, crate::updater::proc::INSTALL).await;
+    let ok = code == 0 && choco_available();
     if !ok {
-        warn!("Chocolatey bootstrap did not complete");
+        warn!("Chocolatey bootstrap did not complete (exit {code})");
     }
     ok
 }

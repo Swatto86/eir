@@ -181,7 +181,20 @@ function setBar(barId, value) {
   el.style.background = barColor(value);
 }
 
+let refreshing = false;
 async function refresh() {
+  // Skip a tick if the previous get_status is still in flight (slow pipe), so
+  // renders can't overlap and stomp each other.
+  if (refreshing) return;
+  refreshing = true;
+  try {
+    await refreshInner();
+  } finally {
+    refreshing = false;
+  }
+}
+
+async function refreshInner() {
   let status;
   try { status = await invoke('get_status'); }
   catch (e) { console.error('get_status failed', e); return; }
@@ -290,20 +303,39 @@ function approvalCard(info) {
     </div>`;
 }
 
+// Approval ids whose decide() call is still in flight — used to keep their buttons
+// disabled across a re-render so a decision can't be double-submitted.
+const decidingIds = new Set();
+// Signature of the currently-rendered approval set. The 2s refresh only rebuilds the
+// list when this changes, so it no longer wipes text selection or re-enables the
+// buttons of an approval the user just acted on (before the service drops it).
+let lastApprovalsSig = null;
+
 function renderApprovals(list) {
   const el = document.getElementById('approvals');
+  const sig = list.map((i) => `${i.id}:${i.created_at}`).join('|');
+  if (sig === lastApprovalsSig) return;
+  lastApprovalsSig = sig;
   el.innerHTML = list.length
     ? list.map(approvalCard).join('')
     : '<div class="empty">Nothing needs your approval right now.</div>';
+  // Re-disable buttons for any decision still resolving.
+  for (const id of decidingIds) {
+    const card = el.querySelector(`.approval-card[data-approval-id="${id}"]`);
+    if (card) card.querySelectorAll('button').forEach((b) => (b.disabled = true));
+  }
 }
 
 async function decide(id, approved, card) {
+  decidingIds.add(id);
   if (card) card.querySelectorAll('button').forEach((b) => (b.disabled = true));
   try {
     await invoke('decide_approval', { id, approved });
   } catch (e) {
     console.error('decide_approval failed', e);
     if (card) card.querySelectorAll('button').forEach((b) => (b.disabled = false));
+  } finally {
+    decidingIds.delete(id);
   }
 }
 

@@ -33,11 +33,14 @@ pub async fn record(
 /// Fill in "after" metrics for all feedback rows still missing them.
 /// Call at the start of each decision cycle once signals are collected.
 pub async fn update_after_states(pool: &SqlitePool, state: &SystemState) -> Result<()> {
+    // Fill EVERY row still awaiting an "after" measurement. A `LIMIT` here stranded
+    // rows beyond the newest N permanently at NULL (excluded from effectiveness
+    // learning); executions per cycle are few, so the pending set stays small.
     let rows = sqlx::query(
         "SELECT id, cpu_before, memory_before, failed_services_before
          FROM execution_feedback
          WHERE cpu_after IS NULL
-         ORDER BY id DESC LIMIT 50",
+         ORDER BY id DESC",
     )
     .fetch_all(pool)
     .await?;
@@ -70,6 +73,18 @@ pub async fn update_after_states(pool: &SqlitePool, state: &SystemState) -> Resu
         .await?;
     }
     Ok(())
+}
+
+/// Delete feedback rows older than `days`. The detectors only look back 30 days, so
+/// anything well past that is dead weight — without this the table grows unbounded on
+/// a long-lived install and slowly slows the windowed queries.
+pub async fn prune_old(pool: &SqlitePool, days: i64) -> Result<u64> {
+    let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let res = sqlx::query("DELETE FROM execution_feedback WHERE recorded_at < ?")
+        .bind(&cutoff)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
 }
 
 fn improvement_score(

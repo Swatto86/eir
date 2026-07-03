@@ -92,16 +92,32 @@ async fn winget_installed_version_by_name(name: &str) -> Option<String> {
     let (_code, text) = proc::run_capped_cmd(cmd, VERIFY).await;
     let (offsets, rows) = winget_table(&text);
     let lname = name.to_lowercase();
+    // An exact (case-insensitive) name match is authoritative. Otherwise collect the
+    // containment matches: a bare bidirectional `contains` verified "Git" against
+    // "GitHub Desktop", so only accept a containment result when it is UNAMBIGUOUS
+    // (a single distinct version) — else return None (→ Unverified) rather than
+    // reading the wrong app's version and declaring a false Verified/Mismatch.
+    let mut contains: Vec<String> = Vec::new();
     for r in &rows {
         let n = column(&offsets, r, "Name").to_lowercase();
-        if !n.is_empty() && (n.contains(&lname) || lname.contains(&n)) {
-            let v = column(&offsets, r, "Version");
-            if !v.is_empty() {
-                return Some(v);
-            }
+        if n.is_empty() {
+            continue;
+        }
+        let v = column(&offsets, r, "Version");
+        if v.is_empty() {
+            continue;
+        }
+        if n == lname {
+            return Some(v);
+        }
+        if n.contains(&lname) || lname.contains(&n) {
+            contains.push(v);
         }
     }
-    None
+    match contains.first() {
+        Some(first) if contains.iter().all(|v| v == first) => Some(first.clone()),
+        _ => None,
+    }
 }
 
 /// Read FileVersion/ProductVersion of an absolute exe path (a second confirmation

@@ -232,15 +232,27 @@ impl Default for SvcState {
 
 /// Restart the service to apply new settings: a detached helper stops then
 /// starts EirSvc (LocalSystem — no UAC). It survives this process exiting.
+///
+/// The helper *waits* for the service to actually reach STOPPED (up to 60s) before
+/// starting it, then retries the start until it reports Running. The old fixed ~3s
+/// `ping` delay with unconditional `&` chaining could fire `sc start` while the
+/// service was still STOP_PENDING (in-flight execution / updater cycle), which fails
+/// and leaves the service stopped with nothing to retry.
 fn restart_self() {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
-    let _ = std::process::Command::new("cmd")
-        .args([
-            "/C",
-            "sc stop EirSvc & ping -n 4 127.0.0.1 >nul & sc start EirSvc",
-        ])
+    const SCRIPT: &str = "sc.exe stop EirSvc | Out-Null; \
+         $d=(Get-Date).AddSeconds(60); \
+         while((Get-Date) -lt $d){ \
+             if((Get-Service EirSvc -ErrorAction SilentlyContinue).Status -eq 'Stopped'){break}; \
+             Start-Sleep -Milliseconds 500 }; \
+         for($i=0;$i -lt 5;$i++){ \
+             sc.exe start EirSvc | Out-Null; \
+             Start-Sleep -Seconds 1; \
+             if((Get-Service EirSvc -ErrorAction SilentlyContinue).Status -eq 'Running'){break} }";
+    let _ = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn();
 }
@@ -631,6 +643,10 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         ..Default::default()
     };
     if let Ok(recent) = updater::history::recent(&db, 50).await {
+        // Seed last_run from history so a restart doesn't force an immediate update
+        // cycle regardless of the configured schedule (the due-check treats
+        // last_run == 0 as "never run").
+        st.updater.last_run = recent.iter().map(|r| r.at).max().unwrap_or(0);
         st.updater.recent = recent;
     }
     st.advisor = Some(AdvisorStatus {
@@ -638,7 +654,15 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         settings: cfg.advisor.to_view(),
         ..Default::default()
     });
-    st.advisor_spend_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    // Seed the advisor's daily spend from the DB so its budget / escalation caps
+    // survive a restart (a settings change restarts the service) instead of resetting
+    // to zero and letting escalation resume after the day's budget was spent.
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    if let Ok((spent, escalations)) = audit::load_advisor_day(&db, &today).await {
+        st.advisor_spent_today = spent;
+        st.advisor_escalations_today = escalations;
+    }
+    st.advisor_spend_date = today;
     // A bad AI config must NOT kill the service — degrade instead, so the pipe
     // and UI stay alive and the user can fix it in Settings.
     let ai: Option<std::sync::Arc<ai::client::AiClient>> = match ai::client::AiClient::new(&cfg.api)
@@ -873,6 +897,18 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         st.advisor_spent_today = advisor_spent_today;
                         st.advisor_escalations_today = advisor_escalations_today;
                         st.advisor = Some(advisor);
+                        // Persist the day's escalation spend so the budget/count caps
+                        // survive a restart (see load at startup).
+                        if let Err(e) = audit::save_advisor_day(
+                            &db,
+                            &st.advisor_spend_date,
+                            st.advisor_spent_today,
+                            st.advisor_escalations_today,
+                        )
+                        .await
+                        {
+                            warn!("Failed to persist advisor daily spend: {e}");
+                        }
 
                         // learned_facts may have changed during the (possibly minutes-long) analysis;
                         // reload fresh rather than reusing the pre-spawn snapshot.
@@ -956,28 +992,50 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                             info!(action = ?action, "Rate-limited — skipping");
                                             continue;
                                         }
-                                        Err(e) => warn!("Rate limit check failed: {e}"),
+                                        // Fail CLOSED: this check is also the failure
+                                        // circuit breaker, so a DB error must skip the
+                                        // fix this cycle rather than let it auto-run.
+                                        Err(e) => {
+                                            warn!("Rate limit check failed — skipping to fail safe: {e}");
+                                            continue;
+                                        }
                                         Ok(false) => {}
                                     }
 
                                     let label = format!("{action:?}");
-                                    if st.in_flight.contains(&label) {
-                                        info!(action = %label, "Already executing — skipping duplicate");
+                                    // Skip if already running OR already sitting in the
+                                    // approval queue. Confidence varies per cycle (AI output
+                                    // minus the learned penalty), so the same action can be
+                                    // RequireApproval one cycle and AutoApprove the next;
+                                    // without the pending check it would auto-run and bypass
+                                    // the queued card, then run a SECOND time when the user
+                                    // later approves the stale card.
+                                    if st.in_flight.contains(&label)
+                                        || st.pending.iter().any(|p| p.info.action == label)
+                                    {
+                                        info!(action = %label, "Already executing or awaiting approval — skipping duplicate");
                                         continue;
                                     }
                                     info!(action = ?action, "AUTO-EXECUTING (queued)");
                                     // Hand off to the executor worker and move on; the outcome
                                     // is folded in when it finishes (see exec_done_rx arm).
                                     st.in_flight.insert(label.clone());
-                                    let _ = exec_tx.send(ExecJob {
+                                    if let Err(e) = exec_tx.send(ExecJob {
                                         action: action.clone(),
                                         decision_id,
                                         baseline: snapshot.system_state.clone(),
-                                        label,
+                                        label: label.clone(),
                                         diagnosis: problem.diagnosis.clone(),
                                         confidence: problem.confidence,
                                         reason: None,
-                                    });
+                                    }) {
+                                        // The worker is gone; no ExecOutcome will arrive, so
+                                        // drop the label instead of leaking it in in_flight
+                                        // (which would skip this action forever and pin the
+                                        // UI to "Executing").
+                                        warn!("Executor worker unavailable: {e}");
+                                        st.in_flight.remove(&label);
+                                    }
                                     st.status = "Executing".to_string();
                                     pipe.broadcast_status(build_status(&st));
                                 }
@@ -1142,15 +1200,19 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                         // (execution log + problem entry) is folded in
                                         // when it finishes, so the loop stays responsive.
                                         st.in_flight.insert(label.clone());
-                                        let _ = exec_tx.send(ExecJob {
+                                        if let Err(e) = exec_tx.send(ExecJob {
                                             action: pa.action,
                                             decision_id: pa.decision_id,
                                             baseline: pa.baseline,
-                                            label,
+                                            label: label.clone(),
                                             diagnosis: pa.info.diagnosis.clone(),
                                             confidence: pa.info.confidence,
                                             reason: Some("approved by user".into()),
-                                        });
+                                        }) {
+                                            // Worker gone — don't leak the label in in_flight.
+                                            warn!("Executor worker unavailable: {e}");
+                                            st.in_flight.remove(&label);
+                                        }
                                     }
                                 } else {
                                     info!(id, diagnosis = %pa.info.diagnosis, "UI-rejected");
@@ -1387,6 +1449,17 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                 {
                     warn!("Feedback update failed: {e}");
                 }
+
+                // Retention: the detectors only look back ~30 days, so keep the
+                // feedback/rejection tables from growing without bound (cheap once
+                // they're pruned — later cycles match nothing).
+                const RETENTION_DAYS: i64 = 90;
+                if let Err(e) = feedback::prune_old(&db, RETENTION_DAYS).await {
+                    warn!("Feedback prune failed: {e}");
+                }
+                if let Err(e) = learn::prune_old_rejections(&db, RETENTION_DAYS).await {
+                    warn!("Rejection prune failed: {e}");
+                }
                 let feedback_summary =
                     feedback::recent_summary(&db, 10).await.unwrap_or_default();
 
@@ -1412,6 +1485,12 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                     .map(|t| t.elapsed() >= ANALYSIS_HEARTBEAT)
                     .unwrap_or(true);
                 if !changed && !heartbeat_due {
+                    // State went quiet (nothing actionable): forget the last fingerprint
+                    // so the SAME problem recurring later counts as a change instead of
+                    // being suppressed until the multi-hour heartbeat.
+                    if fingerprint.is_none() {
+                        last_fingerprint = None;
+                    }
                     info!("No actionable change since last analysis — skipping");
                     // resting_status keeps a still-running off-loop fix as "Executing"
                     // (and an outstanding approval as "PendingApproval") instead of
@@ -1472,7 +1551,6 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                     should_escalate(&final_decision, &advisor_cfg, spent, escalations)
                                 {
                                     info!(reason, "Advisor escalating to a deeper analysis pass");
-                                    escalations += 1;
                                     match ai_task
                                         .analyze_with(
                                             &snapshot,
@@ -1485,6 +1563,10 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                         .await
                                     {
                                         Ok((d2, usage2)) => {
+                                            // Count only a SUCCESSFUL escalation against the
+                                            // daily cap — a failed pass produced no deeper
+                                            // analysis, so it shouldn't burn a slot.
+                                            escalations += 1;
                                             if let Some(u) = &usage2 { spent += u.cost_usd; }
                                             usages.extend(usage2);
                                             final_decision = d2;

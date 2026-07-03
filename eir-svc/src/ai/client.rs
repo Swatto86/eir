@@ -5,12 +5,17 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
-const MAX_TOKENS: u32 = 4096;
+/// Max retries for a transient AI failure before giving up on this cycle.
+const MAX_AI_RETRIES: u32 = 2;
+/// Output-token ceiling per analysis. A busy machine can produce many problems; at
+/// 4096 the structured JSON was truncated mid-object and the whole cycle failed to
+/// parse. Current models comfortably support this larger budget (billed on actual use).
+const MAX_TOKENS: u32 = 8192;
 
 // ── OpenAI-compatible request/response (OpenRouter) ────────────────────────────
 
@@ -277,41 +282,59 @@ impl AiClient {
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.effort);
         let prompt = crate::ai::prompt::build(snapshot, history, feedback_summary, learned);
-        let (raw, usage) = match &self.config {
-            AiClientConfig::Anthropic { api_key, model } => {
-                let m = model_ov.unwrap_or(model);
-                self.call_anthropic(api_key, m, effort, &prompt).await?
-            }
-            AiClientConfig::ClaudeCli {
-                binary,
-                model,
-                user_profile,
-            } => {
-                let m = model_ov.unwrap_or(model);
-                self.call_claude_cli(binary, m, effort, user_profile.as_deref(), &prompt)
-                    .await?
-            }
-            AiClientConfig::OpenRouter { api_key, model } => {
-                let m = model_ov.unwrap_or(model);
-                self.call_openai_style(OPENROUTER_BASE, api_key, m, effort, &prompt)
-                    .await?
-            }
-            AiClientConfig::KiloCli {
-                binary,
-                model,
-                user_profile,
-            } => {
-                let m = model_ov.unwrap_or(model);
-                self.call_kilo_cli(binary, m, effort, user_profile.as_deref(), &prompt)
-                    .await?
+        // Bounded retry on TRANSIENT failures only. Each call returns Err before
+        // yielding any text, so retrying the whole call is safe (no partial output to
+        // corrupt). This runs off the decision loop, so the backoff doesn't stall the
+        // UI; a permanent error (bad key, 400) is returned immediately without retry.
+        let mut attempt: u32 = 0;
+        let (raw, usage) = loop {
+            let result = match &self.config {
+                AiClientConfig::Anthropic { api_key, model } => {
+                    let m = model_ov.unwrap_or(model);
+                    self.call_anthropic(api_key, m, effort, &prompt).await
+                }
+                AiClientConfig::ClaudeCli {
+                    binary,
+                    model,
+                    user_profile,
+                } => {
+                    let m = model_ov.unwrap_or(model);
+                    self.call_claude_cli(binary, m, effort, user_profile.as_deref(), &prompt)
+                        .await
+                }
+                AiClientConfig::OpenRouter { api_key, model } => {
+                    let m = model_ov.unwrap_or(model);
+                    self.call_openai_style(OPENROUTER_BASE, api_key, m, effort, &prompt)
+                        .await
+                }
+                AiClientConfig::KiloCli {
+                    binary,
+                    model,
+                    user_profile,
+                } => {
+                    let m = model_ov.unwrap_or(model);
+                    self.call_kilo_cli(binary, m, effort, user_profile.as_deref(), &prompt)
+                        .await
+                }
+            };
+            match result {
+                Ok(v) => break v,
+                Err(e) if attempt < MAX_AI_RETRIES && is_transient_ai_error(&e) => {
+                    attempt += 1;
+                    let backoff = std::time::Duration::from_secs(2u64.pow(attempt));
+                    warn!(
+                        "AI call failed (transient, attempt {attempt}/{MAX_AI_RETRIES}), \
+                         retrying in {}s: {e}",
+                        backoff.as_secs()
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => return Err(e),
             }
         };
 
         let json_text = strip_fences(&raw);
-        debug!(
-            text = &json_text[..json_text.len().min(500)],
-            "Raw model response"
-        );
+        debug!(text = %char_preview(json_text, 500), "Raw model response");
 
         // Models occasionally wrap the JSON in prose; fall back to the
         // first {...last} object if a direct parse fails.
@@ -601,25 +624,15 @@ impl AiClient {
         }
 
         // The claude CLI is a large binary with a cold Node start plus full
-        // model inference and no streaming, so allow a generous window.
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            child.wait_with_output(),
-        )
-        .await
-        .context("claude CLI timed out after 300s")?
-        .context("claude CLI process error")?;
+        // model inference and no streaming, so allow a generous window. Output is
+        // read with a memory cap so a runaway CLI can't OOM the service.
+        let (status, stdout_raw, stderr_raw) = wait_capped(child, "claude CLI").await?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "claude CLI exited with {}: {}",
-                output.status,
-                stderr.trim()
-            );
+        if !status.success() {
+            bail!("claude CLI exited with {}: {}", status, stderr_raw.trim());
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stdout = stdout_raw.trim().to_string();
         if stdout.is_empty() {
             bail!("claude CLI returned empty output");
         }
@@ -716,24 +729,17 @@ impl AiClient {
         }
 
         // The kilo CLI is a Node binary with a cold start plus agent loop
-        // (--auto) and JSON event emission, so allow a generous window.
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            child.wait_with_output(),
-        )
-        .await
-        .context("kilo CLI timed out after 300s")?
-        .context("kilo CLI process error")?;
+        // (--auto) and JSON event emission, so allow a generous window. Output is
+        // read with a memory cap so a runaway agent loop can't OOM the service.
+        let (status, stdout, stderr_raw) = wait_capped(child, "kilo CLI").await?;
 
-        if !output.status.success() {
+        if !status.success() {
             // Exit 124 = kilo's own timeout (treat like ours); 1 = init/runtime
             // error. Surface stderr so the user can diagnose (e.g. "Not
             // authenticated — run `kilo` once interactively to log in").
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("kilo CLI exited with {}: {}", output.status, stderr.trim());
+            bail!("kilo CLI exited with {}: {}", status, stderr_raw.trim());
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let (text, usage) = parse_kilo_ndjson(&stdout)?;
         if text.trim().is_empty() {
             bail!("kilo CLI returned no assistant text");
@@ -1314,6 +1320,100 @@ fn parse_kilo_ndjson(stdout: &str) -> Result<(String, Option<CallUsage>)> {
     Ok((text, usage))
 }
 
+/// First `max_chars` characters of `s`. Slices by char, never by byte, so a
+/// multi-byte UTF-8 codepoint straddling the limit can't panic (`&s[..n]` would).
+fn char_preview(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
+/// Whether an AI-call error looks transient (worth a retry) vs. permanent (bad key,
+/// 400, unknown model). Matches on the rendered error since the providers surface
+/// their status in the message text.
+fn is_transient_ai_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string().to_lowercase();
+    const MARKERS: &[&str] = &[
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "529",
+        "timed out",
+        "timeout",
+        "overloaded",
+        "temporarily",
+        "rate limit",
+        "connection",
+        "stream read error",
+        "stream error",
+    ];
+    MARKERS.iter().any(|m| s.contains(m))
+}
+
+/// Per-stream memory cap for a CLI subprocess. Bounds RAM against a looping/
+/// misbehaving CLI that emits huge output within the time budget.
+const CLI_OUTPUT_CAP: usize = 16 * 1024 * 1024;
+
+/// Read an optional child stream to at most `cap` bytes, then drain-and-discard the
+/// rest (so the child never blocks on a full pipe while memory stays bounded).
+async fn read_stream_capped<R: tokio::io::AsyncRead + Unpin>(
+    stream: Option<R>,
+    cap: usize,
+) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut out = Vec::new();
+    let Some(mut r) = stream else {
+        return out;
+    };
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if out.len() < cap {
+                    let take = n.min(cap - out.len());
+                    out.extend_from_slice(&chunk[..take]);
+                }
+                // Beyond the cap the bytes are discarded, not buffered.
+            }
+        }
+    }
+    out
+}
+
+/// Wait for a spawned CLI child with a 300s timeout and a per-stream memory cap.
+/// stdout and stderr are read concurrently (a sequential read could deadlock if the
+/// child fills the other pipe's buffer). On timeout the child is killed.
+async fn wait_capped(
+    mut child: tokio::process::Child,
+    what: &str,
+) -> Result<(std::process::ExitStatus, String, String)> {
+    let so = child.stdout.take();
+    let se = child.stderr.take();
+    let combined = async {
+        let (o, e, s) = tokio::join!(
+            read_stream_capped(so, CLI_OUTPUT_CAP),
+            read_stream_capped(se, CLI_OUTPUT_CAP),
+            child.wait(),
+        );
+        (o, e, s)
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(300), combined).await {
+        Ok((o, e, s)) => {
+            let status = s.with_context(|| format!("{what} process error"))?;
+            Ok((
+                status,
+                String::from_utf8_lossy(&o).into_owned(),
+                String::from_utf8_lossy(&e).into_owned(),
+            ))
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            bail!("{what} timed out after 300s")
+        }
+    }
+}
+
 fn strip_fences(s: &str) -> &str {
     // Check ````json` before ```` to avoid matching the shorter fence first
     for (open, close) in [
@@ -1398,6 +1498,47 @@ mod tests {
         // Opus tier costs more than Haiku for the same tokens.
         let opus = estimate_anthropic_cost("claude-opus-4-8", 100_000, 10_000, 0, 0, 0);
         assert!(opus > c);
+    }
+
+    #[test]
+    fn transient_error_classification() {
+        use anyhow::anyhow;
+        // Retryable provider/network conditions.
+        assert!(is_transient_ai_error(&anyhow!(
+            "Anthropic API 429: rate limited"
+        )));
+        assert!(is_transient_ai_error(&anyhow!(
+            "model API 503: unavailable"
+        )));
+        assert!(is_transient_ai_error(&anyhow!(
+            "Anthropic API 529: overloaded"
+        )));
+        assert!(is_transient_ai_error(&anyhow!(
+            "claude CLI timed out after 300s"
+        )));
+        assert!(is_transient_ai_error(&anyhow!(
+            "Anthropic stream read error"
+        )));
+        // Permanent conditions must NOT be retried.
+        assert!(!is_transient_ai_error(&anyhow!(
+            "Anthropic API 401: invalid x-api-key"
+        )));
+        assert!(!is_transient_ai_error(&anyhow!(
+            "model API 400: unknown model"
+        )));
+        assert!(!is_transient_ai_error(&anyhow!(
+            "Failed to parse model response as JSON"
+        )));
+    }
+
+    #[test]
+    fn char_preview_never_splits_a_codepoint() {
+        // 600 em-dashes = 1800 bytes; byte-slicing at 500 would panic mid-codepoint.
+        let s = "—".repeat(600);
+        let p = char_preview(&s, 500);
+        assert_eq!(p.chars().count(), 500);
+        // Shorter-than-limit input is returned whole.
+        assert_eq!(char_preview("hi", 500), "hi");
     }
 
     #[test]
