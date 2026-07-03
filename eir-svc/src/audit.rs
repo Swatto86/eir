@@ -120,6 +120,45 @@ pub async fn get_recent_decisions(pool: &SqlitePool, limit: i64) -> Result<Vec<P
     Ok(decisions)
 }
 
+/// Load the advisor's persisted escalation spend + count for `day` (YYYY-MM-DD UTC).
+/// Returns (0.0, 0) when there is no row yet for that day.
+pub async fn load_advisor_day(pool: &SqlitePool, day: &str) -> Result<(f64, u32)> {
+    let row = sqlx::query("SELECT spent_usd, escalations FROM advisor_daily_spend WHERE day = ?")
+        .bind(day)
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        Some(r) => {
+            let spent: f64 = r.try_get(0)?;
+            let escalations: i64 = r.try_get(1)?;
+            Ok((spent, escalations.max(0) as u32))
+        }
+        None => Ok((0.0, 0)),
+    }
+}
+
+/// Persist the advisor's escalation spend + count for `day` (upsert), so the daily
+/// budget / escalation caps survive a service restart.
+pub async fn save_advisor_day(
+    pool: &SqlitePool,
+    day: &str,
+    spent_usd: f64,
+    escalations: u32,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO advisor_daily_spend (day, spent_usd, escalations)
+         VALUES (?, ?, ?)
+         ON CONFLICT(day) DO UPDATE SET spent_usd = excluded.spent_usd,
+                                        escalations = excluded.escalations",
+    )
+    .bind(day)
+    .bind(spent_usd)
+    .bind(escalations as i64)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn log_usage(pool: &SqlitePool, usage: &CallUsage) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
     sqlx::query(
