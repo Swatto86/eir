@@ -287,8 +287,8 @@ mod tests {
         assert!(blocked("C:/Windows/System32/x.dll")); // forward slashes
         assert!(blocked("\\\\?\\C:\\Windows\\System32\\x.dll")); // \\?\ prefix
         assert!(blocked("C:\\Windows\\..\\Windows\\System32\\x.dll")); // traversal
-        // Traversal that tries to escape past the drive root still resolves back into
-        // C:\Windows on Windows, so it must stay blocked (the drive is never popped).
+                                                                       // Traversal that tries to escape past the drive root still resolves back into
+                                                                       // C:\Windows on Windows, so it must stay blocked (the drive is never popped).
         assert!(blocked("C:\\Windows\\..\\..\\Windows\\System32\\x.dll"));
         // A sibling directory that only shares a name prefix is NOT blocked.
         assert!(!blocked("C:\\WindowsApps\\ok.txt"));
