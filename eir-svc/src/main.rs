@@ -1,7 +1,9 @@
 mod ai;
+mod ask;
 mod audit;
 mod config;
 mod digest;
+mod disk_scan;
 mod executor;
 mod explain;
 mod feedback;
@@ -11,6 +13,7 @@ mod pipe_server;
 mod policy;
 mod safety;
 mod signals;
+mod startup_scan;
 mod updater;
 
 use eir_proto::{
@@ -207,6 +210,33 @@ struct SvcState {
     last_digest_at: i64,
     /// True while a digest generation is in flight (prevents overlap).
     digest_running: bool,
+    /// Recent CPU/memory/disk history for the dashboard timeline, refreshed once per
+    /// decision tick from `system_state_history`.
+    history: Vec<eir_proto::MetricPoint>,
+    /// "Ask Eir" free-text Q&A state broadcast to the UI (None until first question).
+    ask: Option<eir_proto::AskStatus>,
+    /// Recent Ask entries (newest first, capped). Memory-only; lost on restart.
+    ask_entries: VecDeque<eir_proto::AskEntry>,
+    /// True while an Ask answer is being generated (prevents overlap / spam).
+    ask_running: bool,
+    /// Unix seconds the last Ask answer finished (0 = never), for the spend guard.
+    last_ask_at: i64,
+    /// On-demand disk-scan results broadcast to the UI (None until first scan).
+    disk_insights: Option<eir_proto::DiskInsightsView>,
+    /// True while a disk scan is in flight (prevents overlap).
+    disk_scan_running: bool,
+    /// Server-side map of the last scan's cleanable entry ids → the safe fix-action each
+    /// maps to. A "Clean" click carries only the opaque id; the action is reconstructed
+    /// here and routed through the normal policy gate — the wire never carries an action.
+    disk_targets: std::collections::HashMap<String, FixAction>,
+    /// On-demand startup-scan results broadcast to the UI (None until first scan).
+    startup: Option<eir_proto::StartupView>,
+    /// True while a startup scan is in flight (prevents overlap).
+    startup_scan_running: bool,
+    /// Server-side map of the last startup scan's entry ids → toggle info, so an
+    /// enable/disable click can be reconstructed into a `StartupSet` action server-side
+    /// (the wire carries only the opaque id and a bool).
+    startup_targets: std::collections::HashMap<String, startup_scan::StartupToggle>,
 }
 
 impl Default for SvcState {
@@ -236,6 +266,17 @@ impl Default for SvcState {
             digest: None,
             last_digest_at: 0,
             digest_running: false,
+            history: Vec::new(),
+            ask: None,
+            ask_entries: VecDeque::new(),
+            ask_running: false,
+            last_ask_at: 0,
+            disk_insights: None,
+            disk_scan_running: false,
+            disk_targets: std::collections::HashMap::new(),
+            startup: None,
+            startup_scan_running: false,
+            startup_targets: std::collections::HashMap::new(),
         }
     }
 }
@@ -286,7 +327,22 @@ fn build_status(st: &SvcState) -> StatusPayload {
         advisor: st.advisor.clone(),
         learned_facts: st.learned_facts.clone(),
         digest: st.digest.clone(),
+        history: st.history.clone(),
+        ask: st.ask.clone(),
+        disk_insights: st.disk_insights.clone(),
+        startup: st.startup.clone(),
     }
+}
+
+/// Rebuild the broadcast "Ask Eir" view from the running flag, entry history, and an
+/// optional error to surface. The error persists in `st.ask` until the next ask event
+/// replaces it.
+fn refresh_ask(st: &mut SvcState, error: Option<String>) {
+    st.ask = Some(eir_proto::AskStatus {
+        running: st.ask_running,
+        error,
+        entries: st.ask_entries.iter().cloned().collect(),
+    });
 }
 
 /// Hard backstop on escalations per UTC day. The USD budget bounds providers
@@ -569,6 +625,126 @@ fn spawn_executor(
             });
         }
     });
+}
+
+/// Route a user-initiated fix-action (a disk cleanup or startup toggle) through the
+/// SAME policy gate as an AI-proposed fix: evaluate at full confidence, then auto-run a
+/// whitelisted/reversible action via the executor worker or queue anything disruptive
+/// for approval. The UI only ever sends an opaque id; the action is reconstructed
+/// server-side, so this never widens the pipe's trust model. Does NOT broadcast — the
+/// caller broadcasts once after.
+#[allow(clippy::too_many_arguments)]
+async fn route_user_action(
+    st: &mut SvcState,
+    pol: &policy::ExecutionPolicy,
+    db: &SqlitePool,
+    exec_tx: &tokio::sync::mpsc::UnboundedSender<ExecJob>,
+    action: FixAction,
+    diagnosis: &str,
+    reason_label: &str,
+) {
+    let label = format!("{action:?}");
+    if st.in_flight.contains(&label) || st.pending.iter().any(|p| p.info.action == label) {
+        info!(action = %label, "User action already queued or executing — skipping duplicate");
+        return;
+    }
+    let decision_id = match audit::log_manual_decision(db, diagnosis).await {
+        Ok(id) => id,
+        Err(e) => {
+            error!("Failed to log manual decision: {e}");
+            return;
+        }
+    };
+    // A zeroed baseline: a user-requested action isn't scored for effectiveness the way
+    // an autonomous fix is, so an accurate "before" snapshot isn't needed here.
+    let baseline = SystemState::default();
+    match pol.evaluate(&action, 1.0) {
+        policy::Verdict::Block(reason) => {
+            info!(reason = %reason, action = %label, "User action blocked by policy");
+            push_problem(st, diagnosis, 1.0, &label, true, false, Some(reason));
+        }
+        policy::Verdict::AutoApprove => {
+            match safety::rate_limited(db, &action, pol.execution.rate_limit_mins).await {
+                Ok(true) => {
+                    // Surface a reason in the activity feed rather than silently doing
+                    // nothing — a user who clicked expects feedback (the AI path can skip
+                    // quietly; a manual click can't).
+                    info!(action = %label, "User action rate-limited — skipping");
+                    push_problem(
+                        st,
+                        diagnosis,
+                        1.0,
+                        &label,
+                        true,
+                        false,
+                        Some("Skipped — already done recently (rate-limited).".into()),
+                    );
+                    return;
+                }
+                Err(e) => {
+                    warn!("Rate limit check failed — skipping user action to fail safe: {e}");
+                    return;
+                }
+                Ok(false) => {}
+            }
+            st.in_flight.insert(label.clone());
+            if let Err(e) = exec_tx.send(ExecJob {
+                action,
+                decision_id,
+                baseline,
+                label: label.clone(),
+                diagnosis: diagnosis.to_string(),
+                confidence: 1.0,
+                reason: Some(reason_label.to_string()),
+            }) {
+                warn!("Executor worker unavailable: {e}");
+                st.in_flight.remove(&label);
+            }
+        }
+        policy::Verdict::RequireApproval(reason) => {
+            let explanation = explain::explain(&action);
+            let info = ApprovalInfo {
+                id: 0,
+                diagnosis: diagnosis.to_string(),
+                root_cause: String::new(),
+                confidence: 1.0,
+                action: label.clone(),
+                reason,
+                side_effects: String::new(),
+                undo_instructions: String::new(),
+                action_summary: explanation.summary,
+                target: explanation.target,
+                target_details: explain::target_details(&action),
+                reversible: explanation.reversible,
+                created_at: chrono::Utc::now().timestamp(),
+            };
+            match audit::insert_pending_approval(db, decision_id, &action, &info, &baseline).await {
+                Ok(row_id) => {
+                    let mut info = info;
+                    info.id = row_id as u64;
+                    st.pending.push(PendingApproval {
+                        info,
+                        action,
+                        decision_id,
+                        baseline,
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to queue user action for approval: {e}");
+                    push_problem(
+                        st,
+                        diagnosis,
+                        1.0,
+                        &label,
+                        true,
+                        false,
+                        Some(format!("could not queue for approval: {e}")),
+                    );
+                }
+            }
+        }
+    }
+    st.status = resting_status(st);
 }
 
 /// Fingerprint of the *actionable* signals in a snapshot — error-level log
@@ -855,6 +1031,21 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     // rendered digest (plus its usage) back through this channel.
     let (digest_done_tx, mut digest_done_rx) =
         tokio::sync::mpsc::unbounded_channel::<(eir_proto::DigestView, Option<CallUsage>)>();
+    // "Ask Eir" answers one free-text question off the loop; the answer (or an error
+    // string) comes back here paired with the original question.
+    #[allow(clippy::type_complexity)]
+    let (ask_done_tx, mut ask_done_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        String,
+        Result<(String, Option<CallUsage>), String>,
+    )>();
+    // On-demand disk scan runs off the loop (blocking walkdir) and reports its ranked
+    // result back here.
+    let (disk_done_tx, mut disk_done_rx) =
+        tokio::sync::mpsc::unbounded_channel::<Result<disk_scan::DiskScanResult, String>>();
+    // On-demand startup scan (registry/folder enumeration + optional AI classify) runs
+    // off the loop and reports back here.
+    let (startup_done_tx, mut startup_done_rx) =
+        tokio::sync::mpsc::unbounded_channel::<Result<startup_scan::StartupScanResult, String>>();
     /// Regenerate the digest weekly.
     const DIGEST_INTERVAL_SECS: i64 = 7 * 24 * 3600;
     let mut analysis_running = false;
@@ -953,6 +1144,106 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             st.digest = Some(view);
                             pipe.broadcast_status(build_status(&st));
                         }
+                        continue;
+                    }
+                    Some(result) = startup_done_rx.recv() => {
+                        // A startup scan finished. Fold in the entries + the id→toggle map.
+                        st.startup_scan_running = false;
+                        let now = chrono::Utc::now().timestamp();
+                        match result {
+                            Ok(res) => {
+                                if let Some(u) = res.usage {
+                                    if let Err(e) = audit::log_usage(&db, &u).await {
+                                        warn!("Failed to log startup-classify usage: {e}");
+                                    }
+                                    match audit::usage_summary(&db).await {
+                                        Ok(s) => st.usage = Some(s),
+                                        Err(e) => warn!("Failed to compute usage summary: {e}"),
+                                    }
+                                }
+                                st.startup_targets = res.targets;
+                                st.startup = Some(eir_proto::StartupView {
+                                    running: false,
+                                    scanned_at: now,
+                                    error: None,
+                                    entries: res.entries,
+                                });
+                            }
+                            Err(e) => {
+                                warn!("Startup scan failed: {e}");
+                                let prev = st.startup.take();
+                                st.startup = Some(eir_proto::StartupView {
+                                    running: false,
+                                    scanned_at: prev.as_ref().map(|s| s.scanned_at).unwrap_or(0),
+                                    error: Some(e),
+                                    entries: prev.map(|s| s.entries).unwrap_or_default(),
+                                });
+                            }
+                        }
+                        pipe.broadcast_status(build_status(&st));
+                        continue;
+                    }
+                    Some(result) = disk_done_rx.recv() => {
+                        // A disk scan finished. Fold in the ranked entries + the id→action
+                        // map (used to reconstruct a "Clean" click server-side).
+                        st.disk_scan_running = false;
+                        let now = chrono::Utc::now().timestamp();
+                        match result {
+                            Ok(res) => {
+                                st.disk_targets = res.targets;
+                                st.disk_insights = Some(eir_proto::DiskInsightsView {
+                                    running: false,
+                                    scanned_at: now,
+                                    error: None,
+                                    entries: res.entries,
+                                });
+                            }
+                            Err(e) => {
+                                warn!("Disk scan failed: {e}");
+                                let prev = st.disk_insights.take();
+                                st.disk_insights = Some(eir_proto::DiskInsightsView {
+                                    running: false,
+                                    scanned_at: prev.as_ref().map(|d| d.scanned_at).unwrap_or(0),
+                                    error: Some(e),
+                                    entries: prev.map(|d| d.entries).unwrap_or_default(),
+                                });
+                            }
+                        }
+                        pipe.broadcast_status(build_status(&st));
+                        continue;
+                    }
+                    Some((question, result)) = ask_done_rx.recv() => {
+                        // An "Ask Eir" answer finished (or failed). Fold it into the Q&A
+                        // history; never touch st.error (same isolation as exec_done_rx).
+                        st.ask_running = false;
+                        st.last_ask_at = chrono::Utc::now().timestamp();
+                        match result {
+                            Ok((answer, usage)) => {
+                                if let Some(u) = usage {
+                                    if let Err(e) = audit::log_usage(&db, &u).await {
+                                        warn!("Failed to log ask usage: {e}");
+                                    }
+                                    match audit::usage_summary(&db).await {
+                                        Ok(s) => st.usage = Some(s),
+                                        Err(e) => warn!("Failed to compute usage summary: {e}"),
+                                    }
+                                }
+                                if st.ask_entries.len() >= 10 {
+                                    st.ask_entries.pop_back();
+                                }
+                                st.ask_entries.push_front(eir_proto::AskEntry {
+                                    question,
+                                    answer,
+                                    at: chrono::Utc::now().timestamp(),
+                                });
+                                refresh_ask(&mut st, None);
+                            }
+                            Err(e) => {
+                                warn!("Ask Eir failed: {e}");
+                                refresh_ask(&mut st, Some(format!("Couldn't answer that: {e}")));
+                            }
+                        }
+                        pipe.broadcast_status(build_status(&st));
                         continue;
                     }
                     Some(phase) = update_progress_rx.recv() => {
@@ -1565,6 +1856,249 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 }
                             });
                         }
+                        UiMsg::AskEir { question } => {
+                            let now = chrono::Utc::now().timestamp();
+                            if let Some(reason) = ask::ask_rejection_reason(
+                                &question,
+                                ai.is_some(),
+                                st.ask_running,
+                                st.last_ask_at,
+                                now,
+                            ) {
+                                refresh_ask(&mut st, Some(reason.to_string()));
+                                pipe.broadcast_status(build_status(&st));
+                            } else if let Some(ai_ref) = ai.as_ref() {
+                                st.ask_running = true;
+                                refresh_ask(&mut st, None);
+                                pipe.broadcast_status(build_status(&st));
+                                // Snapshot the loop-owned context now; gather the DB-derived
+                                // trend/learned pieces inside the off-loop task.
+                                let (cpu, memory, disk) = (st.cpu, st.memory, st.disk);
+                                let failed = st.failed_services.clone();
+                                let last_analysis = st.last_analysis.clone();
+                                let recent_problems: Vec<String> = st
+                                    .recent_problems
+                                    .iter()
+                                    .rev()
+                                    .take(8)
+                                    .map(|p| format!("{} ({})", p.diagnosis, p.action))
+                                    .collect();
+                                let recent_executions: Vec<String> = st
+                                    .recent_executions
+                                    .iter()
+                                    .rev()
+                                    .take(8)
+                                    .map(|e| {
+                                        format!(
+                                            "{}: {}",
+                                            e.action,
+                                            if e.success { "ok" } else { "failed" }
+                                        )
+                                    })
+                                    .collect();
+                                let db_a = db.clone();
+                                let ai_a = ai_ref.clone();
+                                let done = ask_done_tx.clone();
+                                tokio::spawn(async move {
+                                    // Bound the whole answer in a nested task + timeout,
+                                    // mirroring the analysis/digest tasks, so a wedged AI
+                                    // call can't latch ask_running for the process lifetime.
+                                    const ASK_MAX: Duration = Duration::from_secs(4 * 60);
+                                    let q = question.clone();
+                                    let mut inner = tokio::spawn(async move {
+                                        let trend =
+                                            audit::metric_trend(&db_a).await.ok().flatten();
+                                        let learned = learn::LearnedFacts::load(&db_a)
+                                            .await
+                                            .prompt_section();
+                                        let ctx = ask::AskContext {
+                                            cpu,
+                                            memory,
+                                            disk,
+                                            failed_services: failed,
+                                            trend,
+                                            last_analysis,
+                                            recent_problems,
+                                            recent_executions,
+                                            learned,
+                                        };
+                                        let prompt = ask::build_prompt(&ctx, &question);
+                                        // Main/default model, no web search — the labeller/
+                                        // digest completion entry point.
+                                        ai_a.complete_text(&prompt, "")
+                                            .await
+                                            .map(|(t, u)| (t.trim().to_string(), u))
+                                            .map_err(|e| e.to_string())
+                                    });
+                                    let result =
+                                        match tokio::time::timeout(ASK_MAX, &mut inner).await {
+                                            Ok(Ok(Ok((t, u)))) if !t.is_empty() => Ok((t, u)),
+                                            Ok(Ok(Ok(_))) => {
+                                                Err("the model returned an empty answer".to_string())
+                                            }
+                                            Ok(Ok(Err(e))) => Err(e),
+                                            Ok(Err(_join)) => {
+                                                Err("the answer task panicked".to_string())
+                                            }
+                                            Err(_elapsed) => {
+                                                inner.abort();
+                                                Err("answering timed out".to_string())
+                                            }
+                                        };
+                                    let _ = done.send((q, result));
+                                });
+                            }
+                        }
+                        UiMsg::ScanDisk => {
+                            // Gate on the scan-in-flight flag and pause (a paused guardian
+                            // shouldn't be walking the disk). Keep prior results visible
+                            // while the new scan runs.
+                            if !st.disk_scan_running && !st.paused {
+                                st.disk_scan_running = true;
+                                let scanned_at =
+                                    st.disk_insights.as_ref().map(|d| d.scanned_at).unwrap_or(0);
+                                let entries = st
+                                    .disk_insights
+                                    .as_ref()
+                                    .map(|d| d.entries.clone())
+                                    .unwrap_or_default();
+                                st.disk_insights = Some(eir_proto::DiskInsightsView {
+                                    running: true,
+                                    scanned_at,
+                                    error: None,
+                                    entries,
+                                });
+                                pipe.broadcast_status(build_status(&st));
+                                let done = disk_done_tx.clone();
+                                tokio::spawn(async move {
+                                    const SCAN_MAX: Duration = Duration::from_secs(5 * 60);
+                                    // The scan bounds its own walk with this deadline; the
+                                    // join timeout is a backstop (spawn_blocking can't be
+                                    // aborted, but the deadline stops the walk regardless).
+                                    let deadline = std::time::Instant::now() + SCAN_MAX;
+                                    let mut handle =
+                                        tokio::task::spawn_blocking(move || disk_scan::scan(deadline));
+                                    let result = match tokio::time::timeout(
+                                        SCAN_MAX + Duration::from_secs(30),
+                                        &mut handle,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(res)) => Ok(res),
+                                        Ok(Err(_join)) => Err("disk scan task panicked".to_string()),
+                                        Err(_elapsed) => {
+                                            handle.abort();
+                                            Err("disk scan timed out".to_string())
+                                        }
+                                    };
+                                    let _ = done.send(result);
+                                });
+                            }
+                        }
+                        UiMsg::CleanDiskEntry { id } => {
+                            // Map the opaque id to a safe action from THIS service's own
+                            // last scan (unknown/stale id → ignore), then route it through
+                            // the normal policy gate. The wire never carries an action.
+                            match st.disk_targets.get(&id).cloned() {
+                                Some(action) => {
+                                    route_user_action(
+                                        &mut st,
+                                        &pol,
+                                        &db,
+                                        &exec_tx,
+                                        action,
+                                        "User-requested disk cleanup",
+                                        "user-requested cleanup",
+                                    )
+                                    .await;
+                                    pipe.broadcast_status(build_status(&st));
+                                }
+                                None => {
+                                    info!(%id, "Clean requested for unknown/stale disk entry — ignoring");
+                                }
+                            }
+                        }
+                        UiMsg::ScanStartup => {
+                            if !st.startup_scan_running && !st.paused {
+                                st.startup_scan_running = true;
+                                let scanned_at =
+                                    st.startup.as_ref().map(|s| s.scanned_at).unwrap_or(0);
+                                let entries = st
+                                    .startup
+                                    .as_ref()
+                                    .map(|s| s.entries.clone())
+                                    .unwrap_or_default();
+                                st.startup = Some(eir_proto::StartupView {
+                                    running: true,
+                                    scanned_at,
+                                    error: None,
+                                    entries,
+                                });
+                                pipe.broadcast_status(build_status(&st));
+                                let done = startup_done_tx.clone();
+                                let ai_s = ai.clone();
+                                let model_s = cfg.api.update_check_model.clone();
+                                tokio::spawn(async move {
+                                    const STARTUP_MAX: Duration = Duration::from_secs(4 * 60);
+                                    let mut inner = tokio::spawn(async move {
+                                        startup_scan::scan(ai_s.as_deref(), &model_s)
+                                            .await
+                                            .map_err(|e| e.to_string())
+                                    });
+                                    let result =
+                                        match tokio::time::timeout(STARTUP_MAX, &mut inner).await {
+                                            Ok(Ok(r)) => r,
+                                            Ok(Err(_join)) => {
+                                                Err("startup scan task panicked".to_string())
+                                            }
+                                            Err(_elapsed) => {
+                                                inner.abort();
+                                                Err("startup scan timed out".to_string())
+                                            }
+                                        };
+                                    let _ = done.send(result);
+                                });
+                            }
+                        }
+                        UiMsg::SetStartupEntry { id, enable } => {
+                            // Reconstruct the toggle from THIS service's own last scan
+                            // (unknown/stale id → ignore), then route the StartupSet through
+                            // the normal policy gate (approval-gated — reversible, but the
+                            // pipe is writable by any local user, so a human confirms).
+                            let target = st
+                                .startup_targets
+                                .get(&id)
+                                .map(|t| (t.name.clone(), t.location.clone(), t.hive.clone()));
+                            match target {
+                                Some((name, location, hive)) => {
+                                    let action = FixAction::StartupSet {
+                                        name,
+                                        location,
+                                        hive,
+                                        enable,
+                                    };
+                                    let diag = if enable {
+                                        "User re-enabled a startup entry"
+                                    } else {
+                                        "User disabled a startup entry"
+                                    };
+                                    route_user_action(
+                                        &mut st,
+                                        &pol,
+                                        &db,
+                                        &exec_tx,
+                                        action,
+                                        diag,
+                                        "user startup change",
+                                    )
+                                    .await;
+                                    pipe.broadcast_status(build_status(&st));
+                                }
+                                None => {
+                                    info!(%id, "Startup toggle for unknown/stale entry — ignoring");
+                                }
+                            }
+                        }
                         }
                         continue;
                     }
@@ -1647,6 +2181,16 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                     st.memory          = sys.memory_usage_percent;
                     st.disk            = sys.disk_usage_percent;
                     st.failed_services = sys.failed_services.clone();
+                }
+                // Refresh the dashboard resource timeline (last 24h, thinned) once per
+                // tick — cheap, and off the per-broadcast path (build_status only clones
+                // the cached vec). Reads the same per-cycle series the trend detector uses.
+                {
+                    let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+                    match audit::metric_history(&db, &cutoff, 200).await {
+                        Ok(h) => st.history = h,
+                        Err(e) => warn!("Failed to load metric history: {e}"),
+                    }
                 }
                 pipe.broadcast_status(build_status(&st));
 

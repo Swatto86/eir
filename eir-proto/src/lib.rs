@@ -39,6 +39,103 @@ pub struct StatusPayload {
     /// `#[serde(default)]` keeps an older payload decodable.
     #[serde(default)]
     pub digest: Option<DigestView>,
+    /// Recent CPU/memory/disk history for the dashboard timeline (chronological).
+    /// `#[serde(default)]` keeps an older payload decodable.
+    #[serde(default)]
+    pub history: Vec<MetricPoint>,
+    /// "Ask Eir" free-text Q&A state (None until the first question). `#[serde(default)]`
+    /// keeps an older payload decodable.
+    #[serde(default)]
+    pub ask: Option<AskStatus>,
+    /// On-demand disk-space scan results (None until the first scan). `#[serde(default)]`
+    /// keeps an older payload decodable.
+    #[serde(default)]
+    pub disk_insights: Option<DiskInsightsView>,
+    /// On-demand startup-entry scan results (None until the first scan).
+    /// `#[serde(default)]` keeps an older payload decodable.
+    #[serde(default)]
+    pub startup: Option<StartupView>,
+}
+
+/// One point of the dashboard resource timeline. Percentages, unix-seconds `at`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MetricPoint {
+    pub at: i64,
+    pub cpu: f32,
+    pub memory: f32,
+    pub disk: f32,
+}
+
+/// "Ask Eir" state: whether an answer is being generated, the last error, and the
+/// recent question/answer history (newest first).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AskStatus {
+    pub running: bool,
+    pub error: Option<String>,
+    pub entries: Vec<AskEntry>,
+}
+
+/// One answered question. `answer` is diagnostic prose — nothing is parsed or
+/// executed from it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AskEntry {
+    pub question: String,
+    pub answer: String,
+    /// Unix seconds when answered.
+    pub at: i64,
+}
+
+/// Results of an on-demand disk-space scan, rendered in the Disk view.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct DiskInsightsView {
+    pub running: bool,
+    /// Unix seconds of the last completed scan (0 = never).
+    pub scanned_at: i64,
+    pub error: Option<String>,
+    pub entries: Vec<DiskEntryView>,
+}
+
+/// One space consumer found by the disk scan. `note`/`category` are deterministic
+/// (never AI-authored), so the user can trust them. `cleanable` means the entry maps
+/// to a safe fix-action offered behind the normal policy gate.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct DiskEntryView {
+    /// Stable id (hash of the path) — the key the UI sends back to clean it.
+    pub id: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub category: String,
+    pub note: String,
+    pub cleanable: bool,
+}
+
+/// Results of an on-demand startup-entry scan, rendered in the Startup view.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct StartupView {
+    pub running: bool,
+    /// Unix seconds of the last completed scan (0 = never).
+    pub scanned_at: i64,
+    pub error: Option<String>,
+    pub entries: Vec<StartupEntryView>,
+}
+
+/// One logon startup entry. `verdict`/`note` are AI-advisory (empty when the AI is
+/// unconfigured — the deterministic listing is useful on its own); they trigger
+/// nothing. `location` is a closed-set selector (never a raw registry path).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct StartupEntryView {
+    /// Stable id — the key the UI sends back to enable/disable it.
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    /// Where it launches from: "hkcu_run" | "hklm_run" | "startup_folder" |
+    /// "common_startup_folder" | "scheduled_task". A selector, not a path.
+    pub location: String,
+    pub enabled: bool,
+    /// AI classification: "keep" | "optional" | "unnecessary" (empty if unconfigured).
+    pub verdict: String,
+    /// One-line plain-English "what this is" (empty if unconfigured).
+    pub note: String,
 }
 
 /// The latest weekly health digest, rendered on the dashboard.
@@ -375,5 +472,25 @@ pub enum UiMsg {
     /// the `ExecutionSummary.undo_id`.
     UndoRegistry {
         id: i64,
+    },
+    /// Ask Eir a free-text question, answered with live system context. The answer is
+    /// diagnostic prose only — nothing is parsed or executed from it.
+    AskEir {
+        question: String,
+    },
+    /// Run an on-demand disk-space scan.
+    ScanDisk,
+    /// Clean one disk-scan entry by its id. The service maps the id to a safe
+    /// fix-action from its own last scan and routes it through the normal policy gate.
+    CleanDiskEntry {
+        id: String,
+    },
+    /// Run an on-demand startup-entry scan.
+    ScanStartup,
+    /// Enable or disable one startup entry by its id (Task-Manager-style, reversible).
+    /// The service maps the id to an entry from its own last scan.
+    SetStartupEntry {
+        id: String,
+        enable: bool,
     },
 }

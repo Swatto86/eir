@@ -63,7 +63,7 @@ impl LogEvent {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SystemState {
     pub uptime_secs: u64,
     pub cpu_usage_percent: f32,
@@ -271,6 +271,20 @@ pub enum FixAction {
     /// store (often a prerequisite for SFC). Long-running, approval-gated, never
     /// whitelisted.
     DismRestoreHealth,
+    /// Enable or disable a logon startup entry by writing the Windows "StartupApproved"
+    /// flag — the same mechanism as Task Manager's Startup tab. Fully reversible (nothing
+    /// is deleted). Created only by the user-initiated startup scan; the AI never proposes
+    /// it (it's not in the prompt's action catalogue). Approval-gated (off the whitelist).
+    StartupSet {
+        /// The StartupApproved value name: the Run value name, or the `.lnk` filename.
+        name: String,
+        /// Closed-set selector for the approved key: `machine_run` | `user_run` |
+        /// `user_startup_folder` | `common_startup_folder`. Never a raw registry path.
+        location: String,
+        /// User SID for the `user_*` locations (validated in the adapter), empty otherwise.
+        hive: String,
+        enable: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

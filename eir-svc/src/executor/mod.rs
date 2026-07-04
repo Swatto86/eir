@@ -8,6 +8,7 @@ pub mod repair;
 pub mod security;
 pub mod services;
 pub mod software;
+pub mod startup;
 pub mod tasks;
 
 use crate::models::{ExecutionResult, FixAction};
@@ -117,6 +118,15 @@ pub async fn execute(action: &FixAction) -> ExecutionResult {
         }
         FixAction::SfcScan => make_result(action, repair::sfc_scan().await),
         FixAction::DismRestoreHealth => make_result(action, repair::dism_restore_health().await),
+        FixAction::StartupSet {
+            name,
+            location,
+            hive,
+            enable,
+        } => make_result(
+            action,
+            startup::set_enabled(name, location, hive, *enable).await,
+        ),
         FixAction::FileDelete { path } => {
             let safe = path.replace('\'', "''");
             // Guard: refuse if path is a directory, and require the item to exist.

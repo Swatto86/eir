@@ -151,6 +151,35 @@
     .bar-track { height: 5px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 3px; overflow: hidden; }
     .bar-fill  { height: 100%; border-radius: 3px; transition: width .5s; }
 
+    .spark-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding: 14px 16px; }
+    .spark { display: flex; flex-direction: column; gap: 5px; }
+    .spark-head { display: flex; justify-content: space-between; align-items: baseline; }
+    .spark-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .07em; }
+    .spark-val { font-size: 13px; font-weight: 650; font-variant-numeric: tabular-nums; }
+    .spark svg { width: 100%; height: 44px; display: block; overflow: visible; }
+    .spark-axis { fill: none; stroke: var(--border); stroke-width: 1; }
+
+    /* ── Ask Eir ── */
+    .ask-compose { padding: 14px 15px; display: flex; flex-direction: column; gap: 10px; }
+    .ask-compose textarea { width: 100%; resize: vertical; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 13.5px; font-family: inherit; line-height: 1.55; }
+    .ask-compose textarea:focus { outline: none; border-color: var(--accent); }
+    .ask-actions { display: flex; align-items: center; gap: 12px; }
+    .ask-q { display: flex; gap: 8px; padding: 11px 15px; font-weight: 650; font-size: 13.5px; border-bottom: 1px solid var(--border); user-select: text; }
+    .ask-q .qmark { color: var(--accent); flex-shrink: 0; }
+    .ask-a { padding: 13px 15px; font-size: 13px; line-height: 1.65; white-space: pre-wrap; user-select: text; }
+    .ask-when { padding: 0 15px 11px; font-size: 11px; color: var(--muted); }
+    .ask-spinner { padding: 13px 15px; color: var(--muted); font-size: 13px; }
+
+    /* ── Disk / Startup rows ── */
+    .di-row { display: flex; align-items: center; gap: 10px; padding: 9px 15px; border-bottom: 1px solid var(--border); font-size: 13px; flex-wrap: wrap; }
+    .di-row:last-child { border-bottom: none; }
+    .di-main { flex: 1; min-width: 0; }
+    .di-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
+    .di-note { font-size: 11.5px; color: var(--muted); margin-top: 2px; line-height: 1.45; user-select: text; }
+    .di-size { font-variant-numeric: tabular-nums; color: var(--muted); white-space: nowrap; }
+    .di-cat { font-size: 10.5px; padding: 1px 7px; border-radius: 5px; background: var(--surface-2); border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+    .di-pill { font-size: 10.5px; padding: 1px 7px; border-radius: 20px; font-weight: 600; white-space: nowrap; }
+
     .dash-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
     .ai-now-text { padding: 13px 15px; font-size: 13px; line-height: 1.65; white-space: pre-wrap; color: var(--text); user-select: text; }
     .ai-now-meta { padding: 0 15px 12px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 11px; color: var(--muted); }
@@ -268,9 +297,12 @@
     <div class="brand"><div id="status-dot"></div><h1>Eir</h1></div>
     <nav id="nav">
       <button class="nav-btn active" data-view="dashboard"><span class="nav-ico">⌂</span>Dashboard</button>
+      <button class="nav-btn" data-view="ask"><span class="nav-ico">✦</span>Ask Eir</button>
       <button class="nav-btn" data-view="approvals"><span class="nav-ico">✋</span>Approvals<span class="badge" id="nav-approvals"></span></button>
       <button class="nav-btn" data-view="activity"><span class="nav-ico">☰</span>Activity</button>
       <button class="nav-btn" data-view="updates"><span class="nav-ico">⭳</span>App Updates</button>
+      <button class="nav-btn" data-view="disk"><span class="nav-ico">▤</span>Disk Space</button>
+      <button class="nav-btn" data-view="startup"><span class="nav-ico">⏻</span>Startup</button>
       <button class="nav-btn" data-view="learned"><span class="nav-ico">◎</span>Learned</button>
       <button class="nav-btn" data-view="settings"><span class="nav-ico">⚙</span>Settings</button>
       <button class="nav-btn" data-view="about"><span class="nav-ico">ⓘ</span>About</button>
@@ -318,6 +350,11 @@
         </div>
       </div>
 
+      <div class="card" id="history-card" style="display:none">
+        <div class="card-header">Last 24 hours</div>
+        <div class="spark-grid" id="spark-grid"></div>
+      </div>
+
       <div class="card" id="dash-approvals-card" style="display:none">
         <div class="mini-cta">
           <span class="big" id="dash-approvals-count">0</span>
@@ -353,6 +390,24 @@
       </div>
     </section>
 
+    <!-- ── Ask Eir ── -->
+    <section class="view" id="view-ask">
+      <div class="card">
+        <div class="card-header">Ask about your PC</div>
+        <div class="ask-compose">
+          <textarea id="ask-input" maxlength="1000" rows="3"
+            placeholder="e.g. Why is my PC slow right now?  Is my disk OK?  What was that error about?"></textarea>
+          <div class="ask-actions">
+            <span class="set-status" id="ask-status"></span>
+            <div style="flex:1"></div>
+            <button class="btn primary" id="ask-send">Ask Eir</button>
+          </div>
+        </div>
+      </div>
+      <div class="set-note" style="padding:0 2px">Eir answers from what it can see on this PC right now. It won't give you commands to run — it applies fixes itself, through its approval system.</div>
+      <div id="ask-list"></div>
+    </section>
+
     <!-- ── Approvals ── -->
     <section class="view" id="view-approvals">
       <div id="approvals"><div class="empty">Nothing needs your approval right now.</div></div>
@@ -383,6 +438,34 @@
           <div id="updater-history"></div>
         </div>
       </div>
+    </section>
+
+    <!-- ── Disk Space ── -->
+    <section class="view" id="view-disk">
+      <div class="card">
+        <div class="card-header">
+          What's using your disk <span id="disk-state" style="text-transform:none;letter-spacing:0"></span>
+          <span class="hspacer"></span>
+          <button class="btn small primary" id="disk-scan">Scan now</button>
+        </div>
+        <div id="disk-error" class="upd-note" style="display:none;color:var(--red)"></div>
+        <div id="disk-list"><div class="empty">Click “Scan now” to find what's taking up space.</div></div>
+      </div>
+      <div class="set-note" style="padding:0 2px">“Clean” routes through Eir's normal safety checks — reversible cleanups run right away, anything riskier waits in Approvals. Items marked report-only are shown for awareness and aren't touched.</div>
+    </section>
+
+    <!-- ── Startup ── -->
+    <section class="view" id="view-startup">
+      <div class="card">
+        <div class="card-header">
+          What launches at sign-in <span id="startup-state" style="text-transform:none;letter-spacing:0"></span>
+          <span class="hspacer"></span>
+          <button class="btn small primary" id="startup-scan">Scan now</button>
+        </div>
+        <div id="startup-error" class="upd-note" style="display:none;color:var(--red)"></div>
+        <div id="startup-list"><div class="empty">Click “Scan now” to see what starts with Windows.</div></div>
+      </div>
+      <div class="set-note" style="padding:0 2px">Disabling an entry is reversible — it's the same switch as Task Manager's Startup tab; nothing is deleted. The keep/optional/unnecessary hints are AI suggestions, not automatic actions.</div>
     </section>
 
     <!-- ── Learned ── -->

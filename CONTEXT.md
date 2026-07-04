@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.23.1. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.24.0. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.23.1. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-04 | Eir | v0.24.0 user-facing tools (F10–F13) | Added four on-demand features: a dashboard health timeline (reads the previously UI-invisible `system_state_history`), "Ask Eir" free-text Q&A (bounded `complete_text`, diagnostic-only — nothing parsed/executed from the answer), disk-space insights ("what's eating my SSD", cleanup mapped only to existing safe actions), and a startup advisor (Run keys + Startup folders, StartupApproved toggle via the new reversible `FixAction::StartupSet`, AI classify is advisory-only). Trust boundary held: UI sends only opaque ids, the service reconstructs the action from its own last-scan state and routes through the same policy gate (`route_user_action`). An adversarial multi-lens sweep found no security/concurrency defects; three UX-feedback papercuts (rate-limited/stale-id/paused clicks) were fixed. Self-review also caught that `executor::startup::approved_key` must `Registry::`-qualify keys (`HKEY_USERS` has no PSDrive).
 
 2026-07-04 | Eir | v0.23.1 second-sweep fixes | A second adversarial sweep confirmed the v0.23.0 registry gate, AI/wire layer, and loop concurrency are sound. Three fixes: LogCleanup now canonicalises its scan root (an 8.3 short-name or junction root could lexically dodge the protected-dir check yet resolve to System32); the first-ever weekly-digest OS notification is no longer suppressed on fresh installs; and the digest prompt no longer frames the all-time learned-fact count as a weekly figure. `usage_log` pruning was deliberately skipped (it feeds the lifetime usage card).
 

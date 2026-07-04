@@ -135,6 +135,34 @@ async fn undo_registry(id: i64, tx: State<'_, UiCmdTx>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn ask_eir(question: String, tx: State<'_, UiCmdTx>) -> Result<(), String> {
+    tx.0.try_send(UiMsg::AskEir { question })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn scan_disk(tx: State<'_, UiCmdTx>) -> Result<(), String> {
+    tx.0.try_send(UiMsg::ScanDisk).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn clean_disk_entry(id: String, tx: State<'_, UiCmdTx>) -> Result<(), String> {
+    tx.0.try_send(UiMsg::CleanDiskEntry { id })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn scan_startup(tx: State<'_, UiCmdTx>) -> Result<(), String> {
+    tx.0.try_send(UiMsg::ScanStartup).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_startup_entry(id: String, enable: bool, tx: State<'_, UiCmdTx>) -> Result<(), String> {
+    tx.0.try_send(UiMsg::SetStartupEntry { id, enable })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn clear_problems(tx: State<'_, UiCmdTx>) -> Result<(), String> {
     tx.0.try_send(UiMsg::ClearProblems)
         .map_err(|e| e.to_string())
@@ -610,6 +638,11 @@ fn main() {
             decide_approval,
             toggle_pause,
             undo_registry,
+            ask_eir,
+            scan_disk,
+            clean_disk_entry,
+            scan_startup,
+            set_startup_entry,
             update_settings,
             clear_problems,
             clear_executions,

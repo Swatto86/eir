@@ -181,6 +181,22 @@ pub fn explain(action: &FixAction) -> ActionExplanation {
             target: "Windows component store".to_string(),
             reversible: false,
         },
+        FixAction::StartupSet { name, enable, .. } => ActionExplanation {
+            summary: if *enable {
+                format!(
+                    "Re-enables the startup entry '{name}' so it launches again when you sign in. \
+                     This is the same switch as Task Manager's Startup tab — nothing is deleted."
+                )
+            } else {
+                format!(
+                    "Stops the startup entry '{name}' from launching when you sign in. This is the \
+                     same switch as Task Manager's Startup tab — nothing is deleted, and it can be \
+                     re-enabled anytime."
+                )
+            },
+            target: name.clone(),
+            reversible: true,
+        },
     }
 }
 

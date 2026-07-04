@@ -43,9 +43,12 @@ applyTheme();
 
 const VIEW_TITLES = {
   dashboard: 'Dashboard',
+  ask: 'Ask Eir',
   approvals: 'Approvals',
   activity: 'Activity',
   updates: 'App Updates',
+  disk: 'Disk Space',
+  startup: 'Startup Apps',
   learned: 'What Eir Has Learned',
   settings: 'Settings',
   about: 'About',
@@ -260,6 +263,10 @@ async function refreshInner() {
   renderUpdater(status.updater);
   renderLearned(status.learned_facts);
   renderDigest(status.digest);
+  renderHistory(status);
+  renderAsk(status.ask);
+  renderDisk(status.disk_insights, status.paused);
+  renderStartup(status.startup, status.paused);
 
   if (status.error && /settings|not applied/i.test(status.error)) {
     const ss = document.getElementById('set-status');
@@ -278,6 +285,247 @@ function renderDigest(d) {
   document.getElementById('digest-when').textContent =
     d.generated_at ? ago(d.generated_at) : '';
 }
+
+// ── Health timeline (24h sparklines) ────────────────────────────────────────────
+
+// One sparkline SVG: a polyline of `key` over the points' time span, 0–100% on Y,
+// with marker dots for problems/fixes. preserveAspectRatio="none" stretches the fixed
+// viewBox to the card width. No chart library — hand-built to match the no-dep frontend.
+function sparkline(points, key, color, markers) {
+  const W = 240, H = 44, pad = 3;
+  const t0 = points[0].at;
+  const t1 = points[points.length - 1].at;
+  const span = Math.max(1, t1 - t0);
+  const x = (at) => pad + (W - 2 * pad) * (at - t0) / span;
+  const y = (v) => pad + (H - 2 * pad) * (1 - Math.min(100, Math.max(0, v)) / 100);
+  const d = points.map((p, i) => `${i ? 'L' : 'M'}${x(p.at).toFixed(1)},${y(p[key]).toFixed(1)}`).join(' ');
+  const dots = markers
+    .filter((m) => m.at >= t0 && m.at <= t1)
+    .map((m) => `<circle cx="${x(m.at).toFixed(1)}" cy="${(H - 2).toFixed(1)}" r="2.2" fill="${m.color}"><title>${escAttr(m.label)}</title></circle>`)
+    .join('');
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <line class="spark-axis" x1="0" y1="${(H - 1).toFixed(1)}" x2="${W}" y2="${(H - 1).toFixed(1)}"/>
+    <path d="${d}" fill="none" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
+    ${dots}</svg>`;
+}
+
+function sparkCell(label, key, color, points, markers, latest) {
+  return `<div class="spark">
+    <div class="spark-head"><span class="spark-label">${label}</span><span class="spark-val" style="color:${color}">${pct(latest)}</span></div>
+    ${sparkline(points, key, color, markers)}
+  </div>`;
+}
+
+function renderHistory(status) {
+  const card = document.getElementById('history-card');
+  const pts = status.history || [];
+  if (pts.length < 2) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+  const markers = [];
+  for (const p of (status.recent_problems || [])) {
+    if (p.at) markers.push({ at: p.at, color: p.blocked ? 'var(--red)' : 'var(--blue)', label: p.diagnosis });
+  }
+  for (const e of (status.recent_executions || [])) {
+    if (e.at) markers.push({ at: e.at, color: e.success ? 'var(--green)' : 'var(--red)', label: e.action });
+  }
+  const last = pts[pts.length - 1];
+  document.getElementById('spark-grid').innerHTML =
+    sparkCell('CPU', 'cpu', 'var(--blue)', pts, markers, last.cpu) +
+    sparkCell('Memory', 'memory', 'var(--blue)', pts, markers, last.memory) +
+    sparkCell('Disk', 'disk', last.disk >= 90 ? 'var(--red)' : 'var(--accent)', pts, markers, last.disk);
+}
+
+// ── Ask Eir ──────────────────────────────────────────────────────────────────
+
+let lastAskSig = null;
+function renderAsk(ask) {
+  const list = document.getElementById('ask-list');
+  const sendBtn = document.getElementById('ask-send');
+  const statusEl = document.getElementById('ask-status');
+  const running = !!(ask && ask.running);
+  sendBtn.disabled = running;
+  sendBtn.textContent = running ? 'Thinking…' : 'Ask Eir';
+  // Reconcile the status line with the service each poll; the transient "Sending…"
+  // set by submitAsk is replaced here once the service reflects running/error.
+  statusEl.textContent = running ? '' : ((ask && ask.error) || '');
+  const entries = (ask && ask.entries) || [];
+  const sig = JSON.stringify({ r: running, e: entries.map((x) => x.at) });
+  if (sig === lastAskSig) return;
+  lastAskSig = sig;
+  let html = running ? '<div class="card"><div class="ask-spinner">Eir is thinking…</div></div>' : '';
+  html += entries.map((e) => `
+    <div class="card ask-entry">
+      <div class="ask-q"><span class="qmark">Q</span><span>${esc(e.question)}</span></div>
+      <div class="ask-a">${esc(e.answer)}</div>
+      <div class="ask-when">${ago(e.at)}</div>
+    </div>`).join('');
+  list.innerHTML = html;
+}
+
+async function submitAsk() {
+  const input = document.getElementById('ask-input');
+  const q = input.value.trim();
+  if (!q) return;
+  const statusEl = document.getElementById('ask-status');
+  statusEl.textContent = 'Sending…';
+  try {
+    await invoke('ask_eir', { question: q });
+    input.value = '';
+  } catch (e) {
+    statusEl.textContent = 'Failed: ' + e;
+  }
+  refresh();
+}
+
+document.getElementById('ask-send').addEventListener('click', submitAsk);
+document.getElementById('ask-input').addEventListener('keydown', (e) => {
+  // Ctrl/Cmd+Enter submits (plain Enter makes newlines in the textarea).
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submitAsk(); }
+});
+
+// ── Disk space ───────────────────────────────────────────────────────────────
+
+function humanBytes(n) {
+  n = n || 0;
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? n : v.toFixed(1)) + ' ' + u[i];
+}
+
+let lastDiskSig = null;
+function renderDisk(di, paused) {
+  const stateEl = document.getElementById('disk-state');
+  const errEl = document.getElementById('disk-error');
+  const list = document.getElementById('disk-list');
+  const btn = document.getElementById('disk-scan');
+  const running = !!(di && di.running);
+  // Disable while scanning, and while paused (the service ignores a scan when paused,
+  // so reflect that rather than dropping the click silently).
+  btn.disabled = running || !!paused;
+  btn.title = paused ? 'Guardian is paused — resume to scan' : '';
+  btn.textContent = running ? 'Scanning…' : 'Scan now';
+  stateEl.textContent = (di && di.scanned_at) ? '· scanned ' + ago(di.scanned_at) : (running ? '· scanning…' : '');
+  errEl.style.display = (di && di.error) ? 'block' : 'none';
+  errEl.textContent = (di && di.error) || '';
+  const entries = (di && di.entries) || [];
+  const sig = JSON.stringify({ r: running, e: entries, at: di && di.scanned_at });
+  if (sig === lastDiskSig) return;
+  lastDiskSig = sig;
+  if (running && !entries.length) { list.innerHTML = '<div class="empty">Scanning your disk… this can take a minute.</div>'; return; }
+  if (!entries.length) {
+    list.innerHTML = (di && di.scanned_at)
+      ? '<div class="empty">Nothing significant to clean up.</div>'
+      : '<div class="empty">Click “Scan now” to find what\'s taking up space.</div>';
+    return;
+  }
+  list.innerHTML = entries.map(diskRow).join('');
+}
+
+function diskRow(e) {
+  const clean = e.cleanable
+    ? `<button class="upd-mini disk-clean" data-id="${escAttr(e.id)}" title="Clean this up (via Eir's safety checks)">Clean</button>`
+    : '<span class="di-pill tag-warn">report-only</span>';
+  return `<div class="di-row">
+    <div class="di-main">
+      <div class="di-name" title="${escAttr(e.path)}">${esc(e.path)}</div>
+      ${e.note ? `<div class="di-note">${esc(e.note)}</div>` : ''}
+    </div>
+    <span class="di-cat">${esc(e.category)}</span>
+    <span class="di-size">${humanBytes(e.size_bytes)}</span>
+    ${clean}
+  </div>`;
+}
+
+document.getElementById('disk-scan').addEventListener('click', () => {
+  invoke('scan_disk').catch((err) => console.error('scan_disk failed', err));
+});
+document.getElementById('disk-list').addEventListener('click', (e) => {
+  const btn = e.target.closest('.disk-clean');
+  if (!btn) return;
+  // Disable briefly to stop a double-submit, then re-enable — the command is
+  // fire-and-forget (resolves once queued, not once applied), and the row isn't
+  // repainted unless the entry set changes, so we must recover the button ourselves.
+  // Re-clicks are safe: the service dedupes via in_flight/pending and rate-limits.
+  btn.disabled = true;
+  invoke('clean_disk_entry', { id: btn.dataset.id })
+    .catch((err) => console.error('clean_disk_entry failed', err))
+    .finally(() => setTimeout(() => { btn.disabled = false; }, 2500));
+});
+
+// ── Startup apps ─────────────────────────────────────────────────────────────
+
+const STARTUP_VERDICT = {
+  keep: '<span class="di-pill tag-ok">Keep</span>',
+  optional: '<span class="di-pill tag-warn">Optional</span>',
+  unnecessary: '<span class="di-pill tag-block">Unnecessary</span>',
+};
+const STARTUP_LOC = {
+  hkcu_run: 'Registry (you)',
+  hklm_run: 'Registry (all users)',
+  startup_folder: 'Startup folder',
+  common_startup_folder: 'Startup folder (all users)',
+  scheduled_task: 'Scheduled task',
+};
+
+let lastStartupSig = null;
+function renderStartup(sv, paused) {
+  const stateEl = document.getElementById('startup-state');
+  const errEl = document.getElementById('startup-error');
+  const list = document.getElementById('startup-list');
+  const btn = document.getElementById('startup-scan');
+  const running = !!(sv && sv.running);
+  btn.disabled = running || !!paused;
+  btn.title = paused ? 'Guardian is paused — resume to scan' : '';
+  btn.textContent = running ? 'Scanning…' : 'Scan now';
+  stateEl.textContent = (sv && sv.scanned_at) ? '· scanned ' + ago(sv.scanned_at) : (running ? '· scanning…' : '');
+  errEl.style.display = (sv && sv.error) ? 'block' : 'none';
+  errEl.textContent = (sv && sv.error) || '';
+  const entries = (sv && sv.entries) || [];
+  const sig = JSON.stringify({ r: running, e: entries, at: sv && sv.scanned_at });
+  if (sig === lastStartupSig) return;
+  lastStartupSig = sig;
+  if (running && !entries.length) { list.innerHTML = '<div class="empty">Scanning startup entries…</div>'; return; }
+  if (!entries.length) {
+    list.innerHTML = (sv && sv.scanned_at)
+      ? '<div class="empty">No startup entries found.</div>'
+      : '<div class="empty">Click “Scan now” to see what starts with Windows.</div>';
+    return;
+  }
+  list.innerHTML = entries.map(startupRow).join('');
+}
+
+function startupRow(e) {
+  const verdict = STARTUP_VERDICT[e.verdict] || '';
+  const loc = STARTUP_LOC[e.location] || e.location;
+  const toggle = e.enabled
+    ? `<button class="upd-mini startup-toggle" data-id="${escAttr(e.id)}" data-enable="0" title="Stop this launching at sign-in">Disable</button>`
+    : `<button class="upd-mini startup-toggle" data-id="${escAttr(e.id)}" data-enable="1" title="Let this launch at sign-in again">Enable</button>`;
+  const state = e.enabled ? '' : '<span class="di-pill tag-block">Disabled</span>';
+  return `<div class="di-row"${e.enabled ? '' : ' style="opacity:.55"'}>
+    <div class="di-main">
+      <div class="di-name" title="${escAttr(e.command)}">${esc(e.name)}</div>
+      <div class="di-note">${esc(loc)}${e.note ? ' — ' + esc(e.note) : ''}</div>
+    </div>
+    ${verdict}${state}
+    ${toggle}
+  </div>`;
+}
+
+document.getElementById('startup-scan').addEventListener('click', () => {
+  invoke('scan_startup').catch((err) => console.error('scan_startup failed', err));
+});
+document.getElementById('startup-list').addEventListener('click', (e) => {
+  const btn = e.target.closest('.startup-toggle');
+  if (!btn) return;
+  const enable = btn.dataset.enable === '1';
+  // Same recovery as disk Clean: brief disable to block a double-submit, then re-enable.
+  // The toggle is approval-gated and server-side deduped, so a re-click is harmless.
+  btn.disabled = true;
+  invoke('set_startup_entry', { id: btn.dataset.id, enable })
+    .catch((err) => console.error('set_startup_entry failed', err))
+    .finally(() => setTimeout(() => { btn.disabled = false; }, 2500));
+});
 
 // ── Approvals ────────────────────────────────────────────────────────────────
 

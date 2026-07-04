@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-04 · **Release:** v0.23.1
+**Last updated:** 2026-07-04 · **Release:** v0.24.0
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -56,6 +56,7 @@ which is the substrate the self-improvement layer learns from (see
 - [AI layer & prompts](#ai-layer--prompts)
 - [Executor, policy, safety & explanations](#executor-policy-safety--explanations)
 - [Autonomous app updater](#autonomous-app-updater)
+- [User-facing on-demand tools (Ask / Timeline / Disk / Startup)](#user-facing-on-demand-tools-ask--timeline--disk--startup)
 - [Persistence, audit DB & the existing feedback loop](#persistence-audit-db--the-existing-feedback-loop)
 - [Self-improvement: machine-pattern learning](#self-improvement-machine-pattern-learning)
 - [Known limitations & backlog](#known-limitations--backlog)
@@ -192,7 +193,7 @@ Supporting types:
 - **`AdvisorStatus`** (`lib.rs:64-77`): `enabled`, `escalated`, `escalation_model`, `reason`, `spent_today_usd`, `settings: AdvisorSettingsView`.
 - **`UiSettings`** / **`UsageSummary`** plus the `*Update` mirrors (`SettingsUpdate`, `UpdaterSettingsUpdate`, `AdvisorSettingsUpdate`) that flow back as `UiMsg` payloads. The provider settings carry `openrouter`/`anthropic` key flags and secrets, plus `kilo_cli_user_profile`/`kilo_cli_path` hint fields; the removed OpenAI-compatible provider's `base_url`/`api_key_set` remain on `UiSettings` as always-empty **deprecated wire fields** so a not-yet-updated v0.16 tray app (which requires them) can still decode the payload during an update's skew window. The API-key-based `kilocode` gateway provider (and its `kilocode_api_key`/`kilocode_key_set` wire fields) was removed in v0.19 in favour of the subscription-based `kilo_cli` path — an old config's `provider = "kilocode"` now aliases to `kilo_cli` on load rather than failing to parse.
 
-**Backward-compat invariant**: every field added after the original protocol is annotated `#[serde(default)]` (e.g. `pending_approvals`, `updater`, `advisor`, `learned_facts`, `effort`, the deterministic `ApprovalInfo` fields, all `at` timestamps). This lets an older service or UI decode a newer payload without error — a deliberate forward/backward-compatibility design across version skew.
+**Backward-compat invariant**: every field added after the original protocol is annotated `#[serde(default)]` (e.g. `pending_approvals`, `updater`, `advisor`, `learned_facts`, `effort`, the deterministic `ApprovalInfo` fields, all `at` timestamps, and the v0.24.0 on-demand-tools fields `history`/`ask`/`disk_insights`/`startup` plus their `UiMsg` variants `AskEir`/`ScanDisk`/`CleanDiskEntry`/`ScanStartup`/`SetStartupEntry`). This lets an older service or UI decode a newer payload without error — a deliberate forward/backward-compatibility design across version skew.
 
 **Secret-handling invariant**: `UiSettings` never carries secret values, only booleans (`openrouter_key_set`, `anthropic_key_set`) so the UI shows "configured" without exposing keys. **OpenRouter is now the only provider that takes a pasted API key** (the default `anthropic` provider also needs one but is otherwise out of scope here); `claude_cli` and `kilo_cli` borrow a locally logged-in subscription session instead. Inbound `SettingsUpdate` uses `Option<String>` for secrets where `None` = "unchanged" and a non-empty value replaces the stored secret; the JS sends `null` to preserve.
 
@@ -241,6 +242,7 @@ Commands (`main.rs:28-112`, plus `util.rs`):
 - `set_app_ignore { id, ignore, note }` → `SetAppIgnore`.
 - `set_advisor_settings(AdvisorSettingsUpdate)` → `SetAdvisorSettings`.
 - `get_autostart_enabled` / `set_autostart_enabled { enabled }` — UI-local commands backed by `tauri-plugin-autostart`; they never cross the service pipe.
+- `ask_eir { question }`, `scan_disk`, `clean_disk_entry { id }`, `scan_startup`, `set_startup_entry { id, enable }` (v0.24.0) — the on-demand-tools commands, each a fire-and-forget `UiMsg` (`AskEir`/`ScanDisk`/`CleanDiskEntry`/`ScanStartup`/`SetStartupEntry`). The clean/toggle commands carry only an opaque id; the service reconstructs the action from its own last-scan state.
 - `get_app_version` (About view; reads the package version from the build) and `check_updates_now` (About view's on-demand update check — installs and relaunches when a newer signed release exists; guarded by a shared `UPDATE_IN_PROGRESS` AtomicBool so it can't race the 6-hourly background checker into two concurrent installers) — UI-local.
 - `util::gbp_per_usd` (USD→GBP rate via a hidden PowerShell `Invoke-RestMethod`, with a `0.79` offline fallback) and `util::open_url` (validates `http(s)://` then `Start-Process`) — UI-local helpers, not pipe traffic (`util.rs`).
 
@@ -529,7 +531,9 @@ Per diagnosed problem (`main.rs:1208`):
 
 ### FixAction implementations
 
-19 variants (`models.rs:135`), each with a guard appropriate to its blast radius:
+22 variants (`models.rs`), each with a guard appropriate to its blast radius (the last —
+`StartupSet` — was added in v0.24.0 for the user-initiated startup advisor and is never
+AI-proposed):
 
 | Action | Adapter | Mechanism | Built-in guard |
 |---|---|---|---|
@@ -549,6 +553,8 @@ Per diagnosed problem (`main.rs:1208`):
 | `FirewallEnable{profile}` | `security.rs` | `netsh advfirewall set <profile> state on` | profile mapped via allowlist |
 | `DefenderSignatureUpdate` | `security.rs` | `Update-MpSignature` | safe by nature (refresh only) |
 | `DefenderRealtimeEnable` | `security.rs` | `Set-MpPreference -DisableRealtimeMonitoring $false` | approval-gated (could conflict with 3rd-party AV) |
+| `SfcScan` / `DismRestoreHealth` | `repair.rs` | `sfc /scannow` / `DISM …/RestoreHealth` (long timeout) | approval-gated, never whitelisted |
+| `StartupSet{name,location,hive,enable}` | `startup.rs` | writes the `StartupApproved` REG_BINARY flag (`0x02`/`0x03`) via `Registry::`-qualified `Set-ItemProperty` | **closed-set `location` → hard-coded key**, `valid_sid` on `hive`, glob-reject on name; approval-gated, not AI-proposed, reversible |
 
 Adapter-level guards are **defence in depth**: they enforce regardless of policy.toml, mostly via const allow/block lists plus single-quote escaping (`'` → `''`) before string interpolation into PowerShell.
 
@@ -663,6 +669,82 @@ Native candidate identity is anchored to the machine (`native_candidates_from`, 
 ### update_attempts history
 
 `history::record_attempts` (`history.rs:17`) inserts one row per attempt into the `update_attempts` table (migration 0007) under the run's `cycle_id`: app id/name, from/to version, method, success, category (stable snake_case token, NULL on success), exit code, signature, sha256, detail, AI cost, timestamp. `recent` feeds the UI history view (newest first); `clear` backs the UI's "Clear" on the App Updates card. This is the audit trail for unattended installs.
+
+## User-facing on-demand tools (Ask / Timeline / Disk / Startup)
+
+Added in v0.24.0 (features F10–F13), these turn the existing signal/AI/executor stack into
+things the user *opens on purpose*. All four follow the same seams: new `#[serde(default)]`
+`StatusPayload` fields + `UiMsg` variants in `eir-proto`; a thin fire-and-forget Tauri
+command in `eir-ui`; a `ui/main.js` renderer (all service strings through `esc()`/`escAttr()`);
+and — where a scan is involved — an **off-loop task** mirroring the analysis/digest hardening
+(inner `tokio::spawn` under `tokio::time::timeout`, a `*_running` flag released on success,
+panic, *and* timeout, result over a dedicated mpsc arm).
+
+**The trust invariant they all share:** the command pipe is writable by any authenticated
+local user, so a UI message never carries a `FixAction` or a raw path — it carries an
+**opaque id**. The service maps that id to an action *from its own last-scan state*
+(`st.disk_targets` / `st.startup_targets`) and routes it through the same `pol.evaluate`
+gate as an AI-proposed fix (`route_user_action`, `main.rs`). An unknown/stale id is ignored.
+
+### F11 — Health timeline (`audit::metric_history` + `ui` sparklines)
+
+`audit::metric_history(pool, cutoff_rfc3339, cap)` reads the previously UI-invisible
+`system_state_history` series (the same one the trend detector uses), oldest-first, and
+`thin_points` downsamples it to ≤ `cap` (200) points keeping the endpoints — both pure and
+unit-tested. `st.history` is refreshed once per decision tick (not per broadcast, so
+`build_status` stays a cheap clone). The dashboard renders three hand-built inline-SVG
+sparklines (CPU/mem/disk, 0–100%) with marker dots at problem/execution timestamps — no chart
+library, consistent with the no-dependency frontend.
+
+### F10 — "Ask Eir" (`ask.rs`, off-loop `complete_text`)
+
+A free-text question is answered with live context. `ask::ask_rejection_reason` (pure) gates
+each request (empty / >1000 chars / no provider / already running / <15 s since the last — a
+spend guard on the open pipe). On accept, the loop snapshots the context (metrics, failed
+services, recent problems/executions) and spawns an off-loop task that gathers the DB-derived
+trend + learned facts, builds a bounded prompt (`ask::build_prompt`, pure — instructs the model
+to answer diagnostically and **never** emit commands/actions), and calls `AiClient::complete_text`
+(main/default model, no web search — the labeller/digest entry point). The answer is
+display-only; **nothing is parsed or executed from it** — fixes still come only from the
+decision cycle. History (`st.ask_entries`) is memory-only (cap 10, newest first), lost on restart.
+
+### F12 — Disk-space insights (`disk_scan.rs`)
+
+An on-demand scan (`ScanDisk`) ranks the biggest space consumers on the system drive — "what's
+eating my SSD" (SSD era: space is the scarce resource, not fragmentation). `scan(deadline)` runs
+in `spawn_blocking` (walkdir, `dir_size` bounded by an internal deadline + a join-timeout backstop;
+reparse points are skipped to avoid cycles/double-counting). `system_specs()` is a **pure,
+unit-tested** list of targets with deterministic, hand-written categories and notes (the
+`explain.rs` philosophy — never AI-authored). **Cleanup maps only to pre-existing safe actions:**
+`DiskCleanup{temp|prefetch}` (whitelisted → auto-runs) and a stray `MEMORY.DMP` → `FileDelete`
+(approval-gated, with the existing `file_facts` risk classification). Everything else
+(`Windows.old`, browser/app caches, Recycle Bin, hiberfil/pagefile, per-user temp, largest
+`AppData\Local` folders) is **report-only** in v1. A "Clean" click sends the entry id;
+`CleanDiskEntry` maps it via `st.disk_targets` and routes through `route_user_action`. No AI call.
+
+### F13 — Startup advisor (`startup_scan.rs` + `executor/startup.rs`)
+
+`ScanStartup` enumerates what launches at logon — Run-key values (per-user + machine) and
+Startup-folder `.lnk`s — with each entry's enabled/disabled state from the Windows
+**"StartupApproved"** flag. Because LocalSystem's `HKCU` is the SYSTEM hive, per-user data is
+read from each loaded interactive-user hive under `HKEY_USERS\S-1-5-21-…` (via `ProfileList`);
+Wow6432Node Run and logon scheduled tasks are **out of scope for v1** (documented limitation).
+The enumeration is one PowerShell pass emitting compact JSON (`parse_entries` tolerates the
+empty/single-object/array shapes `ConvertTo-Json` produces); `decode_enabled` (pure) turns the
+StartupApproved first byte into "enabled" (absent = Windows default enabled; low bit set =
+disabled). One bounded `complete_text` call optionally classifies each entry (keep / optional /
+unnecessary + a one-line note) — **advisory only, triggers nothing**; parse failures leave the
+listing intact.
+
+Enable/disable is the new **`FixAction::StartupSet { name, location, hive, enable }`** — writes a
+12-byte `StartupApproved` REG_BINARY (`0x02` enabled / `0x03` disabled), the same mechanism as
+Task Manager's Startup tab, **fully reversible (nothing is deleted)**. `executor::startup`:
+`location` is a **closed set** mapped to a hard-coded key (`approved_key`, provider-qualified with
+`Registry::` so `HKEY_USERS` resolves — it has no default PSDrive); any SID is validated
+(`valid_sid`, `S-1-5-21-…`) before interpolation; the value name rejects glob metacharacters.
+`StartupSet` is **not in the AI prompt catalogue** (user-initiated only) and **not whitelisted**,
+so `pol.evaluate` lands it on `RequireApproval` automatically (the pipe is user-writable, so a
+human confirms each toggle). A `SetStartupEntry` click maps the id via `st.startup_targets`.
 
 ## Persistence, audit DB & the existing feedback loop
 
@@ -940,6 +1022,25 @@ one app already known to behave this way.
 
 ## Known limitations & backlog
 
+**Added in v0.24.0 (F10–F13 user-facing tools)** — with deliberate v1 deferrals:
+- **Disk insights**: cleanup maps only to *existing* safe actions (`DiskCleanup{temp|prefetch}`
+  auto; a stray `MEMORY.DMP` via `FileDelete`, approval). Emptying the Recycle Bin, `powercfg /h off`,
+  DISM component cleanup, and clearing an arbitrary per-user temp/cache directory each need a **new**
+  fix-action with its own blast radius — deferred until the report-only entries prove worth acting on.
+- **Startup advisor**: enumerates HKCU/HKLM Run + Startup folders only. **Wow6432Node Run** (its
+  StartupApproved state lives under `Run32`) and **logon scheduled tasks** are out of scope for v1;
+  a task toggle would reuse `TaskDisable`/`TaskEnable`. Per-user data is read only from *loaded*
+  interactive-user hives (a signed-out user's entries aren't seen).
+- **Ask Eir** history is memory-only (lost on service restart) by design — it's UI state, not audit data.
+- **On-demand actions & feedback**: `DiskCleanup("temp")` clears the *service account's* `%TEMP%`
+  (`C:\Windows\Temp`), which is what the "Windows temp" entry sizes — a per-user temp clean would need
+  a new action. A rate-limited/deduped user click now surfaces a reason in the activity feed, and the
+  clean/toggle buttons self-recover (the command is fire-and-forget); a fuller per-action ack channel
+  is still not implemented (the pipe remains fire-and-forget).
+- `system_state_history` is now *read* by the dashboard timeline (`metric_history`) as well as the
+  trend detector; it still grows unbounded (~52k rows/yr at the default cadence) — pruning is not yet
+  implemented and is low priority.
+
 **Resolved in v0.23.0** (bullets below may still describe the pre-fix state):
 - Registry `registry_reset` gate now uses component-boundary matching (a sibling key sharing a name prefix could bypass the old `starts_with` allowlist), denies persistence subkeys (Run/RunOnce/Winlogon/IFEO), and the policy layer has real registry blocklist entries. Registry resets are now **reversible**: the prior value is snapshotted and can be reverted with one click (`registry_undo` table).
 - `LogCleanup` refuses a drive-root/Windows-tree scan root and `days_old == 0`, and skips files under protected system dirs (it previously recursed past the policy-checked root).
@@ -1031,7 +1132,7 @@ Current gaps surfaced while mapping each subsystem (the self-improvement plan ab
 **Persistence, audit DB & the existing feedback loop**
 
 - No model/policy learning: feedback is purely prompt injection of a text summary. Nothing in the DB auto-tunes confidence_threshold or policy; success_rate only logs/warns.
-- system_state_history (full per-cycle metrics + SystemState JSON) is written every cycle but NEVER read — a rich time-series learning signal currently unused.
+- system_state_history (full per-cycle metrics + SystemState JSON) is written every cycle; its cpu/mem/disk columns are now read by the trend detector (v0.23.0) and the dashboard timeline (`metric_history`, v0.24.0), but the full `SystemState` JSON snapshot column is still unused for any learning.
 - decisions.execution_output column is declared but never written or read (dead column; executions live in execution_log).
 - update_attempts stores from_version, category, exit_code, signature, sha256, cost_usd but updater::history::recent surfaces only name/method/success/detail/created_at; per-attempt AI cost and failure category are persisted yet unused for any learning or aggregation.
 - improvement_score uses fixed hand-tuned weights and only 3 dimensions (cpu/mem/failed-services); it ignores disk and any other signal, and an action whose effect lands beyond one cycle is mis-scored.

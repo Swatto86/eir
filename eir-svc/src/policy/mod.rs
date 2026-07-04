@@ -189,6 +189,7 @@ fn action_type_name(action: &FixAction) -> &'static str {
         FixAction::DefenderRealtimeEnable => "defender_realtime_enable",
         FixAction::SfcScan => "sfc_scan",
         FixAction::DismRestoreHealth => "dism_restore_health",
+        FixAction::StartupSet { .. } => "startup_set",
     }
 }
 

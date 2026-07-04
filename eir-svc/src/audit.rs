@@ -74,6 +74,30 @@ pub async fn log_decision(
     Ok(id)
 }
 
+/// Insert a minimal `decisions` row for a user-initiated action (a disk cleanup or
+/// startup toggle) so its execution/approval has a real `decision_id` and it shows up
+/// in decision history. Writes no `system_state_history` row, so it never pollutes the
+/// resource timeline or the trend detector.
+pub async fn log_manual_decision(pool: &SqlitePool, summary: &str) -> Result<i64> {
+    let timestamp = Utc::now().to_rfc3339();
+    let response = serde_json::json!({
+        "analysis": summary,
+        "problems": [],
+        "needs_deeper_analysis": false,
+    })
+    .to_string();
+    let id = sqlx::query(
+        "INSERT INTO decisions (timestamp, signal_snapshot, claude_response, confidence, executed)
+         VALUES (?, '{}', ?, 1.0, 0)",
+    )
+    .bind(&timestamp)
+    .bind(&response)
+    .execute(pool)
+    .await?
+    .last_insert_rowid();
+    Ok(id)
+}
+
 pub async fn mark_decision_executed(pool: &SqlitePool, decision_id: i64) -> Result<()> {
     sqlx::query("UPDATE decisions SET executed = 1 WHERE id = ?")
         .bind(decision_id)
@@ -245,6 +269,52 @@ fn summarise_trend(samples: &[MetricSample]) -> Option<String> {
             notes.join("; ")
         ))
     }
+}
+
+/// Read the resource history since `cutoff_rfc3339` (chronological order), thinned to
+/// at most `cap` points so the dashboard-timeline payload stays small. Reads the same
+/// `system_state_history` series the trend detector uses (rows are written once per
+/// analysed cycle).
+pub async fn metric_history(
+    pool: &SqlitePool,
+    cutoff_rfc3339: &str,
+    cap: usize,
+) -> Result<Vec<eir_proto::MetricPoint>> {
+    let rows = sqlx::query(
+        "SELECT timestamp, cpu_usage, memory_usage, disk_usage
+         FROM system_state_history WHERE timestamp >= ? ORDER BY id ASC",
+    )
+    .bind(cutoff_rfc3339)
+    .fetch_all(pool)
+    .await?;
+    let points: Vec<eir_proto::MetricPoint> = rows
+        .iter()
+        .map(|r| {
+            let ts: String = r.try_get::<String, _>(0).unwrap_or_default();
+            let at = chrono::DateTime::parse_from_rfc3339(&ts)
+                .map(|d| d.timestamp())
+                .unwrap_or(0);
+            eir_proto::MetricPoint {
+                at,
+                cpu: r.try_get::<Option<f64>, _>(1).ok().flatten().unwrap_or(0.0) as f32,
+                memory: r.try_get::<Option<f64>, _>(2).ok().flatten().unwrap_or(0.0) as f32,
+                disk: r.try_get::<Option<f64>, _>(3).ok().flatten().unwrap_or(0.0) as f32,
+            }
+        })
+        .collect();
+    Ok(thin_points(points, cap))
+}
+
+/// Downsample `points` to at most `cap` by uniform stride, always keeping the first
+/// and last. Pure, unit-tested.
+fn thin_points(points: Vec<eir_proto::MetricPoint>, cap: usize) -> Vec<eir_proto::MetricPoint> {
+    let n = points.len();
+    if cap < 2 || n <= cap {
+        return points;
+    }
+    (0..cap)
+        .map(|i| points[i * (n - 1) / (cap - 1)].clone())
+        .collect()
 }
 
 /// Aggregated audit counts over a window, for the weekly health digest.
@@ -565,6 +635,34 @@ mod tests {
         vals.iter()
             .map(|&(cpu, mem, disk)| MetricSample { cpu, mem, disk })
             .collect()
+    }
+
+    fn mp(at: i64) -> eir_proto::MetricPoint {
+        eir_proto::MetricPoint {
+            at,
+            cpu: 1.0,
+            memory: 2.0,
+            disk: 3.0,
+        }
+    }
+
+    #[test]
+    fn thin_points_caps_and_keeps_endpoints() {
+        let pts: Vec<_> = (0..1000).map(mp).collect();
+        let out = thin_points(pts, 200);
+        assert_eq!(out.len(), 200);
+        assert_eq!(out.first().unwrap().at, 0);
+        assert_eq!(out.last().unwrap().at, 999);
+        // Monotonic non-decreasing timestamps preserved.
+        assert!(out.windows(2).all(|w| w[0].at <= w[1].at));
+    }
+
+    #[test]
+    fn thin_points_leaves_small_series_untouched() {
+        let pts: Vec<_> = (0..10).map(mp).collect();
+        assert_eq!(thin_points(pts.clone(), 200).len(), 10);
+        // cap < 2 is a no-op guard (never happens in practice; cap is 200).
+        assert_eq!(thin_points(pts, 1).len(), 10);
     }
 
     #[test]

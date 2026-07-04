@@ -32,7 +32,9 @@ actions = [
     # file_delete (deletes a file, e.g. an app's config), process_kill (can close a
     # foreground app/game), powershell_diagnostic, driver_disable,
     # software_uninstall (also hard-blocked), bcd_edit, sfc_scan, dism_restore_health,
-    # defender_realtime_enable (reversible but could conflict with a user's AV choice)
+    # defender_realtime_enable (reversible but could conflict with a user's AV choice),
+    # startup_set (user-initiated startup enable/disable — reversible, but the command
+    # pipe is writable by any local user, so a human confirms each one)
 ]
 
 [blocklist]
