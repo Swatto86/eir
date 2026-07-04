@@ -7,8 +7,8 @@
             "type": "command",
             "shell": "bash",
             "timeout": 15,
-            "statusMessage": "Checking for an untagged release commit",
-            "command": "sha=$(git rev-parse HEAD 2>/dev/null)||exit 0; case \"$(git log -1 --format=%s 2>/dev/null)\" in *\"[release]\"*);; *)exit 0;; esac; [ -n \"$(git tag --points-at HEAD 2>/dev/null)\" ]&&exit 0; gd=$(git rev-parse --git-dir 2>/dev/null)||exit 0; s=\"$gd/eir-release-reminded\"; [ \"$(cat \"$s\" 2>/dev/null)\" = \"$sha\" ]&&exit 0; printf %s \"$sha\">\"$s\"; printf '{\"decision\":\"block\",\"reason\":\"HEAD (%s) is a [release]-marked commit with no matching git tag. If the automated gate is green and this is the intended release, cut the rolling release: tag vX.Y.Z to match the four manifests, push the tag, then delete the previous GitHub release and tag. If CI is not green or you are intentionally deferring, say so and stop.\"}' \"$sha\"; exit 0"
+            "statusMessage": "Checking for an untagged release version",
+            "command": "root=$(git rev-parse --show-toplevel 2>/dev/null)||exit 0; cd \"$root\"||exit 0; ver=$(grep -m1 '\"version\"' eir-ui/tauri.conf.json 2>/dev/null|grep -Eo '[0-9]+\\.[0-9]+\\.[0-9]+'|head -1); [ -z \"$ver\" ]&&exit 0; git rev-parse -q --verify \"refs/tags/v$ver\">/dev/null 2>&1&&exit 0; case \"$(git log -1 --format=%s 2>/dev/null)\" in *\"[release]\"*);; *)exit 0;; esac; sha=$(git rev-parse HEAD 2>/dev/null)||exit 0; gd=$(git rev-parse --git-dir 2>/dev/null)||exit 0; s=\"$gd/eir-release-reminded\"; [ \"$(cat \"$s\" 2>/dev/null)\" = \"$sha\" ]&&exit 0; printf %s \"$sha\">\"$s\"; printf '{\"decision\":\"block\",\"reason\":\"HEAD is a [release] commit but the manifest version v%s has no matching git tag. If the automated gate is green and this is the intended release, cut the rolling release: git tag v%s to match the four manifests, push it, then delete the previous GitHub release and tag. If CI is not green or you are intentionally deferring, say so and stop.\"}' \"$ver\" \"$ver\"; exit 0"
           }
         ]
       }
