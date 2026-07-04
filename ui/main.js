@@ -537,10 +537,27 @@ const STARTUP_VERDICT = {
 const STARTUP_LOC = {
   hkcu_run: 'Registry (you)',
   hklm_run: 'Registry (all users)',
+  hklm_run32: 'Registry (32-bit, all users)',
   startup_folder: 'Startup folder',
   common_startup_folder: 'Startup folder (all users)',
-  scheduled_task: 'Scheduled task',
+  run_once: 'RunOnce (one-shot)',
+  policies_run: 'Policy Run key',
+  winlogon: 'Winlogon (system)',
+  scheduled_task: 'Scheduled task (sign-in)',
+  service: 'Auto-start service',
 };
+
+// "Hide Windows entries" filter (Microsoft-signed binaries), persisted. Default on —
+// like Autoruns' Hide Microsoft Entries, the signal is in the third-party rows.
+let startupHideMs = localStorage.getItem('eirStartupHideMs') !== '0';
+const hideMsBox = document.getElementById('startup-hide-ms');
+hideMsBox.checked = startupHideMs;
+hideMsBox.addEventListener('change', () => {
+  startupHideMs = hideMsBox.checked;
+  localStorage.setItem('eirStartupHideMs', startupHideMs ? '1' : '0');
+  lastStartupSig = null; // force the list to rebuild with the new filter
+  refresh();
+});
 
 let lastStartupSig = null;
 function renderStartup(sv, paused) {
@@ -552,25 +569,32 @@ function renderStartup(sv, paused) {
   btn.disabled = running || !!paused;
   btn.title = paused ? 'Guardian is paused — resume to scan' : '';
   btn.textContent = running ? 'Scanning…' : 'Scan now';
-  const entries = (sv && sv.entries) || [];
+  const all = (sv && sv.entries) || [];
+  const hidden = startupHideMs ? all.filter((x) => x.microsoft).length : 0;
+  const entries = hidden ? all.filter((x) => !x.microsoft) : all;
   const bits = [];
   if (sv && sv.scanned_at) bits.push('scanned ' + ago(sv.scanned_at));
   else if (running) bits.push('scanning…');
-  if (entries.length) {
-    const off = entries.filter((x) => !x.enabled).length;
-    bits.push(entries.length + (entries.length === 1 ? ' entry' : ' entries') + (off ? `, ${off} disabled` : ''));
+  if (all.length) {
+    const off = all.filter((x) => !x.enabled).length;
+    bits.push(all.length + (all.length === 1 ? ' entry' : ' entries') + (off ? `, ${off} disabled` : ''));
+    if (hidden) bits.push(`${hidden} Windows hidden`);
   }
   stateEl.textContent = bits.length ? '· ' + bits.join(' · ') : '';
   errEl.style.display = (sv && sv.error) ? 'block' : 'none';
   errEl.textContent = (sv && sv.error) || '';
-  const sig = JSON.stringify({ r: running, e: entries, at: sv && sv.scanned_at });
+  const sig = JSON.stringify({ r: running, e: entries, at: sv && sv.scanned_at, h: startupHideMs });
   if (sig === lastStartupSig) return;
   lastStartupSig = sig;
-  if (running && !entries.length) { list.innerHTML = '<div class="empty">Scanning startup entries…</div>'; return; }
-  if (!entries.length) {
+  if (running && !all.length) { list.innerHTML = '<div class="empty">Scanning startup entries…</div>'; return; }
+  if (!all.length) {
     list.innerHTML = (sv && sv.scanned_at)
       ? '<div class="empty">No startup entries found.</div>'
       : '<div class="empty">Click “Scan now” to see what starts with Windows.</div>';
+    return;
+  }
+  if (!entries.length) {
+    list.innerHTML = '<div class="empty">All entries are Windows components — untick “Hide Windows” to see them.</div>';
     return;
   }
   list.innerHTML = entries.map(startupRow).join('');
@@ -579,17 +603,22 @@ function renderStartup(sv, paused) {
 function startupRow(e) {
   const verdict = STARTUP_VERDICT[e.verdict] || '';
   const loc = STARTUP_LOC[e.location] || e.location;
-  const toggle = e.enabled
-    ? `<button class="upd-mini startup-toggle" data-id="${escAttr(e.id)}" data-enable="0" title="Stop this launching at sign-in">Disable</button>`
-    : `<button class="upd-mini startup-toggle" data-id="${escAttr(e.id)}" data-enable="1" title="Let this launch at sign-in again">Enable</button>`;
+  const signer = e.signer
+    ? `<span class="di-cat" title="Publisher, from the file's digital signature">${esc(e.signer)}</span>`
+    : '<span class="di-cat" title="No digital signature found on the launched file">unsigned</span>';
+  const control = e.report_only
+    ? '<span class="di-pill tag-warn" title="Listed for awareness — Eir has no safe switch for this location">report-only</span>'
+    : (e.enabled
+      ? `<button class="upd-mini startup-toggle" data-id="${escAttr(e.id)}" data-enable="0" title="Stop this launching at sign-in">Disable</button>`
+      : `<button class="upd-mini startup-toggle" data-id="${escAttr(e.id)}" data-enable="1" title="Let this launch at sign-in again">Enable</button>`);
   const state = e.enabled ? '' : '<span class="di-pill tag-block">Disabled</span>';
   return `<div class="di-row"${e.enabled ? '' : ' style="opacity:.55"'}>
     <div class="di-main">
       <div class="di-name" title="${escAttr(e.command)}">${esc(e.name)}</div>
       <div class="di-note">${esc(loc)}${e.note ? ' — ' + esc(e.note) : ''}</div>
     </div>
-    ${verdict}${state}
-    ${toggle}
+    ${signer}${verdict}${state}
+    ${control}
   </div>`;
 }
 

@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-04 · **Release:** v0.24.4
+**Last updated:** 2026-07-04 · **Release:** v0.25.0
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -78,7 +78,7 @@ Eir is a single Cargo workspace (`resolver = "2"`) with three crates, plus a sta
 | `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service: signal collection, AI client, policy, execution, autonomous updater, SQLite audit DB. Heavy `windows` 0.58 feature set. |
 | `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), tracing. `build-dependencies`: `tauri-build` 2. |
 
-All three crates are versioned in lockstep — currently `0.24.4` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
+All three crates are versioned in lockstep — currently `0.25.0` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
 
 The dependency graph is acyclic and points inward: `eir-proto` depends on nothing internal; `eir-svc` and `eir-ui` each depend only on `eir-proto`. The UI and service never link against each other — they are separate processes coupled solely through the `eir-proto` wire contract over `\\.\pipe\EirSvc`.
 
@@ -193,7 +193,7 @@ Supporting types:
 - **`AdvisorStatus`** (`lib.rs:64-77`): `enabled`, `escalated`, `escalation_model`, `reason`, `spent_today_usd`, `settings: AdvisorSettingsView`.
 - **`UiSettings`** / **`UsageSummary`** plus the `*Update` mirrors (`SettingsUpdate`, `UpdaterSettingsUpdate`, `AdvisorSettingsUpdate`) that flow back as `UiMsg` payloads. The provider settings carry `openrouter`/`anthropic` key flags and secrets, plus `kilo_cli_user_profile`/`kilo_cli_path` hint fields; the removed OpenAI-compatible provider's `base_url`/`api_key_set` remain on `UiSettings` as always-empty **deprecated wire fields** so a not-yet-updated v0.16 tray app (which requires them) can still decode the payload during an update's skew window. The API-key-based `kilocode` gateway provider (and its `kilocode_api_key`/`kilocode_key_set` wire fields) was removed in v0.19 in favour of the subscription-based `kilo_cli` path — an old config's `provider = "kilocode"` now aliases to `kilo_cli` on load rather than failing to parse.
 
-**Backward-compat invariant**: every field added after the original protocol is annotated `#[serde(default)]` (e.g. `pending_approvals`, `updater`, `advisor`, `learned_facts`, `effort`, the deterministic `ApprovalInfo` fields, all `at` timestamps, and the v0.24.0 on-demand-tools fields `history`/`ask`/`disk_insights`/`startup` plus their `UiMsg` variants `AskEir`/`ScanDisk`/`CleanDiskEntry`/`ScanStartup`/`SetStartupEntry`). This lets an older service or UI decode a newer payload without error — a deliberate forward/backward-compatibility design across version skew.
+**Backward-compat invariant**: every field added after the original protocol is annotated `#[serde(default)]` (e.g. `pending_approvals`, `updater`, `advisor`, `learned_facts`, `effort`, the deterministic `ApprovalInfo` fields, all `at` timestamps, and the v0.24.0 on-demand-tools fields `history`/`ask`/`disk_insights`/`startup` plus their `UiMsg` variants `AskEir`/`ScanDisk`/`CleanDiskEntry`/`ScanStartup`/`SetStartupEntry`, and the v0.25.0 `StartupEntryView` fields `signer`/`report_only`/`microsoft`). This lets an older service or UI decode a newer payload without error — a deliberate forward/backward-compatibility design across version skew.
 
 **Secret-handling invariant**: `UiSettings` never carries secret values, only booleans (`openrouter_key_set`, `anthropic_key_set`) so the UI shows "configured" without exposing keys. **OpenRouter is now the only provider that takes a pasted API key** (the default `anthropic` provider also needs one but is otherwise out of scope here); `claude_cli` and `kilo_cli` borrow a locally logged-in subscription session instead. Inbound `SettingsUpdate` uses `Option<String>` for secrets where `None` = "unchanged" and a non-empty value replaces the stored secret; the JS sends `null` to preserve.
 
@@ -726,29 +726,53 @@ unit-tested** list of targets with deterministic, hand-written categories and no
 `AppData\Local` folders) is **report-only** in v1. A "Clean" click sends the entry id;
 `CleanDiskEntry` maps it via `st.disk_targets` and routes through `route_user_action`. No AI call.
 
-### F13 — Startup advisor (`startup_scan.rs` + `executor/startup.rs`)
+### F13 — Startup advisor (`startup_scan.rs` + `executor/startup.rs` + `executor/tasks.rs`)
 
-`ScanStartup` enumerates what launches at logon — Run-key values (per-user + machine) and
-Startup-folder `.lnk`s — with each entry's enabled/disabled state from the Windows
-**"StartupApproved"** flag. Because LocalSystem's `HKCU` is the SYSTEM hive, per-user data is
-read from each loaded interactive-user hive under `HKEY_USERS\S-1-5-21-…` (via `ProfileList`);
-Wow6432Node Run and logon scheduled tasks are **out of scope for v1** (documented limitation).
-The enumeration is one PowerShell pass emitting compact JSON (`parse_entries` tolerates the
-empty/single-object/array shapes `ConvertTo-Json` produces); `decode_enabled` (pure) turns the
-StartupApproved first byte into "enabled" (absent = Windows default enabled; low bit set =
-disabled). One bounded `complete_text` call optionally classifies each entry (keep / optional /
-unnecessary + a one-line note) — **advisory only, triggers nothing**; parse failures leave the
-listing intact.
+`ScanStartup` (rebuilt **Autoruns-style in v0.25.0**) enumerates the auto-start extension
+points: Run keys (per-user + machine + the **HKLM Wow6432Node** 32-bit view), Startup-folder
+`.lnk`s (targets resolved via `WScript.Shell` — confirmed session-0-safe, it's `wshom.ocx`,
+not the Explorer-bound `Shell.Application`), one-shot **RunOnce** keys, **`Policies\Explorer\
+Run`** keys, **Winlogon Shell/Userinit anomalies** (emitted only when non-default — a clean
+machine adds no noise), **logon-triggered scheduled tasks** outside `\Microsoft\`, and
+**auto-start services** whose binary lives outside `<drive>:\Windows\` (regex anchored at the
+drive root, optionally quoted, so `C:\Users\Public\Windows\evil.exe` can't masquerade its way
+out of the listing). Because LocalSystem's `HKCU` is the SYSTEM hive, per-user data is read
+from each loaded interactive-user hive under `HKEY_USERS\S-1-5-21-…` (via `ProfileList`).
 
-Enable/disable is the new **`FixAction::StartupSet { name, location, hive, enable }`** — writes a
-12-byte `StartupApproved` REG_BINARY (`0x02` enabled / `0x03` disabled), the same mechanism as
-Task Manager's Startup tab, **fully reversible (nothing is deleted)**. `executor::startup`:
-`location` is a **closed set** mapped to a hard-coded key (`approved_key`, provider-qualified with
-`Registry::` so `HKEY_USERS` resolves — it has no default PSDrive); any SID is validated
-(`valid_sid`, `S-1-5-21-…`) before interpolation; the value name rejects glob metacharacters.
-`StartupSet` is **not in the AI prompt catalogue** (user-initiated only) and **not whitelisted**,
-so `pol.evaluate` lands it on `RequireApproval` automatically (the pipe is user-writable, so a
-human confirms each toggle). A `SetStartupEntry` click maps the id via `st.startup_targets`.
+Each entry carries a **deterministic identity**: the launched binary is resolved from its
+command line (quoted path / `.exe`-prefix / first token; **UNC targets are skipped** — probing
+them from LocalSystem risks both a ~20 s/path SMB stall inside the 120 s budget and machine-
+account auth to an attacker share) and its **Authenticode signer CN** (fallback: VersionInfo
+`CompanyName`) is read once per unique path. `microsoft` (signer/company prefix, pure fn) feeds
+the UI's default-on "Hide Windows" filter; `report_only` marks locations with no safe switch
+(RunOnce, policy keys, Winlogon, services). The enumeration is one PowerShell pass emitting
+compact JSON; `approvedByte` is coerced `[int]` in the script AND tolerated as string on the
+Rust side (`int_or_string`) — PowerShell argument binding was observed live emitting `"-1"`,
+which under a strict `i64` failed the whole array parse into a silent empty scan. PS
+note-properties are stripped by exact name (a `-like 'PS*'` prefix filter dropped/evaded
+legitimately-named `PS…` Run values). `decode_enabled` (pure) turns the StartupApproved first
+byte into "enabled"; tasks/services carry an explicit `state` instead (`entry_enabled`). One
+bounded `complete_text` call optionally explains each entry (keep / optional / unnecessary + a
+≤35-word plain-English note: what it is and **where it likely came from**, grounded on the
+signer and the location's abuse profile) — **advisory only, triggers nothing**; parse failures
+leave the deterministic listing intact. Cap 100 entries; the script emits toggleable launch
+points first so truncation sheds the report-only bulk (services) last.
+
+Enable/disable: Run-key/folder entries use **`FixAction::StartupSet { name, location, hive,
+enable }`** — a 12-byte `StartupApproved` REG_BINARY (`0x02` enabled / `0x03` disabled), the
+same mechanism as Task Manager's Startup tab, **fully reversible**; `machine_run32` maps to the
+`StartupApproved\Run32` subkey. Scheduled-task entries reuse **`TaskEnable`/`TaskDisable`**
+with the full `\Folder\Name` path — `build_task_script` splits it into `-TaskPath`/`-TaskName`
+so a same-named task in another folder can't be hit, and `run_task_cmd` **refuses wildcard
+metacharacters** (`Get-ScheduledTask` globs `*?[]`; single-quoting stops injection, not
+globbing — this guard also covers the AI path's bare names). `executor::startup`: `location`
+is a **closed set** mapped to hard-coded keys (`approved_key`, `Registry::`-qualified); SIDs
+validated (`valid_sid`) before interpolation; value names reject glob metacharacters.
+`StartupSet` is **not in the AI prompt catalogue** and **not whitelisted**, so it lands on
+`RequireApproval`; task toggles are whitelisted for the AI path, so `route_user_action` takes
+`force_approval: true` from `SetStartupEntry` to downgrade their AutoApprove to
+`RequireApproval` — every user-initiated toggle gets a human confirmation (the pipe is
+user-writable). A `SetStartupEntry` click maps the id via `st.startup_targets`.
 
 ## Persistence, audit DB & the existing feedback loop
 
@@ -1026,6 +1050,19 @@ one app already known to behave this way.
 
 ## Known limitations & backlog
 
+**Added in v0.25.0 (Autoruns-style startup advisor):** full ASEP coverage rebuild of F13 —
+see that section for design and guards. The pre-release sweep (three agents + live script
+runs on a real machine) caught and fixed: string-typed `approvedByte` from PowerShell
+argument binding silently blanking the whole scan (now coerced `[int]` + tolerant Rust
+deserializer + regression test); an unanchored `\Windows\` service filter that masquerade
+paths (`C:\Users\Public\Windows\`) could hide in; the `PS*` prefix note-property filter
+dropping (or letting malware hide behind) legitimately-named `PS…` Run values; UNC targets
+able to stall the scan and leak machine-account SMB auth (now skipped); and
+`Get-ScheduledTask` wildcard expansion letting a `*?[]`-named task fan one toggle across
+siblings (now refused, covering the AI path too). Verification level: unit/compile-verified
+plus the enumeration script live-run as the interactive user (20 entries, 6 categories);
+the LocalSystem run, task toggling, and the AI classify pass are not live-exercised.
+
 **Resolved in v0.24.4 (bug sweep):** three review agents (frontend / UI-Rust+wire /
 service-interaction) + manual verification. Fixed: (1) **startup wiped the "AI provider
 not configured" error** before the first broadcast — the settle at the end of `eir_main`
@@ -1081,10 +1118,14 @@ service's actual config-shaped strings + auth failures, after a sweep showed bar
   auto; a stray `MEMORY.DMP` via `FileDelete`, approval). Emptying the Recycle Bin, `powercfg /h off`,
   DISM component cleanup, and clearing an arbitrary per-user temp/cache directory each need a **new**
   fix-action with its own blast radius — deferred until the report-only entries prove worth acting on.
-- **Startup advisor**: enumerates HKCU/HKLM Run + Startup folders only. **Wow6432Node Run** (its
-  StartupApproved state lives under `Run32`) and **logon scheduled tasks** are out of scope for v1;
-  a task toggle would reuse `TaskDisable`/`TaskEnable`. Per-user data is read only from *loaded*
-  interactive-user hives (a signed-out user's entries aren't seen).
+- **Startup advisor**: ~~enumerates HKCU/HKLM Run + Startup folders only~~ **resolved in
+  v0.25.0** — now Autoruns-style (Wow6432Node Run via `StartupApproved\Run32`, RunOnce,
+  policy keys, Winlogon anomalies, logon scheduled tasks via `TaskDisable`/`TaskEnable`,
+  auto-start services report-only), with per-entry Authenticode signer and AI origin
+  explanations; see F13. Still true: per-user data is read only from *loaded*
+  interactive-user hives (a signed-out user's entries aren't seen), `\Microsoft\*` task
+  folders are excluded wholesale, and IFEO/AppInit/shell-extension ASEPs remain out of
+  scope.
 - **Ask Eir** history is memory-only (lost on service restart) by design — it's UI state, not audit data.
 - **On-demand actions & feedback**: `DiskCleanup("temp")` clears the *service account's* `%TEMP%`
   (`C:\Windows\Temp`), which is what the "Windows temp" entry sizes — a per-user temp clean would need

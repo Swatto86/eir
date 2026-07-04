@@ -37,6 +37,11 @@ fn has_glob_meta(s: &str) -> bool {
 pub(crate) fn approved_key(location: &str, hive: &str) -> Result<String> {
     match location {
         "machine_run" => Ok(format!(r"Registry::HKEY_LOCAL_MACHINE\{APPROVED_BASE}\Run")),
+        // The Wow6432Node Run key's approved state lives under Run32 (StartupApproved
+        // itself is not WOW64-redirected).
+        "machine_run32" => Ok(format!(
+            r"Registry::HKEY_LOCAL_MACHINE\{APPROVED_BASE}\Run32"
+        )),
         "common_startup_folder" => Ok(format!(
             r"Registry::HKEY_LOCAL_MACHINE\{APPROVED_BASE}\StartupFolder"
         )),
@@ -85,6 +90,10 @@ mod tests {
         assert_eq!(
             approved_key("machine_run", "").unwrap(),
             r"Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+        );
+        assert_eq!(
+            approved_key("machine_run32", "").unwrap(),
+            r"Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32"
         );
         assert_eq!(
             approved_key("common_startup_folder", "").unwrap(),

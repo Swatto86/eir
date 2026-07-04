@@ -278,8 +278,9 @@ pub enum FixAction {
     StartupSet {
         /// The StartupApproved value name: the Run value name, or the `.lnk` filename.
         name: String,
-        /// Closed-set selector for the approved key: `machine_run` | `user_run` |
-        /// `user_startup_folder` | `common_startup_folder`. Never a raw registry path.
+        /// Closed-set selector for the approved key: `machine_run` | `machine_run32` |
+        /// `user_run` | `user_startup_folder` | `common_startup_folder`. Never a raw
+        /// registry path.
         location: String,
         /// User SID for the `user_*` locations (validated in the adapter), empty otherwise.
         hive: String,

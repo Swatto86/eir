@@ -185,6 +185,8 @@
     .di-size { font-variant-numeric: tabular-nums; color: var(--muted); white-space: nowrap; }
     .di-cat { font-size: 10.5px; padding: 1px 7px; border-radius: 5px; background: var(--surface-2); border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
     .di-pill { font-size: 10.5px; padding: 1px 7px; border-radius: 20px; font-weight: 600; white-space: nowrap; }
+    .hdr-toggle { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); text-transform: none; letter-spacing: 0; font-weight: 400; cursor: pointer; white-space: nowrap; }
+    .hdr-toggle input { accent-color: var(--accent); cursor: pointer; }
 
     .dash-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
     .ai-now-text { padding: 13px 15px; font-size: 13px; line-height: 1.65; white-space: pre-wrap; color: var(--text); user-select: text; }
@@ -481,12 +483,13 @@
         <div class="card-header">
           What launches at sign-in <span id="startup-state" style="text-transform:none;letter-spacing:0"></span>
           <span class="hspacer"></span>
+          <label class="hdr-toggle" title="Hide entries whose file is signed by Microsoft"><input type="checkbox" id="startup-hide-ms" checked> Hide Windows</label>
           <button class="btn small primary" id="startup-scan">Scan now</button>
         </div>
         <div id="startup-error" class="upd-note" style="display:none;color:var(--red)"></div>
         <div id="startup-list"><div class="empty">Click “Scan now” to see what starts with Windows.</div></div>
       </div>
-      <div class="set-note" style="padding:0 2px">Disabling an entry is reversible — it's the same switch as Task Manager's Startup tab; nothing is deleted. The keep/optional/unnecessary hints are AI suggestions, not automatic actions.</div>
+      <div class="set-note" style="padding:0 2px">Covers Run keys (including 32-bit), Startup folders, RunOnce and policy keys, Winlogon anomalies, logon scheduled tasks, and auto-start services. Publisher names come from each file's digital signature; the keep/optional/unnecessary hints and descriptions are AI suggestions, not automatic actions. Disabling is reversible (Task-Manager-style flag or task disable) and asks for confirmation in Approvals; locations with no safe switch are shown report-only.</div>
     </section>
 
     <!-- ── Learned ── -->

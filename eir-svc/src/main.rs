@@ -662,6 +662,11 @@ fn spawn_executor(
 /// for approval. The UI only ever sends an opaque id; the action is reconstructed
 /// server-side, so this never widens the pipe's trust model. Does NOT broadcast — the
 /// caller broadcasts once after.
+///
+/// `force_approval` downgrades a whitelist AutoApprove to RequireApproval — used for
+/// startup toggles so that a task enable/disable (whitelisted for the AI path) gets the
+/// same human confirmation as a `StartupSet`, since the pipe is writable by any local
+/// user.
 #[allow(clippy::too_many_arguments)]
 async fn route_user_action(
     st: &mut SvcState,
@@ -671,6 +676,7 @@ async fn route_user_action(
     action: FixAction,
     diagnosis: &str,
     reason_label: &str,
+    force_approval: bool,
 ) {
     let label = format!("{action:?}");
     if st.in_flight.contains(&label) || st.pending.iter().any(|p| p.info.action == label) {
@@ -687,7 +693,13 @@ async fn route_user_action(
     // A zeroed baseline: a user-requested action isn't scored for effectiveness the way
     // an autonomous fix is, so an accurate "before" snapshot isn't needed here.
     let baseline = SystemState::default();
-    match pol.evaluate(&action, 1.0) {
+    let verdict = match pol.evaluate(&action, 1.0) {
+        policy::Verdict::AutoApprove if force_approval => {
+            policy::Verdict::RequireApproval("User-initiated change — confirm to apply".to_string())
+        }
+        v => v,
+    };
+    match verdict {
         policy::Verdict::Block(reason) => {
             info!(reason = %reason, action = %label, "User action blocked by policy");
             push_problem(st, diagnosis, 1.0, &label, true, false, Some(reason));
@@ -2090,6 +2102,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                         action,
                                         "User-requested disk cleanup",
                                         "user-requested cleanup",
+                                        false,
                                     )
                                     .await;
                                     pipe.broadcast_status(build_status(&st));
@@ -2143,20 +2156,38 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         }
                         UiMsg::SetStartupEntry { id, enable } => {
                             // Reconstruct the toggle from THIS service's own last scan
-                            // (unknown/stale id → ignore), then route the StartupSet through
-                            // the normal policy gate (approval-gated — reversible, but the
-                            // pipe is writable by any local user, so a human confirms).
-                            let target = st
-                                .startup_targets
-                                .get(&id)
-                                .map(|t| (t.name.clone(), t.location.clone(), t.hive.clone()));
+                            // (unknown/stale id → ignore), then route it through the normal
+                            // policy gate with approval FORCED — StartupSet is approval-gated
+                            // by policy anyway, and a task enable/disable (whitelisted for
+                            // the AI path) must get the same human confirmation here, since
+                            // the pipe is writable by any local user.
+                            let target = st.startup_targets.get(&id).map(|t| {
+                                (
+                                    t.name.clone(),
+                                    t.location.clone(),
+                                    t.hive.clone(),
+                                    t.task_path.clone(),
+                                )
+                            });
                             match target {
-                                Some((name, location, hive)) => {
-                                    let action = FixAction::StartupSet {
-                                        name,
-                                        location,
-                                        hive,
-                                        enable,
+                                Some((name, location, hive, task_path)) => {
+                                    let action = if location == "scheduled_task" {
+                                        if enable {
+                                            FixAction::TaskEnable {
+                                                task_name: task_path,
+                                            }
+                                        } else {
+                                            FixAction::TaskDisable {
+                                                task_name: task_path,
+                                            }
+                                        }
+                                    } else {
+                                        FixAction::StartupSet {
+                                            name,
+                                            location,
+                                            hive,
+                                            enable,
+                                        }
                                     };
                                     let diag = if enable {
                                         "User re-enabled a startup entry"
@@ -2171,6 +2202,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                         action,
                                         diag,
                                         "user startup change",
+                                        true,
                                     )
                                     .await;
                                     pipe.broadcast_status(build_status(&st));

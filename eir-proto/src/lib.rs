@@ -132,14 +132,30 @@ pub struct StartupEntryView {
     pub id: String,
     pub name: String,
     pub command: String,
-    /// Where it launches from: "hkcu_run" | "hklm_run" | "startup_folder" |
-    /// "common_startup_folder" | "scheduled_task". A selector, not a path.
+    /// Where it launches from: "hkcu_run" | "hklm_run" | "hklm_run32" |
+    /// "startup_folder" | "common_startup_folder" | "run_once" | "policies_run" |
+    /// "winlogon" | "scheduled_task" | "service". A selector, not a path.
     pub location: String,
     pub enabled: bool,
     /// AI classification: "keep" | "optional" | "unnecessary" (empty if unconfigured).
     pub verdict: String,
-    /// One-line plain-English "what this is" (empty if unconfigured).
+    /// Plain-English "what this is and where it likely came from" (empty if
+    /// unconfigured).
     pub note: String,
+    /// Authenticode signer CN of the launched binary, falling back to the file's
+    /// CompanyName; empty when unsigned/unresolvable. Deterministic, never
+    /// AI-authored. `#[serde(default)]` for wire-compat.
+    #[serde(default)]
+    pub signer: String,
+    /// True for locations Eir lists for awareness but offers no toggle for
+    /// (RunOnce, policy keys, Winlogon, services). `#[serde(default)]` for
+    /// wire-compat (older services' entries were all toggleable and default false).
+    #[serde(default)]
+    pub report_only: bool,
+    /// True when the binary is signed by Microsoft — the UI's "Hide Windows
+    /// entries" filter keys off this. Deterministic. `#[serde(default)]`.
+    #[serde(default)]
+    pub microsoft: bool,
 }
 
 /// The latest weekly health digest, rendered on the dashboard.
