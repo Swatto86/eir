@@ -197,6 +197,8 @@ struct SvcState {
     disk: f32,
     failed_services: Vec<String>,
     last_analysis: String,
+    /// Unix seconds the last completed AI analysis finished (0 = none yet this run).
+    last_analysis_unix: i64,
     recent_problems: VecDeque<ProblemSummary>,
     recent_executions: VecDeque<ExecutionSummary>,
     /// Actions awaiting the user's decision. Mirrored to the audit DB so the queue
@@ -269,6 +271,7 @@ impl Default for SvcState {
             disk: 0.0,
             failed_services: vec![],
             last_analysis: String::new(),
+            last_analysis_unix: 0,
             recent_problems: VecDeque::new(),
             recent_executions: VecDeque::new(),
             pending: Vec::new(),
@@ -338,6 +341,7 @@ fn build_status(st: &SvcState) -> StatusPayload {
         disk: st.disk,
         failed_services: st.failed_services.clone(),
         last_analysis: st.last_analysis.clone(),
+        last_analysis_at: st.last_analysis_unix,
         recent_problems: st.recent_problems.iter().cloned().collect(),
         recent_executions: st.recent_executions.iter().cloned().collect(),
         pending_approvals: st.pending.iter().map(|p| p.info.clone()).collect(),
@@ -1358,6 +1362,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         last_analysis_at = Some(std::time::Instant::now());
 
                         st.last_analysis = claude_decision.analysis.clone();
+                        st.last_analysis_unix = chrono::Utc::now().timestamp();
                         st.error = None;
 
                         // If the UTC day rolled over WHILE this analysis was in flight, the

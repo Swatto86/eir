@@ -11,6 +11,15 @@ window.__TAURI__.window.getCurrentWindow().onCloseRequested((e) => {
   window.__TAURI__.window.getCurrentWindow().hide();
 });
 
+// Escape hides the window (tray-app convention). Inside a field it just blurs,
+// so a stray Escape while typing doesn't yank the window away.
+window.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const el = document.activeElement;
+  if (el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) { el.blur(); return; }
+  window.__TAURI__.window.getCurrentWindow().hide();
+});
+
 // ── Theme (dark / light / system, persisted) ─────────────────────────────────
 
 const THEMES = ['system', 'light', 'dark'];
@@ -60,7 +69,9 @@ function showView(name) {
   document.querySelectorAll('.nav-btn').forEach((b) =>
     b.classList.toggle('active', b.dataset.view === name));
   document.getElementById('view-title').textContent = VIEW_TITLES[name] || name;
-  if (name === 'settings') fillSettings();
+  // Re-entering Settings only refills from the service when there are no unsaved
+  // edits — otherwise a Dashboard detour would silently wipe in-progress changes.
+  if (name === 'settings' && !settingsDirty) fillSettings();
 }
 
 document.getElementById('nav').addEventListener('click', (e) => {
@@ -68,6 +79,7 @@ document.getElementById('nav').addEventListener('click', (e) => {
   if (btn) showView(btn.dataset.view);
 });
 document.getElementById('dash-approvals-go').addEventListener('click', () => showView('approvals'));
+document.getElementById('hero-fix').addEventListener('click', () => showView('settings'));
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
@@ -225,6 +237,10 @@ async function refreshInner() {
   const errDisp = status.error ? 'block' : 'none';
   if (err.style.display !== errDisp) err.style.display = errDisp;
   setText(err, status.error || '');
+  // A configuration-shaped error gets a one-click route to where it's fixed.
+  const fixBtn = document.getElementById('hero-fix');
+  const cfgErr = !!status.error && /provider|api key|key|model|config|settings/i.test(status.error);
+  fixBtn.style.display = cfgErr ? 'inline-block' : 'none';
 
   const ml = document.getElementById('model-label');
   if (status.settings) {
@@ -240,6 +256,8 @@ async function refreshInner() {
   }
 
   document.getElementById('pause-label').textContent = status.paused ? 'Resume' : 'Pause';
+  document.getElementById('pause-ico').textContent = status.paused ? '▶' : '⏸';
+  document.getElementById('pause-btn').classList.toggle('paused', !!status.paused);
 
   document.getElementById('cpu').textContent    = pct(status.cpu);
   document.getElementById('memory').textContent = pct(status.memory);
@@ -282,8 +300,12 @@ async function refreshInner() {
   // Re-tick every relative age in one pass. Ages are baked into signature-guarded
   // lists at build time, so without this an approval that has sat for hours keeps
   // saying "just now" until its content changes. ago(0) → '' keeps zero-ts blank.
+  // Hovering shows the absolute local time (set once — the ts never changes for
+  // a given element; a rebuilt list gets fresh elements).
   document.querySelectorAll('[data-ts]').forEach((el) => {
-    setText(el, ago(+el.dataset.ts));
+    const ts = +el.dataset.ts;
+    setText(el, ago(ts));
+    if (ts && !el.title) el.title = new Date(ts * 1000).toLocaleString();
   });
 
   if (status.error && /settings|not applied/i.test(status.error)) {
@@ -420,8 +442,9 @@ async function submitAsk() {
 
 document.getElementById('ask-send').addEventListener('click', submitAsk);
 document.getElementById('ask-input').addEventListener('keydown', (e) => {
-  // Ctrl/Cmd+Enter submits (plain Enter makes newlines in the textarea).
-  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submitAsk(); }
+  // Enter sends (chat convention); Shift+Enter inserts a newline. isComposing
+  // guards the Enter that confirms an IME composition.
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); submitAsk(); }
 });
 
 // ── Disk space ───────────────────────────────────────────────────────────────
@@ -446,10 +469,15 @@ function renderDisk(di, paused) {
   btn.disabled = running || !!paused;
   btn.title = paused ? 'Guardian is paused — resume to scan' : '';
   btn.textContent = running ? 'Scanning…' : 'Scan now';
-  stateEl.textContent = (di && di.scanned_at) ? '· scanned ' + ago(di.scanned_at) : (running ? '· scanning…' : '');
+  const entries = (di && di.entries) || [];
+  const bits = [];
+  if (di && di.scanned_at) bits.push('scanned ' + ago(di.scanned_at));
+  else if (running) bits.push('scanning…');
+  const cleanable = entries.filter((x) => x.cleanable).reduce((a, x) => a + (x.size_bytes || 0), 0);
+  if (cleanable > 0) bits.push(humanBytes(cleanable) + ' cleanable');
+  stateEl.textContent = bits.length ? '· ' + bits.join(' · ') : '';
   errEl.style.display = (di && di.error) ? 'block' : 'none';
   errEl.textContent = (di && di.error) || '';
-  const entries = (di && di.entries) || [];
   const sig = JSON.stringify({ r: running, e: entries, at: di && di.scanned_at });
   if (sig === lastDiskSig) return;
   lastDiskSig = sig;
@@ -519,10 +547,17 @@ function renderStartup(sv, paused) {
   btn.disabled = running || !!paused;
   btn.title = paused ? 'Guardian is paused — resume to scan' : '';
   btn.textContent = running ? 'Scanning…' : 'Scan now';
-  stateEl.textContent = (sv && sv.scanned_at) ? '· scanned ' + ago(sv.scanned_at) : (running ? '· scanning…' : '');
+  const entries = (sv && sv.entries) || [];
+  const bits = [];
+  if (sv && sv.scanned_at) bits.push('scanned ' + ago(sv.scanned_at));
+  else if (running) bits.push('scanning…');
+  if (entries.length) {
+    const off = entries.filter((x) => !x.enabled).length;
+    bits.push(entries.length + (entries.length === 1 ? ' entry' : ' entries') + (off ? `, ${off} disabled` : ''));
+  }
+  stateEl.textContent = bits.length ? '· ' + bits.join(' · ') : '';
   errEl.style.display = (sv && sv.error) ? 'block' : 'none';
   errEl.textContent = (sv && sv.error) || '';
-  const entries = (sv && sv.entries) || [];
   const sig = JSON.stringify({ r: running, e: entries, at: sv && sv.scanned_at });
   if (sig === lastStartupSig) return;
   lastStartupSig = sig;
@@ -599,7 +634,7 @@ function approvalCard(info) {
       </div>
       <div class="approval-grid">${grid}</div>
       <div class="approval-actions">
-        <button class="btn-approve" data-id="${info.id}">Approve &amp; run</button>
+        <button class="btn-approve" data-id="${info.id}"${info.reversible ? '' : ' data-irreversible="1"'}>Approve &amp; run</button>
         <button class="btn-reject"  data-id="${info.id}">Reject</button>
       </div>
     </div>`;
@@ -646,7 +681,20 @@ document.getElementById('approvals').addEventListener('click', (e) => {
   if (!btn) return;
   const id = parseInt(btn.dataset.id, 10);
   if (!Number.isFinite(id)) return;
-  decide(id, btn.classList.contains('btn-approve'), btn.closest('.approval-card'));
+  const approve = btn.classList.contains('btn-approve');
+  // Approving an IRREVERSIBLE action takes two clicks: the first arms the button
+  // for 6s, the second confirms. Reversible approvals and Reject stay one-click.
+  if (approve && btn.dataset.irreversible && !btn.classList.contains('confirm')) {
+    btn.classList.add('confirm');
+    btn.textContent = 'Click again to confirm — cannot be undone';
+    btn._confirmTimer = setTimeout(() => {
+      btn.classList.remove('confirm');
+      btn.textContent = 'Approve & run';
+    }, 6000);
+    return;
+  }
+  clearTimeout(btn._confirmTimer);
+  decide(id, approve, btn.closest('.approval-card'));
 });
 
 // ── AI-now + activity feed ────────────────────────────────────────────────────
@@ -655,6 +703,8 @@ function renderAiNow(status) {
   setText(document.getElementById('ai-now-text'),
     status.last_analysis || 'Waiting for the first analysis cycle…');
   const bits = [];
+  // When the last analysis ran — the "is it actually alive?" trust signal.
+  if (status.last_analysis_at) bits.push(`<span>analysed ${ago(status.last_analysis_at)}</span>`);
   const a = status.advisor;
   if (a && a.escalated) {
     bits.push(`<span class="tag tag-auto">⤴ escalated${a.escalation_model ? ' → ' + esc(a.escalation_model) : ''}</span>`);
@@ -974,6 +1024,19 @@ document.getElementById('learned-list').addEventListener('click', (e) => {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
+// True while the Settings form holds edits not yet saved. Set by any input in the
+// view; cleared when the form is (re)filled from the service or a save succeeds.
+// While dirty, re-entering the view keeps the edits instead of refilling.
+let settingsDirty = false;
+document.getElementById('view-settings').addEventListener('input', () => { settingsDirty = true; });
+
+// Read an integer input clamped to [min, max] (blank/garbage → def) so a typed
+// out-of-range value saves as what the service will actually honour.
+function numVal(id, def, min, max) {
+  const v = parseInt(document.getElementById(id).value, 10);
+  return Math.min(max, Math.max(min, Number.isFinite(v) ? v : def));
+}
+
 const PROVIDER_HINTS = {
   openrouter: 'One key, hundreds of models — free ones included. Blank model auto-routes to a free model. Key: openrouter.ai/keys',
   claude_cli: 'Uses your Claude subscription via the logged-in claude CLI — no API key. Auto-detects your profile and claude.exe. Blank model = the CLI default; aliases like haiku/sonnet/opus work.',
@@ -1020,6 +1083,7 @@ async function saveAutostartSetting() {
   try {
     box.checked = await invoke('set_autostart_enabled', { enabled });
     st.textContent = 'Saved — applies immediately.';
+    settingsDirty = false;
   } catch (e) {
     st.textContent = 'Failed: ' + e;
   } finally {
@@ -1052,6 +1116,7 @@ function fillSettings() {
     s.kilo_cli_path_set ? '•••••• set — blank keeps it' : 'kilo  (blank = on PATH)';
   fillUpdaterSettings(lastStatus.updater && lastStatus.updater.settings);
   fillAdvisorSettings(lastStatus.advisor && lastStatus.advisor.settings);
+  settingsDirty = false;
 }
 
 async function saveSettings() {
@@ -1069,10 +1134,10 @@ async function saveSettings() {
     anthropic_api_key: anKey || null,
     kilo_cli_user_profile: kiloProfile || null,
     kilo_cli_path: kiloPath || null,
-    confidence_threshold: (parseInt(document.getElementById('set-conf').value, 10) || 80) / 100,
-    decision_interval_secs: parseInt(document.getElementById('set-decint').value, 10) || 600,
-    event_log_poll_interval_secs: parseInt(document.getElementById('set-elpoll').value, 10) || 30,
-    wmi_poll_interval_secs: parseInt(document.getElementById('set-wmipoll').value, 10) || 300,
+    confidence_threshold: numVal('set-conf', 80, 50, 95) / 100,
+    decision_interval_secs: numVal('set-decint', 600, 10, Infinity),
+    event_log_poll_interval_secs: numVal('set-elpoll', 30, 5, Infinity),
+    wmi_poll_interval_secs: numVal('set-wmipoll', 300, 30, Infinity),
     event_log_channels: splitList(document.getElementById('set-channels').value),
     log_directories: splitList(document.getElementById('set-dirs').value),
   };
@@ -1105,8 +1170,9 @@ async function saveSettings() {
     st.textContent = 'Saved. Service restarting — it will reconnect shortly.';
     document.getElementById('set-or-key').value = '';
     document.getElementById('set-an-key').value = '';
-  document.getElementById('set-kilo-profile').value = '';
-  document.getElementById('set-kilo-path').value = '';
+    document.getElementById('set-kilo-profile').value = '';
+    document.getElementById('set-kilo-path').value = '';
+    settingsDirty = false;
   } catch (e) {
     st.textContent = 'Failed: ' + e;
   }
@@ -1138,14 +1204,15 @@ async function saveAdvisorSettings() {
     enabled: document.getElementById('set-adv-enabled').checked,
     escalation_model: document.getElementById('set-adv-model').value.trim(),
     escalation_effort: document.getElementById('set-adv-effort').value,
-    low_confidence_threshold: (Number.isFinite(confPct) ? confPct : 60) / 100,
-    budget_usd_per_day: Number.isFinite(budgetVal) ? budgetVal : 0.5,
+    low_confidence_threshold: Math.min(95, Math.max(0, Number.isFinite(confPct) ? confPct : 60)) / 100,
+    budget_usd_per_day: Math.max(0, Number.isFinite(budgetVal) ? budgetVal : 0.5),
   };
   const st = document.getElementById('set-adv-status');
   st.textContent = 'Saving…';
   try {
     await invoke('set_advisor_settings', { settings });
     st.textContent = 'Saved — applies immediately.';
+    settingsDirty = false;
   } catch (e) {
     st.textContent = 'Failed: ' + e;
   }
@@ -1170,8 +1237,7 @@ async function saveUpdaterSettings() {
   const methods = METHOD_BOXES.filter(([id]) => document.getElementById(id).checked).map(([, n]) => n);
   const settings = {
     enabled: document.getElementById('set-upd-enabled').checked,
-    schedule_interval_secs:
-      Math.max(1, parseInt(document.getElementById('set-upd-interval').value, 10) || 24) * 3600,
+    schedule_interval_secs: numVal('set-upd-interval', 24, 1, Infinity) * 3600,
     methods,
     native_enabled: document.getElementById('set-native-enabled').checked,
     native_signature_policy: document.getElementById('set-sigpol').value,
@@ -1181,6 +1247,7 @@ async function saveUpdaterSettings() {
   try {
     await invoke('set_updater_settings', { settings });
     st.textContent = 'Saved — applies immediately.';
+    settingsDirty = false;
   } catch (e) {
     st.textContent = 'Failed: ' + e;
   }

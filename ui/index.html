@@ -91,6 +91,12 @@
       border-radius: 8px; cursor: pointer; font-size: 12.5px; font-family: inherit;
     }
     .foot-btn:hover { background: var(--surface-2); }
+    .foot-btn.paused { border-color: var(--yellow); color: var(--yellow); }
+
+    /* Keyboard a11y: visible focus ring for tab navigation (mouse clicks unaffected). */
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 1px;
+    }
 
     /* ── Main column ── */
     main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
@@ -224,6 +230,7 @@
     .approval-actions { display: flex; gap: 8px; }
     .btn-approve { padding: 6px 20px; background: var(--green); border: none; border-radius: 8px; color: #fff; cursor: pointer; font-size: 13px; font-family: inherit; }
     .btn-approve:hover { filter: brightness(1.1); }
+    .btn-approve.confirm { background: var(--orange); }
     .btn-approve:disabled, .btn-reject:disabled { opacity: .5; cursor: default; }
     .btn-reject  { padding: 6px 20px; background: transparent; border: 1px solid var(--red); border-radius: 8px; color: var(--red); cursor: pointer; font-size: 13px; font-family: inherit; }
     .btn-reject:hover { background: color-mix(in srgb, var(--red) 12%, transparent); }
@@ -322,7 +329,7 @@
     </nav>
     <div class="side-foot">
       <button class="foot-btn" id="theme-btn" title="Cycle theme (system / light / dark)"><span id="theme-ico">◐</span><span id="theme-label">System</span></button>
-      <button class="foot-btn" id="pause-btn"><span>⏸</span><span id="pause-label">Pause</span></button>
+      <button class="foot-btn" id="pause-btn"><span id="pause-ico">⏸</span><span id="pause-label">Pause</span></button>
     </div>
   </aside>
 
@@ -342,6 +349,7 @@
           <div class="hero-status" id="hero-status">Initializing…</div>
           <div class="hero-sub">System guardian — watching Windows and reacting to errors as they happen.</div>
           <div class="hero-err" id="hero-err" style="display:none"></div>
+          <button class="btn small" id="hero-fix" style="display:none;margin-top:8px">Open Settings</button>
         </div>
       </div>
 
@@ -409,7 +417,7 @@
         <div class="card-header">Ask about your PC</div>
         <div class="ask-compose">
           <textarea id="ask-input" maxlength="1000" rows="3"
-            placeholder="e.g. Why is my PC slow right now?  Is my disk OK?  What was that error about?  (Ctrl+Enter to send)"></textarea>
+            placeholder="e.g. Why is my PC slow right now?  Is my disk OK?  What was that error about?  (Enter to send · Shift+Enter for a new line)"></textarea>
           <div class="ask-actions">
             <span class="set-status" id="ask-status"></span>
             <div style="flex:1"></div>

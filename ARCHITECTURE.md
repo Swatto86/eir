@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-04 · **Release:** v0.24.2
+**Last updated:** 2026-07-04 · **Release:** v0.24.3
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -78,7 +78,7 @@ Eir is a single Cargo workspace (`resolver = "2"`) with three crates, plus a sta
 | `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service: signal collection, AI client, policy, execution, autonomous updater, SQLite audit DB. Heavy `windows` 0.58 feature set. |
 | `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), tracing. `build-dependencies`: `tauri-build` 2. |
 
-All three crates are versioned in lockstep — currently `0.24.2` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
+All three crates are versioned in lockstep — currently `0.24.3` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
 
 The dependency graph is acyclic and points inward: `eir-proto` depends on nothing internal; `eir-svc` and `eir-ui` each depend only on `eir-proto`. The UI and service never link against each other — they are separate processes coupled solely through the `eir-proto` wire contract over `\\.\pipe\EirSvc`.
 
@@ -182,7 +182,7 @@ Two tagged enums carry everything (`#[serde(tag = "type", rename_all = "snake_ca
 - **`ServiceMsg`** (service → UI), one variant: `Status(StatusPayload)` (`lib.rs:287-292`).
 - **`UiMsg`** (UI → service) (`lib.rs:294-329`): `Approve { id: u64, approved: bool }`, `TogglePause`, `UpdateSettings(Box<SettingsUpdate>)`, `ClearProblems`, `ClearExecutions`, `RunUpdatesNow`, `ClearUpdateHistory`, `SetLearnedFact { id: i64, op: String }`, `UpdateUpdaterSettings(Box<UpdaterSettingsUpdate>)`, `SetAppIgnore { id: String, ignore: bool, note: String }`, `SetAdvisorSettings(Box<AdvisorSettingsUpdate>)`. (`Box` keeps the enum small since the settings variants are large.)
 
-**`StatusPayload`** (`lib.rs:5-38`) is the single snapshot the UI renders, carrying: `status` (string state machine value), `paused`, `cpu`/`memory`/`disk` (`f32` percentages), `failed_services`, `last_analysis`, `recent_problems: Vec<ProblemSummary>`, `recent_executions: Vec<ExecutionSummary>`, `pending_approvals: Vec<ApprovalInfo>`, `error: Option<String>`, `usage: Option<UsageSummary>`, `settings: Option<UiSettings>`, `updater: Option<UpdaterStatus>`, `advisor: Option<AdvisorStatus>`, and `learned_facts: Vec<LearnedFactView>`. Derives `Default` so the channel can be seeded empty.
+**`StatusPayload`** (`lib.rs:5-38`) is the single snapshot the UI renders, carrying: `status` (string state machine value), `paused`, `cpu`/`memory`/`disk` (`f32` percentages), `failed_services`, `last_analysis`, `last_analysis_at` (unix secs of the last completed analysis, 0 = none this run; v0.24.3, `#[serde(default)]`), `recent_problems: Vec<ProblemSummary>`, `recent_executions: Vec<ExecutionSummary>`, `pending_approvals: Vec<ApprovalInfo>`, `error: Option<String>`, `usage: Option<UsageSummary>`, `settings: Option<UiSettings>`, `updater: Option<UpdaterStatus>`, `advisor: Option<AdvisorStatus>`, and `learned_facts: Vec<LearnedFactView>`. Derives `Default` so the channel can be seeded empty.
 
 Supporting types:
 - **`ApprovalInfo`** (`lib.rs:226-259`): `id: u64`, `diagnosis`, `root_cause`, `confidence: f32`, `action` (debug render of the fix), `reason` (policy verdict), `side_effects`, `undo_instructions`, plus the trust-critical deterministic fields `action_summary`, `target`, `target_details`, `reversible: bool`, `created_at: i64`. The doc comment notes `action_summary` is "derived from the action type, not the AI, so it can be trusted."
@@ -272,11 +272,12 @@ The frontend was fully rebuilt in v0.17 (still hand-written vanilla HTML/CSS/JS,
 - **Disconnected state**: `refreshInner` toggles a `svc-down` body class for the `ServiceDisconnected`/`Connecting`/`Restarting` states; CSS then greys and blocks pointer events on action buttons (approve/reject, scans, update-now, pause, per-row toggles) and dims the stale metric/history cards, so a click can't be silently dropped. The Rust `ensure_connected` gate is the authoritative backstop (v0.24.1).
 - **XSS hygiene**: all service-supplied strings go through `esc()` / `escAttr()` before insertion into `innerHTML`; applied consistently across approvals, activity, updater rows, and service chips.
 - **Activity feed** merges `recent_problems` + `recent_executions` into one list sorted by `at` descending, with emoji/tag per kind (`activityItems`).
-- **Settings** is a full view (no modal) populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. The provider select offers OpenRouter / Claude CLI (subscription) / Claude (Anthropic API key) / Kilo CLI (subscription) with per-provider hints and key fields; JS pre-validates the provider's key+model requirements before sending (the service's `AiClient::new` remains the authoritative validator). Independent save buttons map to `set_autostart_enabled` (applies immediately), `update_settings` (warns it restarts the service ~15s), `set_updater_settings`, and `set_advisor_settings` (both apply live).
+- **v0.24.3 UX pass**: Escape hides the window (blurs first when a field has focus); Ask Eir sends on plain Enter (Shift+Enter = newline, IME composition guarded); every `data-ts` relative age gets an absolute local-time tooltip (set once per element); the sidebar Pause button turns amber with a ▶ icon while paused; a config-shaped `status.error` (provider/key/model/config) surfaces an "Open Settings" quick link in the hero; the Disk/Startup card headers summarise the last scan ("2.1 GB cleanable" / "12 entries, 3 disabled"); the "What the agent is thinking" meta line shows "analysed Xm ago" from the new `last_analysis_at` wire field; and numeric settings inputs are clamped to their declared min/max on save (`numVal`).
+- **Settings** is a full view (no modal) populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. Since v0.24.3 the view tracks a `settingsDirty` flag (any `input` event): re-entering Settings only refills from the service when the form is clean, so a Dashboard detour no longer wipes unsaved edits; the flag clears on fill and on each successful save. The provider select offers OpenRouter / Claude CLI (subscription) / Claude (Anthropic API key) / Kilo CLI (subscription) with per-provider hints and key fields; JS pre-validates the provider's key+model requirements before sending (the service's `AiClient::new` remains the authoritative validator). Independent save buttons map to `set_autostart_enabled` (applies immediately), `update_settings` (warns it restarts the service ~15s), `set_updater_settings`, and `set_advisor_settings` (both apply live).
 
 ### Clear / Approve / Ignore / Update-now flows
 
-- **Approve / Reject**: a delegated click handler on `#approvals` parses the card's `data-id`, **disables both buttons** to prevent double-submit, and calls `decide_approval(id, approved)`; on error it re-enables them (`main.js:271-280, 456-462`). The command → `UiMsg::Approve` → pipe → decision loop, which resolves it against the persistent queue. The card disappears on the next poll once the service drops it from `pending_approvals`.
+- **Approve / Reject**: a delegated click handler on `#approvals` parses the card's `data-id`, **disables both buttons** to prevent double-submit, and calls `decide_approval(id, approved)`; on error it re-enables them (`main.js:271-280, 456-462`). Since v0.24.3, approving an **irreversible** action (`!info.reversible`, marked `data-irreversible` on the button) takes two clicks: the first arms the button (orange, "Click again to confirm — cannot be undone") for 6 s, the second submits; the armed state survives the 2 s poll because the approvals signature guard skips rebuilds, and a list rebuild simply disarms it. The command → `UiMsg::Approve` → pipe → decision loop, which resolves it against the persistent queue. The card disappears on the next poll once the service drops it from `pending_approvals`.
 - **Pause**: header button (and tray menu) → `toggle_pause` → `UiMsg::TogglePause`; the button label flips Pause/Resume based on `status.paused` (`main.js:228-229, 266-269`).
 - **Clear (Activity)**: one button fires both `clear_problems` and `clear_executions` then `refresh()`s (`main.js:601-604`). **Clear (Updates)** → `clear_update_history` (clears last cycle + persisted attempts).
 - **Ignore (per app)**: delegated click on `#updater-apps` sends `set_app_ignore { id, ignore:true, note:"" }` and optimistically dims the row. The service treats the empty note as **"unchanged"** (v0.24.1) — an ignore toggle no longer wipes a per-app note hand-set in `config.toml`; clearing a note is done there, not from the UI.
@@ -1024,6 +1025,14 @@ one app already known to behave this way.
 ---
 
 ## Known limitations & backlog
+
+**Added in v0.24.3 (UI/UX pass):** two-step confirm on irreversible approvals, settings
+dirty-guard, Enter-to-send Ask, Escape-to-hide, absolute-time tooltips, paused-state
+emphasis, config-error → Settings quick link, disk/startup scan summaries, clamped
+numeric saves, and the `last_analysis_at` wire field ("analysed Xm ago" trust signal).
+UI-only except the wire field (`#[serde(default)]`, skew-safe both directions). The
+config-error quick link keys off error text (`/provider|key|model|config|settings/i`) —
+a heuristic, not a typed error class; a false positive merely shows a harmless button.
 
 **Resolved in v0.24.2 (correctness & hardening sweep, C1–C21):**
 - **Executor drain on stop/restart** (C1): the off-loop executor worker's `JoinHandle` is now held

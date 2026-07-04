@@ -11,6 +11,10 @@ pub struct StatusPayload {
     pub disk: f32,
     pub failed_services: Vec<String>,
     pub last_analysis: String,
+    /// Unix seconds the last completed AI analysis finished (0 = none yet this
+    /// service run). `#[serde(default)]` keeps an older payload decodable.
+    #[serde(default)]
+    pub last_analysis_at: i64,
     pub recent_problems: Vec<ProblemSummary>,
     pub recent_executions: Vec<ExecutionSummary>,
     /// Actions awaiting the user's decision. Persisted across cycles and service
