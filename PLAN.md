@@ -1,251 +1,333 @@
-# Eir — Bug-fix & feature plan (handover to implementer)
+# Eir — Feature plan F10–F13 (handover to implementer)
 
-**Baseline:** v0.22.1 (`fbb0a97`), tree clean, synced with `origin/master`.
-**Method:** five independent adversarial reviewers (service core, AI layer, updater,
-executor/signals, UI/wire-contract), each finding refuted before inclusion. Every
-item below was re-verified against source by hand — file:line anchors are current.
+**Baseline:** v0.23.1 (`488748b`), tree clean, synced with `origin/master`.
+**Theme:** user-facing value. Eir is now a solid autonomous guardian; these four
+features make it something the user *opens on purpose*. Everything is SSD-era:
+no defrag, no disk-optimisation theatre — space, boot time, and answers instead.
 
-**Verification level of this document:** source-read / compile-reasoned only. Nothing
-here was exercised in a running service. Flags marked ⚠️ touch auto-executing paths
-that must be live-tested after the fix.
+**Ground rules (apply to every feature):**
 
-Ordering is by severity, then value/effort. Suggested sequencing is at the bottom.
+- New `StatusPayload` fields are `#[serde(default)]` (backward-compat invariant,
+  `eir-proto/src/lib.rs` — see ARCHITECTURE.md "Wire types").
+- New `UiMsg` variants follow the existing `#[serde(tag = "type", rename_all = "snake_case")]` enum.
+- The UI never constructs a `FixAction` and the service never trusts an action
+  from the wire. Where a feature offers a "fix it" button, the UI sends an
+  opaque entry id; the service maps id → action from **its own** last scan
+  results, then routes through `pol.evaluate` + the normal exec path. The pipe
+  is writable by any authenticated user — that trust model must not widen.
+- Long work runs off-loop, mirroring the analysis-task pattern
+  (`eir-svc/src/main.rs` ~1435: inner `tokio::spawn` under `tokio::time::timeout`,
+  result over a dedicated mpsc, guard flag released even on panic/hang).
+- Every AI call goes through the existing `AiClient` and logs its `CallUsage`
+  into the usage accounting so it appears in the AI-usage card.
+- All service-supplied strings rendered in the UI go through `esc()`/`escAttr()`
+  (`ui/main.js`). No new JS dependencies — the frontend stays committed static
+  vanilla HTML/CSS/JS, no npm.
+- Per release: version bump in the three `Cargo.toml`s + `eir-ui/tauri.conf.json`,
+  re-sync `Cargo.lock` (`scripts/check-versions.ps1` gates CI), update
+  ARCHITECTURE.md + CONTEXT.md in the same commit, `[release]` marker, then tag.
+- Gate before each release: `cargo fmt --all --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`, full
+  tauri build via CI. Adversarial sweep (multi-lens + refute) before tagging,
+  per CLAUDE.md.
 
----
-
-## Bugs
-
-### B1 — ⚠️ CRITICAL: registry allowlist uses raw string prefix, not path-component boundary
-- **Where:** `eir-svc/src/executor/registry.rs:21-23` (allowlist), dead-code net at
-  `eir-svc/src/policy/mod.rs:96-98` + `policy.toml` blocklist.
-- **Root cause:** `lower.starts_with(&p.to_lowercase())` treats the allowlist as a raw
-  string prefix. `HKCU:\SOFTWARE\MicrosoftEvil\...` passes the `HKCU:\SOFTWARE\Microsoft`
-  entry because it is a *string* prefix but not a real subkey. `registry_reset` is on
-  `policy.toml`'s auto-execute whitelist, so at ≥ confidence-threshold this runs with **no
-  human approval**. The policy-layer backstop is dead code: `RegistryReset { .. } if
-  self.path_blocked(key_path)` calls `path_blocked`, which normalises *filesystem* paths and
-  whose blocklist is all `C:\...` entries — it can never match an `HKLM:\`/`HKCU:\` string.
-  So `registry.rs`'s allowlist is the only real gate, and it has exactly the boundary bug
-  that `policy::path_blocked` was already hardened against (see its `normalize_path_lexical`
-  + regression test `path_blocklist_resists_separator_and_traversal_bypasses`).
-- **Second, related concern:** even *without* the boundary bug, `HKCU:\SOFTWARE\Microsoft`
-  is a very broad grant — it covers `…\Windows\CurrentVersion\Run` (a persistence/autostart
-  location). Treat the allowlist breadth as part of this fix, not just the matcher.
-- **Fix:** add a `registry_key_allowed(key)` that splits both key and each prefix on `\`
-  and matches component-by-component (mirror `normalize_path_lexical`'s boundary logic);
-  reject on any non-boundary match. Reconsider whether the four prefixes need to be as broad
-  as they are (at minimum, exclude `…\CurrentVersion\Run*`). Also make the policy layer
-  registry-aware (a registry blocklist, or drop the misleading dead arm).
-- **Test:** unit table proving `HKCU:\SOFTWARE\MicrosoftEvil` and
-  `…\Services\TcpipXYZ` are **rejected** while genuine subkeys pass — analogue of the
-  existing filesystem regression test.
-
-### B2 — ⚠️ HIGH: CLI-provider stdin write can deadlock before output is drained
-- **Where:** `eir-svc/src/ai/client.rs:619-624` (`call_claude_cli`) and `723-729`
-  (`call_kilo_cli`).
-- **Root cause:** `child.stdin.write_all(prompt).await` is awaited to completion *before*
-  `wait_capped` begins draining stdout/stderr. If the prompt exceeds the OS pipe buffer
-  (~64 KB on Windows) and the Node/Bun CLI writes to stdout/stderr before fully consuming
-  stdin, both sides block: the CLI on a full stdout pipe, Eir on a full stdin pipe. A busy
-  machine's prompt (multiple log excerpts up to 2500 chars each + snapshot JSON + history)
-  can exceed 64 KB. On the analysis path the 10-min `ANALYSIS_MAX` task-abort is the only
-  backstop; on the labelling path there is none (see B3).
-- **Fix:** drain concurrently. Take stdout/stderr readers before/at spawn and run the stdin
-  write concurrently with reading (`tokio::join!` the writer future with the capped
-  read/wait, or spawn the writer as its own task and drop stdin on completion). This removes
-  the deadlock on both CLI providers and is the root-cause fix for B3's hang vector.
-- **Test:** hard to unit-test without a real CLI; add a focused test with a stub child that
-  emits > 64 KB to stdout before reading stdin, asserting the call completes rather than
-  hangs. If a stub is impractical, document as compile-verified and live-test with a large
-  synthetic prompt.
-
-### B3 — HIGH: labelling task has no timeout, so a hang latches the labeller off forever
-- **Where:** `eir-svc/src/main.rs:1523-1542`.
-- **Root cause:** the Tier-2 labeller is a bare fire-and-forget `tokio::spawn` guarded only
-  by a `ResetOnDrop` that clears the `labelling` AtomicBool on completion/panic. A task that
-  hangs forever (e.g. via B2 on a CLI provider) never completes and never drops, so the flag
-  stays `true` and the labeller is disabled for the rest of the process lifetime. Unlike the
-  analysis task (`ANALYSIS_MAX` + `inner.abort()`, main.rs:1667) there is no `timeout`.
-- **Fix:** wrap `label_one` the same way the analysis task is wrapped — inner
-  `tokio::spawn` under `tokio::time::timeout`, aborting on elapse so the flag is released.
-  Cheap; keep it even after B2, as defence-in-depth.
-- **Test:** none practical at unit level; covered structurally by matching the analysis
-  task's proven pattern.
-
-### B4 — ⚠️ MEDIUM: LogCleanup recurses past the policy-checked root into blocklisted dirs
-- **Where:** `eir-svc/src/executor/logs.rs:22-52`; policy gate at
-  `eir-svc/src/policy/mod.rs:93-95`.
-- **Root cause:** policy `path_blocked` only checks the scan-root `path`. `logs::cleanup`
-  then `WalkDir`s recursively and deletes any file with a cleanable extension
-  (`log/tmp/dmp/etl/blf/regtrans-ms`) older than `days_old`, with no per-file blocklist
-  recheck. `LogCleanup { path: "C:\\", days_old: 0 }` passes policy (bare root not
-  blocklisted) and then recurses into `System32` etc., deleting `.etl`/`.regtrans-ms`/`.log`
-  files that legitimately live there. `log_cleanup` is on the auto-execute whitelist.
-- **Fix:** re-apply the blocklist per discovered file inside `cleanup` (skip any file whose
-  normalised path is under a blocklisted directory, reusing the same component-boundary
-  matcher). Additionally constrain the scan root to an allowlist of known log locations, and
-  refuse a bare drive root / `days_old == 0`. Belt and suspenders: policy should reject a
-  root that is an *ancestor* of a blocklisted dir, not just one that equals/descends it.
-- **Test:** unit test that `cleanup` given a root containing a blocklisted subdir does not
-  delete files under that subdir.
-
-### B5 — MEDIUM: audit DB opened without WAL / busy_timeout; write errors swallowed
-- **Where:** `eir-svc/src/audit.rs:12-19` (`init_db`); all writer fns log-and-drop on error.
-- **Root cause:** pool opens with `?mode=rwc` + `create_if_missing` only — no
-  `journal_mode(Wal)`, no explicit `busy_timeout`. Multiple concurrent writers by design
-  (decision loop, executor worker, update-cycle task, labeller) serialize on the default
-  rollback journal. sqlx's 5 s default busy-timeout makes routine contention survivable, but
-  any contention exceeding it fails, and every writer just `warn!`s and continues — so a lost
-  write silently drops audit history, breaks the rate-limit circuit breaker for that action
-  (its `execution_log` row never lands), and NULLs effectiveness feedback.
-- **Fix:** in `init_db`, `.journal_mode(SqliteJournalMode::Wal).busy_timeout(Duration::…)`
-  (one line, high value; WAL lets readers and one writer proceed concurrently). Optionally add
-  a small bounded retry on `SQLITE_BUSY` for the writers that feed the rate-limiter.
-- **Test:** existing suite; assert WAL is set via a `PRAGMA journal_mode` read-back if easy.
-
-### B6 — MEDIUM: Choco `Force` remedy is validated and dispatched but never applied
-- **Where:** `eir-svc/src/updater/methods/choco.rs:82-107`; dispatch in
-  `eir-svc/src/updater/orchestrator.rs` (~69-73), `domain.rs` `supports_force`/`has_manager_lock`.
-- **Root cause:** the AI diagnostician can propose `Retry { method: Choco, remedy: Force }`;
-  the validator accepts it (Choco is in `supports_force`) and dispatch computes `force = true`,
-  but `choco::attempt(candidate)` takes no force parameter and its args are the fixed
-  `upgrade <pkg> -y --no-progress --no-color` — `-f`/`--force` is never appended (`-y` only
-  auto-confirms prompts; it does not force a reinstall). The retry re-runs the identical
-  failed command and burns one of `max_attempts_per_app` (default 3). Same bug class the code
-  says it already fixed for `ClearManagerLock` — but only wired through to winget.
-- **Fix:** thread `force: bool` into `choco::attempt` and append `--force` when set.
-- **Test:** unit test on the arg builder asserting `--force` present iff force requested.
-
-### B7 — LOW/MEDIUM: "Ignore app" gives feedback that the next poll clobbers
-- **Where:** `eir-svc/src/main.rs:1353-1373` (`SetAppIgnore`); `ui/main.js:465-468`.
-- **Root cause:** the handler persists `cfg.updater.ignored` but never updates
-  `st.updater.apps` (only rewritten on update-cycle completion, main.rs:850, or clear:1323).
-  The immediate `broadcast_status(build_status(&st))` carries the unchanged apps list, and
-  `renderUpdater` rebuilds `#updater-apps` innerHTML wholesale every 2 s poll, so the JS's
-  optimistic `opacity:.5` is wiped and the ignore looks like a no-op until the next cycle.
-  The ignore itself is not lost — it takes effect next cycle — only the feedback is.
-- **Fix:** in the handler, set an `ignored`/`skipped` marker on the matching
-  `st.updater.apps` row before broadcasting (add a field to `UpdaterAppRow` in `eir-proto`
-  if none fits), and have the UI render ignored rows from that. Keep `#[serde(default)]` for
-  wire-compat.
-- **Test:** none critical; visual.
-
-### Low-severity notes (fix opportunistically; not release-blocking)
-- **L1** `updater/verify.rs:125-142` — AI-supplied `verify_exe` is only checked
-  `is_absolute`, not tied to the app's install dir; a wrong path whose version coincidentally
-  matches could yield a false "Verified" on the fallback path. Constrain under Program
-  Files / the app's install dir. Read-only, low impact.
-- **L2** `main.rs:491-509` — `EXEC_MAX` abort also cancels the trailing audit/feedback
-  writes; a > 10-min DB stall after a *successful* fix would lose its `execution_log` row and
-  let the rate-limiter re-run it. Very low probability; partly mitigated by B5 (WAL). Consider
-  running the audit writes outside the aborted region.
-- **L3** `signals/event_log.rs:141-153` — source-string NUL scan has no buffer bound; a
-  malformed record could walk past the buffer (needs a high-privilege local actor to inject).
-  One-line fix: cap `len` at remaining buffer.
-- **L4** `main.rs` `push_problem` vs `policy::evaluate` — a `Block` reason embeds the
-  learned-penalty-adjusted confidence % while the card shows the raw pre-penalty %; the two
-  can disagree. Display only. Show the same number in both.
-- **L5** `executor/mod.rs` `FileDelete` — no reparse-point/symlink guard; latent only
-  because `file_delete` is not whitelisted. Add the guard before ever whitelisting it.
-- **L6** `ai/client.rs:683` — Kilo CLI workspace is keyed by process PID only, so a
-  concurrent analysis + labeller Kilo call share one `--dir`; also never cleaned up (litters
-  `%TEMP%`). Use a per-call unique dir and remove it after.
-- **L7** `ai/client.rs` SSE paths — a mid-stream truncation surfaces as "Failed to parse
-  model response as JSON" rather than "stream truncated". Diagnostics only.
-- **L8** `ui/main.js` `renderLearned` / parts of `renderUpdater` — unconditional innerHTML
-  rebuild every 2 s wipes text selection (the Approvals list already got a signature-diff
-  guard; siblings didn't). Cosmetic.
+**Suggested packaging:** v0.24.0 = F10 + F11 (fast, low-risk, immediately
+visible). v0.25.0 = F12 + F13 (each adds a scan subsystem; keep the sweeps small).
 
 ---
 
-## Features (ranked by value/effort)
+## F10 — "Ask Eir": free-text questions answered with live system context
 
-F1–F6 are grounded in the project's own backlog (`ARCHITECTURE.md` "Known limitations",
-`CONTEXT.md` open questions); F7–F9 are net-new capability beyond the backlog. Recommend
-F1+F2+F3 first — small and independent; the rest are worthwhile but larger.
+**What.** A new sidebar view where the user types a question — "why is my PC
+slow right now?", "what was that error notification about?", "is my disk OK?" —
+and gets a plain-English answer grounded in the *current* signal snapshot,
+recent problems/executions, learned facts, and the resource trend. Diagnostic
+answer only: the reply proposes no actions and nothing is parsed or executed
+from it. Fixes still come only from the normal decision cycle.
 
-### F1 — Anthropic prompt caching (recommended)
-The ~110-line static guardrail prose is re-sent uncached every cycle on the Anthropic native
-path (`ARCHITECTURE.md` backlog). Add `cache_control` breakpoints on the static system
-prompt in `ai/client.rs`. Direct, ongoing cost reduction; small, self-contained change.
+This is the flagship: it turns the whole existing signal + AI stack into
+something interactive, for one bounded `complete_text` call per question.
 
-### F2 — Persist advisor day-counters (recommended; safety-cap correctness)
-`advisor_spent_today` / `advisor_escalations_today` are in-memory and reset on restart, so a
-service restart resets the daily spend/escalation ceiling — a real bypass of a safety cap
-(`ARCHITECTURE.md` backlog). Persist them to the audit DB keyed by the UTC date they belong
-to; reload on startup and reconcile on date flip. Small; arguably a bug/feature hybrid.
+### Wire (`eir-proto/src/lib.rs`)
 
-### F3 — Automated version-sync check in CI (recommended; cheap footgun guard)
-No check verifies the four version locations stay in sync (3× `Cargo.toml` +
-`eir-ui/tauri.conf.json`); drift ships silently (`CONTEXT.md` open question, backlog). Add a
-~15-line script step in `ci.yml` that fails if they disagree. Cheap; prevents release
-mistakes. While here, resolve the stale root `tauri.conf.json` (remove or make it an explicit
-shim) — the other standing `CONTEXT.md` open question.
+- `UiMsg::AskEir { question: String }`.
+- `StatusPayload.ask: Option<AskStatus>` (`#[serde(default)]`).
+  `AskStatus { running: bool, error: Option<String>, entries: Vec<AskEntry> }`;
+  `AskEntry { question: String, answer: String, at: i64 }`.
 
-### F4 — Registry undo snapshot (pairs with B1; improves the trust story)
-`RegistryReset` is marked `reversible=false` because the prior value is never captured
-(`explain.rs`, backlog). Snapshot the existing value before `reset_value`, persist it, mark
-the action reversible, and expose a one-click undo in the UI. Turns a scary auto-executing
-action into a reversible one — meaningfully better safety posture. Medium effort; natural to
-land alongside the B1 registry work.
+### Service (`eir-svc/src/main.rs` + small `ask.rs` for the prompt builder)
 
-### F5 — Native notification on new pending approval
-An unattended guardian currently surfaces approvals only if the user opens the window. Fire an
-OS notification (Tauri notification plugin) when a fix needs approval, deep-linking to the
-Approvals view. Closes the loop for the tray-resident use case. Small–medium.
+- `SvcState` gains `ask_running: bool` and `ask_entries: VecDeque<AskEntry>`
+  (cap 10, newest first — mirror `push_problem`). Memory-only; history is lost
+  on service restart, which is acceptable (state, not audit data).
+- `ui_rx` arm for `AskEir`:
+  - Reject (set `AskStatus.error`, broadcast) when: question empty/whitespace,
+    `> 1_000` chars, `ai` is `None`, `ask_running`, or the last ask finished
+    `< 15 s` ago (spend guard — the pipe is writable by any local user).
+  - Otherwise set `ask_running = true`, broadcast, and spawn the off-loop task:
+    build the prompt, call `ai.complete_text(prompt, "")` (main model, no web
+    search, no diagnosis system prompt — same entry point the labeller and
+    digest use, `ai/client.rs:880`), under `timeout(ASK_MAX = 4 min)` with the
+    inner-spawn panic isolation. Send `Result<(String, Option<CallUsage>), String>`
+    over a new `ask_done_rx` select arm.
+  - `ask_done_rx` arm: clear `ask_running`, log usage (same path as
+    labeller/digest usage), push an `AskEntry` (or set `error`), broadcast.
+    Do **not** touch `st.error` (same isolation as `exec_done_rx`).
+- Prompt (in `ask.rs`, pure fn, unit-testable): current metrics + failed
+  services + resource-trend note + last N recent problems/executions summaries
+  + active learned facts + the question. Instructions: answer in plain English
+  for a non-technical user, ≤ 300 words, diagnostic only — explicitly "do not
+  propose registry edits, commands, or actions; Eir applies fixes through its
+  own policy engine". Truncate each context section with the existing caps so
+  the prompt stays bounded.
 
-### F6 — Put `system_state_history` to use (larger; propose, don't commit yet)
-Rich per-cycle metrics are written every cycle but **never read** (backlog). A lightweight
-trend signal — "CPU climbing N cycles", "disk trending toward full" fed into the AI prompt
-and/or a UI sparkline — would turn dead data into signal. Bigger scope and needs a design
-pass on what trends are actionable; recommend deferring to its own cycle rather than bundling.
+### UI (`ui/index.html`, `ui/main.js`)
 
-### F7 — SMART disk-health signal (net-new)
-`SystemState.disk_health` is hardcoded `"unknown"` and `network_errors` hardcoded `0`
-(`models.rs`, backlog "neither is actually measured"). Collect real SMART status via
-`Get-PhysicalDisk`/`Get-StorageReliabilityCounter` (or WMI `MSStorageDriver_FailurePredictStatus`)
-in the existing wmi collector cadence, bounded like the other probes (`ps_capped`). Feed it
-into `actionable_fingerprint` so a disk predicting failure triggers a reactive analysis —
-a failing disk is exactly the early warning a guardian exists for. While in there, wire
-`network_errors` from `GetIfEntry2` error counters or drop the field. Medium effort; new
-signal only, no new actions, so no policy surface change.
+- New sidebar item **Ask Eir** with a textarea (maxlength 1000), a Send button
+  (disabled while `ask.running` or provider unconfigured — mirror the
+  update-now gating pattern), a spinner line while running, and the entry list
+  rendered newest-first. Show `ask.error` inline. Everything through `esc()`.
 
-### F8 — DISM/SFC system-file repair actions (net-new; revisit of a deliberate deferral)
-`sfc /scannow` and `DISM /Online /Cleanup-Image /RestoreHealth` were deferred when execution
-ran inline because they block for many minutes (see `eir-breadth-theme` memory / backlog).
-That blocker is gone: fixes now run on the off-loop executor worker with `EXEC_MAX` = 10 min.
-Add two `FixAction` variants (`SfcScan`, `DismRestoreHealth`) — **require-approval, never
-whitelisted** (long-running, writes to the component store), with a dedicated generous
-timeout (SFC can exceed 10 min; give these their own cap rather than EXEC_MAX), progress
-surfaced via the existing execution feed, and prompt guidance so the AI proposes them only
-for corruption-signature events (CBS/ESENT/WHEA errors). Medium–large; the highest-leverage
-"fix everything" breadth item.
+### Tests
 
-### F9 — Weekly plain-English health digest (net-new)
-The audit DB holds decisions, executions, feedback scores, update attempts, and (with F6)
-metric history — but there is no retrospective view. Once a week, generate a short digest —
-what Eir saw, fixed, blocked, learned, spent — as one bounded AI call over aggregated audit
-rows (counts/summaries, not raw snapshots), surfaced as a new UI card and an OS notification
-(reuses F5's plumbing). Costs one cheap call a week; makes the guardian's value visible
-instead of silent. Medium effort; natural after F5, benefits from F6.
+- Prompt builder: unit tests that each context section appears, caps hold, and
+  the no-actions instruction is present.
+- Gating: unit test the reject conditions as a pure fn
+  (`ask_rejection_reason(&state, &question, now) -> Option<&str>`), table-style.
+
+### Risks / refutations
+
+- *Spend abuse via the open pipe* — bounded by the in-flight guard + 15 s gap +
+  1 000-char cap; each call is one non-web completion. Accepted.
+- *Answer drifts into instructions the user might run by hand* — prompt forbids
+  it; answer is display-only, never parsed. Residual risk is the same as any
+  chat assistant. Accepted.
+- *CLI providers* — `complete_text` already routes them; nothing new.
 
 ---
 
-## Suggested sequencing for implementation
+## F11 — Health timeline: render `system_state_history` on the dashboard
 
-1. **Safety-critical bug pass (one release):** B1, B4 (both auto-executing path bypasses),
-   B2 + B3 (CLI deadlock + labeller latch), B5 (WAL). Adversarial-sweep + `--all-targets`
-   clippy + `cargo test --workspace`, then live-test the ⚠️ auto-exec paths (registry reset
-   against a throwaway key; log cleanup against a scratch tree) before tagging.
-2. **Correctness/UX bug pass:** B6, B7, and the L-notes worth taking (L3, L4, L6, L8).
-3. **Feature cycle:** F1 + F2 + F3 together (all small, independent), then F4 alongside the
-   B1 registry work if not already merged. F5 next.
-4. **Signal & breadth cycle (each its own release):** F7 (SMART/network signals), F8
-   (DISM/SFC actions — approval-gated, own timeout, live-test one run before tagging),
-   F6 (trend design pass), then F9 (digest — last, so it has F5's notification plumbing
-   and F6/F7's richer data to report on).
+**What.** `system_state_history` is written every cycle and read only by the
+trend summariser — the user never sees it. Add 24-hour sparkline charts
+(CPU / memory / disk) to the Dashboard with markers where problems were found
+and fixes ran. Zero AI cost, zero risk, uses data Eir already has. This is the
+"is my machine actually healthier?" view the weekly digest talks about.
 
-Per repo policy: bump all four version locations + `Cargo.lock` together, `[release]` marker,
-CI green is the only pre-release gate, single rolling release. Live-run verification of any
-auto-executing fix is required *before* tagging for pass 1 specifically, given the blast
-radius of B1/B4.
+### Service
+
+- `audit.rs`: `get_state_history(pool, since_unix) -> Vec<MetricPoint>` reading
+  `(created_at, cpu, memory, disk)` from `system_state_history`, ordered
+  ascending, bucketed/downsampled to ≤ 200 points (rows are ~1/10 min, so a
+  24 h window is ~144 rows — downsampling is just a safety cap; a plain
+  `LIMIT`-free query + Rust thinning is fine).
+- `SvcState` caches `history: Vec<MetricPoint>`; refresh **once per decision
+  tick** (in the per-cycle body, not per broadcast — broadcasts happen on every
+  state change and must stay cheap).
+
+### Wire
+
+- `MetricPoint { at: i64, cpu: f32, memory: f32, disk: f32 }` in `eir-proto`.
+- `StatusPayload.history: Vec<MetricPoint>` (`#[serde(default)]`). ~150 points
+  ≈ a few KB per snapshot — acceptable on a local pipe.
+
+### UI
+
+- Dashboard section "Last 24 hours": three inline **SVG** sparklines (hand-built
+  polylines — no chart library, consistent with the no-dependency frontend).
+  Overlay markers from `recent_problems` / `recent_executions` timestamps
+  already in the payload (dots on the x-axis; tooltip via `<title>`).
+- Y-axis fixed 0–100 %, colour the disk line with the existing status accents
+  when > 90.
+
+### Tests
+
+- `get_state_history` round-trip against the real migrations (insert synthetic
+  rows, assert ordering + thinning) — mirror the existing audit test style.
+- Downsampling: pure-fn unit test (input > 200 points → ≤ 200, endpoints kept).
+
+### Risks / refutations
+
+- *Payload bloat* — capped at 200 points, refreshed per tick. Refuted.
+- *Table growth* — ~52k rows/year at the default cadence; no pruning needed now.
+  Note it in ARCHITECTURE.md's backlog rather than adding pruning speculatively.
+
+---
+
+## F12 — Disk-space insights: "what's eating my SSD", with policy-gated cleanup
+
+**What.** SSDs make *space* the scarce resource, not fragmentation. An
+on-demand scan (button, like Update now) produces a ranked list of space
+consumers: known reclaimable locations (temp dirs, browser caches, Windows
+update leftovers, crash dumps, `Windows.old`, hibernation file, package-manager
+caches, Recycle Bin) plus the largest top-level directories under `C:\` and
+each user profile. Each entry gets a deterministic category + hand-written note
+(trustworthy, like `explain.rs`); entries that map to a safe existing action
+get a **Clean** button routed through the normal policy gate.
+
+### Wire
+
+- `UiMsg::ScanDisk` and `UiMsg::CleanDiskEntry { id: String }`.
+- `StatusPayload.disk_insights: Option<DiskInsightsView>` (`#[serde(default)]`;
+  note `disk: f32` already exists — do not collide).
+  `DiskInsightsView { running: bool, scanned_at: i64, error: Option<String>,
+  entries: Vec<DiskEntryView> }`;
+  `DiskEntryView { id: String, path: String, size_bytes: u64, category: String,
+  note: String, cleanable: bool }`.
+
+### Service — new `eir-svc/src/disk_scan.rs`
+
+- **Scan (off-loop, mirror `spawn_update_cycle`:** detached task, inner spawn +
+  `timeout(SCAN_MAX = 5 min)`, done-channel arm clears `running` even on
+  panic/hang; `scan_running` flag; `ScanDisk` gated on `!running && !paused`).
+- Deterministic targets, each with a hard-coded category + note (this is the
+  `explain.rs` philosophy — the text the user trusts is never AI-authored):
+  - Per-user + `C:\Windows\Temp` temp dirs; `C:\Windows\SoftwareDistribution\Download`;
+    crash dumps (`C:\Windows\Minidump`, `MEMORY.DMP`); `C:\Windows.old`;
+    `hiberfil.sys`/`pagefile.sys` (report-only); browser caches (Chrome/Edge/
+    Firefox default profile cache dirs per user); package caches (`%LOCALAPPDATA%`
+    npm/pip/cargo/NuGet when present); Recycle Bin (`$Recycle.Bin` per drive,
+    du-style); WSL/Docker `.vhdx` (report-only).
+  - Plus: top-level directory sizes for `C:\` and each `C:\Users\<user>` (depth
+    ≤ 2, `walkdir` with per-entry error tolerance — LocalSystem can read most
+    of it; skip reparse points to avoid cycles and double-counting).
+  - Keep the top ~25 entries by size; ids are stable hashes of the path.
+- **Cleanup mapping (server-side only).** `CleanDiskEntry { id }` looks the id
+  up in the service's own last scan (unknown/stale id → ignore + note). The
+  entry's category maps to an existing `FixAction`:
+  - temp/prefetch → `DiskCleanup { target }` (whitelisted → auto-runs);
+  - log/dump dirs → `LogCleanup { path, days_old: 7 }` (whitelisted; the
+    v0.23.0 canonicalised-root + protected-dir guards already apply);
+  - single large file in a safe location → `FileDelete { path }` (off-whitelist
+    → approval card, with the existing `file_facts` risk classification);
+  - report-only categories (`hiberfil.sys`, WinSxS, `.vhdx`, Recycle Bin) →
+    `cleanable: false`, no action. (Recycle Bin emptying, `powercfg /h off`,
+    and DISM component cleanup are deliberately out of scope v1 — each is a new
+    action with its own blast radius; add later if the entries prove popular.)
+  - The mapped action goes through `pol.evaluate` + `safety::rate_limited` +
+    `in_flight` dedupe and the executor worker — **identical routing to an
+    AI-proposed fix**, reason `"user-requested cleanup"`.
+- No AI call in v1. (An optional later pass could annotate *unknown* large
+  directories with one `complete_text` call; the deterministic notes cover the
+  common cases, so don't build it yet.)
+
+### UI
+
+- New sidebar view **Disk** (or a Dashboard card + view): Scan button (disabled
+  while running, mirror Update-now), scanned-at line, entries as rows — path,
+  human size, category chip, note, Clean button when `cleanable`. Clean click →
+  `clean_disk_entry(id)`; row state updates on the next poll (approvals appear
+  in the Approvals view as usual).
+
+### Tests
+
+- Category mapping: unit table — every category maps to the intended
+  `FixAction` variant or to `cleanable: false`; no category maps to anything
+  off this list.
+- Size scan: unit test the walker on a temp fixture tree (depth cap respected,
+  reparse points skipped, unreadable entries tolerated).
+- Id lookup: stale/unknown id is a no-op.
+
+### Risks / refutations
+
+- *UI-triggered deletion widening the trust model* — refuted: ids map to
+  service-derived actions, policy-gated exactly like AI proposals; `FileDelete`
+  still requires approval; blocklists still apply.
+- *Scanning C:\ as SYSTEM takes minutes* — bounded by depth cap + 5-min
+  timeout; it's on-demand, off-loop, and the loop stays responsive by design.
+- *Double-count via junctions* — skip reparse points (the v0.23.1 LogCleanup
+  canonicalisation bug is the cautionary tale; state this in a comment).
+
+---
+
+## F13 — Startup advisor: what launches at logon, what it costs, one-click disable
+
+**What.** Enumerate everything that starts at logon — Run/RunOnce registry
+entries (HKLM + HKCU, incl. Wow6432Node), Startup folders (per-user + common),
+and logon-triggered scheduled tasks — with current enabled/disabled state from
+`StartupApproved`. One bounded AI call classifies each entry (`keep` /
+`optional` / `unnecessary` + a one-line plain-English "what this is"). The user
+can disable an entry with one click, Task-Manager-style (write the
+`StartupApproved` flag — fully reversible), routed through the approval flow.
+
+### Wire
+
+- `UiMsg::ScanStartup` and `UiMsg::SetStartupEntry { id: String, enable: bool }`.
+- `StatusPayload.startup: Option<StartupView>` (`#[serde(default)]`).
+  `StartupView { running: bool, scanned_at: i64, error: Option<String>,
+  entries: Vec<StartupEntryView> }`;
+  `StartupEntryView { id, name, command, location, enabled: bool,
+  verdict: String, note: String }` (verdict/note empty when AI unconfigured —
+  the deterministic listing is useful on its own).
+
+### Service — new `eir-svc/src/startup_scan.rs` + one new FixAction pair
+
+- **Enumerate (off-loop, same scaffold as F12):** registry Run keys via the
+  existing PowerShell-with-timeout helper (`executor/powershell.rs` pattern) or
+  direct registry reads; Startup folder `.lnk`s; `Get-ScheduledTask` filtered to
+  logon triggers. Read `HKCU\...\Explorer\StartupApproved\{Run,StartupFolder}`
+  (and HKLM equivalent) to report the current enabled/disabled state — first
+  byte `0x02` = enabled, `0x03` = disabled.
+- **Classify:** one `complete_text` call with the entry list (name, command
+  path, signer if cheaply available), returning strict JSON
+  `[{id, verdict, note}]`; parse defensively (reuse the `extract_json_object`
+  approach), unknown ids dropped, missing verdicts default to `optional`. AI
+  text is advisory display only — it triggers nothing.
+- **New actions** in `models.rs` (+ `explain.rs` arms, executor adapter):
+  - `StartupDisable { name: String, location: String }` /
+    `StartupEnable { name, location }` — write the `StartupApproved` binary
+    flag via `Set-ItemProperty -Type Binary` through the timeout helper.
+    `location` is one of a **closed set** (`hkcu_run`, `hklm_run`,
+    `startup_folder`, …) mapped to hard-coded key paths in the adapter — the
+    wire value is a selector, never a raw registry path.
+  - Deliberately **not** added to the AI prompt's action catalogue — these are
+    user-initiated only. Not whitelisted in `policy.toml`, so `pol.evaluate`
+    lands them on `RequireApproval` automatically; `explain.rs` marks them
+    `reversible: true`. Scheduled-task entries reuse the existing
+    `TaskDisable`/`TaskEnable` instead.
+  - `SetStartupEntry` maps id → entry from the service's own last scan (same
+    server-side-mapping rule as F12) and routes the derived action through the
+    normal gate.
+
+### UI
+
+- New sidebar view **Startup**: Scan button, entries grouped by location, state
+  pill (enabled/disabled), verdict chip colour-coded, note text, Disable/Enable
+  button → `set_startup_entry(id, enable)`. Disabled entries render dimmed.
+
+### Tests
+
+- `StartupApproved` flag encode/decode: unit table (enabled bytes, disabled
+  bytes, unknown/absent → treated enabled — that's Windows' default).
+- Location selector → key path mapping: closed-set unit table; unknown selector
+  is an error, not a passthrough.
+- Classification JSON parsing: valid, partial, and garbage inputs.
+
+### Risks / refutations
+
+- *Disabling something needed at logon* — mitigated: approval-gated, reversible
+  by construction (re-enable writes `0x02`), Task-Manager-equivalent mechanism
+  (no entry is deleted, ever), and the AI verdict is advisory only.
+- *Registry writes from a UI click* — the wire carries only an id + a closed
+  location selector; the adapter owns the real paths. No raw-path surface.
+- *HKLM StartupApproved needs admin* — the service is LocalSystem; fine. The
+  per-user key for other users' HKCU is out of scope v1 (scan the interactive
+  user's hive via the loaded profile only; note the limitation in the view).
+
+---
+
+## Sequencing
+
+1. **F11** (timeline) — smallest, zero-risk, exercises the payload/UI seam.
+2. **F10** (Ask Eir) — flagship; reuses the analysis-task scaffold.
+3. → **release v0.24.0** (bump ×4 + lock, docs, sweep, tag).
+4. **F12** (disk insights) — scan scaffold + server-side action mapping.
+5. **F13** (startup advisor) — reuses F12's scaffold + mapping pattern; adds
+   the one new FixAction pair.
+6. → **release v0.25.0**.
+
+Verification level expected in the handback: compile-verified (fmt + clippy
+`--all-targets` + `cargo test --workspace` + full tauri build) with the
+adversarial sweep run per release. Live-run checks that need a real machine
+(scan timings, StartupApproved byte layout on the target Windows build, toast
+notifications) should be flagged explicitly, not implied.
