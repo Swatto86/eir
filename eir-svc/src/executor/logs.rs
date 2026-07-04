@@ -57,6 +57,16 @@ pub fn cleanup(path: &str, days_old: u32) -> Result<String> {
     if !dir.exists() {
         return Ok(format!("Directory '{path}' does not exist, skipping"));
     }
+    // Re-check the CANONICAL root: the lexical `root_too_broad` guard above can be
+    // evaded by an 8.3 short name or a junction whose text differs from a protected dir
+    // but resolves to it on disk. `canonicalize` resolves 8.3 / junctions / symlinks to
+    // the real target (WalkDir won't follow links mid-walk, so guarding the root is
+    // enough). If it can't be canonicalised, the lexical guard already applied.
+    if let Ok(canon) = std::fs::canonicalize(dir) {
+        if root_too_broad(&canon.to_string_lossy()) {
+            bail!("Refusing log cleanup on '{path}' — it resolves to a protected system location");
+        }
+    }
 
     let cutoff = SystemTime::now()
         .checked_sub(Duration::from_secs(days_old as u64 * 86400))

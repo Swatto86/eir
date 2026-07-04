@@ -37,11 +37,12 @@ fn build_prompt(s: &DigestStats) -> String {
          days from these counts. Be reassuring when quiet, specific when not. Do NOT invent \
          details beyond the numbers. No preamble, no markdown, no bullet list — just the \
          paragraph.\n\n\
-         - Analyses run: {decisions}\n\
-         - Fixes applied: {exec_total} ({exec_success} succeeded)\n\
-         - App updates attempted: {updates_total} ({updates_success} succeeded)\n\
-         - Patterns learned about this machine: {learned_facts}\n\
-         - Estimated AI spend: ${spend:.2}\n",
+         The first four counts are for the past 7 days; the last two are running totals.\n\n\
+         - Analyses run (7d): {decisions}\n\
+         - Fixes applied (7d): {exec_total} ({exec_success} succeeded)\n\
+         - App updates attempted (7d): {updates_total} ({updates_success} succeeded)\n\
+         - Estimated AI spend (7d): ${spend:.2}\n\
+         - Patterns known about this machine (all-time total): {learned_facts}\n",
         decisions = s.decisions,
         exec_total = s.exec_total,
         exec_success = s.exec_success,
@@ -68,10 +69,10 @@ mod tests {
             spend_usd: 0.1234,
         };
         let p = build_prompt(&s);
-        assert!(p.contains("Analyses run: 42"));
-        assert!(p.contains("Fixes applied: 5 (4 succeeded)"));
-        assert!(p.contains("App updates attempted: 3 (3 succeeded)"));
-        assert!(p.contains("Patterns learned about this machine: 7"));
+        assert!(p.contains("Analyses run (7d): 42"));
+        assert!(p.contains("Fixes applied (7d): 5 (4 succeeded)"));
+        assert!(p.contains("App updates attempted (7d): 3 (3 succeeded)"));
+        assert!(p.contains("Patterns known about this machine (all-time total): 7"));
         assert!(p.contains("$0.12"));
         // A short instruction, not a giant prompt.
         assert!(p.len() < 1200);

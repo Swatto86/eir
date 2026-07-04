@@ -374,9 +374,12 @@ async fn notify_on_new_approvals(status: SharedStatus, handle: AppHandle) {
             (pending, digest_at)
         };
 
-        // Notify once when a new weekly digest lands (after priming, so an existing
-        // one on launch doesn't alert).
-        if primed && digest_at > last_digest_at && last_digest_at != 0 {
+        // Notify once when a new weekly digest lands. `last_digest_at` is seeded from
+        // the startup value on the priming pass below (before its `continue`), so an
+        // existing digest on launch doesn't alert — but the FIRST-ever digest (seeded
+        // 0 → real) still does. (Dropping the old `last_digest_at != 0` guard, which
+        // swallowed that first notification on every fresh install.)
+        if primed && digest_at > last_digest_at {
             if let Err(e) = handle
                 .notification()
                 .builder()

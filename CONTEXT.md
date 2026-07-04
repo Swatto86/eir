@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.23.0. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.23.1. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.23.0. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-04 | Eir | v0.23.1 second-sweep fixes | A second adversarial sweep confirmed the v0.23.0 registry gate, AI/wire layer, and loop concurrency are sound. Three fixes: LogCleanup now canonicalises its scan root (an 8.3 short-name or junction root could lexically dodge the protected-dir check yet resolve to System32); the first-ever weekly-digest OS notification is no longer suppressed on fresh installs; and the digest prompt no longer frames the all-time learned-fact count as a weekly figure. `usage_log` pruning was deliberately skipped (it feeds the lifetime usage card).
 
 2026-07-03 | Eir | v0.23.0 bug-fix + feature sweep | Fixed the registry allowlist to component-boundary matching (a sibling key sharing a name prefix could bypass it), scoped LogCleanup so it can't recurse into system dirs, fixed a CLI-provider stdin/stdout pipe deadlock, and enabled SQLite WAL. Added: Anthropic prompt caching (static system prompt sent once as a cached block), registry-reset undo (prior value snapshotted → one-click revert), approval + weekly-digest OS notifications, SMART disk-health signal, DISM/SFC repair actions (approval-gated, never whitelisted, own long timeout), a resource-trend signal from the previously-unused system_state_history, and a weekly plain-English health digest. A CI step now fails on version drift across the four manifests.
 

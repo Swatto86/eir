@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-03 · **Release:** v0.23.0
+**Last updated:** 2026-07-04 · **Release:** v0.23.1
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
