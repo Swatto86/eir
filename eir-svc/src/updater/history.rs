@@ -48,6 +48,29 @@ pub async fn record_attempts(
     Ok(())
 }
 
+/// Latest attempt time (unix secs) per `app_id`, for fair staleness ordering. An app
+/// tried most recently — including one that just FAILED — sorts last, so it can't
+/// permanently starve never-tried apps when more updates than `max_apps_per_run` are
+/// pending and the candidate collection order is otherwise fixed.
+pub async fn last_attempt_times(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashMap<String, i64>> {
+    let rows =
+        sqlx::query("SELECT app_id, MAX(created_at) AS last FROM update_attempts GROUP BY app_id")
+            .fetch_all(pool)
+            .await?;
+    let mut map = std::collections::HashMap::new();
+    for r in rows {
+        let id: String = r.try_get("app_id")?;
+        let last: String = r.try_get("last")?;
+        let ts = chrono::DateTime::parse_from_rfc3339(&last)
+            .map(|d| d.timestamp())
+            .unwrap_or(0);
+        map.insert(id, ts);
+    }
+    Ok(map)
+}
+
 /// Delete the whole attempt history (the UI's "Clear" on the App Updates card).
 /// Returns the number of rows removed.
 pub async fn clear(pool: &SqlitePool) -> Result<u64> {

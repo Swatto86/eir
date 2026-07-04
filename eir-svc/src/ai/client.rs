@@ -348,17 +348,25 @@ impl AiClient {
         let json_text = strip_fences(&raw);
         debug!(text = %char_preview(json_text, 500), "Raw model response");
 
-        // Models occasionally wrap the JSON in prose; fall back to the
-        // first {...last} object if a direct parse fails.
-        let decision: ClaudeDecision = match serde_json::from_str(json_text) {
+        // Models occasionally wrap the JSON in prose; fall back to the first
+        // {...last} object if a direct parse fails. Run the fallback over the ORIGINAL
+        // `raw`, not `json_text` — if `strip_fences` picked the wrong block, the real
+        // JSON only survives in `raw`.
+        let mut decision: ClaudeDecision = match serde_json::from_str(json_text) {
             Ok(d) => d,
             Err(_) => {
-                let extracted = extract_json_object(json_text);
-                serde_json::from_str(extracted).with_context(|| {
-                    format!("Failed to parse model response as JSON:\n{json_text}")
-                })?
+                let extracted = extract_json_object(&raw);
+                serde_json::from_str(extracted)
+                    .with_context(|| format!("Failed to parse model response as JSON:\n{raw}"))?
             }
         };
+
+        // Defensive clamp: the model could emit a confidence outside [0,1] (a garbled
+        // "5.0" would render as "500%" in the UI). The policy gate is a `<` comparison
+        // so this can't expand authority, but keep the value sane for display/logs.
+        for p in &mut decision.problems {
+            p.confidence = p.confidence.clamp(0.0, 1.0);
+        }
 
         info!(
             problems = decision.problems.len(),
@@ -424,7 +432,6 @@ impl AiClient {
 
         let mut out = String::new();
         let mut lines = SseLineBuf::new();
-        let mut done = false;
         let mut stream = resp.bytes_stream();
         // Usage accumulates across the stream: input/cache tokens arrive in
         // message_start, output tokens in the final message_delta.
@@ -434,19 +441,15 @@ impl AiClient {
         let mut cache_read = 0u64;
 
         while let Some(chunk) = stream.next().await {
-            if done {
-                break;
-            }
             let chunk = chunk.context("Anthropic stream read error")?;
             lines.push(&chunk);
             while let Some(line) = lines.next_line() {
                 let Some(data) = line.strip_prefix("data: ") else {
                     continue;
                 };
-                if data == "[DONE]" {
-                    done = true;
-                    break;
-                }
+                // Anthropic's Messages API has no OpenAI-style `data: [DONE]` sentinel;
+                // the stream ends with `message_stop` then the connection closes, which
+                // terminates the outer loop. (The OpenAI-compatible path handles [DONE].)
                 let Ok(ev) = serde_json::from_str::<Value>(data) else {
                     continue;
                 };
@@ -1460,15 +1463,19 @@ async fn wait_capped(
 }
 
 fn strip_fences(s: &str) -> &str {
-    // Check ````json` before ```` to avoid matching the shorter fence first
+    let t = s.trim();
+    // Only a fence at the very START of the (trimmed) response is a real code fence.
+    // The old `s.find(open)` scanned the whole string, so a triple-backtick run inside
+    // a log excerpt the model echoed back in "diagnosis"/"reasoning" was mistaken for
+    // the opening fence and the real JSON was sliced away. `strip_prefix` matches only
+    // at the start. Check the tagged fence (```json) before its bare form (```).
     for (open, close) in [
         ("```json", "```"),
         ("```", "```"),
         ("~~~json", "~~~"),
         ("~~~", "~~~"),
     ] {
-        if let Some(start) = s.find(open) {
-            let after = &s[start + open.len()..];
+        if let Some(after) = t.strip_prefix(open) {
             return after
                 .find(close)
                 .map(|e| &after[..e])
@@ -1476,7 +1483,7 @@ fn strip_fences(s: &str) -> &str {
                 .trim();
         }
     }
-    s.trim()
+    t
 }
 
 #[cfg(test)]
@@ -1590,6 +1597,19 @@ mod tests {
     fn strip_fences_and_extract_json() {
         assert_eq!(strip_fences("```json\n{\"a\":1}\n```"), "{\"a\":1}");
         assert_eq!(extract_json("noise {\"a\":1} trailing"), "{\"a\":1}");
+    }
+
+    #[test]
+    fn strip_fences_ignores_backticks_inside_the_payload() {
+        // A model that quotes a log excerpt containing a triple-backtick block inside its
+        // JSON must NOT have that inner fence mistaken for the opening one. Only a fence at
+        // the trimmed start counts; here there is none, so the whole string is returned and
+        // the JSON survives for `serde_json::from_str`.
+        let raw = "{\"diagnosis\":\"saw ```\\nboom\\n``` in the log\",\"confidence\":0.9}";
+        assert_eq!(strip_fences(raw), raw);
+        // And the raw-based fallback recovers the object even if a real fence wraps prose.
+        let wrapped = "Here is the answer:\n```\n{\"diagnosis\":\"x\"}\n```";
+        assert_eq!(extract_json_object(wrapped), "{\"diagnosis\":\"x\"}");
     }
 
     #[test]

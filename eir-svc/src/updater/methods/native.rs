@@ -109,7 +109,16 @@ pub async fn make_plan(
         }
     };
     let cost_usd = usage.map(|u| u.cost_usd).unwrap_or(0.0);
-    let (plan, _releases, reason) = plan_from_response(&content, name, current);
+    let (plan, releases, reason) = plan_from_response(&content, name, current);
+    // If no direct installer was found but the model surfaced a releases page, fold that
+    // manual-download link into the rejection reason (which reaches the UI's failed-native
+    // row) instead of discarding it — otherwise the value is computed and tested but never
+    // shown.
+    let reason = match (&plan, reason, releases) {
+        (None, Some(r), Some(url)) => Some(format!("{r} — manual download: {url}")),
+        (None, None, Some(url)) => Some(format!("no direct installer — manual download: {url}")),
+        (_, r, _) => r,
+    };
     PlanOutcome {
         plan,
         cost_usd,

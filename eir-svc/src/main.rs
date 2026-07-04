@@ -59,10 +59,30 @@ fn run_service() -> windows_service::Result<()> {
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_signal = shutdown.clone();
 
+    // The event handler needs the status handle to report StopPending, but `register`
+    // returns it — so hand it in through a shared cell populated right after registering.
+    let status_slot: std::sync::Arc<
+        std::sync::OnceLock<service_control_handler::ServiceStatusHandle>,
+    > = std::sync::Arc::new(std::sync::OnceLock::new());
+    let status_slot_h = status_slot.clone();
+
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
                 shutdown_signal.store(true, std::sync::atomic::Ordering::SeqCst);
+                // Tell SCM we're stopping and to allow time for the executor drain, so it
+                // doesn't force-kill the process (aborting an in-flight fix) mid-drain.
+                if let Some(h) = status_slot_h.get() {
+                    let _ = h.set_service_status(ServiceStatus {
+                        service_type: ServiceType::OWN_PROCESS,
+                        current_state: ServiceState::StopPending,
+                        controls_accepted: ServiceControlAccept::empty(),
+                        exit_code: ServiceExitCode::Win32(0),
+                        checkpoint: 0,
+                        wait_hint: std::time::Duration::from_secs(35),
+                        process_id: None,
+                    });
+                }
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -71,6 +91,7 @@ fn run_service() -> windows_service::Result<()> {
     };
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
+    let _ = status_slot.set(status_handle);
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Running,
@@ -503,6 +524,10 @@ struct AnalysisSuccess {
     advisor: AdvisorStatus,
     advisor_spent_today: f64,
     advisor_escalations_today: u32,
+    /// Marginal cost of THIS analysis's escalation (0.0 if it didn't escalate), so the
+    /// completion arm can attribute just this run's spend if the UTC day rolled over
+    /// while the analysis was in flight.
+    escalation_cost_usd: f64,
 }
 
 /// Per-job backstop timeout for the executor worker. Defaults to 10 minutes, but the
@@ -524,7 +549,7 @@ fn spawn_executor(
     db: &SqlitePool,
     mut job_rx: tokio::sync::mpsc::UnboundedReceiver<ExecJob>,
     done_tx: tokio::sync::mpsc::UnboundedSender<ExecOutcome>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let db = db.clone();
     tokio::spawn(async move {
         while let Some(job) = job_rx.recv().await {
@@ -624,7 +649,7 @@ fn spawn_executor(
                 cleared_undo_id: None,
             });
         }
-    });
+    })
 }
 
 /// Route a user-initiated fix-action (a disk cleanup or startup toggle) through the
@@ -1022,7 +1047,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     // through the same exec_done arm (so it shows in the activity feed) instead of
     // blocking ui_rx on the restore's PowerShell call.
     let undo_done_tx = exec_done_tx.clone();
-    spawn_executor(&db, exec_rx, exec_done_tx);
+    let exec_handle = spawn_executor(&db, exec_rx, exec_done_tx);
     // AI analysis (and its optional advisor escalation) runs off the loop too — see
     // the analysis_done_rx arm below — so a multi-minute call never delays ui_rx.
     let (analysis_done_tx, mut analysis_done_rx) =
@@ -1100,9 +1125,11 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         }
                         continue;
                     }
-                    _ = tokio::time::sleep_until(react_deadline), if react_at.is_some() => {
-                        // Coalesce any pings that arrived while waiting. The
-                        // decision body below clears react_at.
+                    _ = tokio::time::sleep_until(react_deadline), if react_at.is_some() && !analysis_running => {
+                        // Coalesce any pings that arrived while waiting. The decision body
+                        // below clears react_at. Gated on !analysis_running so a past
+                        // deadline can't busy-loop while an analysis holds the pass open —
+                        // the reaction fires once the analysis completes.
                         while trigger_rx.try_recv().is_ok() {}
                         info!("Reacting to fresh actionable signals");
                         // fall through to the decision body below
@@ -1300,6 +1327,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             advisor,
                             advisor_spent_today,
                             advisor_escalations_today,
+                            escalation_cost_usd,
                         } = match outcome {
                             Ok(s) => s,
                             Err(e) => {
@@ -1332,8 +1360,21 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         st.last_analysis = claude_decision.analysis.clone();
                         st.error = None;
 
-                        st.advisor_spent_today = advisor_spent_today;
-                        st.advisor_escalations_today = advisor_escalations_today;
+                        // If the UTC day rolled over WHILE this analysis was in flight, the
+                        // per-cycle rollover (bottom of the loop body) never ran — it's gated
+                        // behind `if analysis_running`. Folding the task's totals back in would
+                        // restore yesterday's (possibly near-budget) spend onto the new day and
+                        // wrongly block a legitimate new-day escalation. Detect the straddle here
+                        // and attribute only THIS analysis's own escalation to the new day.
+                        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                        if st.advisor_spend_date != today {
+                            st.advisor_spend_date = today;
+                            st.advisor_spent_today = escalation_cost_usd;
+                            st.advisor_escalations_today = u32::from(advisor.escalated);
+                        } else {
+                            st.advisor_spent_today = advisor_spent_today;
+                            st.advisor_escalations_today = advisor_escalations_today;
+                        }
                         // Merge only the escalation/spend fields the task computed. `advisor`
                         // was built from the config captured at spawn time; a SetAdvisorSettings
                         // that lands mid-analysis has already updated st.advisor.enabled/.settings
@@ -1754,25 +1795,50 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::SetAppIgnore { id, ignore, note } => {
+                            // The pipe is writable by any authenticated local user, so cap
+                            // the ignore list (far above any real installed-app count) and
+                            // only persist on an ACTUAL change — otherwise a flood of
+                            // distinct ids could grow config.toml without bound and hammer
+                            // the LocalSystem config with a synchronous write per message.
+                            const MAX_IGNORED: usize = 500;
                             let key = id.to_lowercase();
+                            let mut changed = false;
                             if ignore {
-                                if !cfg.updater.ignored.iter().any(|x| x.eq_ignore_ascii_case(&key))
-                                {
-                                    cfg.updater.ignored.push(key.clone());
+                                let present = cfg
+                                    .updater
+                                    .ignored
+                                    .iter()
+                                    .any(|x| x.eq_ignore_ascii_case(&key));
+                                if !present {
+                                    if cfg.updater.ignored.len() >= MAX_IGNORED {
+                                        warn!(
+                                            "Ignore list at cap ({MAX_IGNORED}) — refusing to add '{key}'"
+                                        );
+                                    } else {
+                                        cfg.updater.ignored.push(key.clone());
+                                        changed = true;
+                                    }
                                 }
-                            } else {
+                            } else if cfg.updater.ignored.iter().any(|x| x.eq_ignore_ascii_case(&key))
+                            {
                                 cfg.updater.ignored.retain(|x| !x.eq_ignore_ascii_case(&key));
+                                changed = true;
                             }
                             // A blank note means "unchanged" — never "clear". The UI has
                             // no notes editor and always sends an empty note with an
                             // ignore toggle, so treating blank as delete would wipe a
                             // note hand-set in config.toml on every Ignore/Unignore click.
                             let n = note.trim();
-                            if !n.is_empty() {
+                            if !n.is_empty()
+                                && cfg.updater.notes.get(&key).map(String::as_str) != Some(n)
+                            {
                                 cfg.updater.notes.insert(key.clone(), n.to_string());
+                                changed = true;
                             }
-                            if let Err(e) = config::save(&cfg, "config.toml") {
-                                warn!("Failed to save app note: {e}");
+                            if changed {
+                                if let Err(e) = config::save(&cfg, "config.toml") {
+                                    warn!("Failed to save app note: {e}");
+                                }
                             }
                             // Reflect the toggle on the live row so the UI shows it
                             // immediately — the broadcast below carries the unchanged
@@ -2107,9 +2173,16 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                 }
                 cycle_count += 1;
                 last_cycle_at = tokio::time::Instant::now();
-                // A scheduled tick covers any pending reaction — cancel it so the
-                // same signals aren't analysed twice back-to-back.
-                react_at = None;
+                // A scheduled tick covers any pending reaction — cancel it so the same
+                // signals aren't analysed twice back-to-back. BUT if an analysis is still
+                // in flight this pass will bail below without analysing, so keep the
+                // reaction pending — otherwise a tick landing mid-analysis would silently
+                // drop it and defer the reactive fast-path to the next full tick. The
+                // sleep_until arm is gated on !analysis_running, so a preserved past
+                // deadline won't busy-loop; it fires once the analysis completes.
+                if !analysis_running {
+                    react_at = None;
+                }
 
                 // Re-discover log directories every 20 cycles
                 if cycle_count.is_multiple_of(20) {
@@ -2287,6 +2360,11 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                 if let Err(e) = learn::prune_old_rejections(&db, RETENTION_DAYS).await {
                     warn!("Rejection prune failed: {e}");
                 }
+                // The decisions / system_state_history / execution_log tables have no other
+                // retention; prune them on the same window (readers need only 24h / a few rows).
+                if let Err(e) = audit::prune_old(&db, RETENTION_DAYS).await {
+                    warn!("Audit prune failed: {e}");
+                }
                 let feedback_summary =
                     feedback::recent_summary(&db, 10).await.unwrap_or_default();
 
@@ -2461,6 +2539,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                     advisor: adv,
                                     advisor_spent_today: spent,
                                     advisor_escalations_today: escalations,
+                                    escalation_cost_usd: spent - spent_baseline,
                                 })
                             }
                             Err(e) => Err(e.to_string()),
@@ -2486,6 +2565,21 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
             info!("Shutdown signal received — stopping service loop");
         }
     }
+
+    // Drain the executor before the runtime is dropped. Both exit paths land here: a
+    // settings-save `restart_self()` returns out of the loop block, and a shutdown/SCM
+    // stop (including the self-updater's `sc stop`) cancels it. An approved fix that was
+    // queued or executing gets to finish and log (execution_log / undo snapshot / feedback)
+    // instead of being aborted when the runtime drops — PROVIDED it completes within the
+    // drain window. Dropping the only `ExecJob` sender closes the job channel so the worker
+    // stops once its queue is empty; the idle case joins instantly. The 30s cap matches
+    // SCM's own stop timeout (run_service reports StopPending + a 35s wait_hint so SCM
+    // waits): a genuinely long repair (SFC/DISM, tens of minutes) can still be cut off by
+    // SCM force-killing the process, which no in-process drain can outlast — those remain
+    // best-effort, not guaranteed.
+    drop(exec_tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), exec_handle).await;
+    info!("Executor drained — service loop stopped");
 }
 
 #[cfg(test)]
@@ -2624,6 +2718,7 @@ mod analysis_outcome_tests {
             advisor: AdvisorStatus::default(),
             advisor_spent_today: 1.23,
             advisor_escalations_today: 2,
+            escalation_cost_usd: 0.0,
         });
         match ok {
             Ok(s) => {

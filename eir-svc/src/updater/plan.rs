@@ -140,6 +140,42 @@ pub fn host_acceptable(host: &str, name: &str) -> bool {
     host_trusted(host) || host_matches_name(host, name)
 }
 
+/// `github.com` is a multi-tenant release host: being *on* it proves nothing about
+/// which repo an asset belongs to, so the blanket host trust let the AI point a native
+/// install at ANY attacker-owned repo. For a `github.com` URL, require the `/owner/repo/`
+/// path to correlate with the app name. Alnum containment (looser than the vendor-domain
+/// equality) because a niche native-only app's repo name is usually its name; a false
+/// negative merely skips the native update (manual/other methods remain).
+///
+/// This NARROWS the risk (a totally-unrelated `attacker/evil` repo is now rejected) but
+/// does NOT eliminate it: a repo *named after* the app (`attacker/krita-fork`) still
+/// correlates — no repo-name-only heuristic can tell a hostile fork from a legitimate one
+/// (`ferdium/ferdium-app`, `krita/krita-desktop`) without a trusted per-app owner
+/// allowlist, which does not exist here. The **Authenticode signature gate + any
+/// vendor-published SHA-256 remain the real backstop** for that residual. The opaque
+/// `*.githubusercontent.com` asset CDNs carry no repo path and are only reachable as
+/// redirect targets, so they stay trusted by host alone (an AI-supplied CDN URL is
+/// likewise gated only by the signature/hash).
+fn github_repo_correlates(u: &url::Url, name: &str) -> bool {
+    let mut segs = u.path_segments().into_iter().flatten();
+    let owner = alnum_token(segs.next().unwrap_or(""));
+    let repo = alnum_token(segs.next().unwrap_or(""));
+    let app = alnum_token(name);
+    let first = name
+        .split_whitespace()
+        .next()
+        .map(alnum_token)
+        .unwrap_or_default();
+    let relates = |seg: &str| -> bool {
+        if seg.is_empty() {
+            return false;
+        }
+        (app.len() >= 3 && (seg.contains(app.as_str()) || app.contains(seg)))
+            || (first.len() >= 3 && (seg.contains(first.as_str()) || first.contains(seg)))
+    };
+    relates(&owner) || relates(&repo)
+}
+
 /// Strict gate for the initial URL and every redirect hop / final URL: https,
 /// no credentials, default port, not a raw IP, not punycode/IDN, and an
 /// acceptable host. Returns Err(reason) so callers can surface why a hop failed.
@@ -173,6 +209,9 @@ pub fn url_acceptable(u: &url::Url, name: &str) -> Result<(), &'static str> {
     }
     if !host_acceptable(&host, name) {
         return Err("untrusted host");
+    }
+    if host == "github.com" && !github_repo_correlates(u, name) {
+        return Err("github repo does not correlate with the app");
     }
     Ok(())
 }
@@ -271,6 +310,12 @@ pub fn validate_plan(
             "host '{host}' is not a trusted release host or the app's vendor domain"
         ));
     }
+    if host == "github.com" && !github_repo_correlates(&parsed, name) {
+        return Err(format!(
+            "github repo in '{}' does not correlate with app '{name}'",
+            parsed.path()
+        ));
+    }
     let path = parsed.path().to_lowercase();
     let kind = if path.ends_with(".msi") {
         InstallerKind::Msi
@@ -355,6 +400,26 @@ mod tests {
             publisher: String::new(),
             verify_exe: None,
         }
+    }
+
+    #[test]
+    fn validate_plan_rejects_uncorrelated_github_repo() {
+        // github.com is trusted as a host, but an attacker-proposed repo unrelated to the
+        // app must still be rejected — the repo path has to correlate with the app name.
+        let err = validate_plan(
+            raw("https://github.com/attacker/evil/releases/download/v1/setup.exe"),
+            "Krita",
+            "1.0.0",
+        )
+        .unwrap_err();
+        assert!(err.contains("github repo"), "got: {err}");
+        // The genuine repo correlates (repo == app) and is accepted.
+        assert!(validate_plan(
+            raw("https://github.com/KDE/krita/releases/download/v5/krita-setup.exe"),
+            "Krita",
+            "1.0.0",
+        )
+        .is_ok());
     }
 
     #[test]

@@ -13,6 +13,13 @@ use tracing::{info, warn};
 
 pub type SharedStatus = Arc<Mutex<StatusPayload>>;
 
+/// Lock the shared status, recovering from a poisoned mutex instead of panicking. The
+/// guarded data is a plain snapshot the poll/tray/pipe loops clone or overwrite, so a
+/// prior panic elsewhere must not cascade into taking those loops down too.
+pub fn lock_status(status: &SharedStatus) -> std::sync::MutexGuard<'_, StatusPayload> {
+    status.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Runs the pipe client loop forever, reconnecting on disconnect.
 /// Updates `status` whenever a StatusPayload arrives from the service, and holds
 /// `connected` true only while a live connection exists so command handlers can
@@ -38,13 +45,13 @@ async fn run_on(
                 // settings-save restart). Show "reconnecting" instead of leaving the
                 // last healthy snapshot on screen; if the service is genuinely down,
                 // the next connect attempt fails and surfaces the full error below.
-                let mut s = status.lock().unwrap();
+                let mut s = lock_status(&status);
                 s.status = "Connecting".to_string();
                 s.error = None;
             }
             Err(e) => {
                 warn!("Pipe client disconnected: {e}");
-                let mut s = status.lock().unwrap();
+                let mut s = lock_status(&status);
                 s.status = "ServiceDisconnected".to_string();
                 s.error = Some(
                     "Eir service is not running. \
@@ -107,7 +114,7 @@ async fn connect_and_run(
                     if !trimmed.is_empty() {
                         match serde_json::from_str::<ServiceMsg>(trimmed) {
                             Ok(ServiceMsg::Status(payload)) => {
-                                *status.lock().unwrap() = payload;
+                                *lock_status(status) = payload;
                             }
                             Err(e) => warn!("Bad service message: {e}"),
                         }

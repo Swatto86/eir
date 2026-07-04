@@ -48,7 +48,17 @@ pub async fn label_one(pool: &SqlitePool, ai: &AiClient, model: &str) -> bool {
     // Text-only completion — the labeller never needs (and shouldn't pay for)
     // web search.
     let content = match ai.complete_text(&prompt, model).await {
-        Ok((c, _usage)) => c,
+        Ok((c, usage)) => {
+            // The labeller is a billed AI call like any other — record its spend so it
+            // shows in usage_log / the usage card and the daily accounting, matching the
+            // "surface all AI spend" invariant the rest of the app upholds.
+            if let Some(u) = &usage {
+                if let Err(e) = crate::audit::log_usage(pool, u).await {
+                    warn!("self-improvement: logging labeller usage failed: {e}");
+                }
+            }
+            c
+        }
         Err(e) => {
             warn!("self-improvement: AI labelling failed: {e}");
             return false;

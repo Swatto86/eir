@@ -131,10 +131,7 @@ fn launched_hidden() -> bool {
 fn get_status(status: State<'_, SharedStatus>) -> StatusPayload {
     // Recover from a poisoned lock instead of panicking: the guarded data is a plain
     // snapshot, so a prior panic elsewhere shouldn't turn every 2s poll into a crash.
-    match status.lock() {
-        Ok(g) => g.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    }
+    pipe_client::lock_status(&status).clone()
 }
 
 #[tauri::command]
@@ -474,7 +471,7 @@ async fn notify_on_new_approvals(status: SharedStatus, handle: AppHandle) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         let (pending, digest_at): (Vec<(u64, String)>, i64) = {
-            let s = status.lock().unwrap();
+            let s = pipe_client::lock_status(&status);
             let pending = s
                 .pending_approvals
                 .iter()
@@ -656,10 +653,17 @@ fn main() {
                             }
                         }
                         "pause" => {
-                            let tx = tx.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let _ = tx.send(UiMsg::TogglePause).await;
-                            });
+                            // Gate on the connected flag like the window commands: a tray
+                            // click while the service is down/restarting would otherwise
+                            // queue silently (a menu item can't surface an error) and could
+                            // replay as a stale toggle on reconnect.
+                            let conn = app.state::<ConnState>();
+                            if ensure_connected(&conn.0).is_ok() {
+                                let tx = tx.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    let _ = tx.send(UiMsg::TogglePause).await;
+                                });
+                            }
                         }
                         "quit" => app.exit(0),
                         _ => {}
@@ -703,7 +707,7 @@ fn main() {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     let (current, paused) = {
-                        let s = status_tray.lock().unwrap();
+                        let s = pipe_client::lock_status(&status_tray);
                         (s.status.clone(), s.paused)
                     };
                     if current != last {

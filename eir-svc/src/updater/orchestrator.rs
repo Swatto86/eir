@@ -346,11 +346,24 @@ pub async fn run_cycle(
     let mut notes = check.notes;
     let mut results = Vec::new();
 
-    for cand in check
-        .candidates
-        .into_iter()
-        .take(ctx.config.max_apps_per_run as usize)
-    {
+    // Fair rotation: order candidates by how recently each was last attempted (never-tried
+    // first, then stalest). The candidate collection order is otherwise fixed, so without
+    // this a persistently-failing app at the front would permanently starve every app past
+    // `max_apps_per_run`. A stable sort keeps the collection order for equal staleness.
+    let last_attempt = crate::updater::history::last_attempt_times(pool)
+        .await
+        .unwrap_or_default();
+    let mut candidates = check.candidates;
+    candidates.sort_by_key(|c| last_attempt.get(&c.id).copied().unwrap_or(0));
+    let cap = ctx.config.max_apps_per_run as usize;
+    let deferred = candidates.len().saturating_sub(cap);
+    if deferred > 0 {
+        notes.push(format!(
+            "{deferred} more app(s) past the per-run cap of {cap} — deferred to a later cycle (stalest first)."
+        ));
+    }
+
+    for cand in candidates.into_iter().take(cap) {
         if budget > 0.0 && spent >= budget {
             notes.push(format!(
                 "Stopped at the £/$ budget after {} apps.",

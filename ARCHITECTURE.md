@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-04 · **Release:** v0.24.1
+**Last updated:** 2026-07-04 · **Release:** v0.24.2
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -78,7 +78,7 @@ Eir is a single Cargo workspace (`resolver = "2"`) with three crates, plus a sta
 | `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service: signal collection, AI client, policy, execution, autonomous updater, SQLite audit DB. Heavy `windows` 0.58 feature set. |
 | `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), tracing. `build-dependencies`: `tauri-build` 2. |
 
-All three crates are versioned in lockstep — currently `0.24.1` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
+All three crates are versioned in lockstep — currently `0.24.2` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
 
 The dependency graph is acyclic and points inward: `eir-proto` depends on nothing internal; `eir-svc` and `eir-ui` each depend only on `eir-proto`. The UI and service never link against each other — they are separate processes coupled solely through the `eir-proto` wire contract over `\\.\pipe\EirSvc`.
 
@@ -545,7 +545,7 @@ AI-proposed):
 | `DiskCleanup{target}` | inline PS (`mod.rs:35`) | only `temp`/`tmp`/`prefetch` mapped; else "no action" | hardcoded target switch |
 | `PowerShellDiagnostic{script}` | `powershell::run_diagnostic` | arbitrary script as SYSTEM | **none** — full machine access; kept off whitelist |
 | `TaskDisable/Enable{task_name}` | `tasks.rs` | `Disable/Enable-ScheduledTask` via spawned `powershell.exe` (`std::process`, no timeout) | single-quote escaping |
-| `RegistryReset{key,name,data}` | `registry.rs` | `Set-ItemProperty` via `std::process` (no timeout) | **`ALLOWED_KEY_PREFIXES` allowlist** (Tcpip, Session Manager, Multimedia, HKCU\SOFTWARE\Microsoft); normalises `HKEY_*` forms |
+| `RegistryReset{key,name,data}` | `registry.rs` | `Set-ItemProperty` via `std::process` (no timeout) | **`ALLOWED_KEY_PREFIXES` allowlist** (Tcpip, Multimedia, HKCU\SOFTWARE\Microsoft); `DENIED_KEY_PREFIXES` denies persistence subkeys (Run/RunOnce/Winlogon/IFEO/**Explorer\StartupApproved**); normalises `HKEY_*` forms |
 | `NetworkDiagnostic{command}` | inline PS (`mod.rs:68`) | only `flush_dns/release_renew/reset_tcp/reset_winsock`; else early-return failure | hardcoded command switch |
 | `DriverDisable{name}` | `driver.rs` | `sc.exe config … start= disabled` | **`CRITICAL_DRIVERS` blocklist** (storage/bus/net/fs/usb/wdf) |
 | `DriverEnable{name}` | `driver.rs` | `sc.exe config … start= demand` | none (auto-whitelisted) |
@@ -1025,6 +1025,26 @@ one app already known to behave this way.
 
 ## Known limitations & backlog
 
+**Resolved in v0.24.2 (correctness & hardening sweep, C1–C21):**
+- **Executor drain on stop/restart** (C1): the off-loop executor worker's `JoinHandle` is now held
+  and drained (`drop(exec_tx)` + a 30 s bounded join) before `eir_main` returns, so an approved fix
+  that was queued/executing finishes and logs instead of being aborted when the runtime drops (the
+  self-updater's `sc stop` and settings-save restart are the common triggers). The SCM handler reports
+  `StopPending` + a 35 s `wait_hint` so SCM waits for the drain. Best-effort only for a repair longer
+  than the window (SFC/DISM) — SCM can still force-kill.
+- **`verify_exe` UNC guard** (C2): `exe_file_version` now requires a drive-letter path, rejecting a
+  UNC path that would force LocalSystem to authenticate to an attacker SMB share.
+- **GitHub host correlation** (C4): a `github.com` native-install URL must now have its `/owner/repo/`
+  correlate with the app name (narrows, doesn't eliminate — the Authenticode/SHA gate is the backstop;
+  see `github_repo_correlates`).
+- **`FileDelete` canonicalisation** (C6), **native-install ACL retry** (C5), **`strip_fences` /
+  raw-JSON fallback** (C3), **advisor midnight day-rollover** (C8), **`LogCleanup` deadline + canonical
+  walk** (C9/C19), **audit-table retention** (C7, above), **updater fair-rotation** (C13),
+  **`match_installed` ambiguity** (C12), **`SetAppIgnore` cap** (C15), and UI fixes (advisor 0-value
+  handling C10, tray-pause connected-gate C11) round out the sweep. Compile/test-verified
+  (fmt + `clippy --all-targets` + `cargo test --workspace`); the shutdown-drain and live SMB/SCM paths
+  are reasoning-verified, not live-exercised.
+
 **Added in v0.24.0 (F10–F13 user-facing tools)** — with deliberate v1 deferrals:
 - **Disk insights**: cleanup maps only to *existing* safe actions (`DiskCleanup{temp|prefetch}`
   auto; a stray `MEMORY.DMP` via `FileDelete`, approval). Emptying the Recycle Bin, `powercfg /h off`,
@@ -1041,8 +1061,9 @@ one app already known to behave this way.
   clean/toggle buttons self-recover (the command is fire-and-forget); a fuller per-action ack channel
   is still not implemented (the pipe remains fire-and-forget).
 - `system_state_history` is now *read* by the dashboard timeline (`metric_history`) as well as the
-  trend detector; it still grows unbounded (~52k rows/yr at the default cadence) — pruning is not yet
-  implemented and is low priority.
+  trend detector. **Resolved in v0.24.2:** it — along with `decisions` and `execution_log` — is now
+  pruned to a 90-day window by `audit::prune_old` (called from the per-cycle retention block beside
+  `feedback::prune_old`), so none of the three high-frequency audit tables grows without bound.
 
 **Resolved in v0.23.0** (bullets below may still describe the pre-fix state):
 - Registry `registry_reset` gate now uses component-boundary matching (a sibling key sharing a name prefix could bypass the old `starts_with` allowlist), denies persistence subkeys (Run/RunOnce/Winlogon/IFEO), and the policy layer has real registry blocklist entries. Registry resets are now **reversible**: the prior value is snapshotted and can be reverted with one click (`registry_undo` table).

@@ -1,7 +1,7 @@
 use crate::policy::{is_within, normalize_path_lexical};
 use anyhow::{bail, Result};
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::info;
 
 const CLEANABLE_EXTENSIONS: &[&str] = &["log", "tmp", "dmp", "etl", "blf", "regtrans-ms"];
@@ -38,7 +38,8 @@ fn root_too_broad(path: &str) -> bool {
 
 /// A specific file that must not be deleted because it lives under a protected dir.
 /// Belt-and-suspenders against junctions/edge roots that slip past [`root_too_broad`].
-fn is_protected_file(path: &str) -> bool {
+/// Shared with the `FileDelete` executor, which canonicalises then re-checks here.
+pub(crate) fn is_protected_file(path: &str) -> bool {
     PROTECTED_DIRS.iter().any(|d| is_within(path, d))
 }
 
@@ -57,16 +58,31 @@ pub fn cleanup(path: &str, days_old: u32) -> Result<String> {
     if !dir.exists() {
         return Ok(format!("Directory '{path}' does not exist, skipping"));
     }
-    // Re-check the CANONICAL root: the lexical `root_too_broad` guard above can be
-    // evaded by an 8.3 short name or a junction whose text differs from a protected dir
-    // but resolves to it on disk. `canonicalize` resolves 8.3 / junctions / symlinks to
-    // the real target (WalkDir won't follow links mid-walk, so guarding the root is
-    // enough). If it can't be canonicalised, the lexical guard already applied.
-    if let Ok(canon) = std::fs::canonicalize(dir) {
-        if root_too_broad(&canon.to_string_lossy()) {
-            bail!("Refusing log cleanup on '{path}' — it resolves to a protected system location");
+    // Canonicalise once, and use the resolved path as BOTH the protected-dir re-check
+    // and the walk root. The lexical `root_too_broad` guard above can be evaded by an 8.3
+    // short name or a junction whose text differs from a protected dir but resolves to it
+    // on disk; `canonicalize` resolves 8.3 / junctions / symlinks to the real target.
+    // Walking the canonical path (not the original `dir`) also closes a check->act gap:
+    // WalkDir always follows a reparse point at the ROOT (`follow_links(false)` only
+    // affects descent), so walking the original path could enter a junction swapped in
+    // after the check. If it can't be canonicalised, the lexical guard already applied;
+    // walk the original path.
+    let walk_root = match std::fs::canonicalize(dir) {
+        Ok(canon) => {
+            if root_too_broad(&canon.to_string_lossy()) {
+                bail!(
+                    "Refusing log cleanup on '{path}' — it resolves to a protected system location"
+                );
+            }
+            canon
         }
-    }
+        Err(_) => dir.to_path_buf(),
+    };
+
+    // Self-terminate before the executor's 10-min backstop aborts us: an abort can't reach
+    // this blocking walk, so without an internal deadline it would keep deleting after the
+    // UI already reported the action "abandoned". Leave a minute of margin.
+    let deadline = Instant::now() + Duration::from_secs(9 * 60);
 
     let cutoff = SystemTime::now()
         .checked_sub(Duration::from_secs(days_old as u64 * 86400))
@@ -75,12 +91,17 @@ pub fn cleanup(path: &str, days_old: u32) -> Result<String> {
     let mut deleted = 0u32;
     let mut skipped = 0u32;
     let mut bytes_freed: u64 = 0;
+    let mut timed_out = false;
 
-    for entry in walkdir::WalkDir::new(dir)
+    for entry in walkdir::WalkDir::new(&walk_root)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
     {
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
         let p = entry.path();
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
         if !CLEANABLE_EXTENSIONS.contains(&ext) {
@@ -116,9 +137,14 @@ pub fn cleanup(path: &str, days_old: u32) -> Result<String> {
     }
 
     let mb_freed = bytes_freed as f64 / (1024.0 * 1024.0);
+    let note = if timed_out {
+        " (stopped early at the time limit)"
+    } else {
+        ""
+    };
     Ok(format!(
         "Cleaned {deleted} files ({mb_freed:.1} MB freed), {skipped} locked/protected/skipped \
-         (>{days_old} days old in '{path}')"
+         (>{days_old} days old in '{path}'){note}"
     ))
 }
 

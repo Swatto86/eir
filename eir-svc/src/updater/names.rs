@@ -154,8 +154,12 @@ fn contiguous_sublist(small: &[String], big: &[String]) -> bool {
 /// raw substring). A raw `contains` let a short AI name like "note" resolve to an
 /// unrelated "Notepad++", which — since the resolved candidate's name feeds the
 /// download host gate — could anchor a malicious vendor domain to a real installed
-/// app. Whole-token matching closes that, and the most specific (longest) match wins
-/// so a short query can't grab the wrong longer app.
+/// app. Whole-token matching closes that. When the fuzzy match is AMBIGUOUS — an AI
+/// name like "Studio" whole-token-matching both "OBS Studio" and "Visual Studio" —
+/// we must NOT arbitrarily pick one (the old longest-key rule fed a wrong installed
+/// version into the update decision and the install-plan prompt). Mirror
+/// `winget_installed_version_by_name`: return a version only when every containment
+/// match agrees on it, else `None` (skip the guess this cycle).
 pub fn match_installed<'a>(
     installed: &'a HashMap<String, String>,
     name: &str,
@@ -168,14 +172,18 @@ pub fn match_installed<'a>(
     if nt.is_empty() {
         return None;
     }
-    installed
+    let versions: Vec<&'a String> = installed
         .iter()
         .filter(|(k, _)| {
             let kt = name_tokens(k);
             !kt.is_empty() && (contiguous_sublist(&nt, &kt) || contiguous_sublist(&kt, &nt))
         })
-        .max_by_key(|(k, _)| k.len())
         .map(|(_, v)| v)
+        .collect();
+    match versions.first() {
+        Some(&first) if versions.iter().all(|v| *v == first) => Some(first),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -293,5 +301,22 @@ mod tests {
         );
         // No overlap -> no match (caller falls back to the AI's own `current`).
         assert_eq!(match_installed(&installed, "Obsidian"), None);
+    }
+
+    #[test]
+    fn match_installed_rejects_ambiguous_disagreeing_versions() {
+        let mut installed = HashMap::new();
+        installed.insert("obs studio".to_string(), "30.0.2".to_string());
+        installed.insert("visual studio".to_string(), "17.9.0".to_string());
+        // "Studio" whole-token-matches both, and their versions disagree — must NOT
+        // arbitrarily pick one (the old longest-key rule silently chose Visual Studio).
+        assert_eq!(match_installed(&installed, "Studio"), None);
+        // But if every containment match agrees on the version, it still resolves.
+        installed.insert("obs studio helper".to_string(), "30.0.2".to_string());
+        installed.remove("visual studio");
+        assert_eq!(
+            match_installed(&installed, "Studio"),
+            Some(&"30.0.2".to_string())
+        );
     }
 }

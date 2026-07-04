@@ -35,7 +35,6 @@ fn staging_root() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("eir-staging"))
 }
 
-static ACL_ONCE: std::sync::Once = std::sync::Once::new();
 static ACL_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Strip inherited ACEs and grant only SYSTEM + Administrators full control, so the
@@ -65,18 +64,20 @@ fn ensure_root() -> std::io::Result<PathBuf> {
     use std::sync::atomic::Ordering;
     let root = staging_root();
     std::fs::create_dir_all(&root)?;
-    ACL_ONCE.call_once(|| {
-        let ok = lock_down_acl(&root);
-        if !ok {
-            warn!("could not lock down staging dir ACL: {}", root.display());
-        }
-        ACL_OK.store(ok, Ordering::SeqCst);
-    });
+    // Lock the staging root down to SYSTEM+Administrators. Retry on every call until it
+    // succeeds instead of latching a one-shot `Once`: a single transient `icacls` failure
+    // (AV interception, a brief lock) must not permanently disable native installs for the
+    // life of the service. Once it succeeds the atomic short-circuits future calls.
     if !ACL_OK.load(Ordering::SeqCst) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "staging directory could not be locked to SYSTEM/Administrators",
-        ));
+        if lock_down_acl(&root) {
+            ACL_OK.store(true, Ordering::SeqCst);
+        } else {
+            warn!("could not lock down staging dir ACL: {}", root.display());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "staging directory could not be locked to SYSTEM/Administrators",
+            ));
+        }
     }
     Ok(root)
 }

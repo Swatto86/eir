@@ -122,8 +122,22 @@ async fn winget_installed_version_by_name(name: &str) -> Option<String> {
 
 /// Read FileVersion/ProductVersion of an absolute exe path (a second confirmation
 /// signal for native installs). Returns None for relative paths or missing files.
+/// Whether `path` is an absolute drive-letter path (`C:\...`). Rejects relative paths
+/// AND UNC / verbatim-UNC paths (`\\host\share\...`): `is_absolute()` is true for UNC,
+/// which Windows would resolve over SMB, making the LocalSystem machine account
+/// authenticate to an attacker-controlled host (a forced-auth / NTLM-relay primitive).
+/// The AI supplies this path, so the guard must be explicit.
+fn is_local_drive_path(path: &str) -> bool {
+    let p = Path::new(path);
+    p.is_absolute()
+        && matches!(
+            p.components().next(),
+            Some(std::path::Component::Prefix(pre)) if matches!(pre.kind(), std::path::Prefix::Disk(_))
+        )
+}
+
 async fn exe_file_version(path: &str) -> Option<String> {
-    if !Path::new(path).is_absolute() {
+    if !is_local_drive_path(path) {
         return None;
     }
     let script = format!(
@@ -144,6 +158,18 @@ async fn exe_file_version(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_local_drive_path_rejects_unc_and_relative() {
+        assert!(is_local_drive_path("C:\\Program Files\\App\\app.exe"));
+        assert!(is_local_drive_path("D:\\x.exe"));
+        // UNC would force LocalSystem to authenticate to a remote SMB host.
+        assert!(!is_local_drive_path("\\\\attacker.example\\share\\x.exe"));
+        assert!(!is_local_drive_path("\\\\?\\UNC\\host\\share\\x.exe"));
+        // Relative / bare paths.
+        assert!(!is_local_drive_path("app.exe"));
+        assert!(!is_local_drive_path("..\\x.exe"));
+    }
 
     #[test]
     fn exe_fallback_softens_only_a_real_mismatch() {

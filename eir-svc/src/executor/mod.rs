@@ -128,6 +128,26 @@ pub async fn execute(action: &FixAction) -> ExecutionResult {
             startup::set_enabled(name, location, hive, *enable).await,
         ),
         FixAction::FileDelete { path } => {
+            // Canonicalise before deleting. An 8.3 short name or a junction can lexically
+            // dodge the policy blocklist yet resolve into a protected system dir — and the
+            // approval card shows the UN-resolved path, so the human can't see the real
+            // target. Resolve it and refuse anything under a protected dir, mirroring the
+            // per-file guard LogCleanup already applies. (canonicalize fails for a missing
+            // file; that path can't be deleted anyway, so fall through to the script,
+            // which reports "not found".) A narrow check-then-act race remains (a swap
+            // between here and Remove-Item), but the target is a single approval-gated
+            // file and `Remove-Item -Force` on a reparse point removes the link itself.
+            if let Ok(canon) = std::fs::canonicalize(path) {
+                if logs::is_protected_file(&canon.to_string_lossy()) {
+                    return make_result(
+                        action,
+                        Err(anyhow::anyhow!(
+                            "Refusing to delete '{path}': resolves into a protected system directory ({})",
+                            canon.display()
+                        )),
+                    );
+                }
+            }
             let safe = path.replace('\'', "''");
             // Guard: refuse if path is a directory, and require the item to exist.
             let script = format!(

@@ -764,7 +764,10 @@ function renderUsage(u) {
   const provider = (lastStatus && lastStatus.settings && lastStatus.settings.provider) || '';
   // Skip the innerHTML rebuild when nothing changed, so the 2s poll doesn't churn
   // the card (and can't wipe a selection on the figures).
-  const usageSig = JSON.stringify({ u, provider });
+  // Include gbpRate: it starts at the 0.79 fallback and is replaced a few seconds after
+  // boot by the live rate. Without it in the signature, the £ cells stay computed off the
+  // stale rate until the usage numbers themselves next change.
+  const usageSig = JSON.stringify({ u, provider, gbpRate });
   if (usageSig === lastUsageSig) return;
   lastUsageSig = usageSig;
   // Claude CLI runs on the subscription: no charge, so cost cells show a dash
@@ -957,9 +960,16 @@ document.getElementById('learned-list').addEventListener('click', (e) => {
   if (!btn) return;
   const id = parseInt(btn.dataset.id, 10);
   if (!Number.isFinite(id)) return;
+  // Disable the row's buttons to prevent a double-submit before the next repaint,
+  // mirroring the approve / undo / disk-clean controls.
+  const row = btn.parentElement;
+  row.querySelectorAll('.learned-act').forEach((b) => { b.disabled = true; });
   invoke('set_learned_fact', { id, op: btn.dataset.op })
     .then(refresh)
-    .catch((err) => console.error('set_learned_fact failed', err));
+    .catch((err) => {
+      console.error('set_learned_fact failed', err);
+      row.querySelectorAll('.learned-act').forEach((b) => { b.disabled = false; });
+    });
 });
 
 // ── Settings ──────────────────────────────────────────────────────────────────
@@ -971,9 +981,18 @@ const PROVIDER_HINTS = {
   kilo_cli: 'Kilo CLI (your Kilo subscription) — no API key; borrows your logged-in Kilo session. Install with `npm install -g @kilocode/cli`, then run `kilo` once to sign in. Model needs the kilo/ prefix to route through your subscription/BYOK, e.g. kilo/minimax/minimax-m2.5.',
 };
 
+const PROVIDER_MODEL_PLACEHOLDERS = {
+  openrouter: 'blank = a free model, or e.g. mistralai/mistral-small',
+  claude_cli: 'blank = CLI default, or haiku / sonnet / opus',
+  anthropic: 'required, e.g. claude-opus-4-8 or claude-haiku-4-5',
+  kilo_cli: 'kilo/ prefix, e.g. kilo/minimax/minimax-m2.5',
+};
+
 function updateProviderHint() {
   const p = document.getElementById('set-provider').value;
   document.getElementById('provider-hint').textContent = PROVIDER_HINTS[p] || '';
+  const model = document.getElementById('set-model');
+  if (model) model.placeholder = PROVIDER_MODEL_PLACEHOLDERS[p] || '';
 }
 document.getElementById('set-provider').addEventListener('change', updateProviderHint);
 
@@ -1100,18 +1119,27 @@ function fillAdvisorSettings(s) {
   document.getElementById('set-adv-enabled').checked = !!s.enabled;
   document.getElementById('set-adv-model').value = s.escalation_model || '';
   document.getElementById('set-adv-effort').value = s.escalation_effort || '';
-  document.getElementById('set-adv-conf').value = Math.round((s.low_confidence_threshold || 0.6) * 100);
+  document.getElementById('set-adv-conf').value = Math.round(
+    (s.low_confidence_threshold != null ? s.low_confidence_threshold : 0.6) * 100
+  );
   document.getElementById('set-adv-budget').value =
     s.budget_usd_per_day != null ? s.budget_usd_per_day : 0.5;
 }
 
 async function saveAdvisorSettings() {
+  // Distinguish a blank field from an explicit 0: the service treats a 0.0 threshold as
+  // "never escalate on low confidence" and a 0 budget as "no daily cap" — both legitimate
+  // deliberate choices. A plain `|| default` silently coerces either 0 back to the default.
+  const confRaw = document.getElementById('set-adv-conf').value.trim();
+  const confPct = confRaw === '' ? 60 : parseInt(confRaw, 10);
+  const budgetRaw = document.getElementById('set-adv-budget').value.trim();
+  const budgetVal = budgetRaw === '' ? 0.5 : parseFloat(budgetRaw);
   const settings = {
     enabled: document.getElementById('set-adv-enabled').checked,
     escalation_model: document.getElementById('set-adv-model').value.trim(),
     escalation_effort: document.getElementById('set-adv-effort').value,
-    low_confidence_threshold: (parseInt(document.getElementById('set-adv-conf').value, 10) || 60) / 100,
-    budget_usd_per_day: parseFloat(document.getElementById('set-adv-budget').value) || 0,
+    low_confidence_threshold: (Number.isFinite(confPct) ? confPct : 60) / 100,
+    budget_usd_per_day: Number.isFinite(budgetVal) ? budgetVal : 0.5,
   };
   const st = document.getElementById('set-adv-status');
   st.textContent = 'Saving…';

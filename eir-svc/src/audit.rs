@@ -627,6 +627,28 @@ pub async fn log_execution(
     Ok(id)
 }
 
+/// Delete rows older than `days` from the three high-frequency audit tables that
+/// otherwise grow without bound (~52k rows/yr each at the default cadence). The
+/// dashboard timeline reads only the last 24h and the trend detector only the last few
+/// rows, so a 90-day window keeps every reader whole. Mirrors `feedback::prune_old`;
+/// cheap after the first pass (later cycles match nothing). Returns total rows removed.
+pub async fn prune_old(pool: &SqlitePool, days: i64) -> anyhow::Result<u64> {
+    let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let mut removed = 0u64;
+    for (table, col) in [
+        ("decisions", "timestamp"),
+        ("system_state_history", "timestamp"),
+        ("execution_log", "executed_at"),
+    ] {
+        let res = sqlx::query(&format!("DELETE FROM {table} WHERE {col} < ?"))
+            .bind(&cutoff)
+            .execute(pool)
+            .await?;
+        removed += res.rows_affected();
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

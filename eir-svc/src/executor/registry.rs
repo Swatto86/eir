@@ -30,6 +30,10 @@ const DENIED_KEY_PREFIXES: &[&str] = &[
     "HKCU:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
     "HKCU:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options",
     "HKCU:\\SOFTWARE\\Microsoft\\Command Processor",
+    // StartupApproved holds the enable/disable state for startup entries. Toggling it is
+    // the job of the validated executor::startup path; deny it here so a generic
+    // RegistryReset can't reach that closed set via a less-scrutinised approval card.
+    "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved",
 ];
 
 /// PowerShell registry cmdlets glob-expand `*?[]` in `-Path`/`-Name` against real keys
