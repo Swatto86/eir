@@ -1,6 +1,9 @@
 use anyhow::Result;
 use eir_proto::{ServiceMsg, StatusPayload, UiMsg, PIPE_NAME};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::windows::named_pipe::ClientOptions,
@@ -11,14 +14,25 @@ use tracing::{info, warn};
 pub type SharedStatus = Arc<Mutex<StatusPayload>>;
 
 /// Runs the pipe client loop forever, reconnecting on disconnect.
-/// Updates `status` whenever a StatusPayload arrives from the service.
-pub async fn run(status: SharedStatus, cmd_rx: mpsc::Receiver<UiMsg>) {
-    run_on(status, cmd_rx, PIPE_NAME).await
+/// Updates `status` whenever a StatusPayload arrives from the service, and holds
+/// `connected` true only while a live connection exists so command handlers can
+/// refuse work that would otherwise be queued and silently dropped.
+pub async fn run(status: SharedStatus, cmd_rx: mpsc::Receiver<UiMsg>, connected: Arc<AtomicBool>) {
+    run_on(status, cmd_rx, PIPE_NAME, connected).await
 }
 
-async fn run_on(status: SharedStatus, mut cmd_rx: mpsc::Receiver<UiMsg>, pipe_name: &str) {
+async fn run_on(
+    status: SharedStatus,
+    mut cmd_rx: mpsc::Receiver<UiMsg>,
+    pipe_name: &str,
+    connected: Arc<AtomicBool>,
+) {
     loop {
-        match connect_and_run(&status, &mut cmd_rx, pipe_name).await {
+        let result = connect_and_run(&status, &mut cmd_rx, pipe_name, &connected).await;
+        // Whatever ended the connection, we are no longer connected — refuse
+        // commands until the next connect succeeds.
+        connected.store(false, Ordering::Relaxed);
+        match result {
             Ok(()) => {
                 // A clean EOF means the service closed the pipe (typically a
                 // settings-save restart). Show "reconnecting" instead of leaving the
@@ -52,6 +66,7 @@ async fn connect_and_run(
     status: &SharedStatus,
     cmd_rx: &mut mpsc::Receiver<UiMsg>,
     pipe_name: &str,
+    connected: &AtomicBool,
 ) -> Result<()> {
     // Keep trying until the pipe is available (service may still be starting).
     let client = loop {
@@ -71,6 +86,7 @@ async fn connect_and_run(
     };
 
     info!("Connected to Eir service pipe");
+    connected.store(true, Ordering::Relaxed);
 
     let (reader, mut writer) = tokio::io::split(client);
     let mut reader = BufReader::new(reader);
@@ -144,10 +160,12 @@ mod tests {
 
         let status: SharedStatus = Arc::new(Mutex::new(StatusPayload::default()));
         let (tx, rx) = mpsc::channel::<UiMsg>(8);
+        let connected = Arc::new(AtomicBool::new(false));
 
         let status_c = status.clone();
+        let connected_c = connected.clone();
         let name_owned = name.to_string();
-        tokio::spawn(async move { run_on(status_c, rx, &name_owned).await });
+        tokio::spawn(async move { run_on(status_c, rx, &name_owned, connected_c).await });
 
         server.connect().await.expect("server accept client");
 
@@ -170,5 +188,20 @@ mod tests {
             got.contains("\"type\":\"approve\"") && got.contains("\"id\":7"),
             "unexpected payload: {got}"
         );
+
+        // By the time a command has round-tripped, the client is connected: the
+        // gate flag must be true so command handlers accept work.
+        assert!(
+            connected.load(Ordering::Relaxed),
+            "connected flag should be true while the pipe is live"
+        );
+    }
+
+    #[test]
+    fn ensure_connected_gate() {
+        let flag = AtomicBool::new(false);
+        assert!(crate::ensure_connected(&flag).is_err());
+        flag.store(true, Ordering::Relaxed);
+        assert!(crate::ensure_connected(&flag).is_ok());
     }
 }

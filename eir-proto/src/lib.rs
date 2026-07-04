@@ -460,7 +460,9 @@ pub enum UiMsg {
     },
     /// Apply updater settings live (no service restart).
     UpdateUpdaterSettings(Box<UpdaterSettingsUpdate>),
-    /// Ignore/un-ignore an app, or set a per-app note for the AI.
+    /// Ignore/un-ignore an app, or set a per-app note for the AI. A blank `note`
+    /// leaves any existing note unchanged (an ignore toggle carries an empty note);
+    /// a non-empty note replaces it. Clearing a note is done in `config.toml`.
     SetAppIgnore {
         id: String,
         ignore: bool,

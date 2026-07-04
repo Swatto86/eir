@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 use tauri::{
     image::Image,
@@ -28,6 +31,23 @@ use tracing::{error, warn};
 
 /// Sender for UI commands (approve, toggle_pause) to the pipe client.
 struct UiCmdTx(mpsc::Sender<UiMsg>);
+
+/// True while the pipe client holds a live connection to the service. Commands
+/// that cross the pipe are refused when this is false, so a click made while the
+/// service is down (or restarting) fails loudly instead of being queued and then
+/// silently dropped when the dead connection's command backlog is drained.
+struct ConnState(Arc<AtomicBool>);
+
+/// Reject a pipe command when the service is disconnected. The UI's catch paths
+/// then re-enable the buttons / show "Failed: …" instead of leaving a control
+/// dead until restart.
+fn ensure_connected(conn: &AtomicBool) -> Result<(), String> {
+    if conn.load(Ordering::Relaxed) {
+        Ok(())
+    } else {
+        Err("Eir service is not connected".to_string())
+    }
+}
 
 const AUTOSTART_ARG: &str = "--hidden";
 const UI_PREFERENCES_FILE: &str = "ui-preferences.json";
@@ -118,76 +138,121 @@ fn get_status(status: State<'_, SharedStatus>) -> StatusPayload {
 }
 
 #[tauri::command]
-async fn decide_approval(id: u64, approved: bool, tx: State<'_, UiCmdTx>) -> Result<(), String> {
+async fn decide_approval(
+    id: u64,
+    approved: bool,
+    tx: State<'_, UiCmdTx>,
+    conn: State<'_, ConnState>,
+) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::Approve { id, approved })
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn toggle_pause(tx: State<'_, UiCmdTx>) -> Result<(), String> {
+async fn toggle_pause(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::TogglePause).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn undo_registry(id: i64, tx: State<'_, UiCmdTx>) -> Result<(), String> {
+async fn undo_registry(
+    id: i64,
+    tx: State<'_, UiCmdTx>,
+    conn: State<'_, ConnState>,
+) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::UndoRegistry { id })
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn ask_eir(question: String, tx: State<'_, UiCmdTx>) -> Result<(), String> {
+async fn ask_eir(
+    question: String,
+    tx: State<'_, UiCmdTx>,
+    conn: State<'_, ConnState>,
+) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::AskEir { question })
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn scan_disk(tx: State<'_, UiCmdTx>) -> Result<(), String> {
+async fn scan_disk(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::ScanDisk).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn clean_disk_entry(id: String, tx: State<'_, UiCmdTx>) -> Result<(), String> {
+async fn clean_disk_entry(
+    id: String,
+    tx: State<'_, UiCmdTx>,
+    conn: State<'_, ConnState>,
+) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::CleanDiskEntry { id })
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn scan_startup(tx: State<'_, UiCmdTx>) -> Result<(), String> {
+async fn scan_startup(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::ScanStartup).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn set_startup_entry(id: String, enable: bool, tx: State<'_, UiCmdTx>) -> Result<(), String> {
+async fn set_startup_entry(
+    id: String,
+    enable: bool,
+    tx: State<'_, UiCmdTx>,
+    conn: State<'_, ConnState>,
+) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::SetStartupEntry { id, enable })
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn clear_problems(tx: State<'_, UiCmdTx>) -> Result<(), String> {
+async fn clear_problems(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::ClearProblems)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn clear_executions(tx: State<'_, UiCmdTx>) -> Result<(), String> {
+async fn clear_executions(
+    tx: State<'_, UiCmdTx>,
+    conn: State<'_, ConnState>,
+) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::ClearExecutions)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn update_settings(settings: SettingsUpdate, tx: State<'_, UiCmdTx>) -> Result<(), String> {
+async fn update_settings(
+    settings: SettingsUpdate,
+    tx: State<'_, UiCmdTx>,
+    conn: State<'_, ConnState>,
+) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::UpdateSettings(Box::new(settings)))
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn run_updates_now(tx: State<'_, UiCmdTx>) -> Result<(), String> {
+async fn run_updates_now(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::RunUpdatesNow)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn clear_update_history(tx: State<'_, UiCmdTx>) -> Result<(), String> {
+async fn clear_update_history(
+    tx: State<'_, UiCmdTx>,
+    conn: State<'_, ConnState>,
+) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::ClearUpdateHistory)
         .map_err(|e| e.to_string())
 }
@@ -196,7 +261,9 @@ async fn clear_update_history(tx: State<'_, UiCmdTx>) -> Result<(), String> {
 async fn set_updater_settings(
     settings: UpdaterSettingsUpdate,
     tx: State<'_, UiCmdTx>,
+    conn: State<'_, ConnState>,
 ) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::UpdateUpdaterSettings(Box::new(settings)))
         .map_err(|e| e.to_string())
 }
@@ -207,13 +274,21 @@ async fn set_app_ignore(
     ignore: bool,
     note: String,
     tx: State<'_, UiCmdTx>,
+    conn: State<'_, ConnState>,
 ) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::SetAppIgnore { id, ignore, note })
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn set_learned_fact(id: i64, op: String, tx: State<'_, UiCmdTx>) -> Result<(), String> {
+async fn set_learned_fact(
+    id: i64,
+    op: String,
+    tx: State<'_, UiCmdTx>,
+    conn: State<'_, ConnState>,
+) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::SetLearnedFact { id, op })
         .map_err(|e| e.to_string())
 }
@@ -222,7 +297,9 @@ async fn set_learned_fact(id: i64, op: String, tx: State<'_, UiCmdTx>) -> Result
 async fn set_advisor_settings(
     settings: AdvisorSettingsUpdate,
     tx: State<'_, UiCmdTx>,
+    conn: State<'_, ConnState>,
 ) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::SetAdvisorSettings(Box::new(settings)))
         .map_err(|e| e.to_string())
 }
@@ -237,7 +314,6 @@ fn get_app_version(handle: AppHandle) -> String {
 /// reports the current state as a string for the UI to display.
 #[tauri::command]
 async fn check_updates_now(handle: AppHandle) -> Result<String, String> {
-    use std::sync::atomic::Ordering;
     if UPDATE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
         return Ok("An update is already downloading.".to_string());
     }
@@ -364,9 +440,22 @@ fn make_icon(base: &IconBase, status: &str) -> Image<'static> {
     Image::new_owned(scaled.into_raw(), TRAY_ICON_PX, TRAY_ICON_PX)
 }
 
+/// Space the internal CamelCase boundaries of a status word for display, mirroring
+/// the UI header ("PendingApproval" → "Pending Approval"). Single words are unchanged.
+fn friendly_status(status: &str) -> String {
+    let mut out = String::with_capacity(status.len() + 4);
+    for (i, c) in status.char_indices() {
+        if i > 0 && c.is_ascii_uppercase() {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn update_tray(tray: &TrayIcon<tauri::Wry>, base: &IconBase, status: &str) {
     let _ = tray.set_icon(Some(make_icon(base, status)));
-    let _ = tray.set_tooltip(Some(&format!("Eir — {status}")));
+    let _ = tray.set_tooltip(Some(&format!("Eir — {}", friendly_status(status))));
 }
 
 // ── Approval notifications ──────────────────────────────────────────────────────
@@ -472,7 +561,6 @@ fn spawn_update_checker(handle: tauri::AppHandle) {
 }
 
 async fn check_for_update(handle: &tauri::AppHandle) {
-    use std::sync::atomic::Ordering;
     if UPDATE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
         return; // a manual check is already installing
     }
@@ -518,6 +606,9 @@ fn main() {
     }));
     let (ui_cmd_tx, ui_cmd_rx) = mpsc::channel::<UiMsg>(16);
 
+    let connected: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let connected_for_pipe = connected.clone();
+
     let status_for_loop = status.clone();
 
     tauri::Builder::default()
@@ -531,6 +622,7 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .manage(status)
         .manage(UiCmdTx(ui_cmd_tx))
+        .manage(ConnState(connected))
         .setup(move |app| {
             let icon_base = Arc::new(decode_icon());
             let start_hidden = launched_hidden();
@@ -559,6 +651,7 @@ fn main() {
                         "open" => {
                             if let Some(w) = app.get_webview_window("main") {
                                 let _ = w.show();
+                                let _ = w.unminimize();
                                 let _ = w.set_focus();
                             }
                         }
@@ -581,6 +674,7 @@ fn main() {
                     {
                         if let Some(w) = tray.app_handle().get_webview_window("main") {
                             let _ = w.show();
+                            let _ = w.unminimize();
                             let _ = w.set_focus();
                         }
                     }
@@ -597,19 +691,35 @@ fn main() {
             // Background: pipe client + tray colour sync
             let status_pipe = status_for_loop.clone();
             tauri::async_runtime::spawn(async move {
-                pipe_client::run(status_pipe, ui_cmd_rx).await;
+                pipe_client::run(status_pipe, ui_cmd_rx, connected_for_pipe).await;
             });
 
             let status_tray = status_for_loop.clone();
             let icon_for_loop = icon_base.clone();
+            let pause_item_tray = pause_item.clone();
             tauri::async_runtime::spawn(async move {
                 let mut last = String::new();
+                let mut last_paused: Option<bool> = None;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let current = status_tray.lock().unwrap().status.clone();
+                    let (current, paused) = {
+                        let s = status_tray.lock().unwrap();
+                        (s.status.clone(), s.paused)
+                    };
                     if current != last {
                         last = current.clone();
                         update_tray(&tray, &icon_for_loop, &current);
+                    }
+                    // Keep the tray menu's pause entry in step with the state, so it
+                    // reads "Resume Monitoring" while paused instead of always offering
+                    // to pause.
+                    if last_paused != Some(paused) {
+                        last_paused = Some(paused);
+                        let _ = pause_item_tray.set_text(if paused {
+                            "Resume Monitoring"
+                        } else {
+                            "Pause Monitoring"
+                        });
                     }
                 }
             });
@@ -661,4 +771,28 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| error!("Eir UI failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn friendly_status_spaces_camelcase() {
+        assert_eq!(friendly_status("PendingApproval"), "Pending Approval");
+        assert_eq!(
+            friendly_status("ServiceDisconnected"),
+            "Service Disconnected"
+        );
+        assert_eq!(friendly_status("Active"), "Active");
+        assert_eq!(friendly_status(""), "");
+    }
+
+    #[test]
+    fn ensure_connected_reflects_flag() {
+        let flag = AtomicBool::new(false);
+        assert!(ensure_connected(&flag).is_err());
+        flag.store(true, Ordering::Relaxed);
+        assert!(ensure_connected(&flag).is_ok());
+    }
 }

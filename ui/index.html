@@ -283,6 +283,19 @@
     .about-body { padding: 0 20px 18px; font-size: 13px; color: var(--muted); line-height: 1.65; max-width: 640px; }
     .about-actions { display: flex; gap: 8px; padding: 0 20px 20px; align-items: center; }
 
+    /* ── Service disconnected: freeze interaction so a click can't be silently dropped ── */
+    /* #dash-approvals-go is excluded — it's a pure client-side view switch, not a pipe command. */
+    body.svc-down .btn.primary:not(#dash-approvals-go),
+    body.svc-down #pause-btn,
+    body.svc-down .approval-actions button,
+    body.svc-down .disk-clean,
+    body.svc-down .startup-toggle,
+    body.svc-down .upd-ignore,
+    body.svc-down .learned-act,
+    body.svc-down .act-undo { pointer-events: none; opacity: .5; }
+    body.svc-down .metric-grid,
+    body.svc-down #history-card { opacity: .6; }
+
     ::-webkit-scrollbar { width: 8px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
@@ -396,7 +409,7 @@
         <div class="card-header">Ask about your PC</div>
         <div class="ask-compose">
           <textarea id="ask-input" maxlength="1000" rows="3"
-            placeholder="e.g. Why is my PC slow right now?  Is my disk OK?  What was that error about?"></textarea>
+            placeholder="e.g. Why is my PC slow right now?  Is my disk OK?  What was that error about?  (Ctrl+Enter to send)"></textarea>
           <div class="ask-actions">
             <span class="set-status" id="ask-status"></span>
             <div style="flex:1"></div>

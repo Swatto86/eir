@@ -976,7 +976,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "eir-proto"
-version = "0.24.0"
+version = "0.24.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -984,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "eir-svc"
-version = "0.24.0"
+version = "0.24.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1011,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "eir-ui"
-version = "0.24.0"
+version = "0.24.1"
 dependencies = [
  "anyhow",
  "eir-proto",

@@ -1763,10 +1763,12 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             } else {
                                 cfg.updater.ignored.retain(|x| !x.eq_ignore_ascii_case(&key));
                             }
+                            // A blank note means "unchanged" — never "clear". The UI has
+                            // no notes editor and always sends an empty note with an
+                            // ignore toggle, so treating blank as delete would wipe a
+                            // note hand-set in config.toml on every Ignore/Unignore click.
                             let n = note.trim();
-                            if n.is_empty() {
-                                cfg.updater.notes.remove(&key);
-                            } else {
+                            if !n.is_empty() {
                                 cfg.updater.notes.insert(key.clone(), n.to_string());
                             }
                             if let Err(e) = config::save(&cfg, "config.toml") {

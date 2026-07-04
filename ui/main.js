@@ -80,6 +80,10 @@ function esc(s) {
 function escAttr(s) { return esc(s).replace(/"/g, '&quot;'); }
 function pct(v) { return `${Math.round(v)}%`; }
 
+// Write only when the value actually changed, so a 2s poll that re-renders
+// identical text doesn't wipe an in-progress selection on user-selectable nodes.
+function setText(el, v) { if (el && el.textContent !== v) el.textContent = v; }
+
 // Relative age from a unix-seconds timestamp (0/missing → blank).
 function ago(ts) {
   if (!ts) return '';
@@ -203,17 +207,24 @@ async function refreshInner() {
   catch (e) { console.error('get_status failed', e); return; }
   lastStatus = status;
 
+  // While the service is down/restarting the last snapshot stays on screen; mark
+  // the body so action buttons visibly disable and stale metrics dim (the Rust
+  // command gate is the real backstop — clicks here would otherwise be dropped).
+  const svcDown = ['ServiceDisconnected', 'Connecting', 'Restarting'].includes(status.status);
+  document.body.classList.toggle('svc-down', svcDown);
+
   const [color, headline] = STATUS_META[status.status] ?? ['var(--gray)', status.status];
   document.getElementById('status-dot').style.background = color;
-  document.getElementById('status-text').textContent =
-    status.status.replace(/([A-Z])/g, ' $1').trim();
+  setText(document.getElementById('status-text'),
+    status.status.replace(/([A-Z])/g, ' $1').trim());
 
   // Dashboard hero
   document.getElementById('hero').style.setProperty('--hero-color', color);
-  document.getElementById('hero-status').textContent = headline;
+  setText(document.getElementById('hero-status'), headline);
   const err = document.getElementById('hero-err');
-  err.style.display = status.error ? 'block' : 'none';
-  err.textContent = status.error || '';
+  const errDisp = status.error ? 'block' : 'none';
+  if (err.style.display !== errDisp) err.style.display = errDisp;
+  setText(err, status.error || '');
 
   const ml = document.getElementById('model-label');
   if (status.settings) {
@@ -268,6 +279,13 @@ async function refreshInner() {
   renderDisk(status.disk_insights, status.paused);
   renderStartup(status.startup, status.paused);
 
+  // Re-tick every relative age in one pass. Ages are baked into signature-guarded
+  // lists at build time, so without this an approval that has sat for hours keeps
+  // saying "just now" until its content changes. ago(0) → '' keeps zero-ts blank.
+  document.querySelectorAll('[data-ts]').forEach((el) => {
+    setText(el, ago(+el.dataset.ts));
+  });
+
   if (status.error && /settings|not applied/i.test(status.error)) {
     const ss = document.getElementById('set-status');
     if (ss) ss.textContent = status.error;
@@ -281,9 +299,8 @@ function renderDigest(d) {
   if (!card) return;
   if (!d || !d.text) { card.style.display = 'none'; return; }
   card.style.display = 'block';
-  document.getElementById('digest-text').textContent = d.text;
-  document.getElementById('digest-when').textContent =
-    d.generated_at ? ago(d.generated_at) : '';
+  setText(document.getElementById('digest-text'), d.text);
+  setText(document.getElementById('digest-when'), d.generated_at ? ago(d.generated_at) : '');
 }
 
 // ── Health timeline (24h sparklines) ────────────────────────────────────────────
@@ -337,6 +354,13 @@ function renderHistory(status) {
 
 // ── Ask Eir ──────────────────────────────────────────────────────────────────
 
+// The stale error to suppress after a submit, until the service reflects the new
+// question (running) or a genuinely different error arrives. null = nothing to
+// suppress. Set by submitAsk. `askBaselineAt` bounds the suppression so a rare
+// same-text re-rejection can't leave "Sending…" stuck forever.
+let askBaselineErr = null;
+let askBaselineAt = 0;
+
 let lastAskSig = null;
 function renderAsk(ask) {
   const list = document.getElementById('ask-list');
@@ -345,9 +369,22 @@ function renderAsk(ask) {
   const running = !!(ask && ask.running);
   sendBtn.disabled = running;
   sendBtn.textContent = running ? 'Thinking…' : 'Ask Eir';
-  // Reconcile the status line with the service each poll; the transient "Sending…"
-  // set by submitAsk is replaced here once the service reflects running/error.
-  statusEl.textContent = running ? '' : ((ask && ask.error) || '');
+  // Reconcile the status line with the service each poll. After a submit, hold a
+  // neutral "Sending…" instead of flashing the *previous* answer's error for the
+  // up-to-2s gap before the service flips `running`; a new rejection (different
+  // text) shows immediately.
+  if (running) {
+    askBaselineErr = null;
+    statusEl.textContent = '';
+  } else {
+    const errText = (ask && ask.error) || '';
+    if (askBaselineErr !== null && errText === askBaselineErr && Date.now() - askBaselineAt < 4000) {
+      statusEl.textContent = 'Sending…';
+    } else {
+      askBaselineErr = null;
+      statusEl.textContent = errText;
+    }
+  }
   const entries = (ask && ask.entries) || [];
   const sig = JSON.stringify({ r: running, e: entries.map((x) => x.at) });
   if (sig === lastAskSig) return;
@@ -357,7 +394,7 @@ function renderAsk(ask) {
     <div class="card ask-entry">
       <div class="ask-q"><span class="qmark">Q</span><span>${esc(e.question)}</span></div>
       <div class="ask-a">${esc(e.answer)}</div>
-      <div class="ask-when">${ago(e.at)}</div>
+      <div class="ask-when" data-ts="${e.at}">${ago(e.at)}</div>
     </div>`).join('');
   list.innerHTML = html;
 }
@@ -370,6 +407,10 @@ async function submitAsk() {
   statusEl.textContent = 'Sending…';
   try {
     await invoke('ask_eir', { question: q });
+    // Remember the error currently on screen so renderAsk suppresses only it (not
+    // a fresh rejection) until the service picks this question up.
+    askBaselineErr = (lastStatus && lastStatus.ask && lastStatus.ask.error) || '';
+    askBaselineAt = Date.now();
     input.value = '';
   } catch (e) {
     statusEl.textContent = 'Failed: ' + e;
@@ -545,7 +586,7 @@ function approvalCard(info) {
     <span class="label">Undo</span>         <span class="val">${esc(info.undo_instructions)}</span>`;
   return `
     <div class="approval-card" data-approval-id="${info.id}">
-      <h2>⚠ Approval needed<span class="appr-age">${ago(info.created_at)}</span></h2>
+      <h2>⚠ Approval needed<span class="appr-age" data-ts="${info.created_at}">${ago(info.created_at)}</span></h2>
       <div class="appr-what">
         <div class="appr-what-label">What this will do</div>
         <div class="appr-what-text">${esc(info.action_summary || info.action)}</div>
@@ -611,8 +652,8 @@ document.getElementById('approvals').addEventListener('click', (e) => {
 // ── AI-now + activity feed ────────────────────────────────────────────────────
 
 function renderAiNow(status) {
-  document.getElementById('ai-now-text').textContent =
-    status.last_analysis || 'Waiting for the first analysis cycle…';
+  setText(document.getElementById('ai-now-text'),
+    status.last_analysis || 'Waiting for the first analysis cycle…');
   const bits = [];
   const a = status.advisor;
   if (a && a.escalated) {
@@ -622,7 +663,9 @@ function renderAiNow(status) {
     bits.push('<span class="tag tag-ok">advisor on</span>');
   }
   if (a && a.spent_today_usd) bits.push(`<span>escalation spend today ~${fmtGbp(a.spent_today_usd)}</span>`);
-  document.getElementById('ai-now-meta').innerHTML = bits.join('');
+  const meta = document.getElementById('ai-now-meta');
+  const metaHtml = bits.join('');
+  if (meta.innerHTML !== metaHtml) meta.innerHTML = metaHtml;
 }
 
 function problemTag(p) {
@@ -656,9 +699,23 @@ function activityItems(status) {
   return items;
 }
 
+// Undo ids whose undo_registry call is still in flight — kept disabled across a
+// re-render so the click can't be double-submitted (mirror of decidingIds).
+const undoingIds = new Set();
+// Signature of the currently-rendered activity list. The 2s poll only rebuilds
+// when this changes, so it no longer wipes a text selection, kills a tooltip, or
+// re-enables an Undo the user just clicked. Ages tick via the data-ts sweep.
+let lastActivitySig = null;
+
 function renderActivity(status) {
   const el = document.getElementById('activity-list');
   const items = activityItems(status);
+  const sig = JSON.stringify(items);
+  if (sig === lastActivitySig) return;
+  lastActivitySig = sig;
+  // Forget in-flight undo ids the service has since cleared (their row no longer
+  // carries the undo_id), so the set can't grow without bound.
+  undoingIds.forEach((id) => { if (!items.some((it) => it.undoId === id)) undoingIds.delete(id); });
   if (!items.length) { el.innerHTML = '<div class="empty">No activity yet</div>'; return; }
   el.innerHTML = items.map((it) => {
     const undo = (it.undoId === 0 || it.undoId)
@@ -668,11 +725,16 @@ function renderActivity(status) {
     <div class="act-item">
       <div class="act-icon">${it.icon}</div>
       <div class="act-main">
-        <div class="act-head">${it.head}<span class="act-when">${ago(it.at)}</span>${undo}</div>
+        <div class="act-head">${it.head}<span class="act-when" data-ts="${it.at}">${ago(it.at)}</span>${undo}</div>
         ${it.why ? `<div class="act-why">${it.why}</div>` : ''}
       </div>
     </div>`;
   }).join('');
+  // Re-disable any undo still resolving across this rebuild.
+  for (const id of undoingIds) {
+    const btn = el.querySelector(`.act-undo[data-undo="${id}"]`);
+    if (btn) btn.disabled = true;
+  }
 }
 
 // One-click registry undo (delegated from the activity list).
@@ -681,9 +743,10 @@ document.getElementById('activity-list').addEventListener('click', (e) => {
   if (!btn) return;
   const id = parseInt(btn.dataset.undo, 10);
   if (!Number.isFinite(id)) return;
+  undoingIds.add(id);
   btn.disabled = true;
   invoke('undo_registry', { id })
-    .catch((err) => { btn.disabled = false; console.error('undo_registry failed', err); });
+    .catch((err) => { undoingIds.delete(id); btn.disabled = false; console.error('undo_registry failed', err); });
 });
 
 document.getElementById('clear-activity').addEventListener('click', async () => {
@@ -693,11 +756,17 @@ document.getElementById('clear-activity').addEventListener('click', async () => 
 
 // ── AI usage ──────────────────────────────────────────────────────────────────
 
+let lastUsageSig = null;
 function renderUsage(u) {
   const card = document.getElementById('usage-card');
   if (!u) { card.style.display = 'none'; return; }
   card.style.display = 'block';
   const provider = (lastStatus && lastStatus.settings && lastStatus.settings.provider) || '';
+  // Skip the innerHTML rebuild when nothing changed, so the 2s poll doesn't churn
+  // the card (and can't wipe a selection on the figures).
+  const usageSig = JSON.stringify({ u, provider });
+  if (usageSig === lastUsageSig) return;
+  lastUsageSig = usageSig;
   // Claude CLI runs on the subscription: no charge, so cost cells show a dash
   // (the CLI's figures are only the equivalent API cost).
   const free = provider === 'claude_cli';
@@ -708,7 +777,9 @@ function renderUsage(u) {
       ? 'No charge — uses your Claude subscription. Token counts shown for transparency.'
       : provider === 'anthropic'
         ? 'Estimated from Anthropic list pricing.'
-        : 'Provider-reported cost where available.';
+        : provider === 'kilo_cli'
+          ? 'Kilo-reported cost — usually covered by your Kilo plan; real for BYOK models.'
+          : 'Provider-reported cost where available.';
   document.getElementById('usage-body').innerHTML = `
     <div class="usage-grid">
       <div></div><div class="usage-h">Last 24h</div><div class="usage-h">Last 7 days</div>
@@ -817,7 +888,7 @@ function renderUpdater(u) {
       histEl.innerHTML = u.recent.slice(0, 15).map((r) =>
         `<div class="upd-note">${r.success ? '✓' : '✗'} ${esc(r.name)} ` +
         `<span style="opacity:.7">(${esc(methodLabel(r.method))})</span>` +
-        `${r.detail ? ' — ' + esc(r.detail) : ''} <span class="row-age">${ago(r.at)}</span></div>`
+        `${r.detail ? ' — ' + esc(r.detail) : ''} <span class="row-age" data-ts="${r.at}">${ago(r.at)}</span></div>`
       ).join('');
     } else {
       histWrap.style.display = 'none';
@@ -1111,7 +1182,7 @@ document.getElementById('about-github').addEventListener('click', () => {
 
 document.getElementById('about-updates').addEventListener('click', async () => {
   const st = document.getElementById('about-status');
-  st.textContent = 'Checking…';
+  st.textContent = 'Checking… if an update is found it will download and restart automatically (this can take a few minutes).';
   try {
     st.textContent = await invoke('check_updates_now');
   } catch (e) {

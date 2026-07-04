@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-04 · **Release:** v0.24.0
+**Last updated:** 2026-07-04 · **Release:** v0.24.1
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -78,7 +78,7 @@ Eir is a single Cargo workspace (`resolver = "2"`) with three crates, plus a sta
 | `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service: signal collection, AI client, policy, execution, autonomous updater, SQLite audit DB. Heavy `windows` 0.58 feature set. |
 | `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), tracing. `build-dependencies`: `tauri-build` 2. |
 
-All three crates are versioned in lockstep — currently `0.22.1` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`.
+All three crates are versioned in lockstep — currently `0.24.1` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
 
 The dependency graph is acyclic and points inward: `eir-proto` depends on nothing internal; `eir-svc` and `eir-ui` each depend only on `eir-proto`. The UI and service never link against each other — they are separate processes coupled solely through the `eir-proto` wire contract over `\\.\pipe\EirSvc`.
 
@@ -220,14 +220,15 @@ Implementation details: the descriptor is **intentionally leaked** and returned 
 
 ### UI side: pipe client (`eir-ui/src/pipe_client.rs`)
 
-- `run(status: SharedStatus, cmd_rx)` loops forever, reconnecting on disconnect with a 5s backoff. `SharedStatus = Arc<Mutex<StatusPayload>>` is the locally-cached snapshot the Tauri command reads (`pipe_client.rs:11,15-37`).
-- On disconnect it overwrites the cached status to `"ServiceDisconnected"` with an actionable error string telling the user to install/start the service (`pipe_client.rs:24-33`).
+- `run(status: SharedStatus, cmd_rx, connected: Arc<AtomicBool>)` loops forever, reconnecting on disconnect with a 5s backoff. `SharedStatus = Arc<Mutex<StatusPayload>>` is the locally-cached snapshot the Tauri command reads.
+- **Connected flag (v0.24.1)**: `connect_and_run` stores `true` into the shared `connected` flag the moment the pipe opens and `run_on` stores `false` the moment the connection ends. Command handlers gate on it via `ensure_connected` (below), so a click made while the service is down or mid-restart fails loudly instead of being queued and then silently dropped by the stale-command drain. The flag flip is covered by a `pipe_client` unit test.
+- On disconnect it overwrites the cached status to `"ServiceDisconnected"` with an actionable error string telling the user to install/start the service. A clean EOF (settings-save restart) instead shows `"Connecting"`; both are among the frontend's `svc-down` states.
 - `connect_and_run` opens the client with retry handling: `ERROR_FILE_NOT_FOUND` (os err 2) → bubble up (pipe not created yet, triggers reconnect); `ERROR_PIPE_BUSY` (231) → 50ms retry; other errors → propagate (`pipe_client.rs:45-59`).
 - **Read and write are separate loops joined by `select!`** (`pipe_client.rs:71-112`). The read loop deserializes `ServiceMsg::Status` and replaces `*status.lock()` wholesale. The write loop drains `cmd_rx` and writes each command as a JSON line + flush. A documented design note explains *why* they're separate: a previous single-`select!` design cancelled the in-flight `read_line` on every command send, and `read_line` is not cancellation-safe, corrupting the status stream and starving writes (`pipe_client.rs:66-70`).
 
 ### Tauri command surface (`eir-ui/src/main.rs`)
 
-Managed state: `SharedStatus` (the cached payload) and `UiCmdTx(mpsc::Sender<UiMsg>)`. The `main()` wiring creates the channel (size 16), seeds the cache to `"Connecting"`, spawns `pipe_client::run`, and registers 13 commands (`main.rs:239-251, 335-349`).
+Managed state: `SharedStatus` (the cached payload), `UiCmdTx(mpsc::Sender<UiMsg>)`, and `ConnState(Arc<AtomicBool>)` (the pipe-connected flag, v0.24.1). The `main()` wiring creates the channel (size 16) and the flag, seeds the cache to `"Connecting"`, spawns `pipe_client::run` with a clone of the flag, and registers the command handlers. Each pipe-facing handler calls `ensure_connected(&conn.0)?` (returns `Err("Eir service is not connected")` when the flag is false) before `try_send`; UI-local commands (`get_status`, autostart, `util::*`, version/update-check) are ungated.
 
 Commands (`main.rs:28-112`, plus `util.rs`):
 - `get_status` — **synchronous**, returns a clone of the cached `StatusPayload`. This is the UI's only read path; it never hits the pipe directly.
@@ -246,14 +247,14 @@ Commands (`main.rs:28-112`, plus `util.rs`):
 - `get_app_version` (About view; reads the package version from the build) and `check_updates_now` (About view's on-demand update check — installs and relaunches when a newer signed release exists; guarded by a shared `UPDATE_IN_PROGRESS` AtomicBool so it can't race the 6-hourly background checker into two concurrent installers) — UI-local.
 - `util::gbp_per_usd` (USD→GBP rate via a hidden PowerShell `Invoke-RestMethod`, with a `0.79` offline fallback) and `util::open_url` (validates `http(s)://` then `Start-Process`) — UI-local helpers, not pipe traffic (`util.rs`).
 
-Every service-facing command is `async`, sends one `UiMsg` on `UiCmdTx`, and maps a send error to `Err(String)`. Those commands are **fire-and-forget**: success means "queued to the pipe writer," not "applied by the service." The UI observes the effect only on the next polled snapshot. `get_status`, the autostart commands, and `util::*` are UI-local and do not use the pipe.
+Every service-facing command is `async`, first calls `ensure_connected` (v0.24.1), then sends one `UiMsg` on `UiCmdTx`, mapping a send error to `Err(String)`. Those commands are **fire-and-forget**: a successful send means "queued to the pipe writer," not "applied by the service." The UI observes the effect only on the next polled snapshot. `get_status`, the autostart commands, and `util::*` are UI-local and do not use the pipe.
 
 ### Tray (`main.rs:114-323`)
 
 - Tray icon is built from an embedded 128px PNG (`ICON_PNG`), recoloured per status (`status_accent` maps states to RGBA tints: green=Active/untouched, amber=Warning, orange=PendingApproval, blue=Executing, red=Error/ServiceDisconnected, grey=other) and Lanczos3-downsampled to 32px (`make_icon`, `recolor`, `decode_icon`).
 - Start-with-Windows is registered by `tauri-plugin-autostart` with the app name `Eir` and the `--hidden` argument. The UI preference is stored in Tauri's app config directory as `ui-preferences.json`, defaults to enabled on first run, and is synced to the OS startup entry during Tauri setup. This separate preference prevents a user-disabled startup entry from being re-enabled on the next manual launch.
-- A background task polls the cached status every 500ms and only repaints the tray icon/tooltip when `status` changes (`main.rs:311-323`).
-- Tray menu: Open Status / Pause Monitoring / Quit. "Pause" sends `UiMsg::TogglePause` directly via the cloned `UiCmdTx`; left-click shows the window (`main.rs:259-302`).
+- A background task polls the cached status every 500ms and repaints the tray icon/tooltip only when `status` changes, and relabels the menu's pause entry only when `paused` changes (v0.24.1). The tooltip runs the status through `friendly_status()` so `"PendingApproval"` shows as `"Pending Approval"` (spaces each CamelCase boundary; unit-tested).
+- Tray menu: Open Status / Pause Monitoring / Quit. The pause entry reads "Resume Monitoring" while paused (v0.24.1) and sends `UiMsg::TogglePause` via the cloned `UiCmdTx`; Open Status and left-click `unminimize()` + `show()` + `set_focus()` the window so a minimized window is restored, not just a hidden one (v0.24.1).
 - **Close-to-tray**: `WindowEvent::CloseRequested` hides the window and `prevent_close()`s; the service keeps running; Quit fully exits (`main.rs:327-334`). The JS also redundantly intercepts `onCloseRequested` (`main.js:54-57`).
 - Self-update: `tauri-plugin-updater` checks 15s after launch then every 6h, and on a newer signed release downloads/installs (NSIS, which elevates and updates the service too) and relaunches (`main.rs:203-232`).
 
@@ -267,6 +268,8 @@ The frontend was fully rebuilt in v0.17 (still hand-written vanilla HTML/CSS/JS,
 - **Native feel**: the webview context menu is suppressed globally (`contextmenu` → `preventDefault`), chrome is `user-select: none` with content opted back in, and there are no native browser dialogs.
 - **About view**: version from `get_app_version`, GitHub link via `util::open_url`, and an on-demand `check_updates_now`.
 - **Poll cadence**: `refresh()` calls `get_status` and re-renders on `setInterval(..., 2000)` — a 2s poll of the *local cache* (no pipe round-trip per poll). `gbp_per_usd` is fetched once at load.
+- **Render churn guards**: every list/text renderer that holds user-selectable content only mutates the DOM when its data changed — list renderers (`renderApprovals`, `renderActivity`, `renderLearned`, `renderUpdater`, `renderAsk`, `renderDisk`, `renderStartup`, `renderUsage`) compare a JSON **signature** and return early when unchanged; single text nodes use the `setText(el, v)` helper (writes only on change). Without this the 2s poll wipes an in-progress text selection and kills tooltips. Because the guards freeze the built HTML, relative ages are emitted as `<span data-ts="…">` and a single sweep at the end of `refreshInner` (`document.querySelectorAll('[data-ts]')`) re-ticks them each poll, so an approval that has sat for hours stops reading "just now" (v0.24.1). `ago(0)` → `''` keeps a zero timestamp blank.
+- **Disconnected state**: `refreshInner` toggles a `svc-down` body class for the `ServiceDisconnected`/`Connecting`/`Restarting` states; CSS then greys and blocks pointer events on action buttons (approve/reject, scans, update-now, pause, per-row toggles) and dims the stale metric/history cards, so a click can't be silently dropped. The Rust `ensure_connected` gate is the authoritative backstop (v0.24.1).
 - **XSS hygiene**: all service-supplied strings go through `esc()` / `escAttr()` before insertion into `innerHTML`; applied consistently across approvals, activity, updater rows, and service chips.
 - **Activity feed** merges `recent_problems` + `recent_executions` into one list sorted by `at` descending, with emoji/tag per kind (`activityItems`).
 - **Settings** is a full view (no modal) populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. The provider select offers OpenRouter / Claude CLI (subscription) / Claude (Anthropic API key) / Kilo CLI (subscription) with per-provider hints and key fields; JS pre-validates the provider's key+model requirements before sending (the service's `AiClient::new` remains the authoritative validator). Independent save buttons map to `set_autostart_enabled` (applies immediately), `update_settings` (warns it restarts the service ~15s), `set_updater_settings`, and `set_advisor_settings` (both apply live).
@@ -276,7 +279,7 @@ The frontend was fully rebuilt in v0.17 (still hand-written vanilla HTML/CSS/JS,
 - **Approve / Reject**: a delegated click handler on `#approvals` parses the card's `data-id`, **disables both buttons** to prevent double-submit, and calls `decide_approval(id, approved)`; on error it re-enables them (`main.js:271-280, 456-462`). The command → `UiMsg::Approve` → pipe → decision loop, which resolves it against the persistent queue. The card disappears on the next poll once the service drops it from `pending_approvals`.
 - **Pause**: header button (and tray menu) → `toggle_pause` → `UiMsg::TogglePause`; the button label flips Pause/Resume based on `status.paused` (`main.js:228-229, 266-269`).
 - **Clear (Activity)**: one button fires both `clear_problems` and `clear_executions` then `refresh()`s (`main.js:601-604`). **Clear (Updates)** → `clear_update_history` (clears last cycle + persisted attempts).
-- **Ignore (per app)**: delegated click on `#updater-apps` sends `set_app_ignore { id, ignore:true, note:"" }` and optimistically dims the row (`main.js:472-478`).
+- **Ignore (per app)**: delegated click on `#updater-apps` sends `set_app_ignore { id, ignore:true, note:"" }` and optimistically dims the row. The service treats the empty note as **"unchanged"** (v0.24.1) — an ignore toggle no longer wipes a per-app note hand-set in `config.toml`; clearing a note is done there, not from the UI.
 - **Learned fact override**: delegated click on `#learned-list` sends `set_learned_fact { id, op }`; the service updates the persisted fact and refreshes the broadcast list (`main.js:511-519`, `main.rs:930-934`).
 - **Update now**: `#upd-now` → `run_updates_now` → `UiMsg::RunUpdatesNow`. The button is disabled when the updater is `running` or `!enabled`, because "the service ignores a manual run unless the updater is enabled" — the UI mirrors that gate rather than enforcing it (`main.js:369-375, 412-415`).
 
@@ -1067,8 +1070,8 @@ Current gaps surfaced while mapping each subsystem (the self-improvement plan ab
 
 - Single-client only: the listener serves one UI connection at a time and aborts/re-accepts on disconnect; concurrent UIs are not supported (pipe_server.rs:126-184).
 - No authentication beyond the ACL: any Authenticated User at Medium+ integrity on the machine can open the pipe and send commands (approve fixes, change settings, trigger updates). The trust boundary is the local interactive logon, not the specific user (pipe_server.rs:33).
-- Command delivery is fire-and-forget with no per-command ack/result: a Tauri command returning Ok only means the UiMsg was queued to the writer, not that the service applied it; the UI infers success only from the next polled snapshot (main.rs:34-112).
-- Optimistic UI can drift from truth: Approve/Reject disable buttons and 'Ignore' dims the row immediately, but if the service rejects or never applies the command there is no negative feedback beyond the row reappearing on the next 2s poll (main.js:271-280,472-478).
+- Command delivery is fire-and-forget with no per-command ack/result: a Tauri command returning Ok only means the UiMsg was queued to the writer, not that the service applied it; the UI infers success only from the next polled snapshot. Since v0.24.1 the handler at least refuses to queue when the pipe is disconnected (`ensure_connected`), so a click during a service outage/restart returns an error instead of vanishing — but a command accepted while connected then lost to a mid-flight drop still has no ack.
+- Optimistic UI can drift from truth: Approve/Reject disable buttons and 'Ignore' dims the row immediately, but if the service rejects or never applies the command there is no negative feedback beyond the row reappearing on the next 2s poll. The disconnected case is now handled (the `svc-down` class plus the Rust gate), but a command dropped while *connected* is still silent.
 - Status freshness is bounded by the 2s UI poll plus the service's broadcast cadence; the UI cannot request an on-demand refresh from the service (it only re-reads the local cache) (main.js:636-637).
 - mpsc command channels are bounded (service 8, UI 16); a stalled writer could in principle apply backpressure, though commands are low-volume (pipe_server.rs:60, main.rs:244).
 - Byte-mode pipe relies entirely on the newline delimiter for framing; a payload containing a literal newline would break framing, but serde_json::to_string emits single-line JSON so this is not currently reachable.
