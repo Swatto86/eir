@@ -69,9 +69,9 @@ function showView(name) {
   document.querySelectorAll('.nav-btn').forEach((b) =>
     b.classList.toggle('active', b.dataset.view === name));
   document.getElementById('view-title').textContent = VIEW_TITLES[name] || name;
-  // Re-entering Settings only refills from the service when there are no unsaved
+  // Re-entering Settings only refills from the service when no card holds unsaved
   // edits — otherwise a Dashboard detour would silently wipe in-progress changes.
-  if (name === 'settings' && !settingsDirty) fillSettings();
+  if (name === 'settings' && dirtyCards.size === 0) fillSettings();
 }
 
 document.getElementById('nav').addEventListener('click', (e) => {
@@ -238,8 +238,13 @@ async function refreshInner() {
   if (err.style.display !== errDisp) err.style.display = errDisp;
   setText(err, status.error || '');
   // A configuration-shaped error gets a one-click route to where it's fixed.
+  // Matched against the service's actual error strings ("not configured … fix it
+  // in Settings", "Settings not applied", "Save settings", "config.toml") plus
+  // auth failures; deliberately NOT bare "model"/"key"/"provider", which appear
+  // in transient errors ("model API error", rate limits) that Settings can't fix.
   const fixBtn = document.getElementById('hero-fix');
-  const cfgErr = !!status.error && /provider|api key|key|model|config|settings/i.test(status.error);
+  const cfgErr = !!status.error
+    && /not configured|settings|config\.toml|api.?key|unauthorized|authentication|401/i.test(status.error);
   fixBtn.style.display = cfgErr ? 'inline-block' : 'none';
 
   const ml = document.getElementById('model-label');
@@ -1024,11 +1029,15 @@ document.getElementById('learned-list').addEventListener('click', (e) => {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
-// True while the Settings form holds edits not yet saved. Set by any input in the
-// view; cleared when the form is (re)filled from the service or a save succeeds.
-// While dirty, re-entering the view keeps the edits instead of refilling.
-let settingsDirty = false;
-document.getElementById('view-settings').addEventListener('input', () => { settingsDirty = true; });
+// Per-card dirty tracking: the Settings view is four independently-saved cards, so
+// a save in one card must not clear unsaved edits in another. Any input marks its
+// enclosing card dirty; a successful save clears only that card; (re)filling from
+// the service clears all. Re-entering the view refills only when nothing is dirty.
+const dirtyCards = new Set();
+document.getElementById('view-settings').addEventListener('input', (e) => {
+  const card = e.target.closest('.card');
+  if (card && card.id) dirtyCards.add(card.id);
+});
 
 // Read an integer input clamped to [min, max] (blank/garbage → def) so a typed
 // out-of-range value saves as what the service will actually honour.
@@ -1083,7 +1092,7 @@ async function saveAutostartSetting() {
   try {
     box.checked = await invoke('set_autostart_enabled', { enabled });
     st.textContent = 'Saved — applies immediately.';
-    settingsDirty = false;
+    dirtyCards.delete('card-autostart');
   } catch (e) {
     st.textContent = 'Failed: ' + e;
   } finally {
@@ -1116,7 +1125,7 @@ function fillSettings() {
     s.kilo_cli_path_set ? '•••••• set — blank keeps it' : 'kilo  (blank = on PATH)';
   fillUpdaterSettings(lastStatus.updater && lastStatus.updater.settings);
   fillAdvisorSettings(lastStatus.advisor && lastStatus.advisor.settings);
-  settingsDirty = false;
+  dirtyCards.clear();
 }
 
 async function saveSettings() {
@@ -1172,7 +1181,7 @@ async function saveSettings() {
     document.getElementById('set-an-key').value = '';
     document.getElementById('set-kilo-profile').value = '';
     document.getElementById('set-kilo-path').value = '';
-    settingsDirty = false;
+    dirtyCards.delete('card-provider');
   } catch (e) {
     st.textContent = 'Failed: ' + e;
   }
@@ -1212,7 +1221,7 @@ async function saveAdvisorSettings() {
   try {
     await invoke('set_advisor_settings', { settings });
     st.textContent = 'Saved — applies immediately.';
-    settingsDirty = false;
+    dirtyCards.delete('card-advisor');
   } catch (e) {
     st.textContent = 'Failed: ' + e;
   }
@@ -1247,7 +1256,7 @@ async function saveUpdaterSettings() {
   try {
     await invoke('set_updater_settings', { settings });
     st.textContent = 'Saved — applies immediately.';
-    settingsDirty = false;
+    dirtyCards.delete('card-updater');
   } catch (e) {
     st.textContent = 'Failed: ' + e;
   }

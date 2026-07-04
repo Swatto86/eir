@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-04 · **Release:** v0.24.3
+**Last updated:** 2026-07-04 · **Release:** v0.24.4
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -78,7 +78,7 @@ Eir is a single Cargo workspace (`resolver = "2"`) with three crates, plus a sta
 | `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service: signal collection, AI client, policy, execution, autonomous updater, SQLite audit DB. Heavy `windows` 0.58 feature set. |
 | `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), tracing. `build-dependencies`: `tauri-build` 2. |
 
-All three crates are versioned in lockstep — currently `0.24.3` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
+All three crates are versioned in lockstep — currently `0.24.4` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
 
 The dependency graph is acyclic and points inward: `eir-proto` depends on nothing internal; `eir-svc` and `eir-ui` each depend only on `eir-proto`. The UI and service never link against each other — they are separate processes coupled solely through the `eir-proto` wire contract over `\\.\pipe\EirSvc`.
 
@@ -253,7 +253,7 @@ Every service-facing command is `async`, first calls `ensure_connected` (v0.24.1
 
 - Tray icon is built from an embedded 128px PNG (`ICON_PNG`), recoloured per status (`status_accent` maps states to RGBA tints: green=Active/untouched, amber=Warning, orange=PendingApproval, blue=Executing, red=Error/ServiceDisconnected, grey=other) and Lanczos3-downsampled to 32px (`make_icon`, `recolor`, `decode_icon`).
 - Start-with-Windows is registered by `tauri-plugin-autostart` with the app name `Eir` and the `--hidden` argument. The UI preference is stored in Tauri's app config directory as `ui-preferences.json`, defaults to enabled on first run, and is synced to the OS startup entry during Tauri setup. This separate preference prevents a user-disabled startup entry from being re-enabled on the next manual launch.
-- A background task polls the cached status every 500ms and repaints the tray icon/tooltip only when `status` changes, and relabels the menu's pause entry only when `paused` changes (v0.24.1). The tooltip runs the status through `friendly_status()` so `"PendingApproval"` shows as `"Pending Approval"` (spaces each CamelCase boundary; unit-tested).
+- A background task polls the cached status every 500ms and repaints the tray icon/tooltip only when `status` changes, and relabels the menu's pause entry only when `paused` changes (v0.24.1). Since v0.24.4 the change-guards advance only when the tray write succeeds, so a transient `set_icon`/`set_tooltip`/`set_text` failure retries next tick instead of freezing the tray on a stale state. The tooltip runs the status through `friendly_status()` so `"PendingApproval"` shows as `"Pending Approval"` (spaces each CamelCase boundary; unit-tested).
 - Tray menu: Open Status / Pause Monitoring / Quit. The pause entry reads "Resume Monitoring" while paused (v0.24.1) and sends `UiMsg::TogglePause` via the cloned `UiCmdTx`; Open Status and left-click `unminimize()` + `show()` + `set_focus()` the window so a minimized window is restored, not just a hidden one (v0.24.1).
 - **Close-to-tray**: `WindowEvent::CloseRequested` hides the window and `prevent_close()`s; the service keeps running; Quit fully exits (`main.rs:327-334`). The JS also redundantly intercepts `onCloseRequested` (`main.js:54-57`).
 - Self-update: `tauri-plugin-updater` checks 15s after launch then every 6h, and on a newer signed release downloads/installs (NSIS, which elevates and updates the service too) and relaunches (`main.rs:203-232`).
@@ -273,7 +273,7 @@ The frontend was fully rebuilt in v0.17 (still hand-written vanilla HTML/CSS/JS,
 - **XSS hygiene**: all service-supplied strings go through `esc()` / `escAttr()` before insertion into `innerHTML`; applied consistently across approvals, activity, updater rows, and service chips.
 - **Activity feed** merges `recent_problems` + `recent_executions` into one list sorted by `at` descending, with emoji/tag per kind (`activityItems`).
 - **v0.24.3 UX pass**: Escape hides the window (blurs first when a field has focus); Ask Eir sends on plain Enter (Shift+Enter = newline, IME composition guarded); every `data-ts` relative age gets an absolute local-time tooltip (set once per element); the sidebar Pause button turns amber with a ▶ icon while paused; a config-shaped `status.error` (provider/key/model/config) surfaces an "Open Settings" quick link in the hero; the Disk/Startup card headers summarise the last scan ("2.1 GB cleanable" / "12 entries, 3 disabled"); the "What the agent is thinking" meta line shows "analysed Xm ago" from the new `last_analysis_at` wire field; and numeric settings inputs are clamped to their declared min/max on save (`numVal`).
-- **Settings** is a full view (no modal) populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. Since v0.24.3 the view tracks a `settingsDirty` flag (any `input` event): re-entering Settings only refills from the service when the form is clean, so a Dashboard detour no longer wipes unsaved edits; the flag clears on fill and on each successful save. The provider select offers OpenRouter / Claude CLI (subscription) / Claude (Anthropic API key) / Kilo CLI (subscription) with per-provider hints and key fields; JS pre-validates the provider's key+model requirements before sending (the service's `AiClient::new` remains the authoritative validator). Independent save buttons map to `set_autostart_enabled` (applies immediately), `update_settings` (warns it restarts the service ~15s), `set_updater_settings`, and `set_advisor_settings` (both apply live).
+- **Settings** is a full view (no modal) populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. Since v0.24.3 the view guards unsaved edits; v0.24.4 made the tracking **per-card** (`dirtyCards` set keyed on the four card ids `card-autostart`/`card-provider`/`card-advisor`/`card-updater`): any input marks its enclosing card dirty, a successful save clears only that card, a fill clears all, and re-entering the view refills only when no card is dirty — so saving the advisor card no longer discards unsaved edits still sitting in the provider card. The provider select offers OpenRouter / Claude CLI (subscription) / Claude (Anthropic API key) / Kilo CLI (subscription) with per-provider hints and key fields; JS pre-validates the provider's key+model requirements before sending (the service's `AiClient::new` remains the authoritative validator). Independent save buttons map to `set_autostart_enabled` (applies immediately), `update_settings` (warns it restarts the service ~15s), `set_updater_settings`, and `set_advisor_settings` (both apply live).
 
 ### Clear / Approve / Ignore / Update-now flows
 
@@ -316,7 +316,7 @@ Not shared/locked — it lives on the loop task and is mutated inline; the UI se
 3. A `fatal!` macro (586-595) sets status `"Error"`, broadcasts, and `return`s — used for config/policy/DB init failures so a hard misconfig stops cleanly but still informs the UI.
 4. Loads `config.toml` and `policy.toml`; the live `confidence_threshold` is overridden from config (`pol.execution.confidence_threshold = cfg.monitoring.confidence_threshold`, line 613) — policy.toml only supplies the fallback.
 5. Inits SQLite (`audit::init_db`), cleans stale updater staging, seeds `updater`/`advisor` status from config + history, sets `advisor_spend_date` to today.
-6. **AI client init is non-fatal** (646-656): a bad AI config sets `status="Error"` + an actionable error and leaves `ai = None`, but the service keeps running so Settings stays usable.
+6. **AI client init is non-fatal** (646-656): a bad AI config sets `status="Error"` + an actionable error and leaves `ai = None`, but the service keeps running so Settings stays usable. The post-warmup settle (and its `resting_status` re-settle) is gated on `ai.is_some()` (v0.24.4) — it previously cleared this error before the first broadcast, leaving a mis-configured provider looking healthy forever.
 7. Spawns signal collectors: `event_log`, `file_watch` (after `discover_watch_dirs`), `wmi`. Sleeps 5 s to let them warm up.
 8. Restores `usage_summary` and `load_pending_approvals` from the DB, then settles `status = resting_status(&st)` and broadcasts.
 9. Sets up the decision `ticker` (`cfg.monitoring.decision_interval_secs`), channels, and the executor worker (below).
@@ -1026,13 +1026,35 @@ one app already known to behave this way.
 
 ## Known limitations & backlog
 
+**Resolved in v0.24.4 (bug sweep):** three review agents (frontend / UI-Rust+wire /
+service-interaction) + manual verification. Fixed: (1) **startup wiped the "AI provider
+not configured" error** before the first broadcast — the settle at the end of `eir_main`
+startup unconditionally set `Active`/`error=None`, and with `ai = None` no later path
+re-set it, so a broken provider looked healthy forever; the settle is now gated on
+`ai.is_some()`. (2) **Settings dirty flag was view-global** — saving one of the four
+cards cleared the flag for all, so unsaved edits in another card were refilled over on
+view re-entry; now per-card (`dirtyCards`). (3) **tray repaint failures were swallowed
+and never retried** — `last = current` advanced even when `set_icon`/`set_tooltip`
+failed, freezing the tray on a stale state; the guard now advances only on success
+(same for the pause menu label). (4) config-error regex tightened (see the v0.24.3 note
+below). Confirmed-correct in the same sweep: `ApprovalInfo.reversible` is derived from
+an exhaustive non-wildcard match over `FixAction` (never AI-supplied), and
+`open_url`'s single-quoted PowerShell interpolation does not expand `$()`/backticks.
+Known-and-accepted (not fixed): the `ensure_connected`→`try_send` TOCTOU (a command
+accepted in the instant the pipe dies is drained without an ack — inherent to the
+fire-and-forget design, already documented under "Pipe protocol & tray UI"), and a
+`log_decision` failure delaying (not losing) the `last_analysis_at` broadcast until
+the next cycle.
+
 **Added in v0.24.3 (UI/UX pass):** two-step confirm on irreversible approvals, settings
 dirty-guard, Enter-to-send Ask, Escape-to-hide, absolute-time tooltips, paused-state
 emphasis, config-error → Settings quick link, disk/startup scan summaries, clamped
 numeric saves, and the `last_analysis_at` wire field ("analysed Xm ago" trust signal).
 UI-only except the wire field (`#[serde(default)]`, skew-safe both directions). The
-config-error quick link keys off error text (`/provider|key|model|config|settings/i`) —
-a heuristic, not a typed error class; a false positive merely shows a harmless button.
+config-error quick link keys off error text — a heuristic, not a typed error class; a
+false positive merely shows a harmless button. (v0.24.4 tightened the pattern to the
+service's actual config-shaped strings + auth failures, after a sweep showed bare
+"model"/"key" matched transient errors like "model API error: rate-limited".)
 
 **Resolved in v0.24.2 (correctness & hardening sweep, C1–C21):**
 - **Executor drain on stop/restart** (C1): the off-loop executor worker's `JoinHandle` is now held

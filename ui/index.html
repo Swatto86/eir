@@ -500,7 +500,7 @@
     <!-- ── Settings ── -->
     <section class="view" id="view-settings">
 
-      <div class="card">
+      <div class="card" id="card-autostart">
         <div class="card-header">Windows startup</div>
         <div class="set-section-desc">Launch Eir automatically when you sign in. Startup launches stay hidden in the tray; manual launches open this window.</div>
         <div class="set-grid">
@@ -513,7 +513,7 @@
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" id="card-provider">
         <div class="card-header">AI provider &amp; monitoring</div>
         <div class="set-section-desc">Which AI model Eir uses to diagnose problems, plus how often it polls Windows for signals. Saving these restarts the service (~15&nbsp;s).</div>
         <div class="set-grid">
@@ -566,7 +566,7 @@
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" id="card-advisor">
         <div class="card-header">Advisor mode</div>
         <div class="set-section-desc">When the agent is unsure, it re-analyses the problem once at a stronger model or higher effort, then acts on the better answer. Off by default; applies live.</div>
         <div class="set-grid">
@@ -595,7 +595,7 @@
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" id="card-updater">
         <div class="card-header">App updates</div>
         <div class="set-section-desc">Eir updates your apps unattended — no UAC prompts — through the methods you allow below. Applies live.</div>
         <div class="set-grid">

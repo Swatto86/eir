@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.24.3. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.24.4. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.24.3. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-04 | Eir | v0.24.4 bug sweep | Three parallel review agents (frontend, UI-Rust/wire, service-interaction), each finding verified against source before fixing. Fixed: startup's post-warmup settle unconditionally cleared the "AI provider not configured" error before the first broadcast (with `ai = None` nothing re-set it — a broken provider looked healthy forever; now gated on `ai.is_some()`); the Settings dirty flag was view-global so saving one card discarded unsaved edits in another on re-entry (now per-card `dirtyCards`); tray repaint failures were swallowed with the change-guard already advanced, freezing the tray on stale state (guard now advances only on success); the hero "Open Settings" regex matched bare "model"/"key" in transient AI errors (tightened to the service's enumerated config-shaped strings + auth failures). Confirmed safe in the same sweep: `ApprovalInfo.reversible` is exhaustively type-derived (never AI-supplied), `open_url`'s single-quoted PowerShell doesn't expand `$()`. Accepted, not fixed: the `ensure_connected`→`try_send` TOCTOU (inherent to fire-and-forget, documented) and a `log_decision`-failure delaying a `last_analysis_at` broadcast by one cycle. Compile-verified (fmt + clippy --all-targets + 191 tests + node --check).
 
 2026-07-04 | Eir | v0.24.3 UI/UX pass | A focused tray-app UX sweep, UI-only except one skew-safe wire field. Safety: approving an irreversible action now takes two clicks (armed orange button, 6 s window; survives the 2 s poll via the existing approvals signature guard). Data-loss guard: Settings tracks a `settingsDirty` flag so re-entering the view no longer refills over unsaved edits; numeric inputs clamp to their declared min/max on save so the sent value matches what the service honours (a mid-range typo no longer silently coerces to the default). Trust signals: `StatusPayload.last_analysis_at` (`#[serde(default)]`) renders "analysed Xm ago" on the dashboard; every relative age gets an absolute-time tooltip. Convenience: Enter sends in Ask Eir (Shift+Enter newline, IME-guarded), Escape hides the window (blurs fields first), config-shaped errors get an "Open Settings" quick link, Disk/Startup headers summarise scans, paused state highlighted in the sidebar, `:focus-visible` rings for keyboard use. Adversarial diff review: one confirmed finding (missing `isComposing` guard) fixed; wire skew, Infinity-serialization, TDZ, and poll-rebuild concerns each refuted. Compile-verified (fmt + clippy --all-targets + `cargo test --workspace` + `node --check`); not live-exercised.
 

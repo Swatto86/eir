@@ -1008,8 +1008,14 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
 
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    st.status = "Active".to_string();
-    st.error = None;
+    // Don't clobber the AI-init failure set above: with `ai = None` every cycle
+    // skips analysis before any error-clearing path, so this startup settle was
+    // the only writer — clearing it here left a mis-configured provider looking
+    // healthy ("Active", no error) forever.
+    if ai.is_some() {
+        st.status = "Active".to_string();
+        st.error = None;
+    }
     if let Ok(s) = audit::usage_summary(&db).await {
         st.usage = Some(s);
     }
@@ -1027,7 +1033,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         }
         Err(e) => warn!("Failed to load pending approvals: {e}"),
     }
-    st.status = resting_status(&st);
+    if ai.is_some() {
+        st.status = resting_status(&st);
+    }
     pipe.broadcast_status(build_status(&st));
 
     let mut ticker = interval(Duration::from_secs(cfg.monitoring.decision_interval_secs));

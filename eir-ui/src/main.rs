@@ -450,9 +450,15 @@ fn friendly_status(status: &str) -> String {
     out
 }
 
-fn update_tray(tray: &TrayIcon<tauri::Wry>, base: &IconBase, status: &str) {
-    let _ = tray.set_icon(Some(make_icon(base, status)));
-    let _ = tray.set_tooltip(Some(&format!("Eir — {}", friendly_status(status))));
+/// Repaint the tray icon + tooltip. Returns false when either write failed so the
+/// caller can retry next tick — otherwise a transient shell failure sticks forever
+/// because the change-guard then sees `last == current` and never repaints.
+fn update_tray(tray: &TrayIcon<tauri::Wry>, base: &IconBase, status: &str) -> bool {
+    let icon_ok = tray.set_icon(Some(make_icon(base, status))).is_ok();
+    let tip_ok = tray
+        .set_tooltip(Some(&format!("Eir — {}", friendly_status(status))))
+        .is_ok();
+    icon_ok && tip_ok
 }
 
 // ── Approval notifications ──────────────────────────────────────────────────────
@@ -710,20 +716,22 @@ fn main() {
                         let s = pipe_client::lock_status(&status_tray);
                         (s.status.clone(), s.paused)
                     };
-                    if current != last {
+                    if current != last && update_tray(&tray, &icon_for_loop, &current) {
                         last = current.clone();
-                        update_tray(&tray, &icon_for_loop, &current);
                     }
                     // Keep the tray menu's pause entry in step with the state, so it
                     // reads "Resume Monitoring" while paused instead of always offering
-                    // to pause.
-                    if last_paused != Some(paused) {
+                    // to pause. Same retry-on-failure shape as the icon above.
+                    if last_paused != Some(paused)
+                        && pause_item_tray
+                            .set_text(if paused {
+                                "Resume Monitoring"
+                            } else {
+                                "Pause Monitoring"
+                            })
+                            .is_ok()
+                    {
                         last_paused = Some(paused);
-                        let _ = pause_item_tray.set_text(if paused {
-                            "Resume Monitoring"
-                        } else {
-                            "Pause Monitoring"
-                        });
                     }
                 }
             });
