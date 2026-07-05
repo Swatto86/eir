@@ -9,6 +9,29 @@ use windows::Win32::System::Services::{
     SERVICE_START, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE, SERVICE_STOP, SERVICE_STOPPED,
 };
 
+/// Services that must never be stopped/restarted by an auto-executed action — an
+/// adapter-level backstop mirroring `driver.rs::CRITICAL_DRIVERS` and
+/// `process.rs::PROTECTED_PROCESSES`, so a `policy.toml` blocklist edit/typo can't
+/// expose them. Stopping any of these can hang or crash the interactive session. Matched
+/// case-insensitively (Windows service names are case-insensitive). `start` is never
+/// guarded — starting a service is not disruptive.
+// Kept to services whose *stop* is genuinely catastrophic (hangs/crashes the interactive
+// session or breaks core IPC), mirroring PROTECTED_PROCESSES' "never touch" intent. Note
+// this deliberately excludes routinely-restartable services like Dnscache and Schedule —
+// restarting the DNS client is a legitimate fix Eir may propose, so it must not be blocked.
+const CRITICAL_SERVICES: &[&str] = &[
+    "rpcss",
+    "dcomlaunch",
+    "winmgmt",
+    "eventlog",
+    "lsm",
+    "plugplay",
+    "samss",
+    "brokerinfrastructure",
+    "power",
+    "lsass",
+];
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -23,6 +46,11 @@ pub fn restart(name: &str) -> Result<String> {
 }
 
 pub fn stop(name: &str) -> Result<String> {
+    // Adapter-level backstop: never stop a critical service, even if policy.toml's
+    // blocklist was edited to omit it. `restart` routes through here, so this covers both.
+    if CRITICAL_SERVICES.contains(&name.to_lowercase().as_str()) {
+        bail!("Refusing to stop critical service '{name}'");
+    }
     let name_w = wide(name);
     let manager = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT)? };
 
@@ -141,4 +169,18 @@ fn wait_for(name: &str, target: SERVICE_STATUS_CURRENT_STATE, timeout_secs: u64)
         let _ = CloseServiceHandle(manager);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stop;
+
+    #[test]
+    fn critical_services_are_refused_before_any_scm_call() {
+        // The guard runs before OpenSCManagerW, so this bails without touching the SCM.
+        for name in ["RpcSs", "rpcss", "EventLog", "Winmgmt", "DcomLaunch"] {
+            let err = stop(name).unwrap_err().to_string();
+            assert!(err.contains("critical"), "{name}: {err}");
+        }
+    }
 }

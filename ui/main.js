@@ -476,10 +476,18 @@ function renderAsk(ask) {
   list.innerHTML = html;
 }
 
+let askSending = false;
 async function submitAsk() {
   const input = document.getElementById('ask-input');
   const q = input.value.trim();
   if (!q) return;
+  // Synchronous in-flight guard: the Send button only disables via the next 2s poll's
+  // ask.running, so without this a fast second Enter/click could queue a duplicate ask
+  // before the service flips running. Re-enabled in finally.
+  if (askSending) return;
+  askSending = true;
+  const sendBtn = document.getElementById('ask-send');
+  sendBtn.disabled = true;
   const statusEl = document.getElementById('ask-status');
   statusEl.textContent = 'Sending…';
   try {
@@ -491,6 +499,9 @@ async function submitAsk() {
     input.value = '';
   } catch (e) {
     statusEl.textContent = 'Failed: ' + e;
+  } finally {
+    askSending = false;
+    sendBtn.disabled = false;
   }
   refresh();
 }
@@ -1412,10 +1423,18 @@ async function saveUpdaterSettings() {
   }
 }
 
-document.getElementById('set-save').addEventListener('click', saveSettings);
-document.getElementById('set-adv-save').addEventListener('click', saveAdvisorSettings);
-document.getElementById('set-upd-save').addEventListener('click', saveUpdaterSettings);
-document.getElementById('set-autostart-save').addEventListener('click', saveAutostartSetting);
+// Disable a Settings save button while its save is in flight, so a double-click can't
+// fire two saves — update_settings restarts the service (~15s), so a second one lands
+// mid-restart. Matches the disable-on-click pattern used by every other action button.
+function saveGuarded(btnId, fn) {
+  const btn = document.getElementById(btnId);
+  btn.disabled = true;
+  Promise.resolve(fn()).finally(() => { btn.disabled = false; });
+}
+document.getElementById('set-save').addEventListener('click', () => saveGuarded('set-save', saveSettings));
+document.getElementById('set-adv-save').addEventListener('click', () => saveGuarded('set-adv-save', saveAdvisorSettings));
+document.getElementById('set-upd-save').addEventListener('click', () => saveGuarded('set-upd-save', saveUpdaterSettings));
+document.getElementById('set-autostart-save').addEventListener('click', () => saveGuarded('set-autostart-save', saveAutostartSetting));
 
 // ── Pause ─────────────────────────────────────────────────────────────────────
 

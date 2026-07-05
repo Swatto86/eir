@@ -524,10 +524,24 @@ fn fault_changed(prev: &str, cur: &str) -> bool {
 /// handler without stalling the loop; returns the fresh failed-services set. cpu/mem/disk
 /// still refresh on the normal cadence — the manual refresh targets the stale-service
 /// complaint, and a full `snapshot_state` would shell out to PowerShell (up to 15 s).
-pub async fn rescan_failed_services() -> Vec<String> {
-    tokio::task::spawn_blocking(|| get_services().1)
+///
+/// Also writes the result into the shared cache `wmi::current` reads. Without this, the
+/// next decision tick (or any reactive wake) would read the still-stale cached snapshot —
+/// the background poller only re-scans every few minutes — and overwrite `st.failed_services`
+/// back to the stale value, silently re-showing the service the user just cleared.
+pub async fn rescan_failed_services(shared: &SharedState) -> Vec<String> {
+    let failed = tokio::task::spawn_blocking(|| get_services().1)
         .await
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Ok(mut guard) = shared.lock() {
+        // Only correct the services field; leave cpu/mem/disk to the next full poll. When
+        // the cache is still None (first poll hasn't run), `current` returns an empty
+        // snapshot, so there's no stale value to reconcile — nothing to do.
+        if let Some(s) = guard.as_mut() {
+            s.failed_services = failed.clone();
+        }
+    }
+    failed
 }
 
 pub fn spawn(
@@ -609,6 +623,34 @@ pub fn current(shared: &SharedState) -> SystemState {
 #[cfg(test)]
 mod tests {
     use super::{effective_firewall, fault_changed, parse_defender_status};
+
+    #[tokio::test]
+    async fn rescan_overwrites_the_cached_failed_services() {
+        // Seed the shared cache with a stale snapshot, then rescan: the cache must be
+        // overwritten with the fresh result (so a later wmi::current() read can't
+        // re-populate st.failed_services with the stale value), and the returned vec must
+        // match the cache. We don't assert the *contents* (machine-dependent), only that
+        // the stale sentinel is gone and cache == return.
+        use crate::models::SystemState;
+        let shared: super::SharedState =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(SystemState {
+                failed_services: vec!["StaleSentinelSvc".into()],
+                ..Default::default()
+            })));
+        let returned = super::rescan_failed_services(&shared).await;
+        let cached = shared
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .failed_services
+            .clone();
+        assert_eq!(cached, returned, "cache must equal the rescan result");
+        assert!(
+            !cached.iter().any(|s| s == "StaleSentinelSvc"),
+            "stale value must be overwritten, not retained"
+        );
+    }
 
     #[test]
     fn fault_change_wakes_on_appear_clear_and_change_but_not_on_steady_state() {

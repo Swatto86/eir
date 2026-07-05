@@ -20,9 +20,17 @@ pub async fn kill(process_name: &str) -> Result<String> {
         bail!("Refusing to kill protected process: {process_name}");
     }
     let safe_name = process_name.replace('\'', "''");
+    // Report success only if a process actually existed and was stopped. The old script
+    // used `-ErrorAction SilentlyContinue` and unconditionally wrote success, so a typo'd/
+    // absent/hallucinated name or an access-denied kill was logged as a fabricated success
+    // (and suppressed retries via safety::rate_limited). Now: throw if nothing matches, and
+    // stop with `-ErrorAction Stop` so a genuine failure surfaces as a non-zero exit.
+    // Every interpolation of the name stays inside single-quoted PS literals.
     let script = format!(
-        "Stop-Process -Name '{safe_name}' -Force -ErrorAction SilentlyContinue; \
-         Write-Output 'Kill signal sent to: {safe_name}'"
+        "$procs = @(Get-Process -Name '{safe_name}' -ErrorAction SilentlyContinue); \
+         if ($procs.Count -eq 0) {{ throw 'No running process named: {safe_name}' }}; \
+         $procs | Stop-Process -Force -ErrorAction Stop; \
+         Write-Output 'Stopped process(es) named: {safe_name}'"
     );
     super::powershell::run_diagnostic(&script).await
 }

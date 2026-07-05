@@ -256,6 +256,9 @@
     .upd-badge { font-size: 11px; padding: 1px 8px; border-radius: 20px; font-weight: 600; margin-left: 6px; white-space: nowrap; }
     .upd-result { flex-basis: 100%; padding: 2px 0 0; font-size: 11px; color: var(--muted); white-space: normal; user-select: text; }
     .upd-note { padding: 6px 15px; font-size: 11px; color: var(--muted); user-select: text; }
+    /* AI/service free text can contain one long unbroken token (a deep path, URL, or hash)
+       — wrap it so it can't overflow the card horizontally (same treatment as .appr-details). */
+    .ask-a, .ai-now-text, .act-why, .di-note, .upd-note, .upd-result { overflow-wrap: break-word; }
     .upd-summary { display: block; padding: 8px 15px; font-size: 12px; border-bottom: 1px solid var(--border); }
     .upd-mini { padding: 2px 9px; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 6px; cursor: pointer; font-size: 11px; font-family: inherit; }
     .upd-mini:hover { background: var(--surface-2); color: var(--text); }

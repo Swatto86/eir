@@ -24,7 +24,22 @@ pub async fn list_updates() -> Vec<AppUpdate> {
         LIST,
     )
     .await;
-    parse_upgrades(&out)
+    let ups = parse_upgrades(&out);
+    // Make the non-English-locale blind spot visible instead of silently reporting zero
+    // updates forever: our column parser locates fields by the English header labels
+    // ("Id"/"Version"), so a localized winget header yields no columns and every row is
+    // dropped. Key on "a table is present (dashed separator, locale-independent) but the
+    // header was NOT locatable" — this precisely targets the localized-header case and
+    // won't fire on the benign English path where the header parses but rows are filtered
+    // out (e.g. --include-unknown rows with an empty Available column). Fails safe: no
+    // wrong action, just no detection — hence a log line, not a hard error.
+    if out.contains("---") && !crate::updater::winget_parse::header_present(&out) {
+        tracing::warn!(
+            "winget returned a table but its header wasn't parseable — likely a non-English \
+             display language (column headers are localized)"
+        );
+    }
+    ups
 }
 
 /// The full `winget upgrade` argument list for one id, optionally forcing past the

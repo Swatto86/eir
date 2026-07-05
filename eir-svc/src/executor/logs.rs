@@ -1,4 +1,4 @@
-use crate::policy::{is_within, normalize_path_lexical};
+use crate::policy::{is_network_path, is_within, normalize_path_lexical};
 use anyhow::{bail, Result};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
@@ -48,6 +48,11 @@ pub fn cleanup(path: &str, days_old: u32) -> Result<String> {
     // delete disguised as a log cleanup. Require a real age window.
     if days_old == 0 {
         bail!("Refusing log cleanup with days_old = 0 — require at least 1 day");
+    }
+    // Defense in depth (policy already blocks this): never walk a UNC/network root — it
+    // would make the LocalSystem account authenticate to a remote host over SMB.
+    if is_network_path(path) {
+        bail!("Refusing log cleanup on '{path}' — network/UNC paths are not allowed");
     }
     // Refuse a root broad enough to reach system directories.
     if root_too_broad(path) {

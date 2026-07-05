@@ -87,6 +87,19 @@ impl ExecutionPolicy {
 
     fn blocked_reason(&self, action: &FixAction) -> Option<String> {
         match action {
+            // A UNC / network path in a filesystem action makes the LocalSystem service
+            // authenticate to a remote host (SMB), which is a credential-relay vector when
+            // the path is AI-influenced — and for FileDelete the approval-card preview
+            // (explain::file_facts) would touch it before a human even approves. Refuse
+            // before either the executor OR the approval card runs. (Extends the updater's
+            // C2 drive-letter-only guard to the executor path actions.)
+            FixAction::LogCleanup { path, .. } | FixAction::FileDelete { path }
+                if is_network_path(path) =>
+            {
+                Some(format!(
+                    "Refusing '{path}' — network/UNC paths are not allowed"
+                ))
+            }
             FixAction::ServiceRestart { service_name }
             | FixAction::ServiceStop { service_name }
             | FixAction::ServiceStart { service_name }
@@ -140,6 +153,15 @@ impl ExecutionPolicy {
 /// blocklist and the registry executor's allow/deny lists so both agree on what
 /// "under this key" means (`C:\Windows` matches `C:\Windows\...` but not
 /// `C:\WindowsApps`).
+/// True for a UNC / network path (`\\server\share`, `//server/share`, `\\?\UNC\...`).
+/// Such a path makes the LocalSystem service authenticate to a remote host, which is a
+/// credential-relay vector when the path is AI-influenced — never a valid local fix
+/// target. The extended-local form `\\?\C:\...` also matches (it starts with `\\`);
+/// that's refused too, deliberately, since the plain `C:\` form is always available.
+pub(crate) fn is_network_path(path: &str) -> bool {
+    path.trim_start().replace('/', "\\").starts_with("\\\\")
+}
+
 pub(crate) fn is_within(path: &str, ancestor: &str) -> bool {
     let cand = normalize_path_lexical(path);
     let anc = normalize_path_lexical(ancestor);
@@ -337,6 +359,55 @@ mod tests {
         assert!(blocked("C:\\Windows\\..\\..\\Windows\\System32\\x.dll"));
         // A sibling directory that only shares a name prefix is NOT blocked.
         assert!(!blocked("C:\\WindowsApps\\ok.txt"));
+    }
+
+    #[test]
+    fn unc_paths_are_blocked_for_filesystem_actions() {
+        // A UNC/network path in LogCleanup (auto-whitelisted) or FileDelete must be blocked
+        // by policy — before the executor runs OR the FileDelete approval preview stats it.
+        let pol = policy_with(&["log_cleanup", "file_delete"]);
+        for p in [
+            r"\\attacker\share\logs",
+            "//attacker/share/logs",
+            r"\\?\UNC\attacker\share\logs",
+        ] {
+            assert!(
+                matches!(
+                    pol.evaluate(
+                        &FixAction::LogCleanup {
+                            path: p.into(),
+                            days_old: 7
+                        },
+                        0.99
+                    ),
+                    Verdict::Block(_)
+                ),
+                "LogCleanup UNC not blocked: {p}"
+            );
+            assert!(
+                matches!(
+                    pol.evaluate(&FixAction::FileDelete { path: p.into() }, 0.99),
+                    Verdict::Block(_)
+                ),
+                "FileDelete UNC not blocked: {p}"
+            );
+        }
+        // A normal local path is unaffected (LogCleanup auto-approves; FileDelete needs
+        // approval since it's whitelisted here but is a per-file action).
+        assert!(matches!(
+            pol.evaluate(
+                &FixAction::LogCleanup {
+                    path: r"C:\Logs\App".into(),
+                    days_old: 7
+                },
+                0.99
+            ),
+            Verdict::AutoApprove
+        ));
+        assert!(is_network_path(r"\\a\b"));
+        assert!(is_network_path("//a/b"));
+        assert!(!is_network_path(r"C:\Logs\App"));
+        assert!(!is_network_path(r"D:\x"));
     }
 
     #[test]

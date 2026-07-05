@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-05 · **Release:** v0.25.3
+**Last updated:** 2026-07-05 · **Release:** v0.25.4
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -544,9 +544,9 @@ AI-proposed):
 
 | Action | Adapter | Mechanism | Built-in guard |
 |---|---|---|---|
-| `ServiceRestart/Stop/Start` | `services.rs` | Win32 SCM API (`OpenSCManagerW`/`ControlService`/`StartServiceW`), restart waits up to 30s for STOPPED then RUNNING | none in adapter (policy blocklist only) |
-| `LogCleanup{path,days_old}` | `logs.rs` | `walkdir`, deletes files with ext in `log/tmp/dmp/etl/blf/regtrans-ms` older than cutoff | ext allowlist; missing dir ⇒ no-op |
-| `DiskCleanup{target}` | inline PS (`mod.rs:35`) | only `temp`/`tmp`/`prefetch` mapped; else "no action" | hardcoded target switch |
+| `ServiceRestart/Stop/Start` | `services.rs` | Win32 SCM API (`OpenSCManagerW`/`ControlService`/`StartServiceW`), restart waits up to 30s for STOPPED then RUNNING | **`CRITICAL_SERVICES` blocklist** in `stop` (RpcSs/DcomLaunch/EventLog/Winmgmt/… — an adapter backstop so a policy.toml edit can't expose them; `restart` routes through `stop`) + policy blocklist |
+| `LogCleanup{path,days_old}` | `logs.rs` | `walkdir`, deletes files with ext in `log/tmp/dmp/etl/blf/regtrans-ms` older than cutoff | ext allowlist; missing dir ⇒ no-op; **UNC/network-path refusal** (a `\\host\share` root would make LocalSystem authenticate over SMB); `days_old ≥ 1`; canonical-walk under protected-dir re-check |
+| `DiskCleanup{target}` | inline PS (`mod.rs:35`) | only `temp`/`tmp`/`prefetch` mapped; an unknown target returns a real **failure** (not a success-shaped no-op that would poison the rate limiter) | hardcoded target switch |
 | `PowerShellDiagnostic{script}` | `powershell::run_diagnostic` | arbitrary script as SYSTEM | **none** — full machine access; kept off whitelist |
 | `TaskDisable/Enable{task_name}` | `tasks.rs` | `Disable/Enable-ScheduledTask` via the timed `powershell::run_diagnostic` helper | single-quote escaping; glob-metachar refusal; a bare (unqualified) name is resolved first and refused if it matches >1 folder; **policy `[blocklist] tasks` denies `\Microsoft\...` (Defender/BitLocker/backup/restore) so auto-execute can't disable a security/maintenance task** |
 | `RegistryReset{key,name,data}` | `registry.rs` | `Set-ItemProperty` via the timed `powershell::run_diagnostic` helper | **`ALLOWED_KEY_PREFIXES` allowlist** (Tcpip, Multimedia, HKCU\SOFTWARE\Microsoft); `DENIED_KEY_PREFIXES` denies persistence subkeys (Run/RunOnce/Winlogon/IFEO/**Explorer\StartupApproved**); normalises `HKEY_*` forms |
@@ -555,8 +555,8 @@ AI-proposed):
 | `DriverEnable{name}` | `driver.rs` | `sc.exe config … start= demand` | none (auto-whitelisted) |
 | `SoftwareUninstall{pkg}` | `software.rs` | Get-Package → registry uninstall string / msiexec | **also hard-blocked in policy** — never runs |
 | `BcdEdit{element,value}` | `boot.rs` | `bcdedit /set {current}` | **`SAFE_ELEMENTS` allowlist** + shell-metachar rejection on value |
-| `ProcessKill{name}` | `process.rs` | `Stop-Process -Force` | **`PROTECTED_PROCESSES` blocklist** (lsass/winlogon/csrss/…); **glob-metachar refusal** (`Stop-Process -Name` globs `*?[]`, so `lsass*` would evade the exact-match blocklist without it) |
-| `FileDelete{path}` | inline PS (`mod.rs:116`) | refuses directories, requires file to exist, `Remove-Item -Force` (no Recycle Bin) | dir/exists guard in script + policy path blocklist |
+| `ProcessKill{name}` | `process.rs` | `Get-Process` (must exist) → `Stop-Process -Force -ErrorAction Stop` (success reflects reality, not a fabricated "signal sent") | **`PROTECTED_PROCESSES` blocklist** (lsass/winlogon/csrss/…); **glob-metachar refusal** (`Stop-Process -Name` globs `*?[]`, so `lsass*` would evade the exact-match blocklist without it) |
+| `FileDelete{path}` | inline PS (`mod.rs:116`) | refuses directories, requires file to exist, `Remove-Item -Force` (no Recycle Bin) | **UNC/network-path refusal** (policy + executor + the `file_facts` approval preview, so the preview never SMB-auths); dir/exists guard in script; canonicalize→protected-dir re-check; policy path blocklist |
 | `FirewallEnable{profile}` | `security.rs` | `netsh advfirewall set <profile> state on` | profile mapped via allowlist |
 | `DefenderSignatureUpdate` | `security.rs` | `Update-MpSignature` | safe by nature (refresh only) |
 | `DefenderRealtimeEnable` | `security.rs` | `Set-MpPreference -DisableRealtimeMonitoring $false` | approval-gated (could conflict with 3rd-party AV) |
@@ -1052,6 +1052,47 @@ one app already known to behave this way.
 ---
 
 ## Known limitations & backlog
+
+**Resolved in v0.25.4 (third adversarial sweep, F1–F16):** 8-agent sweep + regression pass
+(70/70 prior fixes held). **Two P1s:** (F1) the v0.25.3 manual "Refresh status" wrote
+`st.failed_services` but never updated the WMI cache, so the next decision tick re-populated
+the just-cleared service from the stale `wmi::current()` — `rescan_failed_services` now takes
+`&SharedState` and writes the result into the cache. (F2) UNC/network paths were unguarded in
+the auto-whitelisted `LogCleanup` and the `FileDelete` approval preview (`explain::file_facts`
+stats the path), so an AI-influenced `\\host\share\…` made the LocalSystem account authenticate
+to a remote host over SMB — now blocked in `policy::blocked_reason` (before the executor AND the
+preview) via `is_network_path`, with defense-in-depth bails in `logs::cleanup`, the `FileDelete`
+executor, and `file_facts`. **P2:** (F3) the `Approve`/`Reject` handler cleared `st.error`
+unconditionally (the D7/D14 hole in a different path) — now `!st.paused`-gated; (F4/F5) an
+unrecognised `DiskCleanup` target and a no-op/failed `process_kill` reported a fabricated
+success that poisoned `safety::rate_limited` — both now report real failure (F4 mirrors the
+`NetworkDiagnostic` branch; F5 verifies the process existed and was stopped); (F6) four
+AI-error paths (`Anthropic`/`OpenRouter` HTTP bodies, `claude`/`kilo` CLI stderr) rebroadcast
+unbounded text into `st.error` — now `char_preview`-truncated like the D12 parse path; (F7)
+Settings save buttons didn't disable in-flight (double-click → double restart). **P3:** (F8)
+advisor day-rollover stale read documented; (F9) added a `CRITICAL_SERVICES` adapter-level
+backstop in `services::stop` mirroring `driver.rs`/`process.rs`; (F10) startup-advisor and
+Ask-Eir prompts got the D11 untrusted-content framing; (F11) winget logs a warning when a table
+parses to zero rows (non-English-locale blind spot); (F12/F13) Ask "Send" in-flight guard and
+`overflow-wrap` on AI-text classes. Compile/test-verified (fmt + clippy `--all-targets -D
+warnings` + `cargo test --workspace`, new unit tests for F1/F2/F9); the frontend (F7/F12/F13),
+the F5 live kill, and the F2 live SMB path are reasoning/compile-verified, not live-exercised.
+
+Accepted / deferred from this sweep (decided, not silently dropped):
+- **F14** — retried-and-discarded AI attempts' partial billed usage is still not logged
+  (`client.rs`'s retry loop returns `CallUsage` only from the final attempt). This was the
+  never-implemented D13; **accepted** as a subset of the existing "usage cost is indicative,
+  not exact billing" limitation — under flaky connectivity `advisor_spent_today`/`usage_log`
+  can under-count, bounded by `MAX_ESCALATIONS_PER_DAY` and the daily USD cap.
+- **F15** — version comparison drops prerelease suffixes (`1.0.0-rc1` == `1.0.0`), so an RC
+  never sees its stabilised release. **Accepted** (safe direction — a missed update, never a
+  spurious one; prerelease installs are rare in the target app population), alongside the
+  existing `is_newer` driver-false-positive note.
+- **F16** — a genuinely corrupt (not merely locked) `eir.db` routes to `fatal!` with no
+  recreate-fresh fallback (unlike `config.toml`'s D6 `.bak`). **Accepted**: it fails gracefully
+  (an Error status, no crash-loop) rather than auto-deleting the audit DB — which would risk
+  destroying recoverable data (incl. persisted pending approvals) on a false-positive corruption
+  detection. Documented rather than auto-recovered by design.
 
 **Resolved in v0.25.3 (stale-status fix + manual reset, E1–E2):** a recovered failed
 service could linger on the dashboard for up to ~10–15 min. Root cause: the WMI collector

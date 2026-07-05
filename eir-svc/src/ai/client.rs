@@ -434,7 +434,7 @@ impl AiClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            bail!("Anthropic API {status}: {text}");
+            bail!("Anthropic API {status}: {}", char_preview(&text, 2000));
         }
 
         let mut out = String::new();
@@ -548,7 +548,7 @@ impl AiClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            bail!("model API {status}: {text}");
+            bail!("model API {status}: {}", char_preview(&text, 2000));
         }
 
         let mut out = String::new();
@@ -659,7 +659,11 @@ impl AiClient {
             wait_capped(child, "claude CLI", Some(prompt.as_bytes().to_vec())).await?;
 
         if !status.success() {
-            bail!("claude CLI exited with {}: {}", status, stderr_raw.trim());
+            bail!(
+                "claude CLI exited with {}: {}",
+                status,
+                char_preview(stderr_raw.trim(), 2000)
+            );
         }
 
         let stdout = stdout_raw.trim().to_string();
@@ -769,7 +773,11 @@ impl AiClient {
             // Exit 124 = kilo's own timeout (treat like ours); 1 = init/runtime
             // error. Surface stderr so the user can diagnose (e.g. "Not
             // authenticated — run `kilo` once interactively to log in").
-            bail!("kilo CLI exited with {}: {}", status, stderr_raw.trim());
+            bail!(
+                "kilo CLI exited with {}: {}",
+                status,
+                char_preview(stderr_raw.trim(), 2000)
+            );
         }
 
         let (text, usage) = parse_kilo_ndjson(&stdout)?;

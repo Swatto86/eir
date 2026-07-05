@@ -44,7 +44,20 @@ pub async fn execute(action: &FixAction) -> ExecutionResult {
                     "Remove-Item -Path 'C:\\Windows\\Prefetch\\*' -Force -ErrorAction SilentlyContinue; \
                      Write-Output 'Prefetch cleaned'"
                 }
-                _ => "Write-Output 'Unknown disk cleanup target — no action taken'",
+                other => {
+                    // Report a real failure, not a success-shaped no-op — disk_cleanup is
+                    // auto-executed, so a false "success" here would poison the rate limiter
+                    // (safety::rate_limited suppresses a fingerprint that already "succeeded").
+                    // Mirrors the NetworkDiagnostic unknown-command branch below.
+                    let msg = format!("Unknown disk cleanup target: '{other}'");
+                    error!("{msg}");
+                    return ExecutionResult {
+                        action: format!("{action:?}"),
+                        success: false,
+                        output: msg,
+                        undo: None,
+                    };
+                }
             };
             make_result(action, powershell::run_diagnostic(script).await)
         }
@@ -128,6 +141,16 @@ pub async fn execute(action: &FixAction) -> ExecutionResult {
             startup::set_enabled(name, location, hive, *enable).await,
         ),
         FixAction::FileDelete { path } => {
+            // Defense in depth (policy already blocks this): refuse a UNC/network path
+            // BEFORE canonicalize, which would otherwise authenticate to a remote host.
+            if crate::policy::is_network_path(path) {
+                return make_result(
+                    action,
+                    Err(anyhow::anyhow!(
+                        "Refusing to delete '{path}' — network/UNC paths are not allowed"
+                    )),
+                );
+            }
             // Canonicalise before deleting. An 8.3 short name or a junction can lexically
             // dodge the policy blocklist yet resolve into a protected system dir — and the
             // approval card shows the UN-resolved path, so the human can't see the real

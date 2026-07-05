@@ -44,6 +44,14 @@ fn header_offsets(text: &str) -> Vec<(&'static str, usize)> {
     offsets
 }
 
+/// Whether the winget table header (located by the English "Id"/"Version" labels) was
+/// found in `text`. Returns false on a localized (non-English) header even when a table
+/// is present — used to distinguish the locale blind spot from the benign "header found,
+/// rows all filtered out" case (e.g. `--include-unknown` rows with an empty Available).
+pub fn header_present(text: &str) -> bool {
+    !header_offsets(text).is_empty()
+}
+
 /// Read one column's trimmed value from a row. A column spans from its own start
 /// to the next column's start (the last runs to end of line). Returns "" when the
 /// column is absent or starts past the row's end.

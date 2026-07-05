@@ -275,6 +275,14 @@ pub fn target_details(action: &FixAction) -> String {
 /// does it exist, how big is it, when was it last written, and what kind of file
 /// does it look like (regenerable cache vs. irreplaceable user data).
 fn file_facts(path: &str) -> String {
+    // Never stat a UNC/network path to build the preview — std::fs::metadata on it would
+    // make the LocalSystem service authenticate to the remote host over SMB before the
+    // human even approves. Policy blocks the action anyway; this keeps the preview inert.
+    if crate::policy::is_network_path(path) {
+        return "This is a network/UNC path. Eir refuses network paths, so this action \
+                would be rejected — nothing is previewed or deleted."
+            .to_string();
+    }
     let p = std::path::Path::new(path);
     let meta = match std::fs::metadata(p) {
         Ok(m) => m,

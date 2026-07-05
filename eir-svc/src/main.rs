@@ -1700,7 +1700,8 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             // cpu/mem/disk refresh on the normal cadence. Deliberately does
                             // NOT clear st.error — that banner is a live AI/config error
                             // with its own lifecycle, not stale status.
-                            st.failed_services = signals::wmi::rescan_failed_services().await;
+                            st.failed_services =
+                                signals::wmi::rescan_failed_services(&wmi_shared).await;
                             // Re-settle the transient "Warning" to a resting status, but
                             // never downgrade a live "Error" (resting_status has no Error
                             // tier, so calling it while st.error is set would show "Active"
@@ -1796,7 +1797,12 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                         Some("rejected by user".into()),
                                     );
                                 }
-                                st.error = None;
+                                // Match every other error-clear site: don't wipe a live
+                                // AI/config error the user may have paused because of. An
+                                // Approve/Reject is unrelated to that error.
+                                if !st.paused {
+                                    st.error = None;
+                                }
                             }
                             // Whether resolved or stale, settle the status and
                             // refresh the UI (the card disappears from the queue).
