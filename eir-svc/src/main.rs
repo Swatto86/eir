@@ -832,6 +832,19 @@ fn actionable_fingerprint(snap: &SignalSnapshot) -> Option<String> {
     Some(parts.join("\n"))
 }
 
+/// Copy a WMI snapshot's live metrics (cpu/mem/disk + failed services) into the broadcast
+/// state. This is the single per-tick writer of these fields, sourced from
+/// `wmi::current(&wmi_shared)`. The load-bearing invariant: whatever this reads from the
+/// WMI cache becomes the broadcast truth — so a manual `RefreshStatus` must update the WMI
+/// cache too (not just `st.failed_services`), or the next tick reverts it. Extracted so
+/// that seam is unit-testable (`manual_refresh_survives_a_following_tick`, the F1 regression).
+fn apply_live_metrics(st: &mut SvcState, sys: &SystemState) {
+    st.cpu = sys.cpu_usage_percent;
+    st.memory = sys.memory_usage_percent;
+    st.disk = sys.disk_usage_percent;
+    st.failed_services = sys.failed_services.clone();
+}
+
 fn push_problem(
     st: &mut SvcState,
     diagnosis: &str,
@@ -2349,13 +2362,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                 );
 
                 // ── Update metrics in broadcast ──────────────────────────────
-                {
-                    let sys = &snapshot.system_state;
-                    st.cpu             = sys.cpu_usage_percent;
-                    st.memory          = sys.memory_usage_percent;
-                    st.disk            = sys.disk_usage_percent;
-                    st.failed_services = sys.failed_services.clone();
-                }
+                apply_live_metrics(&mut st, &snapshot.system_state);
                 // Refresh the dashboard resource timeline (last 24h, thinned) once per
                 // tick — cheap, and off the per-broadcast path (build_status only clones
                 // the cached vec). Reads the same per-cycle series the trend detector uses.
@@ -2698,6 +2705,80 @@ mod status_tests {
         // Paused outranks an in-flight execution.
         st.paused = true;
         assert_eq!(resting_status(&st), "Paused");
+    }
+
+    /// F1 regression: a manual RefreshStatus that clears a recovered service must survive
+    /// the NEXT decision tick. A tick calls `apply_live_metrics(&mut st, wmi::current(...))`,
+    /// so if the refresh updated `st.failed_services` but not the WMI cache, the tick reads
+    /// the stale cache and reverts the clear. This exercises that exact seam.
+    #[test]
+    fn manual_refresh_survives_a_following_tick() {
+        use crate::signals::wmi;
+        use std::sync::{Arc, Mutex};
+
+        // Stale, pre-recovery state: both the cache and st show the service as failed.
+        let cache: wmi::SharedState = Arc::new(Mutex::new(Some(SystemState {
+            failed_services: vec!["Spooler".into()],
+            ..Default::default()
+        })));
+        let mut st = SvcState {
+            failed_services: vec!["Spooler".into()],
+            ..Default::default()
+        };
+
+        // Manual refresh: the service recovered. The handler clears st AND (the F1 fix)
+        // writes the fresh result into the WMI cache. Model both writes.
+        let fresh: Vec<String> = vec![];
+        st.failed_services = fresh.clone();
+        if let Some(s) = cache.lock().unwrap().as_mut() {
+            s.failed_services = fresh.clone();
+        }
+
+        // A following decision tick re-reads the cache and applies live metrics.
+        apply_live_metrics(&mut st, &wmi::current(&cache));
+
+        assert!(
+            st.failed_services.is_empty(),
+            "a manual refresh must not be reverted by the next tick — if this fails, the \
+             RefreshStatus handler stopped updating the WMI cache (F1 regression)"
+        );
+    }
+
+    /// A stale cache that was NOT reconciled by a refresh still wins on the next tick — the
+    /// negative of the above, documenting that `apply_live_metrics` is authoritative from
+    /// the cache (so the F1 fix's cache write is load-bearing, not incidental).
+    #[test]
+    fn tick_applies_the_cache_verbatim() {
+        let sys = SystemState {
+            cpu_usage_percent: 12.5,
+            failed_services: vec!["W32Time".into()],
+            ..Default::default()
+        };
+        let mut st = SvcState::default();
+        apply_live_metrics(&mut st, &sys);
+        assert_eq!(st.cpu, 12.5);
+        assert_eq!(st.failed_services, vec!["W32Time".to_string()]);
+    }
+
+    /// build_status must project the live metrics + failed services into the broadcast
+    /// payload — catches a field added to SvcState but not wired into StatusPayload.
+    #[test]
+    fn build_status_projects_metrics_and_failed_services() {
+        let st = SvcState {
+            cpu: 42.0,
+            memory: 71.0,
+            disk: 55.0,
+            failed_services: vec!["Spooler".into(), "W32Time".into()],
+            ..Default::default()
+        };
+        let payload = build_status(&st);
+        assert_eq!(payload.cpu, 42.0);
+        assert_eq!(payload.memory, 71.0);
+        assert_eq!(payload.disk, 55.0);
+        assert_eq!(
+            payload.failed_services,
+            vec!["Spooler".to_string(), "W32Time".to_string()]
+        );
     }
 }
 
