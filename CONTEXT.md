@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.25.0. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.25.1. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.25.0. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-05 | Eir | v0.25.1 UX pass (frontend-only) | Three additions, no wire/service change. (1) Toast feedback for fire-and-forget commands (approve/reject, disk clean, startup toggle, undo, clear, run-updates, pause) — the UX answer to the ack-less pipe; toasts say "queued"/"sent", never falsely claim "done" (a resolved invoke is still only "queued to the writer"). (2) Copy-to-clipboard on the hero error and per-approval target+details (`navigator.clipboard` + textarea/execCommand fallback). (3) Activity filter chips (All/Fixes/Diagnoses/Failures) — filter folded into the render signature so a chip switch forces one rebuild; undo bookkeeping deliberately keyed on the unfiltered list so a hidden row can't drop its in-flight Undo. All pure client-side (no invoke), so live under `svc-down`. One frontend review agent + self-review: no confirmed defects (XSS-safe — toasts use textContent + literal strings; load-order, filter/signature, toast timer eviction, and null-handling all traced and refuted). Gate green (fmt/clippy/192 tests/node --check/version-sync); not live-exercised.
 
 2026-07-04 | Eir | v0.25.0 Autoruns-style startup advisor | Rebuilt F13 to cover the real ASEP surface: Run keys incl. Wow6432Node (toggle via `StartupApproved\Run32`), RunOnce, `Policies\Explorer\Run`, Winlogon Shell/Userinit anomalies (emitted only when non-default), logon scheduled tasks outside `\Microsoft\` (toggle reuses `TaskEnable`/`TaskDisable` with a precise `-TaskPath`/`-TaskName` split), and auto-start services outside `\Windows\` (report-only). Every entry carries the launched binary's Authenticode signer (fallback CompanyName) — deterministic ground truth the AI prompt is anchored to — and the AI note now explains what each item is and where it likely came from. UI: signer chips, report-only pills, default-on "Hide Windows" filter (Microsoft-signed). Trust boundary held: wire still carries only opaque ids; task toggles are forced through approval (`route_user_action force_approval`) to match `startup_set`'s human-confirms rationale even though `task_disable` is AI-whitelisted. Sweep fixes before release: string `approvedByte` blanked the whole scan (live-caught), masquerade-path `\Windows\` filter evasion, `PS*` note-property prefix filter, UNC stall/SMB-auth skip, `Get-ScheduledTask` wildcard fan-out (refused). Live-verified as interactive user (enum script: 20 entries/6 categories on the dev machine); LocalSystem run, toggling, and AI classify are compile/unit-verified only.
 

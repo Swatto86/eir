@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-04 · **Release:** v0.25.0
+**Last updated:** 2026-07-05 · **Release:** v0.25.1
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -78,7 +78,7 @@ Eir is a single Cargo workspace (`resolver = "2"`) with three crates, plus a sta
 | `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service: signal collection, AI client, policy, execution, autonomous updater, SQLite audit DB. Heavy `windows` 0.58 feature set. |
 | `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), tracing. `build-dependencies`: `tauri-build` 2. |
 
-All three crates are versioned in lockstep — currently `0.25.0` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
+All three crates are versioned in lockstep — currently `0.25.1` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
 
 The dependency graph is acyclic and points inward: `eir-proto` depends on nothing internal; `eir-svc` and `eir-ui` each depend only on `eir-proto`. The UI and service never link against each other — they are separate processes coupled solely through the `eir-proto` wire contract over `\\.\pipe\EirSvc`.
 
@@ -273,6 +273,7 @@ The frontend was fully rebuilt in v0.17 (still hand-written vanilla HTML/CSS/JS,
 - **XSS hygiene**: all service-supplied strings go through `esc()` / `escAttr()` before insertion into `innerHTML`; applied consistently across approvals, activity, updater rows, and service chips.
 - **Activity feed** merges `recent_problems` + `recent_executions` into one list sorted by `at` descending, with emoji/tag per kind (`activityItems`).
 - **v0.24.3 UX pass**: Escape hides the window (blurs first when a field has focus); Ask Eir sends on plain Enter (Shift+Enter = newline, IME composition guarded); every `data-ts` relative age gets an absolute local-time tooltip (set once per element); the sidebar Pause button turns amber with a ▶ icon while paused; a config-shaped `status.error` (provider/key/model/config) surfaces an "Open Settings" quick link in the hero; the Disk/Startup card headers summarise the last scan ("2.1 GB cleanable" / "12 entries, 3 disabled"); the "What the agent is thinking" meta line shows "analysed Xm ago" from the new `last_analysis_at` wire field; and numeric settings inputs are clamped to their declared min/max on save (`numVal`).
+- **v0.25.1 UX pass** (frontend-only, no wire/service change): **toasts** (`toast(msg, kind)` → `#toast-wrap`, `textContent` only, auto-dismiss 2.6 s / 5 s for errors, click-to-dismiss, stack capped at 4) give fire-and-forget commands (approve/reject, disk clean, startup toggle, undo, clear, run-updates, pause) an immediate acknowledgement instead of waiting on the next 2 s poll — the UX answer to the ack-less pipe (a resolved `invoke` still only means "queued", so toasts say "queued"/"sent"/"sent to Approvals", not "done"). **Copy-to-clipboard** (`copyText`, `navigator.clipboard` with a textarea/`execCommand` fallback) on the hero error and per-approval target+details, for pasting a diagnosis elsewhere. **Activity filter chips** (All / Fixes / Diagnoses / Failures): `activityItems` tags each row `type` (`fix`/`diag`) + `fail`; `renderActivity` filters via `matchesActivityFilter`, folds `activityFilter` into the signature so a chip switch forces one rebuild, and keeps the undo bookkeeping keyed on the *unfiltered* list so a hidden row can't drop its in-flight Undo. All three are pure client-side (no `invoke`), so they stay live under the `svc-down` class.
 - **Settings** is a full view (no modal) populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. Since v0.24.3 the view guards unsaved edits; v0.24.4 made the tracking **per-card** (`dirtyCards` set keyed on the four card ids `card-autostart`/`card-provider`/`card-advisor`/`card-updater`): any input marks its enclosing card dirty, a successful save clears only that card, a fill clears all, and re-entering the view refills only when no card is dirty — so saving the advisor card no longer discards unsaved edits still sitting in the provider card. The provider select offers OpenRouter / Claude CLI (subscription) / Claude (Anthropic API key) / Kilo CLI (subscription) with per-provider hints and key fields; JS pre-validates the provider's key+model requirements before sending (the service's `AiClient::new` remains the authoritative validator). Independent save buttons map to `set_autostart_enabled` (applies immediately), `update_settings` (warns it restarts the service ~15s), `set_updater_settings`, and `set_advisor_settings` (both apply live).
 
 ### Clear / Approve / Ignore / Update-now flows
@@ -1049,6 +1050,15 @@ one app already known to behave this way.
 ---
 
 ## Known limitations & backlog
+
+**Added in v0.25.1 (UX pass):** toasts, copy-to-clipboard, Activity filter chips —
+frontend-only, no wire or service change; see the UI "Layout, theming & rendering"
+section. Toasts are cosmetic acknowledgement of *queued* commands, not delivery
+confirmation — the underlying pipe is still ack-less (a resolved `invoke` means
+"queued to the writer", per "Pipe protocol & tray UI"), so a command lost to a
+mid-flight disconnect still shows a success toast; the `ensure_connected` gate and
+`svc-down` class remain the real backstops. Single frontend reviewer + self-review,
+no confirmed defects; not live-exercised in the running app.
 
 **Added in v0.25.0 (Autoruns-style startup advisor):** full ASEP coverage rebuild of F13 —
 see that section for design and guards. The pre-release sweep (three agents + live script

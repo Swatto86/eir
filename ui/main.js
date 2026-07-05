@@ -20,6 +20,51 @@ window.addEventListener('keydown', (e) => {
   window.__TAURI__.window.getCurrentWindow().hide();
 });
 
+// ── Toasts (transient action feedback) ────────────────────────────────────────
+// Commands are fire-and-forget (a resolved invoke means "queued to the service", not
+// "applied"); a toast gives the click immediate acknowledgement instead of the user
+// waiting on the next 2s poll to infer anything happened.
+const toastWrap = document.getElementById('toast-wrap');
+function toast(msg, kind = '') {
+  const t = document.createElement('div');
+  t.className = 'toast' + (kind ? ' ' + kind : '');
+  t.textContent = msg;
+  const kill = () => { t.classList.add('leaving'); setTimeout(() => t.remove(), 220); };
+  const timer = setTimeout(kill, kind === 'err' ? 5000 : 2600);
+  t.addEventListener('click', () => { clearTimeout(timer); kill(); });
+  toastWrap.appendChild(t);
+  // Cap the stack so a burst of clicks can't fill the screen.
+  while (toastWrap.children.length > 4) toastWrap.firstChild.remove();
+}
+
+// Copy to clipboard with a plain-DOM fallback for webviews where navigator.clipboard
+// is unavailable. Confirms on the button when given one, else via a toast.
+async function copyText(text, btn) {
+  let ok = false;
+  try {
+    await navigator.clipboard.writeText(text);
+    ok = true;
+  } catch {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      ok = document.execCommand('copy');
+      ta.remove();
+    } catch { ok = false; }
+  }
+  if (btn) {
+    const old = btn.textContent;
+    btn.textContent = ok ? '✓ Copied' : 'Copy failed';
+    setTimeout(() => { btn.textContent = old; }, 1500);
+  } else {
+    toast(ok ? 'Copied to clipboard' : 'Copy failed', ok ? 'ok' : 'err');
+  }
+}
+
 // ── Theme (dark / light / system, persisted) ─────────────────────────────────
 
 const THEMES = ['system', 'light', 'dark'];
@@ -80,6 +125,9 @@ document.getElementById('nav').addEventListener('click', (e) => {
 });
 document.getElementById('dash-approvals-go').addEventListener('click', () => showView('approvals'));
 document.getElementById('hero-fix').addEventListener('click', () => showView('settings'));
+document.getElementById('hero-copy').addEventListener('click', (e) => {
+  copyText((lastStatus && lastStatus.error) || '', e.currentTarget);
+});
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
@@ -242,10 +290,12 @@ async function refreshInner() {
   // in Settings", "Settings not applied", "Save settings", "config.toml") plus
   // auth failures; deliberately NOT bare "model"/"key"/"provider", which appear
   // in transient errors ("model API error", rate limits) that Settings can't fix.
-  const fixBtn = document.getElementById('hero-fix');
+  // The whole action row shows only when there's an error; the fix link within it
+  // shows only for config-shaped errors (copy-error is always available when shown).
   const cfgErr = !!status.error
     && /not configured|settings|config\.toml|api.?key|unauthorized|authentication|401/i.test(status.error);
-  fixBtn.style.display = cfgErr ? 'inline-block' : 'none';
+  document.getElementById('hero-actions').style.display = status.error ? 'flex' : 'none';
+  document.getElementById('hero-fix').style.display = cfgErr ? 'inline-block' : 'none';
 
   const ml = document.getElementById('model-label');
   if (status.settings) {
@@ -523,7 +573,8 @@ document.getElementById('disk-list').addEventListener('click', (e) => {
   // Re-clicks are safe: the service dedupes via in_flight/pending and rate-limits.
   btn.disabled = true;
   invoke('clean_disk_entry', { id: btn.dataset.id })
-    .catch((err) => console.error('clean_disk_entry failed', err))
+    .then(() => toast('Cleanup queued — check Activity', 'ok'))
+    .catch((err) => { console.error('clean_disk_entry failed', err); toast('Could not queue cleanup', 'err'); })
     .finally(() => setTimeout(() => { btn.disabled = false; }, 2500));
 });
 
@@ -633,7 +684,8 @@ document.getElementById('startup-list').addEventListener('click', (e) => {
   // The toggle is approval-gated and server-side deduped, so a re-click is harmless.
   btn.disabled = true;
   invoke('set_startup_entry', { id: btn.dataset.id, enable })
-    .catch((err) => console.error('set_startup_entry failed', err))
+    .then(() => toast(`${enable ? 'Enable' : 'Disable'} sent to Approvals to confirm`, 'ok'))
+    .catch((err) => { console.error('set_startup_entry failed', err); toast('Could not send the change', 'err'); })
     .finally(() => setTimeout(() => { btn.disabled = false; }, 2500));
 });
 
@@ -664,6 +716,7 @@ function approvalCard(info) {
       <div class="appr-target">
         <span class="appr-target-label">Target</span>
         <code class="appr-target-val">${esc(info.target || '—')}</code>
+        <button class="copy-btn appr-copy" title="Copy target and details">Copy</button>
         ${details}
       </div>
       <div class="approval-grid">${grid}</div>
@@ -702,8 +755,10 @@ async function decide(id, approved, card) {
   if (card) card.querySelectorAll('button').forEach((b) => (b.disabled = true));
   try {
     await invoke('decide_approval', { id, approved });
+    toast(approved ? 'Approved — running the fix' : 'Rejected', 'ok');
   } catch (e) {
     console.error('decide_approval failed', e);
+    toast('Could not send — is the service connected?', 'err');
     if (card) card.querySelectorAll('button').forEach((b) => (b.disabled = false));
   } finally {
     decidingIds.delete(id);
@@ -711,6 +766,16 @@ async function decide(id, approved, card) {
 }
 
 document.getElementById('approvals').addEventListener('click', (e) => {
+  const copyBtn = e.target.closest('.appr-copy');
+  if (copyBtn) {
+    const card = copyBtn.closest('.approval-card');
+    const target = card.querySelector('.appr-target-val');
+    const details = card.querySelector('.appr-details');
+    const text = [target && target.textContent, details && details.textContent]
+      .filter(Boolean).join('\n');
+    copyText(text, copyBtn);
+    return;
+  }
   const btn = e.target.closest('.btn-approve, .btn-reject');
   if (!btn) return;
   const id = parseInt(btn.dataset.id, 10);
@@ -765,22 +830,31 @@ function exTag(e) {
 }
 
 // Merge problems (diagnoses) + executions (fixes) into one chronological list.
+// `type` drives the filter chips; `fail` marks a blocked diagnosis or failed fix.
 function activityItems(status) {
   const items = [];
   for (const p of (status.recent_problems || [])) {
     const icon = p.blocked ? '🚫' : (p.auto_executed ? '🔧' : '🔎');
     const why = [p.action, p.reason].filter(Boolean).map(esc).join(' — ');
-    items.push({ at: p.at || 0, icon, head: `${problemTag(p)}<span class="act-text" title="${escAttr(p.diagnosis)}">${esc(p.diagnosis)}</span>`, why });
+    items.push({ at: p.at || 0, icon, type: 'diag', fail: !!p.blocked, head: `${problemTag(p)}<span class="act-text" title="${escAttr(p.diagnosis)}">${esc(p.diagnosis)}</span>`, why });
   }
   for (const e of (status.recent_executions || [])) {
     const icon = e.success ? '✅' : '❌';
     // A registry reset that captured its prior value carries an undo_id → offer a
     // one-click revert.
     const undoId = (e.undo_id === 0 || e.undo_id) ? e.undo_id : null;
-    items.push({ at: e.at || 0, icon, undoId, head: `${exTag(e)}<span class="act-text" title="${escAttr(e.action)}">${esc(e.action)}</span>`, why: esc(e.preview || '') });
+    items.push({ at: e.at || 0, icon, undoId, type: 'fix', fail: !e.success, head: `${exTag(e)}<span class="act-text" title="${escAttr(e.action)}">${esc(e.action)}</span>`, why: esc(e.preview || '') });
   }
   items.sort((a, b) => (b.at || 0) - (a.at || 0));
   return items;
+}
+
+// Activity view filter: all | fix | diag | fail (failures across both kinds).
+let activityFilter = 'all';
+function matchesActivityFilter(it) {
+  if (activityFilter === 'all') return true;
+  if (activityFilter === 'fail') return it.fail;
+  return it.type === activityFilter;
 }
 
 // Undo ids whose undo_registry call is still in flight — kept disabled across a
@@ -793,14 +867,22 @@ let lastActivitySig = null;
 
 function renderActivity(status) {
   const el = document.getElementById('activity-list');
-  const items = activityItems(status);
-  const sig = JSON.stringify(items);
+  const all = activityItems(status);
+  // Signature includes the filter so switching chips forces a rebuild; undo bookkeeping
+  // uses the FULL list so an item hidden by the filter can't be forgotten prematurely.
+  const items = all.filter(matchesActivityFilter);
+  const sig = JSON.stringify({ f: activityFilter, items });
   if (sig === lastActivitySig) return;
   lastActivitySig = sig;
   // Forget in-flight undo ids the service has since cleared (their row no longer
   // carries the undo_id), so the set can't grow without bound.
-  undoingIds.forEach((id) => { if (!items.some((it) => it.undoId === id)) undoingIds.delete(id); });
-  if (!items.length) { el.innerHTML = '<div class="empty">No activity yet</div>'; return; }
+  undoingIds.forEach((id) => { if (!all.some((it) => it.undoId === id)) undoingIds.delete(id); });
+  if (!items.length) {
+    el.innerHTML = all.length
+      ? '<div class="empty">Nothing matches this filter.</div>'
+      : '<div class="empty">No activity yet</div>';
+    return;
+  }
   el.innerHTML = items.map((it) => {
     const undo = (it.undoId === 0 || it.undoId)
       ? `<button class="act-undo" data-undo="${escAttr(String(it.undoId))}" title="Restore the previous registry value">↩ Undo</button>`
@@ -830,12 +912,24 @@ document.getElementById('activity-list').addEventListener('click', (e) => {
   undoingIds.add(id);
   btn.disabled = true;
   invoke('undo_registry', { id })
-    .catch((err) => { undoingIds.delete(id); btn.disabled = false; console.error('undo_registry failed', err); });
+    .then(() => toast('Undo sent', 'ok'))
+    .catch((err) => { undoingIds.delete(id); btn.disabled = false; console.error('undo_registry failed', err); toast('Undo failed', 'err'); });
 });
 
 document.getElementById('clear-activity').addEventListener('click', async () => {
-  try { await invoke('clear_problems'); await invoke('clear_executions'); } catch (e) { console.error(e); }
+  try { await invoke('clear_problems'); await invoke('clear_executions'); toast('Activity cleared', 'ok'); }
+  catch (e) { console.error(e); toast('Could not clear activity', 'err'); }
   refresh();
+});
+
+// Activity filter chips — client-side, no service round-trip.
+document.getElementById('activity-filter').addEventListener('click', (e) => {
+  const chip = e.target.closest('.chip');
+  if (!chip || chip.dataset.filter === activityFilter) return;
+  activityFilter = chip.dataset.filter;
+  document.querySelectorAll('#activity-filter .chip').forEach((c) =>
+    c.classList.toggle('active', c === chip));
+  if (lastStatus) renderActivity(lastStatus);
 });
 
 // ── AI usage ──────────────────────────────────────────────────────────────────
@@ -984,10 +1078,12 @@ function renderUpdater(u) {
 }
 
 document.getElementById('upd-now').addEventListener('click', async () => {
-  try { await invoke('run_updates_now'); } catch (e) { console.error('run_updates_now failed', e); }
+  try { await invoke('run_updates_now'); toast('Update run started', 'ok'); }
+  catch (e) { console.error('run_updates_now failed', e); toast('Could not start updates', 'err'); }
 });
 document.getElementById('clear-updates').addEventListener('click', async () => {
-  try { await invoke('clear_update_history'); } catch (e) { console.error('clear_update_history failed', e); }
+  try { await invoke('clear_update_history'); toast('Update history cleared', 'ok'); }
+  catch (e) { console.error('clear_update_history failed', e); toast('Could not clear history', 'err'); }
   refresh();
 });
 
@@ -1299,7 +1395,10 @@ document.getElementById('set-autostart-save').addEventListener('click', saveAuto
 // ── Pause ─────────────────────────────────────────────────────────────────────
 
 document.getElementById('pause-btn').addEventListener('click', async () => {
-  await invoke('toggle_pause');
+  // Report the state we're moving TO — status.paused only flips on the next poll.
+  const willPause = !(lastStatus && lastStatus.paused);
+  try { await invoke('toggle_pause'); toast(willPause ? 'Monitoring paused' : 'Monitoring resumed', 'ok'); }
+  catch (e) { console.error('toggle_pause failed', e); toast('Could not change pause state', 'err'); }
   refresh();
 });
 
