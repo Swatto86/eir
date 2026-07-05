@@ -615,6 +615,23 @@ fn main() {
     let status_for_loop = status.clone();
 
     tauri::Builder::default()
+        // Must be the FIRST plugin. Eir is tray-resident and auto-hides its window, so
+        // users forget it's running and re-launch it; a second process would start a
+        // second tray icon and spin forever on the single-client pipe. Instead, focus
+        // the existing window and let the new process exit.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // Don't surface the window if the second launch was itself a hidden
+            // autostart (--hidden) — honour the tray-only intent as the primary
+            // launch does. A manual re-launch (no --hidden) shows/focuses it.
+            if argv.iter().any(|a| a == AUTOSTART_ARG) {
+                return;
+            }
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(
             tauri_plugin_autostart::Builder::new()
                 .app_name("Eir")

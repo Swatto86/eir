@@ -1098,7 +1098,13 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     /// Regenerate the digest weekly.
     const DIGEST_INTERVAL_SECS: i64 = 7 * 24 * 3600;
     let mut analysis_running = false;
-    const ANALYSIS_MAX: Duration = Duration::from_secs(10 * 60);
+    // Watchdog on a single analysis task. Must exceed the worst-case *legitimate*
+    // duration or it aborts a still-progressing call and discards its (already-billed)
+    // result. A base analyze() can retry twice — up to ~3×300 s HTTP timeout + backoff
+    // ≈ 15 min — and a following advisor escalation is another full call, so the honest
+    // worst case is ~30 min. This is a hang backstop, not a normal-operation limit;
+    // analysis_running only blocks a second overlapping analysis, never ui_rx.
+    const ANALYSIS_MAX: Duration = Duration::from_secs(30 * 60);
     // The labeller is a small text-only call; bound it well under the analysis cap so
     // a wedged CLI subprocess can't hold the labelling flag for long.
     const LABEL_MAX: Duration = Duration::from_secs(3 * 60);
@@ -1287,7 +1293,14 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                     answer,
                                     at: chrono::Utc::now().timestamp(),
                                 });
-                                refresh_ask(&mut st, None);
+                                // Preserve a rejection notice that arrived while this
+                                // answer was in flight (a duplicate submission rejected
+                                // mid-run) — clearing it here would erase the only signal
+                                // the user gets, since the client masks it while running.
+                                // Starting an ask already cleared any prior error, so the
+                                // only error present now is such a mid-flight rejection.
+                                let carry = st.ask.as_ref().and_then(|a| a.error.clone());
+                                refresh_ask(&mut st, carry);
                             }
                             Err(e) => {
                                 warn!("Ask Eir failed: {e}");
@@ -1356,7 +1369,15 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             Ok(s) => s,
                             Err(e) => {
                                 error!("AI analysis failed: {e}");
-                                st.status = "Error".to_string();
+                                // Don't clobber "Paused": while paused the per-cycle body
+                                // early-continues before resting_status runs again, so an
+                                // "Error" set here would latch on the tray until the user
+                                // toggles pause. Every other status writer guards on paused.
+                                st.status = if st.paused {
+                                    "Paused".to_string()
+                                } else {
+                                    "Error".to_string()
+                                };
                                 st.error = Some(format!("AI: {e}"));
                                 pipe.broadcast_status(build_status(&st));
                                 continue;
@@ -1383,7 +1404,11 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
 
                         st.last_analysis = claude_decision.analysis.clone();
                         st.last_analysis_unix = chrono::Utc::now().timestamp();
-                        st.error = None;
+                        // Match the idle-skip/heartbeat gates: don't clear an error the
+                        // user may have paused because of.
+                        if !st.paused {
+                            st.error = None;
+                        }
 
                         // If the UTC day rolled over WHILE this analysis was in flight, the
                         // per-cycle rollover (bottom of the loop body) never ran — it's gated
@@ -2240,9 +2265,14 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         let mut added = 0u32;
                         for dir in all {
                             if known_watch_dirs.insert(dir.clone()) {
-                                let _ = dir_update_tx.send(dir);
                                 added += 1;
                             }
+                            // Send EVERY discovered dir each pass, not just newly-found
+                            // ones, so the watcher re-arms a watch whose OS handle died
+                            // when the directory was deleted+recreated (re-watching an
+                            // already-watched path is a harmless no-op). Gating the send
+                            // on "newly inserted" left a recreated dir dark until restart.
+                            let _ = dir_update_tx.send(dir);
                         }
                         if added > 0 {
                             info!(count = added, "Added newly discovered log directories");

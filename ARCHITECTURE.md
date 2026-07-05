@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-05 · **Release:** v0.25.1
+**Last updated:** 2026-07-05 · **Release:** v0.25.2
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -546,14 +546,14 @@ AI-proposed):
 | `LogCleanup{path,days_old}` | `logs.rs` | `walkdir`, deletes files with ext in `log/tmp/dmp/etl/blf/regtrans-ms` older than cutoff | ext allowlist; missing dir ⇒ no-op |
 | `DiskCleanup{target}` | inline PS (`mod.rs:35`) | only `temp`/`tmp`/`prefetch` mapped; else "no action" | hardcoded target switch |
 | `PowerShellDiagnostic{script}` | `powershell::run_diagnostic` | arbitrary script as SYSTEM | **none** — full machine access; kept off whitelist |
-| `TaskDisable/Enable{task_name}` | `tasks.rs` | `Disable/Enable-ScheduledTask` via spawned `powershell.exe` (`std::process`, no timeout) | single-quote escaping |
-| `RegistryReset{key,name,data}` | `registry.rs` | `Set-ItemProperty` via `std::process` (no timeout) | **`ALLOWED_KEY_PREFIXES` allowlist** (Tcpip, Multimedia, HKCU\SOFTWARE\Microsoft); `DENIED_KEY_PREFIXES` denies persistence subkeys (Run/RunOnce/Winlogon/IFEO/**Explorer\StartupApproved**); normalises `HKEY_*` forms |
+| `TaskDisable/Enable{task_name}` | `tasks.rs` | `Disable/Enable-ScheduledTask` via the timed `powershell::run_diagnostic` helper | single-quote escaping; glob-metachar refusal; a bare (unqualified) name is resolved first and refused if it matches >1 folder; **policy `[blocklist] tasks` denies `\Microsoft\...` (Defender/BitLocker/backup/restore) so auto-execute can't disable a security/maintenance task** |
+| `RegistryReset{key,name,data}` | `registry.rs` | `Set-ItemProperty` via the timed `powershell::run_diagnostic` helper | **`ALLOWED_KEY_PREFIXES` allowlist** (Tcpip, Multimedia, HKCU\SOFTWARE\Microsoft); `DENIED_KEY_PREFIXES` denies persistence subkeys (Run/RunOnce/Winlogon/IFEO/**Explorer\StartupApproved**); normalises `HKEY_*` forms |
 | `NetworkDiagnostic{command}` | inline PS (`mod.rs:68`) | only `flush_dns/release_renew/reset_tcp/reset_winsock`; else early-return failure | hardcoded command switch |
 | `DriverDisable{name}` | `driver.rs` | `sc.exe config … start= disabled` | **`CRITICAL_DRIVERS` blocklist** (storage/bus/net/fs/usb/wdf) |
 | `DriverEnable{name}` | `driver.rs` | `sc.exe config … start= demand` | none (auto-whitelisted) |
 | `SoftwareUninstall{pkg}` | `software.rs` | Get-Package → registry uninstall string / msiexec | **also hard-blocked in policy** — never runs |
 | `BcdEdit{element,value}` | `boot.rs` | `bcdedit /set {current}` | **`SAFE_ELEMENTS` allowlist** + shell-metachar rejection on value |
-| `ProcessKill{name}` | `process.rs` | `Stop-Process -Force` | **`PROTECTED_PROCESSES` blocklist** (lsass/winlogon/csrss/…) |
+| `ProcessKill{name}` | `process.rs` | `Stop-Process -Force` | **`PROTECTED_PROCESSES` blocklist** (lsass/winlogon/csrss/…); **glob-metachar refusal** (`Stop-Process -Name` globs `*?[]`, so `lsass*` would evade the exact-match blocklist without it) |
 | `FileDelete{path}` | inline PS (`mod.rs:116`) | refuses directories, requires file to exist, `Remove-Item -Force` (no Recycle Bin) | dir/exists guard in script + policy path blocklist |
 | `FirewallEnable{profile}` | `security.rs` | `netsh advfirewall set <profile> state on` | profile mapped via allowlist |
 | `DefenderSignatureUpdate` | `security.rs` | `Update-MpSignature` | safe by nature (refresh only) |
@@ -567,7 +567,7 @@ Adapter-level guards are **defence in depth**: they enforce regardless of policy
 
 `executor/powershell.rs`. `run_diagnostic(script)` calls `run_diagnostic_with_timeout` with `DEFAULT_TIMEOUT = 120s` (`powershell.rs:7`). Spawns `powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -Command <script>`, stdin nulled, `kill_on_drop(true)`. Wraps `child.wait_with_output()` in `tokio::time::timeout`; on timeout returns an error and the dropped future kills the process. Non-zero exit ⇒ error carrying stdout+stderr+code. The 120s ceiling bounds the executor worker (`security.rs:36` notes even the Defender pull uses the default cap deliberately).
 
-**Inconsistency / gap:** `registry.rs` and `tasks.rs` do **not** use this helper — they spawn `std::process::Command` directly with **no timeout** and synchronously (`registry.rs:43`, `tasks.rs:18`). Those are dispatched through `blocking(...)`, so a wedged child blocks a spawn_blocking thread, not the loop, but it is unbounded.
+All PowerShell-based adapters — including `registry.rs` and `tasks.rs` — route through `run_diagnostic`, so every one is bounded by the 120s timeout with `kill_on_drop`; none spawns an untimed `std::process::Command`.
 
 ### Policy: the Verdict gate
 
@@ -1051,6 +1051,48 @@ one app already known to behave this way.
 
 ## Known limitations & backlog
 
+**Resolved in v0.25.2 (bug-fix sweep, D1–D22):** an 8-agent adversarial sweep + full
+regression pass (all 44 prior fixes held). Highlights:
+- **Scheduled-task target gate** (D1): `task_disable`/`task_enable` are auto-whitelisted
+  but previously had **no** target restriction at any layer, so the AI could disable a
+  Defender/BitLocker scheduled task with no human review. Now `policy.toml [blocklist]
+  tasks` blocks `\Microsoft\...` (Defender/BitLocker/backup/restore + a `\Microsoft\Windows`
+  catch-all), matched by the same normalised-component `is_within` used for paths; the
+  prompt also tells the model to use full `\Folder\Name` paths and never touch security/
+  maintenance tasks.
+- **Self-update stop-wait** (D2): the NSIS PREINSTALL replaced its fixed `Sleep 5000` with
+  a bounded (~40 s) poll for the service to reach STOPPED — the fixed sleep was shorter than
+  the C1 executor-drain window (up to 30 s), so an update firing mid-fix hit file-in-use on
+  `eir-svc.exe` and failed (the "what broke auto-updates" case).
+- **process_kill glob refusal** (D3) and **bare-task-name ambiguity refusal** (D4): a
+  wildcard process name (`lsass*`) could evade the exact-match blocklist; a bare task name
+  matched every same-named task across folders. Both now refuse up front (glob metachars;
+  a bare name resolving to >1 task).
+- **Stale-watch repair** (D5): a deleted+recreated log directory left its `notify` watch
+  dead until restart; the watcher now re-arms every known dir on rediscovery.
+- **Atomic config write + recovery** (D6): `config.toml` is written via temp-file + rename
+  with a `.bak` of the last parseable config, and `load` recovers from `.bak` on a parse
+  failure instead of going fatal — a crash mid-write no longer bricks the service.
+- **Uninstall leave-no-trace** (D8): the uninstaller now removes the autostart Run values
+  and `%APPDATA%\co.swatto.eir\` (previously orphaned, pointing at the deleted exe).
+- **Single-instance guard** (D9): a second launch now focuses the existing window and exits,
+  instead of a duplicate tray/process starving the single-client pipe.
+- Also: paused-status no longer latches on a late analysis failure (D7/D14); the analysis
+  watchdog was raised to 30 min to cover worst-case retry+escalation (D10); untrusted
+  log/file content is framed as data-not-instructions in the prompt (D11); the raw model
+  blob in a parse-failure error is truncated before broadcast (D12); the ask-rejection
+  notice survives an in-flight answer completing (D21); a flag-shaped scoop name is refused
+  (D16); `prune_old` no longer orphans a decision with an outstanding approval (D17); the
+  registry-reset approval copy is honest about the best-effort undo (D15); and two frontend
+  UX-integrity gaps were closed (Ignore button feedback D19, stuck irreversible-confirm
+  button D20). Verification: `cargo fmt`/`clippy --all-targets -D warnings`/`test --workspace`
+  green, new unit tests for the pure gates (D1/D3/D4/D6/D16). The NSIS stop-wait (D2),
+  uninstall cleanup (D8), single-instance (D9), and stale-watch re-arm (D5) are
+  reasoning/compile-verified, not live-exercised. **Deferred (D18):** the `restart_self`
+  vs NSIS-update `sc stop/start` overlap is a narrow, self-healing race (SCM serialises the
+  calls and both sides retry) — a marker-file mechanism would add more failure surface than
+  the race is worth, so it stays documented rather than fixed, per the plan's own guidance.
+
 **Added in v0.25.1 (UX pass):** toasts, copy-to-clipboard, Activity filter chips —
 frontend-only, no wire or service change; see the UI "Layout, theming & rendering"
 section. Toasts are cosmetic acknowledgement of *queued* commands, not delivery
@@ -1219,7 +1261,7 @@ Current gaps surfaced while mapping each subsystem (the self-improvement plan ab
 - max_retries_per_issue and auto_approve_on_success_rate (policy/mod.rs:17,19) are dead code — deserialized and used only in policy tests; no production code reads them. The #[allow(dead_code)] comment's 'used in Phase 4' claim is inaccurate.
 - The failure circuit breaker (3 failures/window in safety.rs) is window-scoped: a persistently failing action still retries once per rate-limit window rather than backing off exponentially or alerting.
 - No success-rate-driven auto-approval promotion is implemented; success_rate() only feeds a log/warning, never a verdict.
-- registry.rs and tasks.rs spawn powershell.exe via std::process::Command with no timeout, bypassing the powershell.rs timeout helper (bounded only by running on a spawn_blocking thread).
+- (Resolved) registry.rs and tasks.rs now route through the timed `powershell::run_diagnostic` helper like every other PS adapter; there is no longer an untimed `std::process::Command` executor path.
 - No generic undo: RegistryReset is marked reversible=false because the prior value is never snapshotted (explain.rs:92).
 - Rate-limit and dedupe correctness depend on the action's Debug format being stable; any change to FixAction's derived Debug silently breaks both.
 - I did not exercise any action in a running service — findings are read-from-source only (compile/run not verified here).

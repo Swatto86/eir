@@ -759,7 +759,16 @@ async function decide(id, approved, card) {
   } catch (e) {
     console.error('decide_approval failed', e);
     toast('Could not send — is the service connected?', 'err');
-    if (card) card.querySelectorAll('button').forEach((b) => (b.disabled = false));
+    if (card) {
+      card.querySelectorAll('button').forEach((b) => (b.disabled = false));
+      // Disarm any armed irreversible-confirm button; otherwise it stays stuck showing
+      // "cannot be undone" with nothing actually pending confirmation after a failed send.
+      card.querySelectorAll('.btn-approve.confirm').forEach((b) => {
+        clearTimeout(b._confirmTimer);
+        b.classList.remove('confirm');
+        b.textContent = 'Approve & run';
+      });
+    }
   } finally {
     decidingIds.delete(id);
   }
@@ -1094,9 +1103,14 @@ document.getElementById('updater-apps').addEventListener('click', (e) => {
   const ig = e.target.closest('.upd-ignore');
   if (!ig) return;
   const ignore = ig.dataset.ignore !== '0';
+  ig.disabled = true;
   invoke('set_app_ignore', { id: ig.dataset.id, ignore, note: '' })
-    .then(() => { const row = ig.closest('.upd-row'); if (row) row.style.opacity = ignore ? '.5' : ''; })
-    .catch((err) => console.error('set_app_ignore failed', err));
+    .then(() => {
+      const row = ig.closest('.upd-row'); if (row) row.style.opacity = ignore ? '.5' : '';
+      toast(ignore ? 'App ignored' : 'App unignored', 'ok');
+    })
+    .catch((err) => { console.error('set_app_ignore failed', err); toast('Could not update ignore', 'err'); })
+    .finally(() => { ig.disabled = false; });
 });
 
 // ── Learned facts ─────────────────────────────────────────────────────────────

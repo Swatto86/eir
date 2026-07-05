@@ -279,11 +279,30 @@ impl Config {
 }
 
 /// Write the config back to disk (resolved relative to the exe directory).
+///
+/// Atomic: the new TOML is written to a sibling temp file and `rename`d over the live
+/// config (a same-directory rename replaces atomically on NTFS), so a crash or SCM
+/// force-kill mid-write can never leave a truncated, unparseable `config.toml`. The
+/// previous *parseable* config is preserved as `config.toml.bak` first, which [`load`]
+/// falls back to if the live file is ever found corrupt.
 pub fn save(config: &Config, path: &str) -> Result<()> {
     let resolved = resolve(path);
     let toml = toml::to_string_pretty(config).context("Failed to serialize config")?;
-    fs::write(&resolved, toml)
-        .with_context(|| format!("Failed to write config file: {}", resolved.display()))?;
+
+    // Keep the current config as a recovery source — but only if it currently parses,
+    // so a corrupt live file can never overwrite a good backup.
+    if let Ok(existing) = fs::read_to_string(&resolved) {
+        if toml::from_str::<Config>(&existing).is_ok() {
+            let bak = resolved.with_extension("toml.bak");
+            let _ = fs::write(&bak, &existing);
+        }
+    }
+
+    let tmp = resolved.with_extension("toml.tmp");
+    fs::write(&tmp, &toml)
+        .with_context(|| format!("Failed to write temp config file: {}", tmp.display()))?;
+    fs::rename(&tmp, &resolved)
+        .with_context(|| format!("Failed to replace config file: {}", resolved.display()))?;
     Ok(())
 }
 
@@ -304,7 +323,28 @@ pub fn load(path: &str) -> Result<Config> {
     let resolved = resolve(path);
     let contents = fs::read_to_string(&resolved)
         .with_context(|| format!("Failed to read config file: {}", resolved.display()))?;
-    toml::from_str(&contents).with_context(|| "Failed to parse config TOML")
+    match toml::from_str::<Config>(&contents) {
+        Ok(cfg) => Ok(cfg),
+        Err(primary) => {
+            // The live config didn't parse (e.g. truncated by a crash mid-write).
+            // Recover from the last-known-good backup rather than going fatal — a
+            // self-healing service should not be bricked by its own config write.
+            let bak = resolved.with_extension("toml.bak");
+            let recovered = fs::read_to_string(&bak)
+                .ok()
+                .and_then(|c| toml::from_str::<Config>(&c).ok());
+            match recovered {
+                Some(cfg) => {
+                    tracing::warn!(
+                        "config.toml failed to parse ({primary}); recovered from {}",
+                        bak.display()
+                    );
+                    Ok(cfg)
+                }
+                None => Err(primary).context("Failed to parse config TOML"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -361,6 +401,35 @@ audit_db = "./eir.db"
         assert_eq!(reparsed.monitoring.event_log_channels.len(), 2);
         // Blank api key keeps the prior value (None here).
         assert!(reparsed.api.anthropic_api_key.is_none());
+    }
+
+    #[test]
+    fn corrupt_config_recovers_from_backup() {
+        // Simulate a crash that truncated config.toml mid-write: save a good config
+        // (which writes the .bak), clobber the live file with garbage, and confirm
+        // load() recovers from the backup instead of erroring.
+        let dir = std::env::temp_dir().join(format!("eir-cfg-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut good: Config = toml::from_str(SAMPLE).unwrap();
+        good.monitoring.decision_interval_secs = 555;
+        // First save has no existing file to back up.
+        save(&good, &path_str).unwrap();
+        // Save again — now config.toml.bak holds the prior good copy (555), live = 777.
+        let mut good2: Config = toml::from_str(SAMPLE).unwrap();
+        good2.monitoring.decision_interval_secs = 777;
+        save(&good2, &path_str).unwrap();
+
+        // Corrupt the live file (truncated TOML).
+        fs::write(&path, "[api]\nprovider = \"anth").unwrap();
+
+        let loaded = load(&path_str).expect("load recovers from .bak");
+        // Recovery returns the last-known-good backup (555), not the corrupt live file.
+        assert_eq!(loaded.monitoring.decision_interval_secs, 555);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

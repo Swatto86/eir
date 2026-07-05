@@ -636,7 +636,6 @@ pub async fn prune_old(pool: &SqlitePool, days: i64) -> anyhow::Result<u64> {
     let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
     let mut removed = 0u64;
     for (table, col) in [
-        ("decisions", "timestamp"),
         ("system_state_history", "timestamp"),
         ("execution_log", "executed_at"),
     ] {
@@ -646,6 +645,18 @@ pub async fn prune_old(pool: &SqlitePool, days: i64) -> anyhow::Result<u64> {
             .await?;
         removed += res.rows_affected();
     }
+    // Prune `decisions` too, but never a decision that still has an outstanding
+    // approval: pending_approvals has no time-based retention, so pruning its parent
+    // would orphan the queue's decision_id and make a later mark_decision_executed a
+    // silent no-op. An unresolved approval keeps its decision row until it's resolved.
+    let res = sqlx::query(
+        "DELETE FROM decisions WHERE timestamp < ? \
+         AND id NOT IN (SELECT decision_id FROM pending_approvals)",
+    )
+    .bind(&cutoff)
+    .execute(pool)
+    .await?;
+    removed += res.rows_affected();
     Ok(removed)
 }
 

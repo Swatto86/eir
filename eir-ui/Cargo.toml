@@ -1,6 +1,6 @@
 [package]
 name = "eir-ui"
-version = "0.25.1"
+version = "0.25.2"
 edition = "2021"
 authors = ["Swatto <claude.ai@swatto.co.uk>"]
 description = "Eir system monitor — tray UI"
@@ -23,6 +23,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

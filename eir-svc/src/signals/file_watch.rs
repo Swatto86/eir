@@ -207,13 +207,22 @@ pub fn spawn(
         while let Err(std::sync::mpsc::TryRecvError::Empty) = shutdown_rx.try_recv() {
             // Check for directories added by the main loop's re-discovery
             while let Ok(new_dir) = dir_rx.try_recv() {
-                if watched_dirs.contains(&new_dir) || !new_dir.exists() {
+                if !new_dir.exists() {
                     continue;
                 }
+                // Re-issue watch() even for a dir we already track. If a watched
+                // directory was deleted and recreated, the OS handle behind the old
+                // ReadDirectoryChangesW watch is dead and notify silently stops
+                // delivering its events — with no error to tell us which watch died.
+                // notify re-arms an already-watched path harmlessly, so re-watching on
+                // each rediscovery repairs a stale watch without a service restart.
+                let already = watched_dirs.contains(&new_dir);
                 match watcher.watch(&new_dir, RecursiveMode::Recursive) {
                     Ok(()) => {
-                        info!("Now watching: {}", new_dir.display());
-                        watched_dirs.insert(new_dir);
+                        if !already {
+                            info!("Now watching: {}", new_dir.display());
+                            watched_dirs.insert(new_dir);
+                        }
                     }
                     Err(e) => warn!("Cannot watch {}: {e}", new_dir.display()),
                 }

@@ -356,8 +356,15 @@ impl AiClient {
             Ok(d) => d,
             Err(_) => {
                 let extracted = extract_json_object(&raw);
-                serde_json::from_str(extracted)
-                    .with_context(|| format!("Failed to parse model response as JSON:\n{raw}"))?
+                serde_json::from_str(extracted).with_context(|| {
+                    // Truncate: the raw blob can be ~30 KB and would otherwise be cloned
+                    // into st.error and rebroadcast on every 2 s UI poll until the next
+                    // successful cycle.
+                    format!(
+                        "Failed to parse model response as JSON:\n{}",
+                        char_preview(&raw, 2000)
+                    )
+                })?
             }
         };
 

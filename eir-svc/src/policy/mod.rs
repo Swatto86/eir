@@ -31,6 +31,10 @@ pub struct BlocklistConfig {
     /// Action types that are never executed — not even with approval.
     #[serde(default)]
     pub actions: Vec<String>,
+    /// Scheduled-task path prefixes that task_disable/task_enable may never target.
+    /// `#[serde(default)]` so an older `policy.toml` without the key still loads.
+    #[serde(default)]
+    pub tasks: Vec<String>,
 }
 
 pub enum Verdict {
@@ -99,6 +103,11 @@ impl ExecutionPolicy {
             FixAction::FileDelete { path } if self.path_blocked(path) => {
                 Some(format!("Path '{path}' is on the blocklist"))
             }
+            FixAction::TaskDisable { task_name } | FixAction::TaskEnable { task_name }
+                if self.task_blocked(task_name) =>
+            {
+                Some(format!("Scheduled task '{task_name}' is on the blocklist"))
+            }
             _ => None,
         }
     }
@@ -113,6 +122,15 @@ impl ExecutionPolicy {
 
     fn path_blocked(&self, path: &str) -> bool {
         self.blocklist.paths.iter().any(|b| is_within(path, b))
+    }
+
+    /// True if `task_name` equals or sits under any blocklisted task-path prefix,
+    /// compared on normalised components so case/separator tricks can't evade it.
+    /// Only matches fully-qualified names (`\Folder\Name`); a bare leaf name never
+    /// matches a `\Microsoft\…` prefix — the executor refuses ambiguous bare names
+    /// and the prompt tells the model to use full paths, so this is not an escape.
+    fn task_blocked(&self, task_name: &str) -> bool {
+        self.blocklist.tasks.iter().any(|b| is_within(task_name, b))
     }
 }
 
@@ -215,6 +233,7 @@ mod tests {
                 services: vec![],
                 paths: vec![],
                 actions: vec!["software_uninstall".into()],
+                tasks: vec![],
             },
         };
         let action = FixAction::SoftwareUninstall {
@@ -238,6 +257,7 @@ mod tests {
                 services: vec![],
                 paths: vec![],
                 actions: vec![],
+                tasks: vec![],
             },
         }
     }
@@ -292,6 +312,7 @@ mod tests {
                 services: vec![],
                 paths: vec![path.into()],
                 actions: vec![],
+                tasks: vec![],
             },
         }
     }
@@ -316,6 +337,66 @@ mod tests {
         assert!(blocked("C:\\Windows\\..\\..\\Windows\\System32\\x.dll"));
         // A sibling directory that only shares a name prefix is NOT blocked.
         assert!(!blocked("C:\\WindowsApps\\ok.txt"));
+    }
+
+    #[test]
+    fn blocklisted_scheduled_task_is_never_auto_executed() {
+        // task_disable/task_enable are auto-whitelisted, so a fully-qualified critical
+        // task must be blocked by the target blocklist even at max confidence — and the
+        // block must survive case- and separator-variant names.
+        let pol = ExecutionPolicy {
+            execution: ExecutionConfig {
+                confidence_threshold: 0.80,
+                max_retries_per_issue: 3,
+                rate_limit_mins: 30,
+                auto_approve_on_success_rate: 0.95,
+            },
+            whitelist: WhitelistConfig {
+                actions: vec!["task_disable".into(), "task_enable".into()],
+            },
+            blocklist: BlocklistConfig {
+                services: vec![],
+                paths: vec![],
+                actions: vec![],
+                tasks: vec!["\\Microsoft\\Windows\\Windows Defender".into()],
+            },
+        };
+        let blocked = |name: &str| {
+            matches!(
+                pol.evaluate(
+                    &FixAction::TaskDisable {
+                        task_name: name.into()
+                    },
+                    0.99
+                ),
+                Verdict::Block(_)
+            )
+        };
+        assert!(blocked(
+            "\\Microsoft\\Windows\\Windows Defender\\Windows Defender Scheduled Scan"
+        ));
+        assert!(blocked(
+            "/microsoft/windows/windows defender/Windows Defender Cache Maintenance"
+        )); // case + forward slashes
+        assert!(matches!(
+            pol.evaluate(
+                &FixAction::TaskEnable {
+                    task_name: "\\Microsoft\\Windows\\Windows Defender\\Scan".into()
+                },
+                0.99
+            ),
+            Verdict::Block(_)
+        ));
+        // A benign third-party task is unaffected and still auto-approves.
+        assert!(matches!(
+            pol.evaluate(
+                &FixAction::TaskDisable {
+                    task_name: "\\VendorApp\\Updater".into()
+                },
+                0.99
+            ),
+            Verdict::AutoApprove
+        ));
     }
 
     #[test]

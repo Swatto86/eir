@@ -42,9 +42,14 @@ async fn run_scoop(
 }
 
 /// A Scoop app identifier is a slug: `app` or `bucket/app`, using only alphanumerics
-/// and `.`, `-`, `_`, `/`. Anything else is rejected before it reaches `cmd.exe`.
+/// and `.`, `-`, `_`, `/`. Anything else is rejected before it reaches `cmd.exe`. A
+/// leading `-` is refused too: a real scoop slug never starts with a dash, but a name
+/// like `--all` would be re-read by scoop's OWN argv parser as a flag (`scoop update
+/// --all` = update everything), bypassing the per-app/budget scoping — a different
+/// vector from the shell-metacharacter defense the char set already covers.
 fn is_safe_scoop_name(app: &str) -> bool {
     !app.is_empty()
+        && !app.starts_with('-')
         && app
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/'))
@@ -184,5 +189,8 @@ mod tests {
         assert!(!is_safe_scoop_name("app|evil"));
         assert!(!is_safe_scoop_name("a\"b"));
         assert!(!is_safe_scoop_name("app^x"));
+        // A flag-shaped name would be re-parsed by scoop as a flag, not an app.
+        assert!(!is_safe_scoop_name("--all"));
+        assert!(!is_safe_scoop_name("-g"));
     }
 }

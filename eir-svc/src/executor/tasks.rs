@@ -13,7 +13,11 @@ pub async fn enable(task_name: &str) -> Result<String> {
 ///
 /// A full-path name (`\Folder\Name`) is split into `-TaskPath '\Folder\'` +
 /// `-TaskName 'Name'` so exactly that task is targeted — a bare `-TaskName` matches
-/// the name in ANY folder, which could toggle a same-named task somewhere else.
+/// the name in ANY folder, which could toggle a same-named task somewhere else. A bare
+/// name (no leading `\`) is therefore resolved first: if `Get-ScheduledTask` returns
+/// more than one match, the script `throw`s (surfaced as an error) rather than toggling
+/// every same-named task across folders. The `throw` message is a SINGLE-quoted literal
+/// so, like every other value here, no user data ever lands in a double-quoted string.
 fn build_task_script(cmdlet: &str, task_name: &str) -> String {
     // Confirmation is a SINGLE-quoted literal: a double-quoted string would evaluate
     // `$(...)`/`$var`, and the escaping only neutralises quote-breakout inside a
@@ -33,7 +37,10 @@ fn build_task_script(cmdlet: &str, task_name: &str) -> String {
     }
     let name_q = super::powershell::ps_single_quote(task_name);
     format!(
-        "{cmdlet} -TaskName {name_q} -ErrorAction Stop | Out-Null; \
+        "$t = @(Get-ScheduledTask -TaskName {name_q} -ErrorAction Stop); \
+         if ($t.Count -gt 1) {{ throw 'Ambiguous scheduled task — more than one folder \
+         has a task with this name; specify the full \\Folder\\Name path' }}; \
+         $t | {cmdlet} -ErrorAction Stop | Out-Null; \
          Write-Output '{cmdlet} succeeded for {safe_name}'"
     )
 }
@@ -98,10 +105,17 @@ mod tests {
         let root = build_task_script("Enable-ScheduledTask", r"\RootTask");
         assert!(root.contains(r"-TaskPath '\'"));
         assert!(root.contains("-TaskName 'RootTask'"));
-        // A bare name (no backslash) keeps the legacy -TaskName-only form.
+        // A bare name (no backslash) resolves first and refuses an ambiguous match
+        // (a same-named task in multiple folders) instead of toggling all of them.
         let bare = build_task_script("Disable-ScheduledTask", "JustAName");
-        assert!(bare.contains("-TaskName 'JustAName'"));
+        assert!(bare.contains("Get-ScheduledTask -TaskName 'JustAName'"));
+        assert!(bare.contains("$t.Count -gt 1"));
+        assert!(bare.contains("throw '"));
         assert!(!bare.contains("-TaskPath"));
+        assert!(
+            !bare.contains('"'),
+            "bare-name script has no double quotes: {bare}"
+        );
         // A path-form injection attempt stays inside single-quoted literals.
         let inj = build_task_script("Disable-ScheduledTask", r"\Foo\$(calc)");
         assert!(inj.contains(r"'$(calc)'"));

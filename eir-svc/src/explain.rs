@@ -86,11 +86,15 @@ pub fn explain(action: &FixAction) -> ActionExplanation {
         } => ActionExplanation {
             summary: format!(
                 "Sets the registry value '{value_name}' under '{key_path}' to '{value_data}', \
-                 overwriting whatever is there now."
+                 overwriting whatever is there now. The previous value is snapshotted first \
+                 so this can usually be undone — if that snapshot can't be read, no undo is \
+                 offered."
             ),
             target: format!("{key_path}\\{value_name}"),
-            // The prior value is snapshotted before the write (see registry::reset_value),
-            // so this can be auto-undone with one click from the activity feed.
+            // The prior value is snapshotted before the write (see registry::reset_value);
+            // when that read succeeds this is auto-undoable from the activity feed. The
+            // undo button only appears post-execution if a snapshot was actually captured,
+            // so the summary is honest about the best-effort case.
             reversible: true,
         },
         FixAction::NetworkDiagnostic { command } => explain_network(command),
