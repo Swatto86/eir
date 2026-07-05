@@ -931,6 +931,17 @@ document.getElementById('clear-activity').addEventListener('click', async () => 
   refresh();
 });
 
+// Force a live-status refresh (fast services rescan on the service side) — clears a
+// service that has already recovered without waiting for the next poll. Fire-and-forget:
+// the effect lands on the next 2s poll, so the toast says "Refreshing", not "done".
+document.getElementById('refresh-status').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  try { await invoke('refresh_status'); toast('Refreshing service status…', 'ok'); }
+  catch (err) { console.error('refresh_status failed', err); toast('Could not refresh', 'err'); }
+  finally { btn.disabled = false; }
+});
+
 // Activity filter chips — client-side, no service round-trip.
 document.getElementById('activity-filter').addEventListener('click', (e) => {
   const chip = e.target.closest('.chip');

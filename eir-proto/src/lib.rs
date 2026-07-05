@@ -467,6 +467,9 @@ pub enum UiMsg {
     ClearProblems,
     /// Clear the in-memory Recent Executions list.
     ClearExecutions,
+    /// Force an immediate live-status refresh (fast services rescan + re-settle), so a
+    /// recovered failed service clears without waiting for the next poll/decision tick.
+    RefreshStatus,
     /// Run an update cycle now (on demand).
     RunUpdatesNow,
     /// Clear the app-update output: the last cycle's results and the persisted

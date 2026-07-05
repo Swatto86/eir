@@ -510,6 +510,26 @@ fn fault_key(s: &SystemState) -> String {
     parts.join("\n")
 }
 
+/// Whether the fault set changed between two consecutive poll snapshots (keyed by
+/// `fault_key`). Any change wakes the decision loop — a new/changed fault AND a fault
+/// clearing (`cur` empty), so a recovery is reflected promptly — while an unchanged key
+/// (including healthy → healthy) stays quiet so a persistent fault doesn't re-trigger
+/// every poll.
+fn fault_changed(prev: &str, cur: &str) -> bool {
+    prev != cur
+}
+
+/// Force an immediate services-only rescan for the manual "Refresh status" command.
+/// Fast (SCM enumeration, no PowerShell), so it can be awaited inline in the command
+/// handler without stalling the loop; returns the fresh failed-services set. cpu/mem/disk
+/// still refresh on the normal cadence — the manual refresh targets the stale-service
+/// complaint, and a full `snapshot_state` would shell out to PowerShell (up to 15 s).
+pub async fn rescan_failed_services() -> Vec<String> {
+    tokio::task::spawn_blocking(|| get_services().1)
+        .await
+        .unwrap_or_default()
+}
+
 pub fn spawn(
     poll_interval_secs: u64,
     trigger: super::TriggerTx,
@@ -537,7 +557,14 @@ pub fn spawn(
                             // Wake the decision loop when a NEW fault appears
                             // (a changed, non-empty fault set).
                             let key = fault_key(&s);
-                            let changed = key != last_fault_key && !key.is_empty();
+                            // Wake the loop on ANY change to the fault set — including a
+                            // fault CLEARING (key → empty) — so a recovered service or
+                            // re-enabled firewall is reflected within one reactive debounce
+                            // instead of waiting for the next scheduled decision tick. A
+                            // pure recovery makes `actionable_fingerprint` empty, so the
+                            // idle-skip gate suppresses the AI call: this refreshes the UI
+                            // without spending on analysis.
+                            let changed = fault_changed(&last_fault_key, &key);
                             last_fault_key = key;
                             if let Ok(mut guard) = shared_clone.lock() {
                                 *guard = Some(s);
@@ -581,7 +608,21 @@ pub fn current(shared: &SharedState) -> SystemState {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_firewall, parse_defender_status};
+    use super::{effective_firewall, fault_changed, parse_defender_status};
+
+    #[test]
+    fn fault_change_wakes_on_appear_clear_and_change_but_not_on_steady_state() {
+        // Appear (healthy → fault) and clear (fault → healthy) must BOTH wake the loop —
+        // the clear case is the fix (a recovered service was previously never re-pushed).
+        assert!(fault_changed("", "S|Spooler"), "fault appearing must wake");
+        assert!(fault_changed("S|Spooler", ""), "fault clearing must wake");
+        // A different fault set is a change too.
+        assert!(fault_changed("S|Spooler", "S|W32Time"));
+        // Steady state (unchanged) must stay quiet so a persistent fault doesn't
+        // re-trigger every poll — including healthy → healthy.
+        assert!(!fault_changed("S|Spooler", "S|Spooler"));
+        assert!(!fault_changed("", ""));
+    }
 
     #[test]
     fn gpo_enforced_on_firewall_is_never_a_fault() {

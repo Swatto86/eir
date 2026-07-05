@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-05 · **Release:** v0.25.2
+**Last updated:** 2026-07-05 · **Release:** v0.25.3
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -180,7 +180,7 @@ The UI subsystem is a thin Tauri tray app (`eir-ui`) that talks to the LocalSyst
 Two tagged enums carry everything (`#[serde(tag = "type", rename_all = "snake_case")]`):
 
 - **`ServiceMsg`** (service → UI), one variant: `Status(StatusPayload)` (`lib.rs:287-292`).
-- **`UiMsg`** (UI → service) (`lib.rs:294-329`): `Approve { id: u64, approved: bool }`, `TogglePause`, `UpdateSettings(Box<SettingsUpdate>)`, `ClearProblems`, `ClearExecutions`, `RunUpdatesNow`, `ClearUpdateHistory`, `SetLearnedFact { id: i64, op: String }`, `UpdateUpdaterSettings(Box<UpdaterSettingsUpdate>)`, `SetAppIgnore { id: String, ignore: bool, note: String }`, `SetAdvisorSettings(Box<AdvisorSettingsUpdate>)`. (`Box` keeps the enum small since the settings variants are large.)
+- **`UiMsg`** (UI → service) (`lib.rs:294-329`): `Approve { id: u64, approved: bool }`, `TogglePause`, `UpdateSettings(Box<SettingsUpdate>)`, `ClearProblems`, `ClearExecutions`, `RefreshStatus`, `RunUpdatesNow`, `ClearUpdateHistory`, `SetLearnedFact { id: i64, op: String }`, `UpdateUpdaterSettings(Box<UpdaterSettingsUpdate>)`, `SetAppIgnore { id: String, ignore: bool, note: String }`, `SetAdvisorSettings(Box<AdvisorSettingsUpdate>)`. (`Box` keeps the enum small since the settings variants are large.) `RefreshStatus` forces an immediate services-only rescan (`wmi::rescan_failed_services`) + status re-settle, so the manual "Refresh" button clears a recovered service without waiting for the poll.
 
 **`StatusPayload`** (`lib.rs:5-38`) is the single snapshot the UI renders, carrying: `status` (string state machine value), `paused`, `cpu`/`memory`/`disk` (`f32` percentages), `failed_services`, `last_analysis`, `last_analysis_at` (unix secs of the last completed analysis, 0 = none this run; v0.24.3, `#[serde(default)]`), `recent_problems: Vec<ProblemSummary>`, `recent_executions: Vec<ExecutionSummary>`, `pending_approvals: Vec<ApprovalInfo>`, `error: Option<String>`, `usage: Option<UsageSummary>`, `settings: Option<UiSettings>`, `updater: Option<UpdaterStatus>`, `advisor: Option<AdvisorStatus>`, and `learned_facts: Vec<LearnedFactView>`. Derives `Default` so the channel can be seeded empty.
 
@@ -236,6 +236,7 @@ Commands (`main.rs:28-112`, plus `util.rs`):
 - `set_learned_fact { id, op }` → `UiMsg::SetLearnedFact` (`op` is `pin`, `disable`, or `forget`).
 - `toggle_pause` → `UiMsg::TogglePause`.
 - `clear_problems` / `clear_executions` → `ClearProblems` / `ClearExecutions`.
+- `refresh_status` → `RefreshStatus` (Dashboard "Refresh" in the Failed Services card; forces a services rescan so a recovered service clears immediately).
 - `update_settings(SettingsUpdate)` → `UpdateSettings`.
 - `run_updates_now` → `RunUpdatesNow`.
 - `clear_update_history` → `ClearUpdateHistory`.
@@ -351,6 +352,7 @@ The outer `tokio::select!` races the main loop future against the `shutdown` fut
 
 - `TogglePause` → flip `paused`, resettle status.
 - `ClearProblems` / `ClearExecutions` → clear the respective deque.
+- `RefreshStatus` → force a fast services-only rescan (`wmi::rescan_failed_services`, no PowerShell), overwrite `failed_services`, re-settle `resting_status`, and broadcast — clears a recovered service on demand. Deliberately does **not** touch `st.error` (that is a live AI/config error, not stale status).
 - `UpdateSettings` → `apply_update`, **validate by constructing a fresh `AiClient`**; on failure reject and reload config from disk (never restart into a bricked provider); on success save and `restart_self()` then `return` (provider settings require a restart).
 - `Approve { id, approved }` → find/remove the pending item and `delete_pending_approval`. If approved and not already `in_flight`, insert label and send an `ExecJob` (reason `"approved by user"`); if approved but already in-flight, log and skip re-run; if rejected, push a `rejected by user` problem. Always resettle status + broadcast.
 - `RunUpdatesNow` → **gated on the same controls as the scheduled run** (`enabled && !paused && !updater_running`) — the pipe is writable by any authenticated user, so a manual run must not override admin state.
@@ -437,7 +439,7 @@ Eir's signal layer is three independent background collectors that each maintain
 ### Aggregation and the actionable fingerprint (`eir-svc/src/main.rs`)
 
 - **Wiring:** all three spawn at startup (`event_log::spawn`, `file_watch::spawn` after `discover_watch_dirs`, `wmi::spawn`), each holding a clone of the reactive `TriggerTx` (`signals/mod.rs` — capacity-1 tokio mpsc, `try_send` so a burst coalesces and a send never blocks); a 5 s settle sleep follows before status flips to "Active".
-- **WMI trigger:** each snapshot computes `fault_key` from the shared `SystemState::fault_parts()` (failed services, firewall explicitly off, Defender faults while Defender is the active AV) and pings the trigger only when the key **changed and is non-empty** — a persistent fault never re-triggers on every poll.
+- **WMI trigger:** each snapshot computes `fault_key` from the shared `SystemState::fault_parts()` (failed services, firewall explicitly off, Defender faults while Defender is the active AV) and pings the trigger whenever the key **changed** — including a fault *clearing* (key → empty), so a recovered service is reflected within one reactive debounce instead of waiting for the next scheduled decision tick. An unchanged key never re-triggers, so a persistent fault doesn't fire every poll. A pure recovery leaves `actionable_fingerprint` empty, so the idle-skip gate suppresses the expensive AI **analysis** — the wake just refreshes the UI (clears the stale failed-service chip). It reaches the loop body like any other reactive wake, so the bounded once-per-fact learned-fact labeller may still run if a fact is unlabelled (unchanged from prior behaviour); steady-state that's zero.
 - **Per cycle:** the decision loop builds the snapshot from `event_log::drain` and `file_watch::drain` (both one-shot reads), `wmi::current` (clone of latest), plus DB decision history.
 - **`actionable_fingerprint`** decides whether a cycle is even worth an AI call and dedups unchanged states. It is built from **shared predicates in `models.rs`** so the fingerprint and the reactive triggers can't drift: `LogEvent::is_actionable()` (`F|path|sev|count`), `EventLogEntry::is_actionable()` (`E|level|source|id`), and `SystemState::fault_parts()` (`S|name`, `FW|name` only when explicitly `Some(false)`, `DEF|realtime_off`/`DEF|sig_stale` for age `>3` only when Defender is the active AV), plus CPU/MEM/DISK `>90` flags. Parts are sorted and joined; **empty → `None` → skip the Claude call.** Identical fingerprint across cycles means nothing changed, so it's skipped.
 
@@ -1050,6 +1052,22 @@ one app already known to behave this way.
 ---
 
 ## Known limitations & backlog
+
+**Resolved in v0.25.3 (stale-status fix + manual reset, E1–E2):** a recovered failed
+service could linger on the dashboard for up to ~10–15 min. Root cause: the WMI collector
+woke the decision loop only on a *new* fault, never on a fault *clearing*, so a recovery
+waited for the next scheduled decision tick (`decision_interval_secs`, default 10 min) on
+top of the ≤5 min WMI poll. **E1:** the collector now wakes the loop on any change to the
+fault set — including a clear — via the pure `fault_changed` (unit-tested); a pure recovery
+still hits the empty-fingerprint idle-skip so no AI *analysis* runs. **E2:** a manual
+"Refresh" button in the Dashboard *Failed Services* card sends `UiMsg::RefreshStatus`,
+which forces a fast services-only rescan (`wmi::rescan_failed_services`, no PowerShell),
+overwrites `failed_services`, re-settles `resting_status`, and broadcasts — clearing a
+recovered service on demand across every view + the tray from the single broadcast. It
+deliberately does **not** clear `st.error` (a live AI/config error, not stale status) or
+the Activity history (which has its own Clear). Compile/test-verified (fmt + clippy
+`--all-targets -D warnings` + `cargo test --workspace`, +1 `fault_changed` test); the
+end-to-end loop wake and the frontend are reasoning-verified, not live-exercised.
 
 **Resolved in v0.25.2 (bug-fix sweep, D1–D22):** an 8-agent adversarial sweep + full
 regression pass (all 44 prior fixes held). Highlights:

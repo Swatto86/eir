@@ -227,6 +227,13 @@ async fn clear_executions(
 }
 
 #[tauri::command]
+async fn refresh_status(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
+    tx.0.try_send(UiMsg::RefreshStatus)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn update_settings(
     settings: SettingsUpdate,
     tx: State<'_, UiCmdTx>,
@@ -785,6 +792,7 @@ fn main() {
             update_settings,
             clear_problems,
             clear_executions,
+            refresh_status,
             run_updates_now,
             clear_update_history,
             set_updater_settings,

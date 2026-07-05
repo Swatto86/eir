@@ -1692,6 +1692,24 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             st.recent_executions.clear();
                             pipe.broadcast_status(build_status(&st));
                         }
+                        UiMsg::RefreshStatus => {
+                            // Force a fresh services scan so a recovered service clears
+                            // immediately instead of waiting for the next WMI poll +
+                            // decision tick, then re-settle the hero/tray. Services-only
+                            // (sub-second) so awaiting it inline doesn't stall the loop;
+                            // cpu/mem/disk refresh on the normal cadence. Deliberately does
+                            // NOT clear st.error — that banner is a live AI/config error
+                            // with its own lifecycle, not stale status.
+                            st.failed_services = signals::wmi::rescan_failed_services().await;
+                            // Re-settle the transient "Warning" to a resting status, but
+                            // never downgrade a live "Error" (resting_status has no Error
+                            // tier, so calling it while st.error is set would show "Active"
+                            // over an unresolved error banner).
+                            if st.status != "Error" {
+                                st.status = resting_status(&st);
+                            }
+                            pipe.broadcast_status(build_status(&st));
+                        }
                         UiMsg::UpdateSettings(update) => {
                             cfg.apply_update(*update);
                             // Validate before committing — never restart into a broken
