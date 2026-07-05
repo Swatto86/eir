@@ -179,6 +179,7 @@ const STATUS_META = {
   Warning:             ['var(--yellow)', 'Problems found'],
   PendingApproval:     ['var(--orange)', 'Waiting for your approval'],
   Executing:           ['var(--blue)',   'Applying a fix'],
+  Gaming:              ['#8b5cf6',       'Game Mode — staying out of the way while you play'],
   Error:               ['var(--red)',    'Error'],
   ServiceDisconnected: ['var(--red)',    'Service disconnected'],
   Restarting:          ['var(--gray)',   'Service restarting…'],
@@ -313,6 +314,8 @@ async function refreshInner() {
   document.getElementById('pause-label').textContent = status.paused ? 'Resume' : 'Pause';
   document.getElementById('pause-ico').textContent = status.paused ? '▶' : '⏸';
   document.getElementById('pause-btn').classList.toggle('paused', !!status.paused);
+  document.getElementById('game-btn').classList.toggle('active', !!status.gaming);
+  document.getElementById('game-label').textContent = status.gaming ? 'Game Mode: On' : 'Game Mode';
 
   document.getElementById('cpu').textContent    = pct(status.cpu);
   document.getElementById('memory').textContent = pct(status.memory);
@@ -1276,6 +1279,8 @@ function fillSettings() {
   document.getElementById('set-wmipoll').value = s.wmi_poll_interval_secs || 300;
   document.getElementById('set-channels').value = (s.event_log_channels || []).join(', ');
   document.getElementById('set-dirs').value = (s.log_directories || []).join(', ');
+  document.getElementById('set-game-auto').checked = s.game_mode_auto !== false;
+  document.getElementById('set-game-power').checked = !!s.game_mode_power_boost;
   document.getElementById('set-or-key').placeholder =
     s.openrouter_key_set ? '•••••• set — blank keeps it' : 'not set';
   document.getElementById('set-an-key').placeholder =
@@ -1310,6 +1315,8 @@ async function saveSettings() {
     wmi_poll_interval_secs: numVal('set-wmipoll', 300, 30, Infinity),
     event_log_channels: splitList(document.getElementById('set-channels').value),
     log_directories: splitList(document.getElementById('set-dirs').value),
+    game_mode_auto: document.getElementById('set-game-auto').checked,
+    game_mode_power_boost: document.getElementById('set-game-power').checked,
   };
   const st = document.getElementById('set-status');
 
@@ -1443,6 +1450,15 @@ document.getElementById('pause-btn').addEventListener('click', async () => {
   const willPause = !(lastStatus && lastStatus.paused);
   try { await invoke('toggle_pause'); toast(willPause ? 'Monitoring paused' : 'Monitoring resumed', 'ok'); }
   catch (e) { console.error('toggle_pause failed', e); toast('Could not change pause state', 'err'); }
+  refresh();
+});
+
+document.getElementById('game-btn').addEventListener('click', async () => {
+  // Manual toggle (a latch, distinct from the auto-detector's lease). If auto-detect has
+  // it on, turning it off here is re-enabled by the next detector heartbeat (by design).
+  const on = !(lastStatus && lastStatus.gaming);
+  try { await invoke('set_gaming', { on, manual: true }); toast(on ? 'Game Mode on' : 'Game Mode off', 'ok'); }
+  catch (e) { console.error('set_gaming failed', e); toast('Could not change Game Mode', 'err'); }
   refresh();
 });
 

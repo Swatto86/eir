@@ -92,6 +92,7 @@
     }
     .foot-btn:hover { background: var(--surface-2); }
     .foot-btn.paused { border-color: var(--yellow); color: var(--yellow); }
+    .foot-btn.active { border-color: #8b5cf6; color: #8b5cf6; }
 
     /* Keyboard a11y: visible focus ring for tab navigation (mouse clicks unaffected). */
     button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
@@ -358,6 +359,7 @@
     </nav>
     <div class="side-foot">
       <button class="foot-btn" id="theme-btn" title="Cycle theme (system / light / dark)"><span id="theme-ico">◐</span><span id="theme-label">System</span></button>
+      <button class="foot-btn" id="game-btn" title="Game Mode: pause Eir's updates &amp; housekeeping while you play"><span id="game-ico">🎮</span><span id="game-label">Game Mode</span></button>
       <button class="foot-btn" id="pause-btn"><span id="pause-ico">⏸</span><span id="pause-label">Pause</span></button>
     </div>
   </aside>
@@ -597,8 +599,12 @@
           <input id="set-channels" type="text" placeholder="System, Application, Security">
           <label for="set-dirs">Extra log directories</label>
           <input id="set-dirs" type="text" placeholder="C:\Logs, D:\App\Logs">
+          <label for="set-game-auto" title="Automatically enable Game Mode when a fullscreen game is detected">Auto Game Mode</label>
+          <input id="set-game-auto" type="checkbox">
+          <label for="set-game-power" title="Switch to the High Performance power plan during Game Mode, restored on exit">Game Mode power boost</label>
+          <input id="set-game-power" type="checkbox">
         </div>
-        <div class="set-note">Eir reacts to errors the moment they land (debounced ~10&nbsp;s); the decision interval is just the background sweep.</div>
+        <div class="set-note">Eir reacts to errors the moment they land (debounced ~10&nbsp;s); the decision interval is just the background sweep. Game Mode pauses the updater &amp; housekeeping while a fullscreen game runs.</div>
         <div class="set-actions">
           <button class="btn primary" id="set-save">Save &amp; restart service</button>
           <span class="set-status" id="set-status"></span>

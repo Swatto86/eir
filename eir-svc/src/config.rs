@@ -174,10 +174,21 @@ pub struct MonitoringConfig {
     /// Overrides the fallback in policy.toml; editable from the app's Settings.
     #[serde(default = "default_confidence")]
     pub confidence_threshold: f32,
+    /// Auto-enable Game Mode when the tray detects a fullscreen game/app. On by default —
+    /// it only makes Eir quieter (defers updater/digest), never destructive.
+    #[serde(default = "default_true")]
+    pub game_mode_auto: bool,
+    /// While Game Mode is active, switch to the High Performance power plan and restore it
+    /// on exit. Off by default (marginal on desktops; changes display/sleep timeouts).
+    #[serde(default)]
+    pub game_mode_power_boost: bool,
 }
 
 fn default_confidence() -> f32 {
     0.80
+}
+fn default_true() -> bool {
+    true
 }
 fn default_el_poll() -> u64 {
     30
@@ -240,6 +251,8 @@ impl Config {
             // Deprecated wire fields (see eir_proto::UiSettings).
             base_url: String::new(),
             api_key_set: false,
+            game_mode_auto: self.monitoring.game_mode_auto,
+            game_mode_power_boost: self.monitoring.game_mode_power_boost,
         }
     }
 
@@ -275,6 +288,8 @@ impl Config {
         // Clamp to a sane range: never 0 (would auto-run everything) nor ≥1.0
         // (would never run anything).
         self.monitoring.confidence_threshold = u.confidence_threshold.clamp(0.50, 0.95);
+        self.monitoring.game_mode_auto = u.game_mode_auto;
+        self.monitoring.game_mode_power_boost = u.game_mode_power_boost;
     }
 }
 
@@ -383,6 +398,8 @@ audit_db = "./eir.db"
             event_log_channels: vec!["System".into(), "Application".into()],
             log_directories: vec!["C:\\Logs".into()],
             confidence_threshold: 0.9,
+            game_mode_auto: true,
+            game_mode_power_boost: false,
         });
         // Must serialize to TOML the loader can read back (else a settings save bricks the service).
         let serialized = toml::to_string_pretty(&cfg).unwrap();

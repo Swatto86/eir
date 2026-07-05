@@ -7,6 +7,7 @@ mod disk_scan;
 mod executor;
 mod explain;
 mod feedback;
+mod game_mode;
 mod learn;
 mod models;
 mod pipe_server;
@@ -260,6 +261,15 @@ struct SvcState {
     /// enable/disable click can be reconstructed into a `StartupSet` action server-side
     /// (the wire carries only the opaque id and a bool).
     startup_targets: std::collections::HashMap<String, startup_scan::StartupToggle>,
+    /// Game Mode is a *lease*, not a latch: the tray re-asserts it on a heartbeat while a
+    /// fullscreen game runs, and this holds the unix-secs deadline it's valid until (0 =
+    /// off). Gaming is active while `gaming_until > now`, so a crashed/closed tray lets it
+    /// auto-expire and Eir resumes full guardian duty — see `is_gaming_at`.
+    gaming_until: i64,
+    /// The user's explicit Game Mode toggle — a latch (persists until toggled off), unlike
+    /// the auto-detector's heartbeat lease. Gaming is active if this is set OR the lease is
+    /// live.
+    gaming_manual: bool,
 }
 
 impl Default for SvcState {
@@ -301,8 +311,34 @@ impl Default for SvcState {
             startup: None,
             startup_scan_running: false,
             startup_targets: std::collections::HashMap::new(),
+            gaming_until: 0,
+            gaming_manual: false,
         }
     }
+}
+
+/// Whether Game Mode is active at `now`: the manual latch is set, OR the auto-detector's
+/// lease hasn't expired. Pure — the loop's gates/status use `now = Utc::now().timestamp()`;
+/// tests pass a fixed `now`.
+fn is_gaming_at(st: &SvcState, now: i64) -> bool {
+    st.gaming_manual || st.gaming_until > now
+}
+
+/// Convenience wrapper reading the real clock, for status/broadcast projection.
+fn is_gaming(st: &SvcState) -> bool {
+    is_gaming_at(st, chrono::Utc::now().timestamp())
+}
+
+/// Whether a *scheduled* autonomous update cycle should start now. Pure + testable. Gated
+/// on: updater enabled, not paused, not already running, **not in Game Mode**, and the
+/// schedule interval having elapsed. The manual `RunUpdatesNow` path bypasses this entirely
+/// (an explicit "update now" click is honoured even during a game).
+fn updater_due(enabled: bool, interval_secs: i64, last_run: i64, st: &SvcState, now: i64) -> bool {
+    enabled
+        && !st.paused
+        && !st.updater_running
+        && !is_gaming_at(st, now)
+        && (last_run == 0 || now - last_run >= interval_secs)
 }
 
 /// Restart the service to apply new settings: a detached helper stops then
@@ -356,6 +392,7 @@ fn build_status(st: &SvcState) -> StatusPayload {
         ask: st.ask.clone(),
         disk_insights: st.disk_insights.clone(),
         startup: st.startup.clone(),
+        gaming: is_gaming(st),
     }
 }
 
@@ -475,6 +512,9 @@ fn spawn_update_cycle(
 fn resting_status(st: &SvcState) -> String {
     if st.paused {
         "Paused"
+    } else if is_gaming(st) {
+        // Below Paused (an explicit user pause outranks auto Game Mode), above the rest.
+        "Gaming"
     } else if !st.pending.is_empty() {
         "PendingApproval"
     } else if !st.in_flight.is_empty() {
@@ -952,6 +992,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         Ok(d) => d,
         Err(e) => fatal!(format!("DB init: {e}")),
     };
+    // Crash-safe Game Mode power restore: if the service died mid-game with a boosted power
+    // plan, the pre-boost scheme GUID is persisted — restore it now.
+    game_mode::restore(&db).await;
     // Seed the updater status from config + history, and clear any stale install
     // staging left by a previous run.
     updater::download::cleanup_stale_staging();
@@ -1134,8 +1177,15 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     // trigger landing inside the gap is deferred, never dropped.
     const REACTIVE_DEBOUNCE: Duration = Duration::from_secs(10);
     const REACTIVE_MIN_GAP: Duration = Duration::from_secs(60);
+    // Game Mode lease: the tray re-asserts SetGaming(true) on a ~30s heartbeat, so 90s
+    // covers two missed beats before the lease expires and Eir resumes full guardian duty.
+    const GAMING_LEASE_SECS: i64 = 90;
     let mut last_cycle_at = tokio::time::Instant::now();
     let mut react_at: Option<tokio::time::Instant> = None;
+    // Last-known Game Mode state, tracked across the SetGaming handler and the per-tick
+    // reconcile so a lease that lapses with no explicit off (e.g. a crashed tray) still
+    // triggers the power-plan restore + a re-analysis.
+    let mut was_gaming = false;
     // Last analysed actionable-signal fingerprint; identical states are skipped.
     let mut last_fingerprint: Option<String> = None;
     // When we last ran an analysis. None = never (forces a baseline run). Even on
@@ -1722,6 +1772,53 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             if st.status != "Error" {
                                 st.status = resting_status(&st);
                             }
+                            pipe.broadcast_status(build_status(&st));
+                        }
+                        UiMsg::SetGaming { on, manual } => {
+                            let now = chrono::Utc::now().timestamp();
+                            let was = is_gaming_at(&st, now);
+                            // Manual = a latch (persists until toggled off); auto = a lease
+                            // (the tray re-asserts on a heartbeat, so it auto-expires if the
+                            // tray dies). They're independent inputs to `is_gaming_at`.
+                            if manual {
+                                st.gaming_manual = on;
+                            } else {
+                                st.gaming_until = if on { now + GAMING_LEASE_SECS } else { 0 };
+                            }
+                            // Drive the power plan off the *overall* gaming transition, not
+                            // the raw `on` flag — turning off one input (e.g. the manual
+                            // latch) while the other (the auto lease) is still active must
+                            // NOT restore power mid-game.
+                            let is_now = is_gaming_at(&st, now);
+                            // Drive the power plan off-loop — powercfg can take up to 10s and
+                            // this arm shares the single decision-loop select! with every
+                            // other UI command / ticker, so it must never block inline.
+                            if !was && is_now {
+                                // Gaming started: apply the power boost (Phase 2, only if the
+                                // opt-in setting is on). Applied once per session.
+                                was_gaming = true;
+                                let power_boost = cfg.monitoring.game_mode_power_boost;
+                                let db_g = db.clone();
+                                tokio::spawn(async move {
+                                    game_mode::on_gaming_edge(power_boost, true, &db_g).await;
+                                });
+                            } else if was && !is_now {
+                                // Gaming ended: restore the power plan (a no-op if not
+                                // boosted), and force a fresh analysis (an unchanged
+                                // fingerprint would otherwise be idle-skipped) + a prompt
+                                // reaction, so anything noticed during the game is handled now.
+                                let db_g = db.clone();
+                                tokio::spawn(async move {
+                                    game_mode::on_gaming_edge(false, false, &db_g).await;
+                                });
+                                was_gaming = false;
+                                last_fingerprint = None;
+                                if react_at.is_none() {
+                                    react_at =
+                                        Some(tokio::time::Instant::now() + REACTIVE_DEBOUNCE);
+                                }
+                            }
+                            st.status = resting_status(&st);
                             pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::UpdateSettings(update) => {
@@ -2317,14 +2414,31 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                     }
                 }
 
+                // ── Game Mode lease reconcile ─────────────────────────────────
+                // If the lease lapsed with no explicit off (e.g. the tray crashed), restore
+                // any boosted power plan and re-analyse — mirroring the SetGaming end-edge.
+                // restore() is a cheap DB read that no-ops without a stored boost. Bounds
+                // the "boosted after a tray crash" window to one decision tick.
+                {
+                    let g = is_gaming(&st);
+                    if was_gaming && !g {
+                        let db_g = db.clone();
+                        tokio::spawn(async move { game_mode::restore(&db_g).await });
+                        last_fingerprint = None;
+                    }
+                    was_gaming = g;
+                }
+
                 // ── Autonomous updater: start a scheduled cycle when due ──────
                 {
                     let now = chrono::Utc::now().timestamp();
-                    let interval_secs = cfg.updater.schedule_interval_secs as i64;
-                    let due = cfg.updater.enabled
-                        && !st.paused
-                        && !st.updater_running
-                        && (st.updater.last_run == 0 || now - st.updater.last_run >= interval_secs);
+                    let due = updater_due(
+                        cfg.updater.enabled,
+                        cfg.updater.schedule_interval_secs as i64,
+                        st.updater.last_run,
+                        &st,
+                        now,
+                    );
                     if due {
                         info!("Autonomous update cycle due — starting");
                         st.updater_running = true;
@@ -2386,6 +2500,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                 // blocks the loop. One at a time.
                 let now_ts = chrono::Utc::now().timestamp();
                 if !st.digest_running
+                    && !is_gaming_at(&st, now_ts)
                     && (st.last_digest_at == 0 || now_ts - st.last_digest_at >= DIGEST_INTERVAL_SECS)
                 {
                     st.digest_running = true;
@@ -2692,8 +2807,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
 mod status_tests {
     use super::*;
 
-    /// resting_status must order Paused > PendingApproval > Executing > Active, so an
-    /// off-loop fix keeps the UI on "Executing" (the off-loop-execution invariant).
+    /// resting_status must order Paused > Gaming > PendingApproval > Executing > Active.
     #[test]
     fn resting_status_precedence() {
         let mut st = SvcState::default();
@@ -2702,9 +2816,55 @@ mod status_tests {
         st.in_flight.insert("ServiceRestart".into());
         assert_eq!(resting_status(&st), "Executing");
 
-        // Paused outranks an in-flight execution.
+        // Game Mode outranks an in-flight execution / pending approval.
+        st.gaming_until = i64::MAX;
+        assert_eq!(resting_status(&st), "Gaming");
+
+        // Paused outranks Game Mode (an explicit user pause wins).
         st.paused = true;
         assert_eq!(resting_status(&st), "Paused");
+    }
+
+    /// Game Mode is a lease: active only while `gaming_until > now`, so a crashed/closed
+    /// tray auto-expires it.
+    #[test]
+    fn gaming_is_a_lease() {
+        let mut st = SvcState::default();
+        assert!(!is_gaming_at(&st, 1000));
+        st.gaming_until = 1090; // e.g. now(1000) + 90s lease
+        assert!(is_gaming_at(&st, 1000));
+        assert!(is_gaming_at(&st, 1089));
+        assert!(!is_gaming_at(&st, 1090)); // expired at the deadline
+        assert!(!is_gaming_at(&st, 2000));
+
+        // The manual latch keeps gaming active regardless of the (expired) lease — the two
+        // inputs are independent (auto detector = lease, user toggle = latch).
+        st.gaming_manual = true;
+        assert!(is_gaming_at(&st, 5000));
+        st.gaming_manual = false;
+        st.gaming_until = 0;
+        assert!(!is_gaming_at(&st, 5000));
+    }
+
+    /// A scheduled update cycle is suppressed while gaming (but the manual RunUpdatesNow
+    /// path — which never calls updater_due — is unaffected).
+    #[test]
+    fn updater_due_suppressed_during_gaming() {
+        let mut st = SvcState::default();
+        let now = 100_000i64;
+        // Enabled, never run before, not paused/running, not gaming → due.
+        assert!(updater_due(true, 3600, 0, &st, now));
+        // Gaming → not due.
+        st.gaming_until = now + 90;
+        assert!(!updater_due(true, 3600, 0, &st, now));
+        // Lease expired → due again.
+        assert!(updater_due(true, 3600, 0, &st, now + 200));
+        // Paused or interval-not-elapsed also suppress (unchanged behaviour).
+        st.gaming_until = 0;
+        st.paused = true;
+        assert!(!updater_due(true, 3600, 0, &st, now));
+        st.paused = false;
+        assert!(!updater_due(true, 3600, now, &st, now)); // just ran
     }
 
     /// F1 regression: a manual RefreshStatus that clears a recovered service must survive

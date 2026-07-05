@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-05 · **Release:** v0.25.4
+**Last updated:** 2026-07-06 · **Release:** v0.26.0
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -1052,6 +1052,45 @@ one app already known to behave this way.
 ---
 
 ## Known limitations & backlog
+
+**Added in v0.26.0 (Game Mode):** while a fullscreen game/app is running, Eir gets out of
+the way — it suppresses its own disruptive background work and can optionally boost the power
+plan. It deliberately does **not** kill apps/services for FPS (assessed and rejected: placebo
+benefit on modern hardware, breaks real setups, security regression, crash-unsafe restore,
+fights the guardian).
+- **Detection is tray-side.** `EirSvc` (session 0) can't see the interactive desktop's
+  fullscreen state, so the tray (`eir-ui/src/game_detect.rs`) polls `SHQueryUserNotificationState`
+  every 5 s (`QUNS_RUNNING_D3D_FULL_SCREEN`/`QUNS_BUSY` → fullscreen) and reports over the pipe.
+  It heartbeats `SetGaming{on:true,manual:false}` every 30 s while a game runs and, after a
+  60 s exit-debounce, sends `on:false`. **Windowed (non-fullscreen) games aren't detected — use
+  the manual toggle.**
+- **Lease vs latch.** The service tracks two independent inputs: `gaming_until` (the auto
+  detector's 90 s lease, so a crashed/closed tray auto-expires it and Eir resumes) and
+  `gaming_manual` (the user's explicit toggle — a latch that persists until toggled off).
+  `is_gaming_at = gaming_manual || gaming_until > now`. Status tier: **Paused > Gaming >
+  PendingApproval > Executing > Active**.
+- **What it suppresses:** the scheduled updater (`updater_due` now includes `!is_gaming_at`)
+  and the weekly digest. The manual "update now" is **not** suppressed. The reactive fix loop
+  keeps running (it only fires on an actual fault, rare during a game, and the auto-whitelisted
+  actions are non-disruptive/sub-second) — deferring it was judged not worth the defer/resume
+  machinery for v1.
+- **Optional power boost (Phase 2, opt-in, off by default):** on the gaming start-edge, if
+  `game_mode_power_boost` is on, `game_mode.rs` saves the current `powercfg` scheme GUID to the
+  `app_state` DB table and switches to High Performance; on the end-edge it restores + clears.
+  The powercfg calls run **off-loop** (`tokio::spawn`) so the ≤10 s `powercfg` can't stall the
+  decision loop. Crash-safe: `game_mode::restore` runs on service startup, and a per-tick
+  reconcile restores the plan if the lease lapses with no explicit off (bounding a crashed-tray
+  boost to one decision tick). Restore/boost are driven off the *overall* `is_gaming` transition
+  (not the raw `on` flag), so turning off one input while the other is still active never
+  restores mid-game.
+- **Known v1 limitations:** windowed games need the manual toggle; a fullscreen video player
+  also triggers it (arguably desirable — don't update mid-movie); if auto is on and the user
+  manually toggles Game Mode *off* mid-game, the detector's next heartbeat re-enables it (turn
+  auto off for full manual control); the Game Mode *settings* (`game_mode_auto`,
+  `game_mode_power_boost`) save via the provider card and restart the service (they're set-once,
+  unlike the live manual toggle). The 8-agent-style pre-release review was one adversarial agent
+  + self-review; the frontend, the live `SHQueryUserNotificationState` detection, and the live
+  `powercfg` boost/restore are reasoning/compile-verified, not live-exercised.
 
 **Resolved in v0.25.4 (third adversarial sweep, F1–F16):** 8-agent sweep + regression pass
 (70/70 prior fixes held). **Two P1s:** (F1) the v0.25.3 manual "Refresh status" wrote

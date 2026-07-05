@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod game_detect;
 mod pipe_client;
 mod util;
 
@@ -234,6 +235,18 @@ async fn refresh_status(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> R
 }
 
 #[tauri::command]
+async fn set_gaming(
+    on: bool,
+    manual: bool,
+    tx: State<'_, UiCmdTx>,
+    conn: State<'_, ConnState>,
+) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
+    tx.0.try_send(UiMsg::SetGaming { on, manual })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn update_settings(
     settings: SettingsUpdate,
     tx: State<'_, UiCmdTx>,
@@ -403,6 +416,7 @@ fn status_accent(status: &str) -> Option<[u8; 3]> {
         "Warning" => Some([234, 179, 8]), // amber
         "PendingApproval" => Some([249, 115, 22]), // orange
         "Executing" => Some([59, 130, 246]), // blue
+        "Gaming" => Some([139, 92, 246]), // purple — Game Mode, staying out of the way
         "Error" | "ServiceDisconnected" => Some([239, 68, 68]), // red
         _ => Some([107, 114, 128]),       // grey (connecting / unknown)
     }
@@ -621,6 +635,11 @@ fn main() {
 
     let status_for_loop = status.clone();
 
+    // Game Mode auto-detector inputs (cloned before the Builder consumes the originals).
+    let status_for_detect = status.clone();
+    let connected_for_detect = connected.clone();
+    let ui_cmd_tx_for_detect = ui_cmd_tx.clone();
+
     tauri::Builder::default()
         // Must be the FIRST plugin. Eir is tray-resident and auto-hides its window, so
         // users forget it's running and re-launch it; a second process would start a
@@ -728,6 +747,13 @@ fn main() {
                 pipe_client::run(status_pipe, ui_cmd_rx, connected_for_pipe).await;
             });
 
+            // Background: Game Mode fullscreen auto-detector (reports over the pipe).
+            tauri::async_runtime::spawn(game_detect::run(
+                status_for_detect,
+                ui_cmd_tx_for_detect,
+                connected_for_detect,
+            ));
+
             let status_tray = status_for_loop.clone();
             let icon_for_loop = icon_base.clone();
             let pause_item_tray = pause_item.clone();
@@ -793,6 +819,7 @@ fn main() {
             clear_problems,
             clear_executions,
             refresh_status,
+            set_gaming,
             run_updates_now,
             clear_update_history,
             set_updater_settings,

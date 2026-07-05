@@ -11,6 +11,41 @@ use std::str::FromStr;
 use std::time::Duration;
 use tracing::{info, warn};
 
+/// Set a value in the small `app_state` key/value store (upsert). For transient state
+/// that must survive a restart — currently Game Mode's power-restore GUID.
+pub async fn set_state(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO app_state (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Read a value from `app_state`, or `None` if the key is absent.
+pub async fn get_state(pool: &SqlitePool, key: &str) -> Result<Option<String>> {
+    let row = sqlx::query("SELECT value FROM app_state WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(match row {
+        Some(r) => Some(r.try_get("value")?),
+        None => None,
+    })
+}
+
+/// Delete a key from `app_state` (idempotent).
+pub async fn delete_state(pool: &SqlitePool, key: &str) -> Result<()> {
+    sqlx::query("DELETE FROM app_state WHERE key = ?")
+        .bind(key)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn init_db(path: &str) -> Result<SqlitePool> {
     // WAL lets the concurrent writers (decision loop, executor worker, update-cycle
     // task, labeller) proceed with a reader without serialising on a rollback

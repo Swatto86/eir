@@ -59,6 +59,12 @@ pub struct StatusPayload {
     /// `#[serde(default)]` keeps an older payload decodable.
     #[serde(default)]
     pub startup: Option<StartupView>,
+    /// True while Game Mode is active — a fullscreen game/app is running (auto-detected
+    /// by the tray) or the user toggled it on, so Eir suppresses its own disruptive
+    /// background work (updater, digest). `#[serde(default)]` keeps an older payload
+    /// decodable.
+    #[serde(default)]
+    pub gaming: bool,
 }
 
 /// One point of the dashboard resource timeline. Percentages, unix-seconds `at`.
@@ -336,6 +342,14 @@ pub struct UiSettings {
     pub base_url: String,
     #[serde(default)]
     pub api_key_set: bool,
+    /// Auto-enable Game Mode when a fullscreen game is detected (the tray reads this to
+    /// decide whether to run the detector). `#[serde(default)]` keeps an older payload
+    /// decodable (defaults to false there, but the service default is true).
+    #[serde(default)]
+    pub game_mode_auto: bool,
+    /// Switch to the High Performance power plan while Game Mode is active. `#[serde(default)]`.
+    #[serde(default)]
+    pub game_mode_power_boost: bool,
 }
 
 /// A settings change from the UI. Secret fields are `None` to mean "unchanged";
@@ -365,6 +379,13 @@ pub struct SettingsUpdate {
     pub log_directories: Vec<String>,
     #[serde(default)]
     pub confidence_threshold: f32,
+    /// Auto-enable Game Mode during fullscreen games. `#[serde(default)]` keeps an older
+    /// tray app's update decodable.
+    #[serde(default)]
+    pub game_mode_auto: bool,
+    /// Switch to High Performance power plan during Game Mode. `#[serde(default)]`.
+    #[serde(default)]
+    pub game_mode_power_boost: bool,
 }
 
 /// Aggregated AI usage, surfaced in the UI so the user can see how much of
@@ -470,6 +491,14 @@ pub enum UiMsg {
     /// Force an immediate live-status refresh (fast services rescan + re-settle), so a
     /// recovered failed service clears without waiting for the next poll/decision tick.
     RefreshStatus,
+    /// Set Game Mode. `manual: false` is the tray's auto-detector — `on: true` extends a
+    /// short lease re-asserted on a heartbeat, so a crashed tray auto-expires it. `manual:
+    /// true` is the user's explicit toggle — a latch that persists until toggled off (no
+    /// heartbeat needed). Gaming is active if the manual latch is set OR the lease is live.
+    SetGaming {
+        on: bool,
+        manual: bool,
+    },
     /// Run an update cycle now (on demand).
     RunUpdatesNow,
     /// Clear the app-update output: the last cycle's results and the persisted
