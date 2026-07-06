@@ -720,7 +720,10 @@ async fn route_user_action(
     force_approval: bool,
 ) {
     let label = format!("{action:?}");
-    if st.in_flight.contains(&label) || st.pending.iter().any(|p| p.info.action == label) {
+    // Dedup on the semantic key, not the label: parameters can differ while the
+    // targeted issue is the same (see FixAction::dedup_key).
+    let dedup = action.dedup_key();
+    if st.in_flight.contains(&label) || st.pending.iter().any(|p| p.action.dedup_key() == dedup) {
         info!(action = %label, "User action already queued or executing — skipping duplicate");
         return;
     }
@@ -1621,8 +1624,12 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                     // without the pending check it would auto-run and bypass
                                     // the queued card, then run a SECOND time when the user
                                     // later approves the stale card.
+                                    // Pending is matched on the semantic key, not the
+                                    // label — AI-regenerated parameters must not defeat
+                                    // the check (see FixAction::dedup_key).
+                                    let dedup = action.dedup_key();
                                     if st.in_flight.contains(&label)
-                                        || st.pending.iter().any(|p| p.info.action == label)
+                                        || st.pending.iter().any(|p| p.action.dedup_key() == dedup)
                                     {
                                         info!(action = %label, "Already executing or awaiting approval — skipping duplicate");
                                         continue;
@@ -1660,7 +1667,12 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                     // Skip if it's already queued for approval OR already running
                                     // off-loop — otherwise a re-surfacing problem could queue a
                                     // second card for an in-flight approved action and double-run it.
-                                    if st.pending.iter().any(|p| p.info.action == action_label)
+                                    // Pending is matched on the semantic key, not the label: the AI
+                                    // re-proposes a persistent fault every analysis run with slightly
+                                    // different parameters (script text, value payload), and an exact
+                                    // label match would let those pile up as duplicate cards.
+                                    let dedup = action.dedup_key();
+                                    if st.pending.iter().any(|p| p.action.dedup_key() == dedup)
                                         || st.in_flight.contains(&action_label)
                                     {
                                         info!(action = %action_label, "Already awaiting approval or executing — skipping duplicate");

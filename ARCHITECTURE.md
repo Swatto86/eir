@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-06 · **Release:** v0.27.2
+**Last updated:** 2026-07-06 · **Release:** v0.27.3
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -1052,6 +1052,22 @@ one app already known to behave this way.
 ---
 
 ## Known limitations & backlog
+
+**Fixed in v0.27.3 (semantic approval dedup):** duplicate approval cards no longer build up
+across analysis runs. The duplicate guards compared the exact Debug label of the proposed
+action, but the AI regenerates free-text parameters every cycle (a PowerShell script body,
+a registry `value_data`, a cleanup `days_old`) — so a persistent fault queued a new,
+textually-different card each run. `FixAction::dedup_key()` (models.rs) now identifies the
+*issue* an action addresses — variant + the target it acts on, ASCII-case-folded, excluding
+regenerable parameters — and all three guard sites (the AI RequireApproval path, the AI
+auto-exec path, and `route_user_action`) match pending cards on that key.
+`PowerShellDiagnostic` keys on the variant alone (at most one SYSTEM-script card pending at
+a time; a different issue re-surfaces on a later cycle). `StartupSet` keeps its `enable`
+flag in the key — enable vs disable are distinct user intents. `load_pending_approvals`
+also sweeps pre-existing duplicates on startup: newest card per key survives, older ones
+are deleted (same pattern as the unreadable-row cleanup). Known residual: `in_flight`
+matching is still exact-label, so a re-proposal during the seconds-wide execution window of
+an approved action can still queue once — self-correcting next cycle.
 
 **Improved in v0.27.2 (learning-loop deepening — targeted-outcome attribution):** Eir now
 judges each fix by whether the *specific fault it targeted* actually cleared, instead of a

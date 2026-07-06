@@ -288,6 +288,77 @@ pub enum FixAction {
     },
 }
 
+impl FixAction {
+    /// Stable identity of the *issue* an action addresses, used to stop duplicate
+    /// approval cards piling up across analysis runs. A persistent fault is re-proposed
+    /// every cycle, and AI-generated parameters (a PowerShell script body, a registry
+    /// value payload, a cleanup age) rarely come back byte-identical — so the exact
+    /// Debug label cannot be the dedup key. This keys on the variant plus the target it
+    /// acts on (case-folded, Windows names being case-insensitive) and deliberately
+    /// excludes the regenerable parameters.
+    pub fn dedup_key(&self) -> String {
+        let (kind, target) = match self {
+            FixAction::ServiceRestart { service_name } => ("service_restart", service_name),
+            FixAction::ServiceStop { service_name } => ("service_stop", service_name),
+            FixAction::ServiceStart { service_name } => ("service_start", service_name),
+            // days_old excluded: cleaning the same path is the same issue.
+            FixAction::LogCleanup { path, .. } => ("log_cleanup", path),
+            FixAction::DiskCleanup { target } => ("disk_cleanup", target),
+            // The script body is regenerated every analysis run, so it can't identify
+            // the issue. Key on the variant alone: at most one SYSTEM-script card is
+            // pending at a time — a different issue needing a script simply re-surfaces
+            // on a later cycle once the user has dealt with the current card.
+            FixAction::PowerShellDiagnostic { .. } => {
+                return "powershell_diagnostic".to_string();
+            }
+            FixAction::TaskDisable { task_name } => ("task_disable", task_name),
+            FixAction::TaskEnable { task_name } => ("task_enable", task_name),
+            // value_data excluded: resetting the same value is the same issue.
+            FixAction::RegistryReset {
+                key_path,
+                value_name,
+                ..
+            } => {
+                return format!(
+                    "registry_reset|{}|{}",
+                    key_path.to_ascii_lowercase(),
+                    value_name.to_ascii_lowercase()
+                );
+            }
+            FixAction::NetworkDiagnostic { command } => ("network_diagnostic", command),
+            FixAction::DriverDisable { driver_name } => ("driver_disable", driver_name),
+            FixAction::DriverEnable { driver_name } => ("driver_enable", driver_name),
+            FixAction::SoftwareUninstall { package_name } => ("software_uninstall", package_name),
+            // value excluded: changing the same boot element is the same issue.
+            FixAction::BcdEdit { element, .. } => ("bcd_edit", element),
+            FixAction::ProcessKill { process_name } => ("process_kill", process_name),
+            FixAction::FileDelete { path } => ("file_delete", path),
+            FixAction::FirewallEnable { profile } => ("firewall_enable", profile),
+            FixAction::DefenderSignatureUpdate => return "defender_signature_update".to_string(),
+            FixAction::DefenderRealtimeEnable => return "defender_realtime_enable".to_string(),
+            FixAction::SfcScan => return "sfc_scan".to_string(),
+            FixAction::DismRestoreHealth => return "dism_restore_health".to_string(),
+            // enable is INCLUDED: an enable and a disable card for the same entry are
+            // different user intents (user-initiated only), not analysis-loop spam.
+            FixAction::StartupSet {
+                name,
+                location,
+                hive,
+                enable,
+            } => {
+                return format!(
+                    "startup_set|{}|{}|{}|{}",
+                    name.to_ascii_lowercase(),
+                    location.to_ascii_lowercase(),
+                    hive.to_ascii_lowercase(),
+                    enable
+                );
+            }
+        };
+        format!("{kind}|{}", target.to_ascii_lowercase())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ExecutionResult {
     pub action: String,
@@ -371,6 +442,89 @@ mod tests {
             windows_update_status: "ok".into(),
             security: SecurityPosture::default(),
         }
+    }
+
+    #[test]
+    fn dedup_key_identifies_the_issue_not_the_exact_parameters() {
+        // Regenerated free text must NOT defeat dedup: same issue → same key.
+        assert_eq!(
+            FixAction::PowerShellDiagnostic {
+                script: "Get-Process | Sort CPU".into()
+            }
+            .dedup_key(),
+            FixAction::PowerShellDiagnostic {
+                script: "Get-EventLog -Newest 50".into()
+            }
+            .dedup_key(),
+        );
+        assert_eq!(
+            FixAction::RegistryReset {
+                key_path: "HKLM\\X".into(),
+                value_name: "Start".into(),
+                value_data: "2".into()
+            }
+            .dedup_key(),
+            FixAction::RegistryReset {
+                key_path: "hklm\\x".into(),
+                value_name: "start".into(),
+                value_data: "3".into()
+            }
+            .dedup_key(),
+        );
+        assert_eq!(
+            FixAction::LogCleanup {
+                path: "C:\\Logs".into(),
+                days_old: 30
+            }
+            .dedup_key(),
+            FixAction::LogCleanup {
+                path: "c:\\logs".into(),
+                days_old: 7
+            }
+            .dedup_key(),
+        );
+        // Windows service names are case-insensitive.
+        assert_eq!(
+            FixAction::ServiceRestart {
+                service_name: "Spooler".into()
+            }
+            .dedup_key(),
+            FixAction::ServiceRestart {
+                service_name: "spooler".into()
+            }
+            .dedup_key(),
+        );
+
+        // Different issues → different keys.
+        assert_ne!(
+            FixAction::ServiceRestart {
+                service_name: "Spooler".into()
+            }
+            .dedup_key(),
+            FixAction::ServiceRestart {
+                service_name: "W32Time".into()
+            }
+            .dedup_key(),
+        );
+        assert_ne!(
+            FixAction::ServiceRestart {
+                service_name: "Spooler".into()
+            }
+            .dedup_key(),
+            FixAction::ServiceStart {
+                service_name: "Spooler".into()
+            }
+            .dedup_key(),
+        );
+        // StartupSet keeps the enable flag: enable vs disable for the same entry are
+        // different user intents, both allowed to queue.
+        let startup = |enable: bool| FixAction::StartupSet {
+            name: "OneDrive".into(),
+            location: "user_run".into(),
+            hive: "S-1-5-21-x".into(),
+            enable,
+        };
+        assert_ne!(startup(true).dedup_key(), startup(false).dedup_key());
     }
 
     #[test]

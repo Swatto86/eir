@@ -629,7 +629,26 @@ pub async fn load_pending_approvals(pool: &SqlitePool) -> Result<Vec<PendingAppr
             }
         }
     }
-    Ok(out)
+
+    // Sweep duplicates that built up before dedup-on-queue existed: keep the NEWEST
+    // card per issue (freshest diagnosis and baseline) and delete the older ones,
+    // mirroring the unreadable-row cleanup above.
+    let mut seen = std::collections::HashSet::new();
+    let mut keep = Vec::new();
+    for pa in out.into_iter().rev() {
+        if seen.insert(pa.action.dedup_key()) {
+            keep.push(pa);
+        } else {
+            info!(
+                id = pa.info.id,
+                action = %pa.info.action,
+                "Removing duplicate pending approval"
+            );
+            let _ = delete_pending_approval(pool, pa.info.id).await;
+        }
+    }
+    keep.reverse(); // restore oldest-first order for the survivors
+    Ok(keep)
 }
 
 /// Remove a resolved approval (approved or rejected) from the queue.
