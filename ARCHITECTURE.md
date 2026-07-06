@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-06 · **Release:** v0.27.0
+**Last updated:** 2026-07-06 · **Release:** v0.27.1
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -1052,6 +1052,17 @@ one app already known to behave this way.
 ---
 
 ## Known limitations & backlog
+
+**Added in v0.27.1 (Ask Eir scope guard):** the Ask prompt now opens with an on-purpose rule
+— Ask Eir only helps with THIS PC (health, performance, errors, software, updates, storage,
+security, settings) and the attached files/images, and politely declines off-topic questions
+(general knowledge, coding help, creative writing, opinions), so it isn't used as a general
+chatbot burning the user's AI budget. A carve-out keeps the PC's own software/app/error-message
+questions explicitly in scope (no over-refusal). It's a **soft** guard (a prompt instruction, no
+classifier) — proportionate for a single-user tool; a determined user can still reframe an
+off-topic ask, which is a non-issue (self-inflicted). The only other Ask throttle remains the
+15 s inter-question rate limit + 1000-char cap; there is still no per-day Ask spend cap
+(deferred — the advisor's escalation path is the only USD-budgeted AI call).
 
 **Added in v0.27.0 (Ask Eir attachments):** Ask Eir can now take file, folder, and image
 attachments for context.

@@ -60,6 +60,12 @@ pub fn build_prompt(ctx: &AskContext, question: &str, attachments: &str) -> Stri
     s.push_str(
         "You are Eir, an autonomous Windows guardian, answering the PC owner's question in \
          plain English. Rules:\n\
+         - Stay on purpose: you ONLY help with THIS PC — its health, performance, errors, \
+         software, updates, storage, security, and settings — plus anything in the attached \
+         files/images. If asked something off-topic (general knowledge, coding help, creative \
+         writing, opinions, or any subject unrelated to this computer), briefly and politely \
+         decline and remind them you're here to help with their PC. Questions about the PC's \
+         own software, apps, and error messages ARE on-topic.\n\
          - Answer ONLY from the context below and the question; do not invent specifics.\n\
          - Write for a non-technical home user, at most 300 words, no markdown.\n\
          - This is diagnostic help only. Do NOT propose registry edits, PowerShell, \
@@ -166,6 +172,12 @@ mod tests {
         assert!(p.contains("why is my disk so full?"));
         // The no-manual-actions instruction must always be present.
         assert!(p.contains("Do NOT propose registry edits"));
+        // The on-purpose scope guard must always be present, so Ask Eir isn't used as a
+        // general chatbot burning the user's AI budget.
+        assert!(p.contains("Stay on purpose"));
+        assert!(p.contains("politely decline"));
+        // …but PC software/error questions stay explicitly in-scope (no over-refusal).
+        assert!(p.contains("apps, and error messages ARE on-topic"));
     }
 
     #[test]
