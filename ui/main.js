@@ -473,6 +473,7 @@ function renderAsk(ask) {
   html += entries.map((e) => `
     <div class="card ask-entry">
       <div class="ask-q"><span class="qmark">Q</span><span>${esc(e.question)}</span></div>
+      ${(e.attachments && e.attachments.length) ? `<div class="ask-att-tag">📎 ${e.attachments.map(esc).join(', ')}</div>` : ''}
       <div class="ask-a">${esc(e.answer)}</div>
       <div class="ask-when" data-ts="${e.at}">${ago(e.at)}</div>
     </div>`).join('');
@@ -500,6 +501,9 @@ async function submitAsk() {
     askBaselineErr = (lastStatus && lastStatus.ask && lastStatus.ask.error) || '';
     askBaselineAt = Date.now();
     input.value = '';
+    // The service consumed the pending attachments on a successful queue.
+    askChips = [];
+    renderAskChips();
   } catch (e) {
     statusEl.textContent = 'Failed: ' + e;
   } finally {
@@ -514,6 +518,32 @@ document.getElementById('ask-input').addEventListener('keydown', (e) => {
   // Enter sends (chat convention); Shift+Enter inserts a newline. isComposing
   // guards the Enter that confirms an IME composition.
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); submitAsk(); }
+});
+
+// ── Ask attachments (mirrors the service's pending list via command returns) ────
+let askChips = [];
+function renderAskChips() {
+  document.getElementById('ask-attach-chips').innerHTML = askChips.map((a, i) => `
+    <span class="ask-chip" title="${escAttr(a.name)}">
+      <span>${a.kind === 'image' ? '🖼' : '📄'}</span>
+      <span class="nm">${esc(a.name)}</span>
+      <span class="rm" data-i="${i}" title="Remove">✕</span>
+    </span>`).join('');
+}
+async function pickAttachments(kind) {
+  try {
+    askChips = await invoke('add_ask_attachments', { kind }) || [];
+    renderAskChips();
+    if (askChips.length >= 12) toast('Attachment limit reached (12)', 'ok');
+  } catch (e) { console.error('add_ask_attachments failed', e); toast('Could not attach', 'err'); }
+}
+document.getElementById('ask-attach-files').addEventListener('click', () => pickAttachments('files'));
+document.getElementById('ask-attach-folder').addEventListener('click', () => pickAttachments('folder'));
+document.getElementById('ask-attach-chips').addEventListener('click', async (e) => {
+  const rm = e.target.closest('.rm');
+  if (!rm) return;
+  try { askChips = await invoke('remove_ask_attachment', { index: parseInt(rm.dataset.i, 10) }) || []; renderAskChips(); }
+  catch (err) { console.error('remove_ask_attachment failed', err); }
 });
 
 // ── Disk space ───────────────────────────────────────────────────────────────

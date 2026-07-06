@@ -93,6 +93,24 @@ pub struct AskEntry {
     pub answer: String,
     /// Unix seconds when answered.
     pub at: i64,
+    /// Short labels of the attachments this question carried (for the history card).
+    #[serde(default)]
+    pub attachments: Vec<String>,
+}
+
+/// A file/image/folder-file attachment for an Ask question, already read and bounded by
+/// the tray (in the user's session — the service never opens an attacker-named path).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AskAttachment {
+    /// Display name (filename, or `folder/file.txt` for a folder pick).
+    pub name: String,
+    /// `"text"` or `"image"`.
+    pub kind: String,
+    /// For `text`: the (bounded, UTF-8) file text. For `image`: base64-encoded bytes.
+    pub content: String,
+    /// For `image`: the media type (`image/jpeg` / `image/png`). Empty for text.
+    #[serde(default)]
+    pub media_type: String,
 }
 
 /// Results of an on-demand disk-space scan, rendered in the Disk view.
@@ -528,9 +546,12 @@ pub enum UiMsg {
         id: i64,
     },
     /// Ask Eir a free-text question, answered with live system context. The answer is
-    /// diagnostic prose only — nothing is parsed or executed from it.
+    /// diagnostic prose only — nothing is parsed or executed from it. `attachments` are
+    /// files/images/folder-files the tray already read + bounded (never a path).
     AskEir {
         question: String,
+        #[serde(default)]
+        attachments: Vec<AskAttachment>,
     },
     /// Run an on-demand disk-space scan.
     ScanDisk,

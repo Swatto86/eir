@@ -174,6 +174,12 @@
     .ask-q { display: flex; gap: 8px; padding: 11px 15px; font-weight: 650; font-size: 13.5px; border-bottom: 1px solid var(--border); user-select: text; }
     .ask-q .qmark { color: var(--accent); flex-shrink: 0; }
     .ask-a { padding: 13px 15px; font-size: 13px; line-height: 1.65; white-space: pre-wrap; user-select: text; }
+    .ask-attach-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 15px 0; }
+    .ask-chip { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px; padding: 3px 4px 3px 8px; max-width: 240px; }
+    .ask-chip .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ask-chip .rm { cursor: pointer; opacity: .55; padding: 0 4px; }
+    .ask-chip .rm:hover { opacity: 1; }
+    .ask-att-tag { font-size: 11px; color: var(--muted); margin-top: 2px; }
     .ask-when { padding: 0 15px 11px; font-size: 11px; color: var(--muted); }
     .ask-spinner { padding: 13px 15px; color: var(--muted); font-size: 13px; }
 
@@ -452,14 +458,17 @@
         <div class="ask-compose">
           <textarea id="ask-input" maxlength="1000" rows="3"
             placeholder="e.g. Why is my PC slow right now?  Is my disk OK?  What was that error about?  (Enter to send · Shift+Enter for a new line)"></textarea>
+          <div id="ask-attach-chips" class="ask-attach-chips"></div>
           <div class="ask-actions">
+            <button class="btn" id="ask-attach-files" title="Attach files or images as context">📎 Files</button>
+            <button class="btn" id="ask-attach-folder" title="Attach a folder's text files as context">📁 Folder</button>
             <span class="set-status" id="ask-status"></span>
             <div style="flex:1"></div>
             <button class="btn primary" id="ask-send">Ask Eir</button>
           </div>
         </div>
       </div>
-      <div class="set-note" style="padding:0 2px">Eir answers from what it can see on this PC right now. It won't give you commands to run — it applies fixes itself, through its approval system.</div>
+      <div class="set-note" style="padding:0 2px">Eir answers from what it can see on this PC right now — attach files, screenshots or a folder to give it more. It won't give you commands to run; it applies fixes itself, through its approval system.</div>
       <div id="ask-list"></div>
     </section>
 

@@ -1141,6 +1141,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     #[allow(clippy::type_complexity)]
     let (ask_done_tx, mut ask_done_rx) = tokio::sync::mpsc::unbounded_channel::<(
         String,
+        Vec<String>, // attachment labels, for the history entry
         Result<(String, Option<CallUsage>), String>,
     )>();
     // On-demand disk scan runs off the loop (blocking walkdir) and reports its ranked
@@ -1332,7 +1333,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         pipe.broadcast_status(build_status(&st));
                         continue;
                     }
-                    Some((question, result)) = ask_done_rx.recv() => {
+                    Some((question, attachments, result)) = ask_done_rx.recv() => {
                         // An "Ask Eir" answer finished (or failed). Fold it into the Q&A
                         // history; never touch st.error (same isolation as exec_done_rx).
                         st.ask_running = false;
@@ -1355,6 +1356,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                     question,
                                     answer,
                                     at: chrono::Utc::now().timestamp(),
+                                    attachments,
                                 });
                                 // Preserve a rejection notice that arrived while this
                                 // answer was in flight (a duplicate submission rejected
@@ -2108,7 +2110,10 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 }
                             });
                         }
-                        UiMsg::AskEir { question } => {
+                        UiMsg::AskEir {
+                            question,
+                            attachments,
+                        } => {
                             let now = chrono::Utc::now().timestamp();
                             if let Some(reason) = ask::ask_rejection_reason(
                                 &question,
@@ -2123,6 +2128,30 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 st.ask_running = true;
                                 refresh_ask(&mut st, None);
                                 pipe.broadcast_status(build_status(&st));
+                                // Route attachments: text files fold into the prompt, images
+                                // go to the multimodal call. The tray already read + bounded
+                                // them (in the user's session) — here we only classify.
+                                let mut text_files: Vec<(String, String)> = Vec::new();
+                                let mut images: Vec<ai::client::ImageInput> = Vec::new();
+                                let mut labels: Vec<String> = Vec::new();
+                                for a in &attachments {
+                                    labels.push(a.name.clone());
+                                    if a.kind == "image" && !a.content.is_empty() {
+                                        images.push(ai::client::ImageInput {
+                                            base64: a.content.clone(),
+                                            media_type: if a.media_type.is_empty() {
+                                                "image/jpeg".to_string()
+                                            } else {
+                                                a.media_type.clone()
+                                            },
+                                        });
+                                    } else if a.kind == "text" {
+                                        text_files.push((a.name.clone(), a.content.clone()));
+                                    }
+                                }
+                                let images_dropped =
+                                    !images.is_empty() && !ai_ref.supports_images();
+                                let image_count = images.len();
                                 // Snapshot the loop-owned context now; gather the DB-derived
                                 // trend/learned pieces inside the off-loop task.
                                 let (cpu, memory, disk) = (st.cpu, st.memory, st.disk);
@@ -2157,6 +2186,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                     // call can't latch ask_running for the process lifetime.
                                     const ASK_MAX: Duration = Duration::from_secs(4 * 60);
                                     let q = question.clone();
+                                    let labels_c = labels;
                                     let mut inner = tokio::spawn(async move {
                                         let trend =
                                             audit::metric_trend(&db_a).await.ok().flatten();
@@ -2174,12 +2204,26 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                             recent_executions,
                                             learned,
                                         };
-                                        let prompt = ask::build_prompt(&ctx, &question);
-                                        // Main/default model, no web search — the labeller/
-                                        // digest completion entry point.
-                                        ai_a.complete_text(&prompt, "")
+                                        let attach_section =
+                                            ask::format_text_attachments(&text_files);
+                                        let prompt =
+                                            ask::build_prompt(&ctx, &question, &attach_section);
+                                        // Drop images the provider can't read (CLI providers);
+                                        // the answer gets a note so the user isn't misled.
+                                        let imgs = if images_dropped { Vec::new() } else { images };
+                                        ai_a.complete_multimodal(&prompt, &imgs, "")
                                             .await
-                                            .map(|(t, u)| (t.trim().to_string(), u))
+                                            .map(|(t, u)| {
+                                                let mut t = t.trim().to_string();
+                                                if images_dropped && !t.is_empty() {
+                                                    t = format!(
+                                                        "(Note: your AI provider can't read \
+                                                         images, so {image_count} attached \
+                                                         image(s) weren't analysed.)\n\n{t}"
+                                                    );
+                                                }
+                                                (t, u)
+                                            })
                                             .map_err(|e| e.to_string())
                                     });
                                     let result =
@@ -2197,7 +2241,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                                 Err("answering timed out".to_string())
                                             }
                                         };
-                                    let _ = done.send((q, result));
+                                    let _ = done.send((q, labels_c, result));
                                 });
                             }
                         }

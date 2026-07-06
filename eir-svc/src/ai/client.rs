@@ -129,6 +129,16 @@ impl SseLineBuf {
     }
 }
 
+/// A base64-encoded image attachment for a multimodal completion. Only the HTTP
+/// providers (Anthropic API, OpenRouter vision models) consume these; the CLI providers
+/// ignore them (see `AiClient::supports_images`).
+#[derive(Clone, Debug)]
+pub struct ImageInput {
+    pub base64: String,
+    /// e.g. `image/jpeg` or `image/png`.
+    pub media_type: String,
+}
+
 // ── Client ────────────────────────────────────────────────────────────────────
 
 pub struct AiClient {
@@ -302,6 +312,7 @@ impl AiClient {
                         effort,
                         Some(crate::ai::prompt::SYSTEM_PROMPT),
                         &context,
+                        &[],
                     )
                     .await
                 }
@@ -316,7 +327,7 @@ impl AiClient {
                 }
                 AiClientConfig::OpenRouter { api_key, model } => {
                     let m = model_ov.unwrap_or(model);
-                    self.call_openai_style(OPENROUTER_BASE, api_key, m, effort, &prompt)
+                    self.call_openai_style(OPENROUTER_BASE, api_key, m, effort, &prompt, &[])
                         .await
                 }
                 AiClientConfig::KiloCli {
@@ -393,6 +404,7 @@ impl AiClient {
         effort: &str,
         system: Option<&str>,
         user: &str,
+        images: &[ImageInput],
     ) -> Result<(String, Option<CallUsage>)> {
         // For the analysis path, `system` carries the static instructions and is sent
         // as a CACHED system prompt so the large, unchanging guardrail block is billed
@@ -400,11 +412,32 @@ impl AiClient {
         // price every time; the per-cycle context is the (uncached) user turn. Prompt
         // caching is GA, so no beta header is needed. Text-only completions (labeller,
         // digest) pass `system: None` and must NOT get the diagnosis system prompt.
+        // With image attachments the user turn becomes a content array (image blocks
+        // then the text); without, it stays a plain string (the analysis/text path).
+        let content = if images.is_empty() {
+            json!(user)
+        } else {
+            let mut blocks: Vec<serde_json::Value> = images
+                .iter()
+                .map(|img| {
+                    json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": img.media_type,
+                            "data": img.base64,
+                        },
+                    })
+                })
+                .collect();
+            blocks.push(json!({ "type": "text", "text": user }));
+            json!(blocks)
+        };
         let mut body = json!({
             "model": model,
             "max_tokens": MAX_TOKENS,
             "stream": true,
-            "messages": [{"role": "user", "content": user}],
+            "messages": [{"role": "user", "content": content}],
         });
         if let Some(sys) = system {
             body["system"] = json!([{
@@ -514,22 +547,48 @@ impl AiClient {
         model: &str,
         effort: &str,
         prompt: &str,
+        images: &[ImageInput],
     ) -> Result<(String, Option<CallUsage>)> {
         let url = format!("{base_url}/chat/completions");
-        let body = OpenAiRequest {
-            model,
-            max_tokens: MAX_TOKENS,
-            stream: true,
-            messages: vec![ChatMessage {
-                role: "user",
-                content: prompt,
-            }],
-            // Ask for a final usage chunk (tokens + cost where supported).
-            stream_options: Some(StreamOptions {
-                include_usage: true,
-            }),
-            usage: Some(UsageInclude { include: true }),
-            reasoning: openai_effort(effort).map(|e| Reasoning { effort: e }),
+        // Text-only uses the typed request; with images the user content becomes an
+        // OpenAI-style parts array ({type:text} + {type:image_url, data-uri}). Both
+        // serialise to a Value so `.json()` takes either.
+        let body: serde_json::Value = if images.is_empty() {
+            serde_json::to_value(OpenAiRequest {
+                model,
+                max_tokens: MAX_TOKENS,
+                stream: true,
+                messages: vec![ChatMessage {
+                    role: "user",
+                    content: prompt,
+                }],
+                stream_options: Some(StreamOptions {
+                    include_usage: true,
+                }),
+                usage: Some(UsageInclude { include: true }),
+                reasoning: openai_effort(effort).map(|e| Reasoning { effort: e }),
+            })
+            .unwrap_or_default()
+        } else {
+            let mut parts = vec![json!({ "type": "text", "text": prompt })];
+            for img in images {
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{};base64,{}", img.media_type, img.base64) },
+                }));
+            }
+            let mut b = json!({
+                "model": model,
+                "max_tokens": MAX_TOKENS,
+                "stream": true,
+                "messages": [{ "role": "user", "content": parts }],
+                "stream_options": { "include_usage": true },
+                "usage": { "include": true },
+            });
+            if let Some(e) = openai_effort(effort) {
+                b["reasoning"] = json!({ "effort": e });
+            }
+            b
         };
 
         let resp = self
@@ -905,7 +964,8 @@ impl AiClient {
             AiClientConfig::Anthropic { api_key, .. } => {
                 let m = anthropic_web_model(ov);
                 // No diagnosis system prompt — this is a plain text completion.
-                self.call_anthropic(api_key, &m, "", None, prompt).await
+                self.call_anthropic(api_key, &m, "", None, prompt, &[])
+                    .await
             }
             AiClientConfig::ClaudeCli {
                 binary,
@@ -918,7 +978,7 @@ impl AiClient {
             }
             AiClientConfig::OpenRouter { api_key, model } => {
                 let m = if ov.is_empty() { model.as_str() } else { ov };
-                self.call_openai_style(OPENROUTER_BASE, api_key, m, "", prompt)
+                self.call_openai_style(OPENROUTER_BASE, api_key, m, "", prompt, &[])
                     .await
             }
             AiClientConfig::KiloCli {
@@ -930,6 +990,46 @@ impl AiClient {
                 self.call_kilo_cli(binary, m, "", user_profile.as_deref(), prompt)
                     .await
             }
+        }
+    }
+
+    /// Whether this provider can accept image attachments. Only the HTTP providers do
+    /// (and OpenRouter only with a vision-capable model — a non-vision model surfaces a
+    /// per-call API error). The CLI providers don't, so the Ask handler warns and answers
+    /// text-only for them.
+    pub fn supports_images(&self) -> bool {
+        matches!(
+            self.config,
+            AiClientConfig::Anthropic { .. } | AiClientConfig::OpenRouter { .. }
+        )
+    }
+
+    /// Like [`complete_text`], but with image attachments. On a CLI provider (no image
+    /// support) the images are ignored and it falls back to a text-only completion — the
+    /// caller checks [`supports_images`] to warn the user.
+    pub async fn complete_multimodal(
+        &self,
+        prompt: &str,
+        images: &[ImageInput],
+        model_override: &str,
+    ) -> Result<(String, Option<CallUsage>)> {
+        if images.is_empty() {
+            return self.complete_text(prompt, model_override).await;
+        }
+        let ov = model_override.trim();
+        match &self.config {
+            AiClientConfig::Anthropic { api_key, .. } => {
+                let m = anthropic_web_model(ov);
+                self.call_anthropic(api_key, &m, "", None, prompt, images)
+                    .await
+            }
+            AiClientConfig::OpenRouter { api_key, model } => {
+                let m = if ov.is_empty() { model.as_str() } else { ov };
+                self.call_openai_style(OPENROUTER_BASE, api_key, m, "", prompt, images)
+                    .await
+            }
+            // CLI providers can't take images — answer text-only (the handler warns).
+            _ => self.complete_text(prompt, model_override).await,
         }
     }
 

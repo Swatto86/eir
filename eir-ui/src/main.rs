@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ask_attach;
 mod game_detect;
 mod pipe_client;
 mod util;
@@ -169,10 +170,103 @@ async fn ask_eir(
     question: String,
     tx: State<'_, UiCmdTx>,
     conn: State<'_, ConnState>,
+    atts: State<'_, AskAttachments>,
 ) -> Result<(), String> {
     ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::AskEir { question })
-        .map_err(|e| e.to_string())
+    let attachments = atts.0.lock().map_err(|e| e.to_string())?.clone();
+    tx.0.try_send(UiMsg::AskEir {
+        question,
+        attachments,
+    })
+    .map_err(|e| e.to_string())?;
+    // Consume the pending attachments only after a successful queue.
+    atts.0.lock().map_err(|e| e.to_string())?.clear();
+    Ok(())
+}
+
+/// Pending Ask attachments, collected by the picker and consumed on the next `ask_eir`.
+struct AskAttachments(std::sync::Mutex<Vec<eir_proto::AskAttachment>>);
+
+#[tauri::command]
+async fn add_ask_attachments(
+    kind: String,
+    app: AppHandle,
+    atts: State<'_, AskAttachments>,
+) -> Result<Vec<ask_attach::AttachmentMeta>, String> {
+    let app2 = app.clone();
+    // Dialog + file reads + image transcode all off the async runtime.
+    let processed: Vec<eir_proto::AskAttachment> =
+        tauri::async_runtime::spawn_blocking(move || {
+            use tauri_plugin_dialog::DialogExt;
+            if kind == "folder" {
+                match app2.dialog().file().blocking_pick_folder() {
+                    Some(fp) => fp
+                        .into_path()
+                        .ok()
+                        .map(|p| ask_attach::process_folder(&p))
+                        .unwrap_or_default(),
+                    None => vec![],
+                }
+            } else {
+                match app2.dialog().file().blocking_pick_files() {
+                    Some(fps) => {
+                        let paths: Vec<std::path::PathBuf> = fps
+                            .into_iter()
+                            .filter_map(|fp| fp.into_path().ok())
+                            .collect();
+                        ask_attach::process_files(&paths)
+                    }
+                    None => vec![],
+                }
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut guard = atts.0.lock().map_err(|e| e.to_string())?;
+    let mut total: usize = guard.iter().map(|a| a.content.len()).sum();
+    for a in processed {
+        // Bound both the count and the TOTAL payload (across picks) so the eventual
+        // AskEir line can't exceed the pipe cap and get silently dropped.
+        if guard.len() >= ask_attach::MAX_ATTACHMENTS
+            || total + a.content.len() > ask_attach::MAX_TOTAL_BYTES
+        {
+            break;
+        }
+        total += a.content.len();
+        guard.push(a);
+    }
+    Ok(guard
+        .iter()
+        .map(|a| ask_attach::AttachmentMeta {
+            name: a.name.clone(),
+            kind: a.kind.clone(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn clear_ask_attachments(atts: State<'_, AskAttachments>) -> Result<(), String> {
+    atts.0.lock().map_err(|e| e.to_string())?.clear();
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_ask_attachment(
+    index: usize,
+    atts: State<'_, AskAttachments>,
+) -> Result<Vec<ask_attach::AttachmentMeta>, String> {
+    let mut guard = atts.0.lock().map_err(|e| e.to_string())?;
+    if index < guard.len() {
+        guard.remove(index);
+    }
+    Ok(guard
+        .iter()
+        .map(|a| ask_attach::AttachmentMeta {
+            name: a.name.clone(),
+            kind: a.kind.clone(),
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -666,9 +760,11 @@ fn main() {
         )
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(status)
         .manage(UiCmdTx(ui_cmd_tx))
         .manage(ConnState(connected))
+        .manage(AskAttachments(std::sync::Mutex::new(Vec::new())))
         .setup(move |app| {
             let icon_base = Arc::new(decode_icon());
             let start_hidden = launched_hidden();
@@ -820,6 +916,9 @@ fn main() {
             clear_executions,
             refresh_status,
             set_gaming,
+            add_ask_attachments,
+            clear_ask_attachments,
+            remove_ask_attachment,
             run_updates_now,
             clear_update_history,
             set_updater_settings,

@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-06 · **Release:** v0.26.0
+**Last updated:** 2026-07-06 · **Release:** v0.27.0
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -1052,6 +1052,35 @@ one app already known to behave this way.
 ---
 
 ## Known limitations & backlog
+
+**Added in v0.27.0 (Ask Eir attachments):** Ask Eir can now take file, folder, and image
+attachments for context.
+- **Security invariant — the tray reads, the service never does.** All file I/O
+  (`eir-ui/src/ask_attach.rs`) happens in the tray (the user's session), so it can only read
+  what the user can already read; it sends the service *content* (`AskAttachment`), never a
+  path. The LocalSystem service never opens a wire-supplied path (that would be a
+  SYSTEM-privileged arbitrary-file-read escalation). A native `tauri-plugin-dialog` picker,
+  called from a Rust command, selects the files.
+- **Bounds (tray-side):** images are decoded with dimension/allocation limits (≤20000px,
+  ≤512 MB decode), downscaled to ≤1568px, re-encoded JPEG q80, base64'd; text files are read
+  ≤1 MiB then char-capped at 100k; folder picks are top-level only, skip symlinks and
+  dotfiles/secrets (`.env`, `id_rsa`, `*.key/pem/pfx`, `*.exe/dll`, …) and are bounded by file
+  count + total bytes. The pending list is capped at **12 items and 8 MiB total** — under the
+  raised `MAX_UI_LINE_BYTES` (64 KiB → **12 MiB**, to carry attachments over the pipe) so an
+  AskEir line can't be silently dropped.
+- **Multimodal AI:** `AiClient::complete_multimodal` sends image blocks to the Anthropic API
+  (base64 `image` blocks) and OpenRouter (`image_url` data-URIs); `supports_images()` is false
+  for the CLI providers (Claude/Kilo CLI), which answer text-only with a prepended note that
+  the images weren't read. Text attachments fold into the prompt (fenced, inside the existing
+  untrusted-content framing, char-budget 200k); the text-only path is unchanged (byte-identical
+  request for the analysis/completion callers, which pass no images).
+- **Known limitations:** OpenRouter images need a vision-capable model (a non-vision model
+  surfaces a per-call API error); the CLI providers can't read images at all; folder picks
+  don't recurse into subfolders; the 8 MiB/12-item cap silently truncates a larger pick.
+  Pre-release review: one adversarial agent + self-review (found/fixed a missing aggregate
+  byte-budget on multi-file picks, a byte/char cap mix, and symlink-following in folder picks).
+  The live dialog, image transcode, and multimodal API calls are reasoning/compile-verified,
+  not live-exercised.
 
 **Added in v0.26.0 (Game Mode):** while a fullscreen game/app is running, Eir gets out of
 the way — it suppresses its own disruptive background work and can optionally boost the power

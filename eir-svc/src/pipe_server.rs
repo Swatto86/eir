@@ -14,9 +14,11 @@ use windows::Win32::Security::Authorization::{
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 
 /// Largest UI→service line accepted before the connection is treated as hostile and
-/// dropped. The biggest real `UiMsg` (a settings update) is a few KiB; 64 KiB is a
-/// comfortable ceiling that still bounds memory against a misbehaving/malicious client.
-const MAX_UI_LINE_BYTES: u64 = 64 * 1024;
+/// dropped. Most `UiMsg`s are a few KiB, but an `AskEir` can carry file/image attachments
+/// (the tray bounds each image to ~1 MB base64 and text files to a per-file cap); 12 MiB
+/// comfortably covers a few attachments while still bounding memory against a
+/// misbehaving/malicious client (the pipe is single-client, one line at a time).
+const MAX_UI_LINE_BYTES: u64 = 12 * 1024 * 1024;
 
 /// Build a security descriptor that lets the interactive (non-elevated) UI reach
 /// the pipe. A pipe created by the LocalSystem service otherwise only grants
