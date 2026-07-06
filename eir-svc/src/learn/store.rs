@@ -42,7 +42,7 @@ pub async fn update_attempt_rows(pool: &SqlitePool, window_days: i64) -> Result<
 /// Execution-feedback rows in the window — evidence for ineffective-fix detection.
 pub async fn fix_feedback_rows(pool: &SqlitePool, window_days: i64) -> Result<Vec<FeedbackRow>> {
     let rows = sqlx::query(
-        "SELECT action, succeeded, failed_services_before, failed_services_after \
+        "SELECT action, succeeded, resolved \
          FROM execution_feedback WHERE recorded_at > ?",
     )
     .bind(cutoff(window_days))
@@ -53,8 +53,8 @@ pub async fn fix_feedback_rows(pool: &SqlitePool, window_days: i64) -> Result<Ve
         out.push(FeedbackRow {
             action: r.try_get("action")?,
             succeeded: r.try_get::<i64, _>("succeeded")? != 0,
-            failed_services_before: r.try_get("failed_services_before")?,
-            failed_services_after: r.try_get("failed_services_after")?,
+            // 1 = targeted fault cleared, 0 = didn't, NULL = not metric-checkable / unmeasured.
+            resolved: r.try_get::<Option<i64>, _>("resolved")?.map(|v| v != 0),
         });
     }
     Ok(out)

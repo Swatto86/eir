@@ -314,8 +314,13 @@ async function refreshInner() {
   document.getElementById('pause-label').textContent = status.paused ? 'Resume' : 'Pause';
   document.getElementById('pause-ico').textContent = status.paused ? '▶' : '⏸';
   document.getElementById('pause-btn').classList.toggle('paused', !!status.paused);
-  document.getElementById('game-btn').classList.toggle('active', !!status.gaming);
-  document.getElementById('game-label').textContent = status.gaming ? 'Game Mode: On' : 'Game Mode';
+  const gaming = !!status.gaming;
+  document.getElementById('game-btn').classList.toggle('active', gaming);
+  // Explicit ON/Off both ways so the state is never ambiguous.
+  document.getElementById('game-label').textContent = gaming ? 'Game Mode: ON' : 'Game Mode: Off';
+  document.getElementById('game-btn').title = gaming
+    ? 'Game Mode is ON — updates & housekeeping paused. Click to turn off.'
+    : 'Game Mode is off. Click to pause Eir’s updates & housekeeping while you play.';
 
   document.getElementById('cpu').textContent    = pct(status.cpu);
   document.getElementById('memory').textContent = pct(status.memory);

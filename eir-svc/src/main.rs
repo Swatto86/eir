@@ -629,6 +629,7 @@ fn spawn_executor(
                             exec_id,
                             &result.action,
                             result.success,
+                            &feedback::action_target(&action),
                             &baseline,
                         )
                         .await

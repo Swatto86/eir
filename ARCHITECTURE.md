@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-06 · **Release:** v0.27.1
+**Last updated:** 2026-07-06 · **Release:** v0.27.2
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -1052,6 +1052,28 @@ one app already known to behave this way.
 ---
 
 ## Known limitations & backlog
+
+**Improved in v0.27.2 (learning-loop deepening — targeted-outcome attribution):** Eir now
+judges each fix by whether the *specific fault it targeted* actually cleared, instead of a
+noisy global metric. Previously `detect_fix_ineffective` judged a service fix by whether the
+global `failed_services` **count** dropped — so a restart that cleared service X was branded
+ineffective if an unrelated service Y newly failed in the same window, and
+`update_after_states` stamped the current snapshot onto all pending rows at an arbitrary cycle.
+Now: (1) `feedback::record` stores the fix's `target` (the service name for service actions,
+via `action_target`); (2) `update_after_states` only measures a row once a **settle window**
+(`SETTLE_SECS = 120`) has passed since execution, and records `resolved` — whether that target
+is no longer in `failed_services` (case-insensitive), `NULL` when not metric-checkable; (3)
+`detect_fix_ineffective` keys off `resolved` (a type is penalised only if it *never* clears a
+target it's applied to, ≥quorum, zero-effective guard intact). `improvement_score` now
+includes disk; `recent_summary` reports "cleared / didn't clear the targeted fault". Migration
+0015 adds `target/disk_before/disk_after/resolved` (additive + defaulted — an existing DB
+upgrades cleanly, old rows read as unmeasured and are never mis-penalised). **The
+conservative-only invariant is unchanged**: learning still only Skip / DeprioritiseMethod /
+ConfidencePenalty — nothing raises confidence, auto-approves, or unblocks. Deliberately still
+**not** done (out of scope, would break that invariant): auto-tuning `confidence_threshold`
+upward or promoting a fix to auto-approve. Also: the Game Mode sidebar toggle now shows a
+filled-purple ON state with an explicit "Game Mode: ON / Off" label (previously a subtle
+border + ambiguous label).
 
 **Added in v0.27.1 (Ask Eir scope guard):** the Ask prompt now opens with an on-purpose rule
 — Ask Eir only helps with THIS PC (health, performance, errors, software, updates, storage,

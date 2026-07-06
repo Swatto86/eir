@@ -92,7 +92,10 @@
     }
     .foot-btn:hover { background: var(--surface-2); }
     .foot-btn.paused { border-color: var(--yellow); color: var(--yellow); }
-    .foot-btn.active { border-color: #8b5cf6; color: #8b5cf6; }
+    /* Game Mode ON: filled purple so it's unmistakable at a glance (vs the subtle
+       border-only state it had before). OFF uses the default muted button look. */
+    .foot-btn.active { background: #8b5cf6; border-color: #8b5cf6; color: #fff; }
+    .foot-btn.active:hover { background: #7c4ddb; }
 
     /* Keyboard a11y: visible focus ring for tab navigation (mouse clicks unaffected). */
     button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {

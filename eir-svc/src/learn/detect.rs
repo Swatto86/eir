@@ -159,18 +159,20 @@ pub fn detect_method_failing(rows: &[AttemptRow], quorum: i64) -> Vec<MethodFail
 
 // ── Decision-loop evidence (execution_feedback, approval_rejections) ─────────────
 
-/// One execution-feedback row. Effectiveness is judged by the failed-services count, not
-/// the blended improvement_score: cpu/mem deltas are machine-wide noise, and most fix
-/// types (registry, tasks, security…) legitimately don't move cpu/mem at all, so a
-/// blended-score test would wrongly brand effective fixes ineffective.
+/// One execution-feedback row. Effectiveness is judged by the fix's *targeted outcome*
+/// (`resolved`: did the specific fault it addressed clear?), not the blended
+/// improvement_score and not the global failed-services count — cpu/mem deltas are
+/// machine-wide noise, and the global count can stay flat when this fix's target cleared
+/// but an unrelated service newly failed, wrongly branding an effective fix ineffective.
 #[derive(Debug, Clone)]
 pub struct FeedbackRow {
     /// The executed action's Debug form (e.g. `ServiceRestart { service_name: "X" }`).
     pub action: String,
     pub succeeded: bool,
-    /// Failed-service counts before/after the fix (None until the next cycle measures).
-    pub failed_services_before: Option<i64>,
-    pub failed_services_after: Option<i64>,
+    /// Whether the fix's targeted fault cleared by the settle-windowed after-measurement.
+    /// `Some(true)` = cleared, `Some(false)` = didn't, `None` = not metric-checkable / not
+    /// yet measured (ignored by the detector — never counted as ineffective).
+    pub resolved: Option<bool>,
 }
 
 /// Action types whose effectiveness the failed-services count can actually measure.
@@ -230,12 +232,14 @@ pub fn detect_fix_ineffective(rows: &[FeedbackRow], quorum: i64) -> Vec<FixIneff
         if !SERVICE_FIX_TYPES.contains(&at) {
             continue;
         }
-        if let (Some(before), Some(after)) = (r.failed_services_before, r.failed_services_after) {
+        // Judge by the targeted outcome: did the specific fault this fix addressed clear?
+        // `None` (not metric-checkable / unmeasured) is ignored — never counted ineffective.
+        if let Some(resolved) = r.resolved {
             let agg = by_type.entry(at.to_string()).or_default();
-            if after >= before {
-                agg.ineffective += 1;
-            } else {
+            if resolved {
                 agg.effective += 1;
+            } else {
+                agg.ineffective += 1;
             }
         }
     }
@@ -511,36 +515,21 @@ mod tests {
         assert!(detect_method_failing(&rows, 3).is_empty());
     }
 
-    fn fb(action: &str, ok: bool, before: Option<i64>, after: Option<i64>) -> FeedbackRow {
+    fn fb(action: &str, ok: bool, resolved: Option<bool>) -> FeedbackRow {
         FeedbackRow {
             action: action.to_string(),
             succeeded: ok,
-            failed_services_before: before,
-            failed_services_after: after,
+            resolved,
         }
     }
 
     #[test]
     fn fix_ineffective_when_a_service_type_never_helps() {
+        // 3 succeeded ServiceRestarts whose targeted service never cleared → penalty.
         let rows = vec![
-            fb(
-                "ServiceRestart { service_name: \"A\" }",
-                true,
-                Some(2),
-                Some(2),
-            ), // no drop
-            fb(
-                "ServiceRestart { service_name: \"B\" }",
-                true,
-                Some(3),
-                Some(4),
-            ), // worse
-            fb(
-                "ServiceRestart { service_name: \"C\" }",
-                true,
-                Some(1),
-                Some(1),
-            ), // no drop
+            fb("ServiceRestart { service_name: \"A\" }", true, Some(false)),
+            fb("ServiceRestart { service_name: \"B\" }", true, Some(false)),
+            fb("ServiceRestart { service_name: \"C\" }", true, Some(false)),
         ];
         let got = detect_fix_ineffective(&rows, 3);
         assert_eq!(got.len(), 1);
@@ -550,56 +539,31 @@ mod tests {
 
     #[test]
     fn fix_ineffective_spared_when_the_type_ever_helps() {
-        // 3 ineffective restarts but ALSO one effective one → the type sometimes works,
+        // 3 that didn't clear their target but ALSO one that DID → the type sometimes works,
         // so it must NOT be penalised (avoids suppressing a healthy service's restart).
         let rows = vec![
-            fb(
-                "ServiceRestart { service_name: \"A\" }",
-                true,
-                Some(2),
-                Some(2),
-            ),
-            fb(
-                "ServiceRestart { service_name: \"B\" }",
-                true,
-                Some(2),
-                Some(2),
-            ),
-            fb(
-                "ServiceRestart { service_name: \"C\" }",
-                true,
-                Some(2),
-                Some(2),
-            ),
-            fb(
-                "ServiceRestart { service_name: \"D\" }",
-                true,
-                Some(2),
-                Some(1),
-            ), // effective
+            fb("ServiceRestart { service_name: \"A\" }", true, Some(false)),
+            fb("ServiceRestart { service_name: \"B\" }", true, Some(false)),
+            fb("ServiceRestart { service_name: \"C\" }", true, Some(false)),
+            fb("ServiceRestart { service_name: \"D\" }", true, Some(true)), // cleared its target
         ];
         assert!(detect_fix_ineffective(&rows, 3).is_empty());
     }
 
     #[test]
-    fn fix_ineffective_ignores_non_service_types_and_failed_and_pending() {
+    fn fix_ineffective_ignores_non_service_types_and_failed_and_unmeasured() {
         let rows = vec![
             // A non-service fix is out of scope (this metric can't judge it).
-            fb("DiskCleanup { target: \"temp\" }", true, Some(2), Some(2)),
-            fb("DiskCleanup { target: \"temp\" }", true, Some(2), Some(2)),
-            fb("DiskCleanup { target: \"temp\" }", true, Some(2), Some(2)),
+            fb("DiskCleanup { target: \"temp\" }", true, Some(false)),
+            fb("DiskCleanup { target: \"temp\" }", true, Some(false)),
+            fb("DiskCleanup { target: \"temp\" }", true, Some(false)),
             // Security actions are never penalised by this metric.
-            fb("DefenderSignatureUpdate", true, Some(2), Some(2)),
-            fb("DefenderSignatureUpdate", true, Some(2), Some(2)),
-            fb("DefenderSignatureUpdate", true, Some(2), Some(2)),
-            // Failed / pending service fixes don't count.
-            fb(
-                "ServiceRestart { service_name: \"X\" }",
-                false,
-                Some(2),
-                Some(2),
-            ),
-            fb("ServiceRestart { service_name: \"X\" }", true, None, None),
+            fb("DefenderSignatureUpdate", true, Some(false)),
+            fb("DefenderSignatureUpdate", true, Some(false)),
+            fb("DefenderSignatureUpdate", true, Some(false)),
+            // Failed / unmeasured (resolved=None) service fixes don't count.
+            fb("ServiceRestart { service_name: \"X\" }", false, Some(false)),
+            fb("ServiceRestart { service_name: \"X\" }", true, None),
         ];
         assert!(detect_fix_ineffective(&rows, 3).is_empty());
     }
