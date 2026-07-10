@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-06 · **Release:** v0.27.3
+**Last updated:** 2026-07-10 · **Release:** v0.27.4
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -1052,6 +1052,28 @@ one app already known to behave this way.
 ---
 
 ## Known limitations & backlog
+
+**Fixed in v0.27.4 (bug sweep of the v0.26–v0.27.3 features):** four fixes from a focused
+review of the post-v0.25.4 diff. (1) **Manual Game Mode OFF now works mid-game**: the
+sidebar toggle only cleared the manual latch, so with the auto-detector's 90 s lease live
+the click did nothing (toast said "off", status stayed Gaming). `apply_set_gaming`
+(extracted pure + unit-tested) makes a manual OFF also withdraw the auto lease — the
+documented "next heartbeat may re-enable it" behaviour is now real. An auto off still never
+clears the manual latch, and the power-plan restore still keys off the overall transition.
+(2) **`#game-btn` joins the `svc-down` freeze list** so a disconnected-service click is
+visibly blocked like Pause, not answered with an error toast. (3) **Ask attachment loss on
+the 15 s rate limit**: the tray consumes pending attachments when it queues `AskEir`
+(fire-and-forget pipe), so a service-side rejection silently discarded them; `submitAsk`
+now mirrors the 15 s guard client-side (newest entry timestamp + observed running→idle
+transition) and blocks before sending. Residual: a rejection can still slip through in rare
+paths (e.g. failed previous ask + tray restart inside the window) and still drops
+attachments. (4) **UTF-8 boundary truncation in `as_text`**: a >1 MiB text attachment whose
+capped read cut a multi-byte char mid-sequence was rejected as binary; an
+incomplete-final-sequence error (`error_len() == None`) now keeps the valid prefix. Known
+residuals accepted this sweep: rapid manual double-toggle can interleave the off-loop
+powercfg restore/boost tasks (self-corrects next session); the ≤35 s heartbeat vs 90 s
+lease leaves a few-second gaming-false window if a game re-enters fullscreen just as the
+lease lapses (a decision tick landing inside it could start an update cycle mid-game).
 
 **Fixed in v0.27.3 (semantic approval dedup):** duplicate approval cards no longer build up
 across analysis runs. The duplicate guards compared the exact Debug label of the proposed

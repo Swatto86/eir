@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.25.1. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.27.4. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.25.1. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-10 | Eir | v0.27.4 bug sweep of the v0.26–v0.27.3 features | Single focused review of the post-v0.25.4 diff (Game Mode, Ask attachments/scope guard, learning-loop attribution, approval dedup), each finding verified against the documented design before fixing. Fixed: manual Game Mode OFF was a no-op while the auto-detector's lease was live (only the latch cleared; `apply_set_gaming` extracted pure + tested, manual off now withdraws the lease — matching ARCHITECTURE's stated behaviour); `#game-btn` missing from the `svc-down` freeze list; Ask attachments silently lost when the service's 15 s rate limit rejected a quick follow-up (tray consumes attachments on queue over the ack-less pipe — `submitAsk` now mirrors the guard client-side); `as_text` rejected a >1 MiB attachment as binary when the capped read cut a multi-byte UTF-8 char (incomplete-final-sequence now keeps the valid prefix). Accepted residuals documented in ARCHITECTURE (powercfg task-ordering race on rapid double-toggle; few-second lease-lapse window). Gate green (fmt / clippy --all-targets / 220 tests / node --check / version-sync); fixes are compile+unit-verified, not live-exercised.
 
 2026-07-05 | Eir | v0.25.1 UX pass (frontend-only) | Three additions, no wire/service change. (1) Toast feedback for fire-and-forget commands (approve/reject, disk clean, startup toggle, undo, clear, run-updates, pause) — the UX answer to the ack-less pipe; toasts say "queued"/"sent", never falsely claim "done" (a resolved invoke is still only "queued to the writer"). (2) Copy-to-clipboard on the hero error and per-approval target+details (`navigator.clipboard` + textarea/execCommand fallback). (3) Activity filter chips (All/Fixes/Diagnoses/Failures) — filter folded into the render signature so a chip switch forces one rebuild; undo bookkeeping deliberately keyed on the unfiltered list so a hidden row can't drop its in-flight Undo. All pure client-side (no invoke), so live under `svc-down`. One frontend review agent + self-review: no confirmed defects (XSS-safe — toasts use textContent + literal strings; load-order, filter/signature, toast timer eviction, and null-handling all traced and refuted). Gate green (fmt/clippy/192 tests/node --check/version-sync); not live-exercised.
 

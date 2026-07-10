@@ -447,11 +447,15 @@ let askBaselineErr = null;
 let askBaselineAt = 0;
 
 let lastAskSig = null;
+let askWasRunning = false;
+let askLastDoneAt = 0; // ms; when the last answer finished (mirrors the service's spend guard)
 function renderAsk(ask) {
   const list = document.getElementById('ask-list');
   const sendBtn = document.getElementById('ask-send');
   const statusEl = document.getElementById('ask-status');
   const running = !!(ask && ask.running);
+  if (askWasRunning && !running) askLastDoneAt = Date.now();
+  askWasRunning = running;
   sendBtn.disabled = running;
   sendBtn.textContent = running ? 'Thinking…' : 'Ask Eir';
   // Reconcile the status line with the service each poll. After a submit, hold a
@@ -494,10 +498,19 @@ async function submitAsk() {
   // ask.running, so without this a fast second Enter/click could queue a duplicate ask
   // before the service flips running. Re-enabled in finally.
   if (askSending) return;
+  const statusEl = document.getElementById('ask-status');
+  // Mirror the service's 15s between-questions guard BEFORE sending: a rejected AskEir
+  // still consumes the pending attachments (fire-and-forget pipe), so pre-empting the
+  // rejection here keeps the user's attachments instead of silently dropping them.
+  const entries = (lastStatus && lastStatus.ask && lastStatus.ask.entries) || [];
+  const newestAt = entries.reduce((m, e) => Math.max(m, e.at || 0), 0) * 1000;
+  if (Date.now() - Math.max(askLastDoneAt, newestAt) < 15000) {
+    statusEl.textContent = 'Please wait a few seconds between questions.';
+    return;
+  }
   askSending = true;
   const sendBtn = document.getElementById('ask-send');
   sendBtn.disabled = true;
-  const statusEl = document.getElementById('ask-status');
   statusEl.textContent = 'Sending…';
   try {
     await invoke('ask_eir', { question: q });

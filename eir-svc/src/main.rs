@@ -329,6 +329,22 @@ fn is_gaming(st: &SvcState) -> bool {
     is_gaming_at(st, chrono::Utc::now().timestamp())
 }
 
+/// Apply a `SetGaming` message to the two gaming inputs. Manual is a latch, auto is a
+/// lease — but a manual OFF also withdraws the auto lease, so the user's click actually
+/// ends Game Mode now instead of silently losing to a still-live lease (the auto
+/// detector's next heartbeat may re-assert it — the documented trade-off; turn auto off
+/// for full manual control). Pure + testable.
+fn apply_set_gaming(st: &mut SvcState, on: bool, manual: bool, now: i64, lease_secs: i64) {
+    if manual {
+        st.gaming_manual = on;
+        if !on {
+            st.gaming_until = 0;
+        }
+    } else {
+        st.gaming_until = if on { now + lease_secs } else { 0 };
+    }
+}
+
 /// Whether a *scheduled* autonomous update cycle should start now. Pure + testable. Gated
 /// on: updater enabled, not paused, not already running, **not in Game Mode**, and the
 /// schedule interval having elapsed. The manual `RunUpdatesNow` path bypasses this entirely
@@ -1792,18 +1808,11 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         UiMsg::SetGaming { on, manual } => {
                             let now = chrono::Utc::now().timestamp();
                             let was = is_gaming_at(&st, now);
-                            // Manual = a latch (persists until toggled off); auto = a lease
-                            // (the tray re-asserts on a heartbeat, so it auto-expires if the
-                            // tray dies). They're independent inputs to `is_gaming_at`.
-                            if manual {
-                                st.gaming_manual = on;
-                            } else {
-                                st.gaming_until = if on { now + GAMING_LEASE_SECS } else { 0 };
-                            }
+                            apply_set_gaming(&mut st, on, manual, now, GAMING_LEASE_SECS);
                             // Drive the power plan off the *overall* gaming transition, not
-                            // the raw `on` flag — turning off one input (e.g. the manual
-                            // latch) while the other (the auto lease) is still active must
-                            // NOT restore power mid-game.
+                            // the raw `on` flag — an auto off (exit debounce) while the
+                            // manual latch is still set must NOT restore power mid-game.
+                            // (A manual off clears both inputs, so it does restore.)
                             let is_now = is_gaming_at(&st, now);
                             // Drive the power plan off-loop — powercfg can take up to 10s and
                             // this arm shares the single decision-loop select! with every
@@ -2901,6 +2910,29 @@ mod status_tests {
         st.gaming_manual = false;
         st.gaming_until = 0;
         assert!(!is_gaming_at(&st, 5000));
+    }
+
+    /// The user's manual OFF must end Game Mode even while the auto lease is live —
+    /// otherwise the sidebar toggle silently does nothing mid-game (the click only
+    /// cleared the latch and the lease kept gaming on).
+    #[test]
+    fn manual_off_withdraws_the_auto_lease() {
+        let mut st = SvcState::default();
+        let now = 1_000i64;
+        // Auto lease live, no latch: gaming is on.
+        apply_set_gaming(&mut st, true, false, now, 90);
+        assert!(is_gaming_at(&st, now));
+        // Manual OFF ends it now — both inputs cleared.
+        apply_set_gaming(&mut st, false, true, now, 90);
+        assert!(!is_gaming_at(&st, now));
+        assert_eq!(st.gaming_until, 0);
+
+        // Manual ON is a latch that outlives an auto off…
+        apply_set_gaming(&mut st, true, true, now, 90);
+        apply_set_gaming(&mut st, false, false, now, 90);
+        assert!(is_gaming_at(&st, now));
+        // …and an auto off never touches the latch.
+        assert!(st.gaming_manual);
     }
 
     /// A scheduled update cycle is suppressed while gaming (but the manual RunUpdatesNow

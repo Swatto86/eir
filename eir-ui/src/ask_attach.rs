@@ -155,7 +155,16 @@ fn as_text(bytes: &[u8]) -> Option<String> {
     if bytes.contains(&0) {
         return None;
     }
-    let text = std::str::from_utf8(bytes).ok()?;
+    // The capped read can cut a multi-byte char at the boundary; `error_len() == None`
+    // means "incomplete sequence at end of input" — accept the valid prefix instead of
+    // rejecting the whole file as binary. Any other error is real non-UTF-8 → binary.
+    let text = match std::str::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(e) if e.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or_default()
+        }
+        Err(_) => return None,
+    };
     Some(text.chars().take(MAX_TEXT_FILE_CHARS).collect())
 }
 
@@ -212,6 +221,11 @@ mod tests {
     fn binary_bytes_are_rejected_as_text() {
         assert!(as_text(b"hello\x00world").is_none());
         assert_eq!(as_text(b"plain text").as_deref(), Some("plain text"));
+        // Mid-sequence garbage is binary…
+        assert!(as_text(b"ab\xFF\xFEcd").is_none());
+        // …but a multi-byte char cut at the read cap is a truncation, not a binary file:
+        // keep the valid prefix ("é" is 0xC3 0xA9 — drop the dangling 0xC3).
+        assert_eq!(as_text(b"caf\xC3").as_deref(), Some("caf"));
     }
 
     #[test]
