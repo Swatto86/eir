@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.27.4. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.27.5. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.27.4. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-18 | Eir | v0.27.5 live-incident fixes: claude CLI resolution + restart resilience | A real settings-save (kilo_cli → claude_cli) surfaced two defects. (1) `resolve_claude_binary` only knew the native installer's `.local\bin\claude.exe`; an npm-installed CLI fell back to bare `claude`, which LocalSystem's PATH can't resolve — every AI call failed with "Failed to spawn the claude CLI". Now probes npm's bundled exe (`AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe`) and the `claude.cmd` shim, mirroring the kilo resolver; precedence unit-tested. (2) The settings-restart helper stopped the service but never brought it back (~2m40s outage until a manual reinstall); the helper's spawn result was swallowed, it retried `sc start` for only ~10s, and left no trace. Now: helper output redirects to `eir-restart.log`, start retries every 5s over a 60s window, spawn result is logged, and a spawn *failure* keeps the service alive on the old settings instead of stopping with nothing to start it again. Root cause of the original non-return was not recoverable from evidence (SCM event logging is minimal on the machine); the log file makes any recurrence diagnosable.
 
 2026-07-10 | Eir | v0.27.4 bug sweep of the v0.26–v0.27.3 features | Single focused review of the post-v0.25.4 diff (Game Mode, Ask attachments/scope guard, learning-loop attribution, approval dedup), each finding verified against the documented design before fixing. Fixed: manual Game Mode OFF was a no-op while the auto-detector's lease was live (only the latch cleared; `apply_set_gaming` extracted pure + tested, manual off now withdraws the lease — matching ARCHITECTURE's stated behaviour); `#game-btn` missing from the `svc-down` freeze list; Ask attachments silently lost when the service's 15 s rate limit rejected a quick follow-up (tray consumes attachments on queue over the ack-less pipe — `submitAsk` now mirrors the guard client-side); `as_text` rejected a >1 MiB attachment as binary when the capped read cut a multi-byte UTF-8 char (incomplete-final-sequence now keeps the valid prefix). Accepted residuals documented in ARCHITECTURE (powercfg task-ordering race on rapid double-toggle; few-second lease-lapse window). Gate green (fmt / clippy --all-targets / 220 tests / node --check / version-sync); fixes are compile+unit-verified, not live-exercised.
 

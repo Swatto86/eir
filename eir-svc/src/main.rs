@@ -365,23 +365,53 @@ fn updater_due(enabled: bool, interval_secs: i64, last_run: i64, st: &SvcState, 
 /// `ping` delay with unconditional `&` chaining could fire `sc start` while the
 /// service was still STOP_PENDING (in-flight execution / updater cycle), which fails
 /// and leaves the service stopped with nothing to retry.
-fn restart_self() {
+/// Returns false if the helper could not be spawned — the caller must then
+/// stay alive (a stop with no helper running means nothing ever starts us
+/// again; that failure mode is exactly a "service lost" incident).
+///
+/// The helper redirects all its streams to `eir-restart.log` next to the exe:
+/// by the time a restart has gone wrong this process is gone, so that file is
+/// the only evidence of what `sc` said. It waits for the service to reach
+/// STOPPED (up to 60s; a missing service also exits the wait), then retries
+/// `sc start` every 5s over a 60s window, checking for Running every second —
+/// wide enough to ride out a lingering old process or transient SCM refusal.
+#[must_use]
+fn restart_self() -> bool {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const SCRIPT: &str = "sc.exe stop EirSvc | Out-Null; \
+    let log = config::resolve("eir-restart.log");
+    let script = format!(
+        "& {{ Get-Date -Format o; \
+         sc.exe stop EirSvc; \
          $d=(Get-Date).AddSeconds(60); \
-         while((Get-Date) -lt $d){ \
-             if((Get-Service EirSvc -ErrorAction SilentlyContinue).Status -eq 'Stopped'){break}; \
-             Start-Sleep -Milliseconds 500 }; \
-         for($i=0;$i -lt 5;$i++){ \
-             sc.exe start EirSvc | Out-Null; \
-             Start-Sleep -Seconds 1; \
-             if((Get-Service EirSvc -ErrorAction SilentlyContinue).Status -eq 'Running'){break} }";
-    let _ = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+         while((Get-Date) -lt $d){{ \
+             $s=(Get-Service EirSvc -ErrorAction SilentlyContinue).Status; \
+             if($null -eq $s -or $s -eq 'Stopped'){{break}}; \
+             Start-Sleep -Milliseconds 500 }}; \
+         for($i=0;$i -lt 60;$i++){{ \
+             if((Get-Service EirSvc -ErrorAction SilentlyContinue).Status -eq 'Running'){{break}}; \
+             if($i % 5 -eq 0){{ sc.exe start EirSvc }}; \
+             Start-Sleep -Seconds 1 }}; \
+         Get-Date -Format o; \
+         Get-Service EirSvc -ErrorAction SilentlyContinue | Format-List Name,Status,StartType }} \
+         *> '{}'",
+        log.display()
+    );
+    match std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-        .spawn();
+        .spawn()
+    {
+        Ok(child) => {
+            info!(helper_pid = child.id(), "Restart helper spawned");
+            true
+        }
+        Err(e) => {
+            error!("Failed to spawn restart helper: {e}");
+            false
+        }
+    }
 }
 
 fn build_status(st: &SvcState) -> StatusPayload {
@@ -1865,8 +1895,17 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                         st.status = "Restarting".to_string();
                                         st.error = None;
                                         pipe.broadcast_status(build_status(&st));
-                                        restart_self();
-                                        return; // SCM stop will follow; exit cleanly now
+                                        if restart_self() {
+                                            return; // SCM stop will follow; exit cleanly now
+                                        }
+                                        // No helper running means nothing would ever
+                                        // start us again — stay alive on the old
+                                        // settings instead of stopping into the void.
+                                        st.status = resting_status(&st);
+                                        st.error = Some(
+                                            "Settings saved, but the restart helper failed to launch — restart the EirSvc service manually to apply them.".to_string(),
+                                        );
+                                        pipe.broadcast_status(build_status(&st));
                                     }
                                     Err(e) => {
                                         error!("Failed to save settings: {e}");

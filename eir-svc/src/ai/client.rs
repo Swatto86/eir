@@ -1245,16 +1245,28 @@ fn resolve_user_profile(configured: Option<&str>) -> Option<String> {
 }
 
 /// Resolve the path to the `claude` binary. Uses the configured value when set,
-/// otherwise looks for the standard install location under the resolved user
-/// profile, and finally falls back to "claude" (must then be on PATH).
+/// otherwise tries the known install locations under the resolved user profile —
+/// the native installer's `.local\bin\claude.exe`, then an npm install's bundled
+/// exe (`npm i -g @anthropic-ai/claude-code` — the target its `claude.cmd` shim
+/// dispatches to), then that shim itself (covers package-layout drift; the shim
+/// is npm's stable entry point). All full paths, because the per-user install
+/// dirs are not on LocalSystem's PATH. Finally falls back to bare "claude"
+/// (must then be on PATH — interactive/dev use).
 fn resolve_claude_binary(configured: Option<&str>, user_profile: Option<&str>) -> String {
     if let Some(p) = configured.filter(|p| is_real(p)) {
         return p.trim().to_string();
     }
     if let Some(up) = user_profile {
-        let candidate = format!("{up}\\.local\\bin\\claude.exe");
-        if std::path::Path::new(&candidate).is_file() {
-            return candidate;
+        for candidate in [
+            format!("{up}\\.local\\bin\\claude.exe"),
+            format!(
+                "{up}\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe"
+            ),
+            format!("{up}\\AppData\\Roaming\\npm\\claude.cmd"),
+        ] {
+            if std::path::Path::new(&candidate).is_file() {
+                return candidate;
+            }
         }
     }
     "claude".into()
@@ -1624,6 +1636,42 @@ mod tests {
         assert_eq!(claude_cli_model("opus"), "opus");
         assert_eq!(claude_cli_model("claude-opus-4-8"), "claude-opus-4-8");
         assert_eq!(claude_cli_model("openrouter/free"), "haiku");
+    }
+
+    #[test]
+    fn claude_binary_resolution_prefers_real_installs() {
+        // Configured value wins outright; placeholder is ignored.
+        assert_eq!(
+            resolve_claude_binary(Some("D:\\tools\\claude.exe"), None),
+            "D:\\tools\\claude.exe"
+        );
+        assert_eq!(
+            resolve_claude_binary(Some("C:\\Users\\YourName\\claude.exe"), None),
+            "claude"
+        );
+        // With a profile, candidates are probed in order: native installer,
+        // npm bundled exe, npm shim; missing all → bare "claude".
+        let root = std::env::temp_dir().join(format!("eir-claude-resolve-{}", std::process::id()));
+        let up = root.to_string_lossy().into_owned();
+        assert_eq!(resolve_claude_binary(None, Some(&up)), "claude");
+        let npm_exe = root.join(
+            "AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe",
+        );
+        std::fs::create_dir_all(npm_exe.parent().unwrap()).unwrap();
+        std::fs::write(&npm_exe, b"x").unwrap();
+        assert_eq!(
+            resolve_claude_binary(None, Some(&up)),
+            npm_exe.to_string_lossy()
+        );
+        // Native installer path outranks the npm exe.
+        let native = root.join(".local\\bin\\claude.exe");
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        std::fs::write(&native, b"x").unwrap();
+        assert_eq!(
+            resolve_claude_binary(None, Some(&up)),
+            native.to_string_lossy()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
