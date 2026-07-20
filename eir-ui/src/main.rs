@@ -72,8 +72,36 @@ fn default_autostart_enabled() -> bool {
     true
 }
 
+/// Migrate legacy reverse-DNS app-folder (`co.swatto.eir`) to the friendly
+/// `Eir` folder under the user's config directory. The global Tauri standard
+/// stores app state under `<AppName>`, not the bundle identifier. This is a
+/// one-time rename on startup when the new folder is absent, so existing
+/// users keep their preferences (notably the autostart setting).
+fn migrate_app_folder(handle: &AppHandle) -> Result<(), String> {
+    let old_dir = handle.path().app_config_dir().map_err(|e| e.to_string())?;
+    let new_dir = handle
+        .path()
+        .config_dir()
+        .map_err(|e| e.to_string())?
+        .join("Eir");
+    if old_dir.exists() && !new_dir.exists() {
+        fs::rename(&old_dir, &new_dir).map_err(|e| {
+            format!(
+                "Migrate app folder from '{}' to '{}': {e}",
+                old_dir.display(),
+                new_dir.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn preferences_path(handle: &AppHandle) -> Result<PathBuf, String> {
-    let dir = handle.path().app_config_dir().map_err(|e| e.to_string())?;
+    let dir = handle
+        .path()
+        .config_dir()
+        .map_err(|e| e.to_string())?
+        .join("Eir");
     fs::create_dir_all(&dir).map_err(|e| format!("Create config directory: {e}"))?;
     Ok(dir.join(UI_PREFERENCES_FILE))
 }
@@ -768,6 +796,12 @@ fn main() {
         .setup(move |app| {
             let icon_base = Arc::new(decode_icon());
             let start_hidden = launched_hidden();
+
+            // One-time move of legacy reverse-DNS config folder to the friendly `Eir`
+            // folder. Run before anything reads/writes preferences.
+            if let Err(e) = migrate_app_folder(app.handle()) {
+                warn!("Could not migrate app folder: {e}");
+            }
 
             sync_autostart_on_startup(app.handle());
 
