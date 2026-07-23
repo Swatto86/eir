@@ -121,10 +121,9 @@ native_enabled = true
 #   "allow_unsigned"           — run regardless of signature (least safe)
 native_signature_policy = "require_valid"
 
-# Safety/cost caps.
+# Safety caps.
 max_attempts_per_app = 3      # methods tried per app before giving up
 max_apps_per_run = 20         # apps acted on per cycle
-budget_usd_per_run = 0.50     # AI spend ceiling per cycle (0 = no explicit ceiling)
 max_installer_mb = 256        # largest native installer to download
 
 # Auto-install a missing package manager (Chocolatey/Scoop) when a method needs it.
@@ -144,9 +143,10 @@ ignored = []
 # ── Advisor mode (AI self-tunes its reasoning) ────────────────────────────────
 # When the AI flags a hard/ambiguous situation (or its confidence is low), Eir can
 # re-analyse ONCE at a higher reasoning effort and/or a stronger model — cheap/fast
-# for routine cycles, deeper only when it matters — bounded by a daily spend cap.
-# The escalation tier is fixed config (never AI-chosen); the AI only gets to say
-# "I'm not sure, look harder". Off by default. Editable in the app's Settings.
+# for routine cycles, deeper only when it matters. The escalation tier is fixed
+# config (never AI-chosen); the AI only gets to say "I'm not sure, look harder".
+# A hard count cap (24/day) remains the only backstop. Off by default. Editable in
+# the app's Settings.
 [advisor]
 enabled = false
 
@@ -157,6 +157,3 @@ escalation_effort = ""              # low|medium|high|xhigh|max (blank = keep ba
 
 # Escalate when the best reported confidence is below this (0.0–1.0).
 low_confidence_threshold = 0.6
-
-# Cap on escalation AI spend per day (USD); 0 = no explicit cap.
-budget_usd_per_day = 0.50

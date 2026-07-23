@@ -65,9 +65,6 @@ pub struct UpdaterConfig {
     pub max_attempts_per_app: u32,
     /// Max apps acted on in a single cycle (bounds cost and blast radius).
     pub max_apps_per_run: u32,
-    /// AI spend ceiling (USD) per cycle; 0 = no explicit ceiling (still bounded by
-    /// the attempt caps).
-    pub budget_usd_per_run: f64,
     /// Largest native installer to download, in MiB.
     pub max_installer_mb: u64,
     /// Auto-install a missing package manager (Chocolatey/Scoop) when a method
@@ -121,7 +118,6 @@ impl Default for UpdaterConfig {
             native_signature_policy: SignaturePolicy::default(),
             max_attempts_per_app: 3,
             max_apps_per_run: 20,
-            budget_usd_per_run: 0.50,
             max_installer_mb: 256,
             bootstrap_managers: true,
             ignored: Vec::new(),
@@ -164,6 +160,6 @@ mod tests {
         assert_eq!(back.enabled, cfg.enabled);
         assert_eq!(back.methods, cfg.methods);
         assert_eq!(back.native_signature_policy, cfg.native_signature_policy);
-        assert_eq!(back.budget_usd_per_run, cfg.budget_usd_per_run);
+        assert_eq!(back.max_apps_per_run, cfg.max_apps_per_run);
     }
 }

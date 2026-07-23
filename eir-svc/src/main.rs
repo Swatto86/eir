@@ -28,6 +28,7 @@ use models::{
 use sqlx::SqlitePool;
 use std::{
     collections::{HashSet, VecDeque},
+    ffi::OsString,
     path::PathBuf,
 };
 use tokio::time::{interval, Duration};
@@ -152,9 +153,10 @@ fn install_service() {
         .expect("Failed to create service");
     svc.set_description("Autonomous Windows system repair agent powered by AI")
         .expect("Failed to set description");
-    println!("{SERVICE_NAME} installed successfully.");
-    println!("Start it with:  sc start {SERVICE_NAME}");
-    println!("Stop it with:   sc stop {SERVICE_NAME}");
+    svc.start(&[] as &[OsString])
+        .expect("Failed to start service");
+    println!("{SERVICE_NAME} installed and started.");
+    println!("Stop it with: sc stop {SERVICE_NAME}");
 }
 
 fn uninstall_service() {
@@ -462,12 +464,12 @@ const MAX_ESCALATIONS_PER_DAY: u32 = 24;
 
 /// Decide whether the advisor should re-analyse at a higher tier, and why. Pure.
 /// Returns `Some(reason)` to escalate. Bounded: it fires only when advisor mode is on,
-/// a deeper tier is configured, neither the per-day count cap nor the USD budget is
-/// spent, AND the agent flagged ambiguity or the best confidence is below the threshold.
+/// a deeper tier is configured, the per-day count cap is not spent, AND the agent
+/// flagged ambiguity or the best confidence is below the threshold.
 fn should_escalate(
     decision: &models::ClaudeDecision,
     cfg: &config::AdvisorConfig,
-    spent_today: f64,
+    _spent_today: f64,
     escalations_today: u32,
 ) -> Option<&'static str> {
     if !cfg.enabled {
@@ -478,9 +480,6 @@ fn should_escalate(
         return None;
     }
     if escalations_today >= MAX_ESCALATIONS_PER_DAY {
-        return None;
-    }
-    if cfg.budget_usd_per_day > 0.0 && spent_today >= cfg.budget_usd_per_day {
         return None;
     }
     if decision.needs_deeper_analysis {
@@ -3124,7 +3123,6 @@ mod advisor_tests {
             escalation_model: "opus".into(),
             escalation_effort: String::new(),
             low_confidence_threshold: 0.6,
-            budget_usd_per_day: 0.50,
         }
     }
 
@@ -3162,9 +3160,7 @@ mod advisor_tests {
     }
 
     #[test]
-    fn budget_count_and_missing_tier_block_escalation() {
-        // Over the daily USD budget -> don't, even with the AI flag.
-        assert!(should_escalate(&decision(true, &[]), &cfg(true), 0.50, 0).is_none());
+    fn count_and_missing_tier_block_escalation() {
         // At the per-day escalation COUNT cap -> don't (the provider-agnostic backstop,
         // even though spend is 0, e.g. a provider that reports no cost).
         assert!(should_escalate(

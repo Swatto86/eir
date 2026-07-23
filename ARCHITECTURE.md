@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-23 · **Release:** v0.29.3
+**Last updated:** 2026-07-24 · **Release:** v0.30.0
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -76,9 +76,9 @@ Eir is a single Cargo workspace (`resolver = "2"`) with three crates, plus a sta
 |-------|-------|--------|----------------|
 | `eir-proto` | shared/contract | (lib) | Wire types for the UI↔service named-pipe protocol (serde, snake_case). Pure types, no I/O. Depended on by both other crates (`eir-proto = { path = "../eir-proto" }`). |
 | `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service: signal collection, AI client, policy, execution, autonomous updater, SQLite audit DB. Heavy `windows` 0.58 feature set. |
-| `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), tracing. `build-dependencies`: `tauri-build` 2. |
+| `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), `windows-service` 0.7 (SCM queries + install from About), tracing. `build-dependencies`: `tauri-build` 2. |
 
-All three crates are versioned in lockstep — currently `0.25.1` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
+All three crates are versioned in lockstep — currently `0.30.0` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
 
 The dependency graph is acyclic and points inward: `eir-proto` depends on nothing internal; `eir-svc` and `eir-ui` each depend only on `eir-proto`. The UI and service never link against each other — they are separate processes coupled solely through the `eir-proto` wire contract over `\\.\pipe\EirSvc`.
 
@@ -245,7 +245,7 @@ Commands (`main.rs:28-112`, plus `util.rs`):
 - `set_advisor_settings(AdvisorSettingsUpdate)` → `SetAdvisorSettings`.
 - `get_autostart_enabled` / `set_autostart_enabled { enabled }` — UI-local commands backed by `tauri-plugin-autostart`; they never cross the service pipe.
 - `ask_eir { question }`, `clear_ask`, `scan_disk`, `clean_disk_entry { id }`, `scan_startup`, `set_startup_entry { id, enable }` (v0.24.0 / v0.29.0) — the on-demand-tools commands, each a fire-and-forget `UiMsg` (`AskEir`/`ClearAsk`/`ScanDisk`/`CleanDiskEntry`/`ScanStartup`/`SetStartupEntry`). The clean/toggle commands carry only an opaque id; the service reconstructs the action from its own last-scan state.
-- `get_app_version` (About view; reads the package version from the build) and `check_updates_now` (About view's on-demand update check — installs and relaunches when a newer signed release exists; guarded by a shared `UPDATE_IN_PROGRESS` AtomicBool so it can't race the 6-hourly background checker into two concurrent installers) — UI-local.
+- `get_app_version` (About view; reads the package version from the build), `get_service_state`/`install_service` (About view queries SCM and can re-run the bundled `eir-svc.exe install` elevated), and `check_updates_now` (About view's on-demand update check — installs and relaunches when a newer signed release exists; guarded by a shared `UPDATE_IN_PROGRESS` AtomicBool so it can't race the 6-hourly background checker into two concurrent installers) — UI-local.
 - `util::gbp_per_usd` (USD→GBP rate via a hidden PowerShell `Invoke-RestMethod`, with a `0.79` offline fallback) and `util::open_url` (validates `http(s)://` then `Start-Process`) — UI-local helpers, not pipe traffic (`util.rs`).
 
 Every service-facing command is `async`, first calls `ensure_connected` (v0.24.1), then sends one `UiMsg` on `UiCmdTx`, mapping a send error to `Err(String)`. Those commands are **fire-and-forget**: a successful send means "queued to the pipe writer," not "applied by the service." The UI observes the effect only on the next polled snapshot. `get_status`, the autostart commands, and `util::*` are UI-local and do not use the pipe.
@@ -267,7 +267,7 @@ The frontend was fully rebuilt in v0.17 (still hand-written vanilla HTML/CSS/JS,
 - **Dashboard** shows a status hero (colour-keyed to the service state, with a plain-English headline from `STATUS_META` and the error line), CPU/memory/disk gauge cards, a pending-approvals call-to-action, "What the agent is thinking" (analysis + advisor badges), AI usage, and failed-services chips.
 - **Theming**: dark / light / **system** (follows `prefers-color-scheme` live), persisted in `localStorage`, applied via `data-theme` on `<html>` with CSS-variable palettes.
 - **Native feel**: the webview context menu is suppressed globally (`contextmenu` → `preventDefault`), chrome is `user-select: none` with content opted back in, and there are no native browser dialogs.
-- **About view**: version from `get_app_version`, GitHub link via `util::open_url`, and an on-demand `check_updates_now`.
+- **About view**: version from `get_app_version`; service version from `get_service_version` via the cached pipe status; SCM state from `get_service_state`, with an `install_service` button offered when the service is not installed; GitHub link via `util::open_url`; and an on-demand `check_updates_now`.
 - **Poll cadence**: `refresh()` calls `get_status` and re-renders on `setInterval(..., 2000)` — a 2s poll of the *local cache* (no pipe round-trip per poll). `gbp_per_usd` is fetched once at load.
 - **Render churn guards**: every list/text renderer that holds user-selectable content only mutates the DOM when its data changed — list renderers (`renderApprovals`, `renderActivity`, `renderLearned`, `renderUpdater`, `renderAsk`, `renderDisk`, `renderStartup`, `renderUsage`) compare a JSON **signature** and return early when unchanged; single text nodes use the `setText(el, v)` helper (writes only on change). Without this the 2s poll wipes an in-progress text selection and kills tooltips. Because the guards freeze the built HTML, relative ages are emitted as `<span data-ts="…">` and a single sweep at the end of `refreshInner` (`document.querySelectorAll('[data-ts]')`) re-ticks them each poll, so an approval that has sat for hours stops reading "just now" (v0.24.1). `ago(0)` → `''` keeps a zero timestamp blank.
 - **Disconnected state**: `refreshInner` toggles a `svc-down` body class for the `ServiceDisconnected`/`Connecting`/`Restarting` states; CSS then greys and blocks pointer events on action buttons (approve/reject, scans, update-now, pause, per-row toggles) and dims the stale metric/history cards, so a click can't be silently dropped. The Rust `ensure_connected` gate is the authoritative backstop (v0.24.1).
@@ -491,15 +491,15 @@ Each streaming path surfaces mid-stream provider errors instead of returning emp
 
 ### Advisor escalation tiers (`main.rs` + `config.rs`)
 
-`AdvisorConfig` (`config.rs:26-50`): `enabled` (default false), `escalation_model`, `escalation_effort`, `low_confidence_threshold` (default 0.6, clamped 0.0–0.95 on update), `budget_usd_per_day` (default $0.50). Effort is normalised to `low|medium|high|xhigh|max` or empty (`config.rs:156-161`). The tier is **fixed config, never AI-chosen**.
+`AdvisorConfig` (`config.rs:26-50`): `enabled` (default false), `escalation_model`, `escalation_effort`, `low_confidence_threshold` (default 0.6, clamped 0.0–0.95 on update). Effort is normalised to `low|medium|high|xhigh|max` or empty (`config.rs:156-161`). The tier is **fixed config, never AI-chosen**.
 
-`should_escalate` (`main.rs:271-302`) is pure and returns `Some(reason)` only when **all** hold: advisor enabled; at least one lever set (model or effort); `escalations_today < MAX_ESCALATIONS_PER_DAY` (24, `main.rs:265`); `budget_usd_per_day` not yet spent (when > 0); **and** either `needs_deeper_analysis` is true ("ambiguous") or there is at least one problem whose max confidence is below `low_confidence_threshold` ("confidence was low"). A healthy/empty result never escalates.
+`should_escalate` (`main.rs:271-302`) is pure and returns `Some(reason)` only when **all** hold: advisor enabled; at least one lever set (model or effort); `escalations_today < MAX_ESCALATIONS_PER_DAY` (24, `main.rs:265`); **and** either `needs_deeper_analysis` is true ("ambiguous") or there is at least one problem whose max confidence is below `low_confidence_threshold` ("confidence was low"). A healthy/empty result never escalates.
 
 Escalation flow (`main.rs:1122-1179`): runs the base `analyze` first, then at most one deeper `analyze_with(..., Some(escalation_model), Some(escalation_effort))`. The attempt is counted **before** the call (`advisor_escalations_today += 1`, `main.rs:1147`) so a failing escalation can't retry every cycle and defeat the cap. On success the deeper `ClaudeDecision` **replaces** the base one. The day-counters (`advisor_spent_today`, `advisor_escalations_today`, `advisor_spend_date`) reset on a UTC date change (`main.rs:1124-1129`).
 
 ### Usage / cost accounting
 
-Per-provider usage extraction in `client.rs`: OpenRouter reads a streamed final usage chunk (prompt/completion tokens + `cost` USD where reported); Anthropic native parses token counts from the SSE events and **estimates** cost from list pricing; the Claude CLI reports its envelope usage including cache tokens and the equivalent API cost (no actual charge — subscription); the Kilo CLI reports its NDJSON `step_finish` tokens and cost the same way (also no actual charge — subscription; cost may be absent on some event shapes → 0). Both base and escalation calls log via `audit::log_usage` into the `usage_log` table and refresh `audit::usage_summary` (24h + 7d aggregate of calls/tokens/cost) into broadcast status. Escalation cost additionally accrues to `advisor_spent_today`, which is what the budget cap reads — the USD budget bounds Anthropic (estimated), OpenRouter (reported) and both CLIs (equivalent-cost figure); a CLI call with no cost in its event stream falls back to the 24/day count cap.
+Per-provider usage extraction in `client.rs`: OpenRouter reads a streamed final usage chunk (prompt/completion tokens + `cost` USD where reported); Anthropic native parses token counts from the SSE events and **estimates** cost from list pricing; the Claude CLI reports its envelope usage including cache tokens and the equivalent API cost (no actual charge — subscription); the Kilo CLI reports its NDJSON `step_finish` tokens and cost the same way (also no actual charge — subscription; cost may be absent on some event shapes → 0). Both base and escalation calls log via `audit::log_usage` into the `usage_log` table and refresh `audit::usage_summary` (24h + 7d aggregate of calls/tokens/cost) into broadcast status. Escalation cost additionally accrues to `advisor_spent_today` for visibility, but the only remaining escalation backstop is the hard 24/day count cap.
 
 ### Web-search path (used by the updater, not monitoring)
 
@@ -625,7 +625,7 @@ One full cycle is `run_cycle` (`orchestrator.rs:303`), driven from `main.rs:307`
 
 1. **Determine available methods** — `available_methods` (`orchestrator.rs:207`): a method is usable only if enabled in config AND present on the machine. winget via `detect::winget_path` (`detect.rs`), which checks the PATH alias first, then resolves the real MSIX exe under `C:\Program Files\WindowsApps`, and finally falls back to `Get-AppxPackage -AllUsers` (PowerShell) when the folder itself is not listable as SYSTEM; choco via its ProgramData path (bootstrapped through the official install.ps1 if `bootstrap_managers` and missing — `detect.rs:61`); scoop only if a logged-in user already has it (never installed as SYSTEM); msstore reuses winget; `Native` is offered only when `native_enabled` and an AI client exists.
 2. **Collect candidates** — `check::collect` (`check.rs:97`). Each enabled manager lists its updates (`winget upgrade`, `choco outdated -r`, `scoop status`, `winget upgrade --source msstore`). Results are de-duplicated by app identity via `push_candidate` (`check.rs:66`): earlier (more-preferred) managers win, the id is `clean_app_name(name).to_lowercase()`, and `should_skip` / the seen-set drop ignored/duplicate apps. When a primary manager handles the app, the native installer is appended as a self-healing fallback method (unless the primary already is native). Then an **AI web-search pass** over apps no manager covers (`check_unmanaged`, `check.rs:244`) produces native-only candidates. The unmanaged inventory is now independent of winget: `inventory::list_installed` (`inventory.rs`) enumerates the HKLM + Wow6432Node + per-user Uninstall registry keys, and the result is merged with `winget list` when winget is present. If winget is missing or the AI/native path is disabled, a UI note explains the degraded coverage instead of staying silent.
-3. **Heal each candidate** (bounded by `max_apps_per_run` and the per-run `budget_usd_per_run`) — `heal` (`orchestrator.rs:134`).
+3. **Heal each candidate** (bounded by `max_apps_per_run` and `max_attempts_per_app`) — `heal` (`orchestrator.rs:134`).
 4. **Record** every attempt to the `update_attempts` table under `cycle_id` (`history::record_attempts`).
 
 `CheckResult`/`CycleSummary` carry candidates, per-cycle AI cost, and human notes (truncation, AI-check failures, budget stop). `app_rows` (`orchestrator.rs:248`) flattens each candidate's attempts into one UI row, the winning attempt (first success, else last) deciding state: `verified` / `installed` / `failed` / `skipped`.
@@ -636,7 +636,7 @@ One full cycle is `run_cycle` (`orchestrator.rs:303`), driven from `main.rs:307`
 
 - `dispatch` (`orchestrator.rs:52`) applies any allow-listed remedy (`KillProcess` → sanitised `taskkill /IM <name> /F`, or `Force`) then calls the method adapter.
 - `decide_next` (`orchestrator.rs:111`): when an AI client is configured it calls `diagnose::diagnose` (the diagnostician), otherwise the deterministic ladder `next_method`.
-- **The AI is bounded twice**: a paid `Native` attempt never *starts* once the app's AI spend reaches `budget_remaining` (`orchestrator.rs:159`), and AI diagnosis is paid for only while under budget — otherwise the free deterministic next step is taken (`orchestrator.rs:180`). `app_spent` tracks spend within a single app's heal so the per-run budget is a true ceiling.
+- **The AI is bounded by attempt caps**: `max_attempts_per_app` limits how many methods are tried per app, and `max_apps_per_run` limits how many apps are acted on per cycle. `decide_next` is called to choose the next method after a non-terminal failure (`orchestrator.rs:180`).
 - **Reboot is never taken unattended**: a `RetryAfterReboot` remedy ends the heal (defer) rather than rebooting (`orchestrator.rs:195`).
 
 **Rust always has the final say.** The AI diagnostician (`diagnose.rs`) is shown the *real* captured error, the failure category (classified by Rust, not the AI), and the tried/available methods, and proposes ONE `ProposedStep`. `validate_next_step` (`domain.rs:238`) disposes: an integrity-terminal failure always gives up; a `Switch` target must be available and untried; a `Retry` remedy must fit the method and failure (`remedy_ok`, `domain.rs:269`) — e.g. `Force` only on winget/choco, `ClearManagerLock` only on choco/scoop, `KillProcess` only when the name appears as a whole token of the error text; anything invalid falls back to `deterministic_next`. A malformed AI reply collapses to GiveUp, which the validator then turns into the deterministic step, so a bad reply never strands an app.
@@ -862,7 +862,7 @@ So the entire closed loop is: execute → record before → next-cycle record af
 - **`apply_update(SettingsUpdate)`** applies a UI edit: blank/None secret fields **keep the stored value** (the `keep` closure), so the UI never needs to re-send keys it can't read back. Intervals are floored (`decision ≥10`, event-log `≥5`, wmi `≥30`); `confidence_threshold` is clamped to `0.50–0.95`; `effort` is `normalize_effort`'d to one of low|medium|high|xhigh|max or empty. `ApiProvider::parse` maps `claude_cli`/`openrouter`/`kilo_cli` (plus legacy aliases, including the removed gateway provider's `kilocode`/`kilo` tokens now folding into `kilo_cli`) and defaults anything else to Anthropic; the serde attributes on `ApiProvider` alias the removed `openai_compatible` token to Anthropic so a pre-0.17 config.toml still loads (its now-unknown extra keys are ignored by the toml loader — covered by `removed_provider_aliases_to_anthropic`; the `claude_cli` provider is first-class again as of v0.18, round-trip covered by `claude_cli_provider_round_trips_with_no_key_or_model`; the `kilocode` → `kilo_cli` alias is covered by `kilocode_provider_alias_loads_as_kilo_cli`).
 - **Settings save hot-applies or restarts as needed.** In the loop (`main.rs:802`), an `UpdateSettings` message is validated by constructing an `AiClient` first (rejecting e.g. a keyless provider, reloading the prior config on failure so the service isn't bricked). A pure `settings_update_needs_restart` diff decides whether the changed fields require a process restart (only collector spawn parameters: event-log channels, event-log/WMI poll intervals, log directories). If so, `config::save` + `restart_self()`; if the helper fails to spawn the service stays alive on the old settings. Otherwise the new AI client, policy confidence threshold, and decision ticker are applied live without restart.
 
-`AdvisorConfig` (`config.rs:26`) has its own `to_view`/`apply_view` with the same clamping discipline (threshold clamped `0.0–0.95`, budget `≥0`). It is config-only and not stored in the DB.
+`AdvisorConfig` (`config.rs:26`) has its own `to_view`/`apply_view` with the same clamping discipline (threshold clamped `0.0–0.95`). It is config-only and not stored in the DB.
 
 ---
 
@@ -897,7 +897,7 @@ A two-tier hybrid, shipped deterministic-first:
   audit tables form *learned facts*; Rust validates and persists them; four existing
   decision seams consult them. The AI is **not** in the learning write-path.
 - **Tier 2 (Phase 5, optional):** a bounded AI labeller (under the existing advisor
-  per-day/USD budget) may attach a plain-English explanation or a *strictly narrower*
+  per-day count cap) may attach a plain-English explanation or a *strictly narrower*
   scope to a fact Rust already derived. It can never create, widen, change the kind of,
   or enable anything — exactly mirroring advisor mode (the AI advises; Rust gates).
 
@@ -1127,8 +1127,7 @@ chatbot burning the user's AI budget. A carve-out keeps the PC's own software/ap
 questions explicitly in scope (no over-refusal). It's a **soft** guard (a prompt instruction, no
 classifier) — proportionate for a single-user tool; a determined user can still reframe an
 off-topic ask, which is a non-issue (self-inflicted). The only other Ask throttle remains the
-15 s inter-question rate limit + 1000-char cap; there is still no per-day Ask spend cap
-(deferred — the advisor's escalation path is the only USD-budgeted AI call).
+15 s inter-question rate limit + 1000-char cap; there is still no per-day Ask cap.
 
 **Added in v0.27.0 (Ask Eir attachments):** Ask Eir can now take file, folder, and image
 attachments for context.
@@ -1404,7 +1403,7 @@ service's actual config-shaped strings + auth failures, after a sweep showed bar
 - New **`sfc_scan`** / **`dism_restore_health`** actions (approval-gated, never whitelisted, own long timeout).
 - `system_state_history` is now read: a resource-**trend** note (disk filling, sustained CPU/mem rise) is folded into the prompt context.
 - New **weekly health digest** (one bounded AI call over aggregated audit counts; UI card + OS notification), and an **approval OS notification**.
-- Advisor day-counters are persisted (`advisor_daily_spend`), a **version-sync CI check** was added, and the stale root `tauri.conf.json`/`build.rs` were removed.
+- Advisor day-counters are persisted (`advisor_daily_spend`) for the escalation count backstop only (USD budget removed), a **version-sync CI check** was added, and the stale root `tauri.conf.json`/`build.rs` were removed.
 
 Current gaps surfaced while mapping each subsystem (the self-improvement plan above addresses several).
 
@@ -1457,7 +1456,7 @@ Current gaps surfaced while mapping each subsystem (the self-improvement plan ab
 - The prompt is a single monolithic format! string mixing schema, action catalogue, and ~110 lines of guardrail prose (prompt.rs:28-186); there is no prompt-level test verifying the action examples stay in sync with the FixAction enum tags.
 - No prompt caching is requested on the Anthropic native path (no cache_control breakpoints), so the large static guardrail prose is re-sent uncached every cycle on that provider — a cost-optimisation opportunity.
 - needs_deeper_analysis and the confidence threshold are the only escalation triggers; there is no escalation on outright AI-call failure or on a parse failure — those just error the cycle.
-- Advisor day-counters (spent_today / escalations_today) are in-memory process state reset only on a UTC date flip; they are not persisted, so a service restart resets the daily budget/count ceiling.
+- Advisor day-counters (spent_today / escalations_today) are in-memory process state reset only on a UTC date flip; the count ceiling is now the only backstop after budget removal.
 - The 'last 5 decision history' (prompt) and 'feedback last 10' windows are hard-coded at the call sites (main.rs:1023, feedback recent_summary(db,10)) rather than configurable.
 
 **Executor, policy, safety & explanations**

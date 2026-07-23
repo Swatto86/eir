@@ -28,6 +28,10 @@ use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::mpsc;
 use tracing::{error, warn};
+use windows_service::{
+    service::{ServiceAccess, ServiceState, ServiceStatus},
+    service_manager::{ServiceManager, ServiceManagerAccess},
+};
 
 // ── Managed state ─────────────────────────────────────────────────────────────
 
@@ -457,6 +461,80 @@ fn get_app_version(handle: AppHandle) -> String {
 #[tauri::command]
 fn get_service_version(status: State<'_, SharedStatus>) -> Option<String> {
     pipe_client::lock_status(&status).svc_version.clone()
+}
+
+/// Query the SCM directly for the Eir service state, independent of the pipe
+/// connection. Used by the About view to offer an Install button when the
+/// service is not registered.
+#[tauri::command]
+fn get_service_state() -> Result<String, String> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| format!("Service manager: {e}"))?;
+    let svc = match manager.open_service("EirSvc", ServiceAccess::QUERY_STATUS) {
+        Ok(s) => s,
+        // 1060 = ERROR_SERVICE_DOES_NOT_EXIST.
+        Err(windows_service::Error::Winapi(e)) if e.raw_os_error() == Some(1060) => {
+            return Ok("not_installed".to_string());
+        }
+        Err(e) => return Err(format!("Open service: {e}")),
+    };
+    let status: ServiceStatus = svc
+        .query_status()
+        .map_err(|e| format!("Query status: {e}"))?;
+    let state = match status.current_state {
+        ServiceState::Running => "running",
+        ServiceState::Stopped => "stopped",
+        ServiceState::StartPending => "starting",
+        ServiceState::StopPending => "stopping",
+        ServiceState::PausePending => "pausing",
+        ServiceState::Paused => "paused",
+        ServiceState::ContinuePending => "resuming",
+    };
+    Ok(state.to_string())
+}
+
+/// Install the bundled service binary. The installer has already placed
+/// `eir-svc.exe` next to the UI exe; this command re-runs that binary with
+/// the `install` verb elevated via a UAC prompt.
+#[tauri::command]
+async fn install_service() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("Current exe: {e}"))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "Could not resolve install directory".to_string())?;
+    let svc = dir.join("eir-svc.exe");
+    if !svc.exists() {
+        return Err(format!("Service binary not found: {}", svc.display()));
+    }
+
+    // Run PowerShell elevated and wait so the UI can refresh state once the
+    // service is registered and started.
+    let path = svc.to_string_lossy();
+    let quoted = path.replace('"', "\\\"");
+    let script = format!(
+        "Start-Process -Verb RunAs -FilePath \"{}\" -ArgumentList 'install' -Wait",
+        quoted
+    );
+    let status = tokio::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "hidden",
+            "-Command",
+            &script,
+        ])
+        .status()
+        .await
+        .map_err(|e| format!("Failed to launch installer: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "Service installer exited with code {}",
+            status.code().unwrap_or(-1)
+        ));
+    }
+    Ok("Service installed and started.".to_string())
 }
 
 /// On-demand update check for the About view. Installs and relaunches when a
@@ -973,6 +1051,8 @@ fn main() {
             set_advisor_settings,
             get_app_version,
             get_service_version,
+            get_service_state,
+            install_service,
             check_updates_now,
             get_autostart_enabled,
             set_autostart_enabled,

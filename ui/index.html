@@ -644,10 +644,8 @@
           </select>
           <label for="set-adv-conf">Escalate below confidence (%)</label>
           <input id="set-adv-conf" type="number" min="0" max="95" step="5" placeholder="60">
-          <label for="set-adv-budget">Daily escalation budget (USD)</label>
-          <input id="set-adv-budget" type="number" min="0" step="0.1" placeholder="0.50">
         </div>
-        <div class="set-note">The daily budget caps spend where cost is reported or estimated (OpenRouter, Anthropic). Where no cost is available, escalations are capped at <code>24/day</code> instead.</div>
+        <div class="set-note">Escalations are capped at <code>24/day</code> regardless of provider.</div>
         <div class="set-actions">
           <button class="btn" id="set-adv-save">Save advisor settings</button>
           <span class="set-status" id="set-adv-status"></span>
@@ -707,6 +705,7 @@
         </div>
         <div class="about-actions">
           <button class="btn" id="about-updates">Check for updates</button>
+          <button class="btn" id="about-install-svc" style="display:none">Install service</button>
           <button class="btn" id="about-github">GitHub</button>
           <span class="set-status" id="about-status"></span>
         </div>

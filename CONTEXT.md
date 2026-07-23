@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.29.3. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.30.0. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.29.3. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-24 | Eir | v0.30.0 installer service upgrade + About install button + budget removal | Three related changes. (1) The NSIS installer now explicitly `sc delete EirSvc` in PREINSTALL after stopping the existing service, so any prior registration is torn down before files are written; POSTINSTALL drops the now-redundant stop/uninstall and relies on the service's own `install` verb. (2) The service `install` verb now starts the service automatically after registering it, so fresh installs and the new UI install path don't need a separate `sc start`. (3) The About view queries SCM directly via a new `get_service_state` command and shows an "Install service" button when the service is not installed; `install_service` re-runs the bundled `eir-svc.exe install` elevated through a UAC prompt. (4) The advisor daily USD budget and updater per-run USD budget are removed entirely (fields, gates, settings UI, proto, config template); the hard 24-escalations/day count backstop remains. Spend visibility (usage card, "escalation spend today" chip) and unrelated caps (max apps/attempts per run, max installer size) are kept. Compile+unit-verified; installer/service-install-button paths are not live-exercised.
 
 2026-07-23 | Eir | v0.29.3 service-version observability + self-diagnosing winget note | After three winget-resolution fixes shipped without live LocalSystem verification, the persistent "winget not available" note was suspected to be a stale deployed binary rather than a code defect. Added `StatusPayload.svc_version` (service reports `CARGO_PKG_VERSION`), a UI About-box warning when it differs from the UI version, and `detect::winget_unavailability_reason` that threads the real resolver failure into the updater note. The generic fallback string is now only shown by pre-resolution service binaries, making stale deployments observable. Compile+unit-verified; not live-exercised as LocalSystem.
 
@@ -46,7 +48,7 @@ Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.j
 
 2026-06-26 | Eir | Self-improvement is conservative-only learned facts | Audit-derived learning may skip, deprioritise, suppress noise, or reduce confidence, but it cannot enable actions or raise confidence; this keeps local adaptation from expanding authority.
 
-2026-06-26 | Eir | Advisor mode is bounded escalation, not model-controlled policy | The AI may ask for deeper analysis or trigger low-confidence escalation, but Rust chooses the configured tier and enforces daily spend/attempt caps.
+2026-06-26 | Eir | Advisor mode is bounded escalation, not model-controlled policy | The AI may ask for deeper analysis or trigger low-confidence escalation, but Rust chooses the configured tier and enforces a daily escalation count cap (the only remaining backstop after budget removal in v0.30.0).
 
 ## Cross-project patterns
 

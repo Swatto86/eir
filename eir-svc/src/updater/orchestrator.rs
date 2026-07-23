@@ -146,7 +146,6 @@ pub async fn heal(
     candidate: &UpdateCandidate,
     ctx: &EngineCtx<'_>,
     available: &[Method],
-    budget_remaining: f64,
     learned: &crate::learn::LearnedFacts,
 ) -> Vec<AttemptOutcome> {
     let mut order: Vec<Method> = candidate
@@ -163,21 +162,13 @@ pub async fn heal(
     let max = (ctx.config.max_attempts_per_app as usize).max(1);
     let mut attempts: Vec<AttemptOutcome> = Vec::new();
     let mut tried: Vec<Method> = Vec::new();
-    // AI spend within THIS app's heal, so the per-run budget is a true ceiling and
-    // not just a between-apps gate.
-    let mut app_spent = 0.0_f64;
     let mut current: Option<(Method, Option<Remedy>)> = order.first().map(|&m| (m, None));
 
     while let Some((method, remedy)) = current.take() {
         if attempts.len() >= max {
             break;
         }
-        // Never START a paid native install once the run's AI budget is spent.
-        if method == Method::Native && app_spent >= budget_remaining {
-            break;
-        }
         let mut outcome = dispatch(method, remedy.as_ref(), candidate, ctx).await;
-        app_spent += outcome.cost_usd;
         tried.push(method);
 
         // Stop on success, a terminal integrity failure, "already current" (no work
@@ -193,17 +184,7 @@ pub async fn heal(
             break;
         }
 
-        // Pay for AI diagnosis only while within budget; otherwise take the free
-        // deterministic next step.
-        let (next, dcost) = if app_spent < budget_remaining {
-            decide_next(ctx, candidate, &outcome, &tried, &order).await
-        } else {
-            let det = next_method(&order, &tried, &outcome)
-                .map(NextStep::SwitchTo)
-                .unwrap_or_else(|| NextStep::GiveUp("AI budget reached".to_string()));
-            (det, 0.0)
-        };
-        app_spent += dcost;
+        let (next, dcost) = decide_next(ctx, candidate, &outcome, &tried, &order).await;
         outcome.cost_usd += dcost;
         attempts.push(outcome);
 
@@ -342,7 +323,6 @@ pub async fn run_cycle(
         &learned_skips,
     )
     .await;
-    let budget = ctx.config.budget_usd_per_run;
     let mut spent = check.cost_usd;
     let mut notes = check.notes;
     let mut results = Vec::new();
@@ -365,20 +345,8 @@ pub async fn run_cycle(
     }
 
     for cand in candidates.into_iter().take(cap) {
-        if budget > 0.0 && spent >= budget {
-            notes.push(format!(
-                "Stopped at the £/$ budget after {} apps.",
-                results.len()
-            ));
-            break;
-        }
-        let remaining = if budget > 0.0 {
-            (budget - spent).max(0.0)
-        } else {
-            f64::INFINITY
-        };
         let _ = progress.send(format!("updating {}…", cand.name)).await;
-        let outcomes = heal(&cand, ctx, &available, remaining, &learned).await;
+        let outcomes = heal(&cand, ctx, &available, &learned).await;
         spent += outcomes.iter().map(|o| o.cost_usd).sum::<f64>();
         if let Err(e) = history::record_attempts(pool, cycle_id, &cand, &outcomes).await {
             warn!("failed to record update history for {}: {e}", cand.name);

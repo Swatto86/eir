@@ -234,7 +234,6 @@ pub struct AdvisorSettingsView {
     pub escalation_model: String,
     pub escalation_effort: String,
     pub low_confidence_threshold: f32,
-    pub budget_usd_per_day: f64,
 }
 
 /// An advisor-settings change from the UI.
@@ -244,7 +243,6 @@ pub struct AdvisorSettingsUpdate {
     pub escalation_model: String,
     pub escalation_effort: String,
     pub low_confidence_threshold: f32,
-    pub budget_usd_per_day: f64,
 }
 
 /// Live status of the autonomous app updater, rendered by the UI.

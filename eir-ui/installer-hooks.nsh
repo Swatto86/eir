@@ -30,16 +30,17 @@
     IntOp $R0 $R0 + 1
     IntCmp $R0 20 wait_stopped_done wait_stopped_loop wait_stopped_done
   wait_stopped_done:
+  ; Uninstall the existing service registration before any files are written.
+  ; `sc stop` above already waited for STOPPED, so the old binary can be replaced;
+  ; deleting the registration now guarantees a clean install even if the old exe
+  ; is broken or the stop failed.
+  ExecWait 'sc delete EirSvc'
   Pop $R2
   Pop $R1
   Pop $R0
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  ; Tear down any prior service registration (ignored on fresh install)
-  ExecWait 'sc stop EirSvc'
-  ExecWait '"$INSTDIR\eir-svc.exe" uninstall'
-
   ; Seed config.toml from the bundled template on first install, then remove the
   ; template so the install directory contains only the live config. The service
   ; auto-detects the claude session, so the default config works as-is.
@@ -47,9 +48,8 @@
     CopyFiles /SILENT "$INSTDIR\config.toml.example" "$INSTDIR\config.toml"
   Delete "$INSTDIR\config.toml.example"
 
-  ; Register and start the service
+  ; Register and start the service (the install verb also starts it).
   ExecWait '"$INSTDIR\eir-svc.exe" install'
-  ExecWait 'sc start EirSvc'
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL

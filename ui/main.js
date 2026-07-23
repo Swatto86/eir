@@ -1420,24 +1420,18 @@ function fillAdvisorSettings(s) {
   document.getElementById('set-adv-conf').value = Math.round(
     (s.low_confidence_threshold != null ? s.low_confidence_threshold : 0.6) * 100
   );
-  document.getElementById('set-adv-budget').value =
-    s.budget_usd_per_day != null ? s.budget_usd_per_day : 0.5;
 }
 
 async function saveAdvisorSettings() {
-  // Distinguish a blank field from an explicit 0: the service treats a 0.0 threshold as
-  // "never escalate on low confidence" and a 0 budget as "no daily cap" — both legitimate
-  // deliberate choices. A plain `|| default` silently coerces either 0 back to the default.
+  // A blank confidence field defaults to 60; an explicit 0 is "never escalate on low
+  // confidence". Use trim + parse so 0 is preserved.
   const confRaw = document.getElementById('set-adv-conf').value.trim();
   const confPct = confRaw === '' ? 60 : parseInt(confRaw, 10);
-  const budgetRaw = document.getElementById('set-adv-budget').value.trim();
-  const budgetVal = budgetRaw === '' ? 0.5 : parseFloat(budgetRaw);
   const settings = {
     enabled: document.getElementById('set-adv-enabled').checked,
     escalation_model: document.getElementById('set-adv-model').value.trim(),
     escalation_effort: document.getElementById('set-adv-effort').value,
     low_confidence_threshold: Math.min(95, Math.max(0, Number.isFinite(confPct) ? confPct : 60)) / 100,
-    budget_usd_per_day: Math.max(0, Number.isFinite(budgetVal) ? budgetVal : 0.5),
   };
   const st = document.getElementById('set-adv-status');
   st.textContent = 'Saving…';
@@ -1519,18 +1513,53 @@ document.getElementById('game-btn').addEventListener('click', async () => {
 
 // ── About ─────────────────────────────────────────────────────────────────────
 
-Promise.all([
-  invoke('get_app_version').catch(() => null),
-  invoke('get_service_version').catch(() => null),
-]).then(([appVer, svcVer]) => {
+const aboutSvcEl = document.getElementById('about-service-version');
+const aboutInstallBtn = document.getElementById('about-install-svc');
+const aboutWarnEl = document.getElementById('about-version-warning');
+
+async function refreshAbout() {
+  const [appVer, svcVer, svcState] = await Promise.all([
+    invoke('get_app_version').catch(() => null),
+    invoke('get_service_version').catch(() => null),
+    invoke('get_service_state').catch(() => 'unknown'),
+  ]);
   document.getElementById('about-version').textContent = `Version ${appVer || '—'}`;
-  document.getElementById('about-service-version').textContent = `Service: ${svcVer || 'unknown'}`;
-  const warnEl = document.getElementById('about-version-warning');
-  if (appVer && svcVer && appVer !== svcVer) {
-    warnEl.textContent = `Warning: UI (${appVer}) and service (${svcVer}) versions differ — restart the service or reinstall Eir.`;
-    warnEl.style.display = 'block';
+
+  let svcText = 'Service: ';
+  if (svcState === 'not_installed') {
+    svcText += 'not installed';
+  } else if (svcVer) {
+    svcText += svcVer;
   } else {
-    warnEl.style.display = 'none';
+    svcText += svcState === 'running' ? 'running' : 'unknown';
+  }
+  if (svcState !== 'not_installed' && svcState !== 'running' && svcState !== 'unknown') {
+    svcText += ` (${svcState})`;
+  }
+  aboutSvcEl.textContent = svcText;
+
+  const installable = svcState === 'not_installed' || svcState === 'unknown';
+  aboutInstallBtn.style.display = installable ? 'inline-block' : 'none';
+
+  if (appVer && svcVer && appVer !== svcVer) {
+    aboutWarnEl.textContent = `Warning: UI (${appVer}) and service (${svcVer}) versions differ — restart the service or reinstall Eir.`;
+    aboutWarnEl.style.display = 'block';
+  } else {
+    aboutWarnEl.style.display = 'none';
+  }
+}
+
+aboutInstallBtn.addEventListener('click', async () => {
+  const st = document.getElementById('about-status');
+  aboutInstallBtn.disabled = true;
+  st.textContent = 'Installing service…';
+  try {
+    st.textContent = await invoke('install_service');
+    await refreshAbout();
+  } catch (e) {
+    st.textContent = 'Install failed: ' + e;
+  } finally {
+    aboutInstallBtn.disabled = false;
   }
 });
 
@@ -1547,6 +1576,13 @@ document.getElementById('about-updates').addEventListener('click', async () => {
     st.textContent = 'Check failed: ' + e;
   }
 });
+
+// Refresh service state every time the About view opens.
+document.getElementById('nav').addEventListener('click', (e) => {
+  const btn = e.target.closest('.nav-btn');
+  if (btn && btn.dataset.view === 'about') refreshAbout();
+});
+refreshAbout();
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
