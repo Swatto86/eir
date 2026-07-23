@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-23 · **Release:** v0.29.0
+**Last updated:** 2026-07-23 · **Release:** v0.29.1
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -623,7 +623,7 @@ The updater is an AI-driven, self-healing, fully-unattended app updater that liv
 
 One full cycle is `run_cycle` (`orchestrator.rs:303`), driven from `main.rs:307` (`spawn_update_cycle`) on a detached task with a 60-minute backstop watchdog and a `cycle_id` = `Utc::now().timestamp()` that groups the run's rows in the audit DB. The cycle:
 
-1. **Determine available methods** — `available_methods` (`orchestrator.rs:207`): a method is usable only if enabled in config AND present on the machine. winget via `where winget`; choco via its ProgramData path (bootstrapped through the official install.ps1 if `bootstrap_managers` and missing — `detect.rs:61`); scoop only if a logged-in user already has it (never installed as SYSTEM); msstore reuses winget; `Native` is offered only when `native_enabled` and an AI client exists.
+1. **Determine available methods** — `available_methods` (`orchestrator.rs:207`): a method is usable only if enabled in config AND present on the machine. winget via `detect::winget_path` (`detect.rs`), which checks the PATH alias first and then resolves the real MSIX exe under `C:\Program Files\WindowsApps` (required because LocalSystem has no winget alias); choco via its ProgramData path (bootstrapped through the official install.ps1 if `bootstrap_managers` and missing — `detect.rs:61`); scoop only if a logged-in user already has it (never installed as SYSTEM); msstore reuses winget; `Native` is offered only when `native_enabled` and an AI client exists.
 2. **Collect candidates** — `check::collect` (`check.rs:97`). Each enabled manager lists its updates (`winget upgrade`, `choco outdated -r`, `scoop status`, `winget upgrade --source msstore`). Results are de-duplicated by app identity via `push_candidate` (`check.rs:66`): earlier (more-preferred) managers win, the id is `clean_app_name(name).to_lowercase()`, and `should_skip` / the seen-set drop ignored/duplicate apps. When a primary manager handles the app, the native installer is appended as a self-healing fallback method (unless the primary already is native). Then an **AI web-search pass** over apps no manager covers (`check_unmanaged`, `check.rs:244`) produces native-only candidates. The unmanaged inventory is now independent of winget: `inventory::list_installed` (`inventory.rs`) enumerates the HKLM + Wow6432Node + per-user Uninstall registry keys, and the result is merged with `winget list` when winget is present. If winget is missing or the AI/native path is disabled, a UI note explains the degraded coverage instead of staying silent.
 3. **Heal each candidate** (bounded by `max_apps_per_run` and the per-run `budget_usd_per_run`) — `heal` (`orchestrator.rs:134`).
 4. **Record** every attempt to the `update_attempts` table under `cycle_id` (`history::record_attempts`).
@@ -645,7 +645,7 @@ One full cycle is `run_cycle` (`orchestrator.rs:303`), driven from `main.rs:307`
 
 Default preference order is `winget, choco, scoop, msstore` (`config.rs:114`); `native` is gated separately by `native_enabled` and appended as a per-candidate fallback. Each adapter returns a structured `AttemptOutcome`:
 
-- **winget** (`winget.rs`): runs directly as SYSTEM, captures and cleans winget's output (`clean_winget_output`, ported verbatim with tests for spinner/OEM-mojibake/byte-counter stripping), auto-retries once with `--force` for the portable-modified case, verifies by id.
+- **winget** (`winget.rs`): resolves `winget.exe` through `detect::winget_path` (PATH alias or WindowsApps MSIX), runs directly as SYSTEM, captures and cleans winget's output (`clean_winget_output`, ported verbatim with tests for spinner/OEM-mojibake/byte-counter stripping), auto-retries once with `--force` for the portable-modified case, verifies by id.
 - **choco** (`choco.rs`): `choco outdated -r` (pipe-delimited, pinned packages skipped), `choco upgrade <id> -y`, success codes 0/3010/1641, cross-checks the new version via winget's ARP read.
 - **scoop** (`scoop.rs`): user-scoped — runs the user's `scoop.cmd` shim with `USERPROFILE`/`HOME` pointed at their profile; best-effort, exit-code-only verification (scoop apps don't register in ARP).
 - **msstore** (`msstore.rs`): `winget ... --source msstore`; per-user, may need the user's Store entitlement.

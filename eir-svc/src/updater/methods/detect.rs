@@ -15,6 +15,9 @@ use tracing::{info, warn};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Package-family hash for the official winget (Microsoft.DesktopAppInstaller) MSIX.
+const WINGET_FAMILY: &str = "__8wekyb3d8bbwe";
+
 /// Path to `choco.exe`, if Chocolatey is installed (machine-wide default location).
 pub fn choco_path() -> Option<PathBuf> {
     let pd = std::env::var("ProgramData").ok()?;
@@ -46,14 +49,66 @@ pub fn scoop_available() -> bool {
     scoop_install().is_some()
 }
 
-/// winget is present on modern Windows; confirm via `where`.
+/// winget is present on modern Windows. Checks the interactive PATH alias first,
+/// then resolves the real MSIX exe under `C:\Program Files\WindowsApps` — the latter
+/// is needed when EirSvc runs as LocalSystem, whose profile has no winget alias.
 pub fn winget_available() -> bool {
-    std::process::Command::new("where")
+    winget_path().is_some()
+}
+
+/// Absolute path to `winget.exe`, or `None` if it cannot be found. Prefer the PATH
+/// alias when present, else enumerate the system WindowsApps package directory.
+pub(crate) fn winget_path() -> Option<PathBuf> {
+    resolve_winget_from_path().or_else(resolve_winget_from_windowsapps)
+}
+
+fn resolve_winget_from_path() -> Option<PathBuf> {
+    let out = std::process::Command::new("where")
         .arg("winget")
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+}
+
+fn resolve_winget_from_windowsapps() -> Option<PathBuf> {
+    let root = PathBuf::from("C:\\Program Files\\WindowsApps");
+    let mut best: Option<(String, PathBuf)> = None;
+    for entry in std::fs::read_dir(&root).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("Microsoft.DesktopAppInstaller_") || !name.ends_with(WINGET_FAMILY) {
+            continue;
+        }
+        let exe = entry.path().join("winget.exe");
+        if !exe.is_file() {
+            continue;
+        }
+        let version = extract_winget_dir_version(&name)?;
+        let better = best.as_ref().is_none_or(|(v, _)| {
+            crate::updater::version::version_cmp(&version, v)
+                .is_some_and(|o| o == std::cmp::Ordering::Greater)
+        });
+        if better {
+            best = Some((version, exe));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// `Microsoft.DesktopAppInstaller_<version>_<arch>__8wekyb3d8bbwe` -> `<version>`.
+fn extract_winget_dir_version(dir_name: &str) -> Option<String> {
+    let body = dir_name
+        .strip_prefix("Microsoft.DesktopAppInstaller_")?
+        .strip_suffix(WINGET_FAMILY)?;
+    // Body is "<Version>_<Architecture>" (version never contains underscores).
+    let (version, _arch) = body.rsplit_once('_')?;
+    Some(version.to_string())
 }
 
 /// Install Chocolatey via its official bootstrap script (runs as SYSTEM, no UAC).
@@ -81,4 +136,33 @@ pub async fn bootstrap_choco() -> bool {
         warn!("Chocolatey bootstrap did not complete (exit {code})");
     }
     ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_winget_dir_version_parses_stable_dirs() {
+        assert_eq!(
+            extract_winget_dir_version(
+                "Microsoft.DesktopAppInstaller_1.25.340.0_x64__8wekyb3d8bbwe"
+            ),
+            Some("1.25.340.0".to_string())
+        );
+        assert_eq!(
+            extract_winget_dir_version(
+                "Microsoft.DesktopAppInstaller_1.10.0.0_neutral__8wekyb3d8bbwe"
+            ),
+            Some("1.10.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_winget_dir_version_rejects_other_packages() {
+        assert!(
+            extract_winget_dir_version("Microsoft.WindowsStore_123_x64__8wekyb3d8bbwe").is_none()
+        );
+        assert!(extract_winget_dir_version("not_a_package").is_none());
+    }
 }

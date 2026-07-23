@@ -9,7 +9,7 @@ use crate::updater::config::UpdaterConfig;
 use crate::updater::domain::{Method, UpdateCandidate};
 use crate::updater::methods::{choco, detect, msstore, scoop, winget};
 use crate::updater::names::{clean_app_name, match_installed};
-use crate::updater::proc::{self, LIST};
+use crate::updater::proc::LIST;
 use crate::updater::version::is_newer;
 use crate::updater::winget_parse::parse_unmanaged;
 use serde::Deserialize;
@@ -273,13 +273,15 @@ async fn check_unmanaged(
     let mut seen: HashSet<String> = HashSet::new();
 
     let note = if winget_list_available {
-        let mut cmd = std::process::Command::new("winget");
-        cmd.args([
-            "list",
-            "--accept-source-agreements",
-            "--disable-interactivity",
-        ]);
-        let (_code, list_text) = proc::run_capped_cmd(cmd, LIST).await;
+        let (_code, list_text) = winget::run_winget(
+            vec![
+                "list".to_string(),
+                "--accept-source-agreements".to_string(),
+                "--disable-interactivity".to_string(),
+            ],
+            LIST,
+        )
+        .await;
         let winget_apps = parse_unmanaged(&list_text, managed);
         for (n, v) in winget_apps {
             if seen.insert(n.to_lowercase()) {

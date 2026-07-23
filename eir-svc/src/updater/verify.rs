@@ -5,6 +5,7 @@
 //! comparison itself is pure and unit-tested in `version`; this module is the I/O.
 
 use super::domain::Verification;
+use super::methods::winget;
 use super::proc::{self, VERIFY};
 use super::version::classify_version;
 use super::winget_parse::{column, winget_table};
@@ -62,16 +63,18 @@ pub async fn verify_app(target: &VerifyTarget, expected: &str) -> (Verification,
 
 /// Read an installed app's version from `winget list --id <id> --exact`.
 async fn winget_installed_version(id: &str) -> Option<String> {
-    let mut cmd = std::process::Command::new("winget");
-    cmd.args([
-        "list",
-        "--id",
-        id,
-        "--exact",
-        "--accept-source-agreements",
-        "--disable-interactivity",
-    ]);
-    let (_code, text) = proc::run_capped_cmd(cmd, VERIFY).await;
+    let (_code, text) = winget::run_winget(
+        vec![
+            "list".to_string(),
+            "--id".to_string(),
+            id.to_string(),
+            "--exact".to_string(),
+            "--accept-source-agreements".to_string(),
+            "--disable-interactivity".to_string(),
+        ],
+        VERIFY,
+    )
+    .await;
     let (offsets, rows) = winget_table(&text);
     rows.first()
         .map(|r| column(&offsets, r, "Version"))
@@ -81,15 +84,17 @@ async fn winget_installed_version(id: &str) -> Option<String> {
 /// Read an installed app's version from `winget list --name <name>`, matching the
 /// row whose Name overlaps the queried name (display names are fuzzy).
 async fn winget_installed_version_by_name(name: &str) -> Option<String> {
-    let mut cmd = std::process::Command::new("winget");
-    cmd.args([
-        "list",
-        "--name",
-        name,
-        "--accept-source-agreements",
-        "--disable-interactivity",
-    ]);
-    let (_code, text) = proc::run_capped_cmd(cmd, VERIFY).await;
+    let (_code, text) = winget::run_winget(
+        vec![
+            "list".to_string(),
+            "--name".to_string(),
+            name.to_string(),
+            "--accept-source-agreements".to_string(),
+            "--disable-interactivity".to_string(),
+        ],
+        VERIFY,
+    )
+    .await;
     let (offsets, rows) = winget_table(&text);
     let lname = name.to_lowercase();
     // An exact (case-insensitive) name match is authoritative. Otherwise collect the

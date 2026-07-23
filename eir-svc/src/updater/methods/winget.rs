@@ -7,6 +7,7 @@
 use crate::updater::domain::{
     classify_error, AttemptOutcome, ErrorCategory, Method, UpdateCandidate, Verification,
 };
+use crate::updater::methods::detect;
 use crate::updater::proc::{self, INSTALL, LIST};
 use crate::updater::verify::{verify_app, VerifyTarget};
 use crate::updater::winget_parse::{parse_upgrades, AppUpdate};
@@ -75,9 +76,13 @@ fn no_package_found(output: &str) -> bool {
 /// Run winget directly and capture its merged output. The service is SYSTEM, so no
 /// elevation wrapper is needed; winget also suppresses its live progress bar when
 /// stdout isn't a console, which keeps the capture clean. Shared with the Store
-/// method (which is winget with `--source msstore`).
+/// method (which is winget with `--source msstore`). Resolves the real exe path
+/// because LocalSystem has no winget alias in PATH.
 pub(crate) async fn run_winget(args: Vec<String>, dur: std::time::Duration) -> (i32, String) {
-    proc::run_capped("winget", &args, dur).await
+    match detect::winget_path() {
+        Some(p) => proc::run_capped(&p.to_string_lossy(), &args, dur).await,
+        None => proc::run_capped("winget", &args, dur).await,
+    }
 }
 
 /// winget refused because a portable package's files changed after install — its
