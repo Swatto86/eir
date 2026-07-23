@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.29.1. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.29.2. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.29.1. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-23 | Eir | v0.29.2 LocalSystem winget resolution fallback | v0.29.1's WindowsApps directory enumeration still failed for some LocalSystem profiles because the `C:\Program Files\WindowsApps` folder is not always listable as SYSTEM. Added a third fallback via `Get-AppxPackage -AllUsers` (PowerShell) to read the registered `Microsoft.DesktopAppInstaller` install location; cached with `OnceLock` so the resolution is performed once per process and logged at every step. `winget_available` now only reports false when PATH, directory enumeration, and the AppX repository all fail. Compile+unit-verified; not live-exercised as LocalSystem.
 
 2026-07-23 | Eir | v0.29.1 LocalSystem winget resolution | `detect::winget_available` previously used `where winget`, which fails under the LocalSystem service profile because the MSIX alias exists only in interactive user profiles. Added `detect::winget_path` that checks PATH first (dev/interactive unchanged) and then enumerates `C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*__8wekyb3d8bbwe`, selecting the highest-version `winget.exe`. All winget spawns (`winget.rs::run_winget`, `check.rs`, `verify.rs`) now route through this resolved path. Compile+unit-verified; not live-exercised as LocalSystem.
 

@@ -11,6 +11,7 @@
 
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use tracing::{info, warn};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -49,6 +50,8 @@ pub fn scoop_available() -> bool {
     scoop_install().is_some()
 }
 
+static WINGET_PATH_CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
 /// winget is present on modern Windows. Checks the interactive PATH alias first,
 /// then resolves the real MSIX exe under `C:\Program Files\WindowsApps` — the latter
 /// is needed when EirSvc runs as LocalSystem, whose profile has no winget alias.
@@ -57,9 +60,33 @@ pub fn winget_available() -> bool {
 }
 
 /// Absolute path to `winget.exe`, or `None` if it cannot be found. Prefer the PATH
-/// alias when present, else enumerate the system WindowsApps package directory.
+/// alias when present, else enumerate the system WindowsApps package directory, and
+/// finally fall back to the AppX package repository via PowerShell (some SYSTEM
+/// profiles can query the package but cannot list the WindowsApps folder).
 pub(crate) fn winget_path() -> Option<PathBuf> {
-    resolve_winget_from_path().or_else(resolve_winget_from_windowsapps)
+    WINGET_PATH_CACHE.get_or_init(resolve_winget).clone()
+}
+
+fn resolve_winget() -> Option<PathBuf> {
+    if let Some(p) = resolve_winget_from_path() {
+        info!(path = %p.display(), "winget resolved from PATH");
+        return Some(p);
+    }
+    warn!("winget not found in PATH; trying WindowsApps directory");
+
+    if let Some(p) = resolve_winget_from_windowsapps() {
+        info!(path = %p.display(), "winget resolved from WindowsApps directory");
+        return Some(p);
+    }
+    warn!("winget not found in WindowsApps; trying AppX package repository");
+
+    if let Some(p) = resolve_winget_from_appx() {
+        info!(path = %p.display(), "winget resolved from AppX package repository");
+        return Some(p);
+    }
+
+    warn!("winget could not be resolved; updates will use registry inventory only");
+    None
 }
 
 fn resolve_winget_from_path() -> Option<PathBuf> {
@@ -79,17 +106,32 @@ fn resolve_winget_from_path() -> Option<PathBuf> {
 
 fn resolve_winget_from_windowsapps() -> Option<PathBuf> {
     let root = PathBuf::from("C:\\Program Files\\WindowsApps");
+    let entries = match std::fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(root = %root.display(), error = %e, "cannot list WindowsApps directory");
+            return None;
+        }
+    };
     let mut best: Option<(String, PathBuf)> = None;
-    for entry in std::fs::read_dir(&root).ok()?.flatten() {
+    let mut found = 0usize;
+    for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.starts_with("Microsoft.DesktopAppInstaller_") || !name.ends_with(WINGET_FAMILY) {
             continue;
         }
+        found += 1;
         let exe = entry.path().join("winget.exe");
         if !exe.is_file() {
             continue;
         }
-        let version = extract_winget_dir_version(&name)?;
+        let version = match extract_winget_dir_version(&name) {
+            Some(v) => v,
+            None => {
+                warn!(dir = %name, "could not parse winget directory version");
+                continue;
+            }
+        };
         let better = best.as_ref().is_none_or(|(v, _)| {
             crate::updater::version::version_cmp(&version, v)
                 .is_some_and(|o| o == std::cmp::Ordering::Greater)
@@ -98,7 +140,41 @@ fn resolve_winget_from_windowsapps() -> Option<PathBuf> {
             best = Some((version, exe));
         }
     }
+    if found == 0 {
+        warn!(root = %root.display(), "no Microsoft.DesktopAppInstaller package found in WindowsApps");
+    }
     best.map(|(_, p)| p)
+}
+
+fn resolve_winget_from_appx() -> Option<PathBuf> {
+    const SCRIPT: &str = "Get-AppxPackage -AllUsers | Where-Object { $_.Name -eq 'Microsoft.DesktopAppInstaller' } | Select-Object -First 1 -ExpandProperty InstallLocation";
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            SCRIPT,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        warn!(exit = ?out.status.code(), stderr = %String::from_utf8_lossy(&out.stderr), "Get-AppxPackage query failed");
+        return None;
+    }
+    let loc = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if loc.is_empty() {
+        warn!("Get-AppxPackage returned no install location for Microsoft.DesktopAppInstaller");
+        return None;
+    }
+    let exe = PathBuf::from(loc).join("winget.exe");
+    if exe.is_file() {
+        Some(exe)
+    } else {
+        warn!(path = %exe.display(), "AppX install location does not contain winget.exe");
+        None
+    }
 }
 
 /// `Microsoft.DesktopAppInstaller_<version>_<arch>__8wekyb3d8bbwe` -> `<version>`.
