@@ -1085,18 +1085,18 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     }
     // A bad AI config must NOT kill the service — degrade instead, so the pipe
     // and UI stay alive and the user can fix it in Settings.
-    let ai: Option<std::sync::Arc<ai::client::AiClient>> = match ai::client::AiClient::new(&cfg.api)
-    {
-        Ok(c) => Some(std::sync::Arc::new(c)),
-        Err(e) => {
-            error!("AI client init failed: {e}");
-            st.status = "Error".to_string();
-            st.error = Some(format!(
-                "AI provider not configured: {e} — fix it in Settings"
-            ));
-            None
-        }
-    };
+    let mut ai: Option<std::sync::Arc<ai::client::AiClient>> =
+        match ai::client::AiClient::new(&cfg.api) {
+            Ok(c) => Some(std::sync::Arc::new(c)),
+            Err(e) => {
+                error!("AI client init failed: {e}");
+                st.status = "Error".to_string();
+                st.error = Some(format!(
+                    "AI provider not configured: {e} — fix it in Settings"
+                ));
+                None
+            }
+        };
 
     // Reactive-guardian trigger: collectors ping this the moment they capture
     // something actionable, so fixes start within seconds of an error landing
@@ -1876,22 +1876,29 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::UpdateSettings(update) => {
+                            // Decide whether a restart is required BEFORE mutating cfg.
+                            let needs_restart = cfg.settings_update_needs_restart(&update);
                             cfg.apply_update(*update);
-                            // Validate before committing — never restart into a broken
-                            // provider (e.g. openrouter with no key would brick the service).
-                            if let Err(e) = ai::client::AiClient::new(&cfg.api) {
-                                warn!("Rejected settings: {e}");
-                                st.error = Some(format!("Settings not applied — {e}"));
-                                if let Ok(reloaded) = config::load("config.toml") {
-                                    cfg = reloaded; // discard the invalid change
+                            // Validate before committing — never apply a broken provider
+                            // (e.g. openrouter with no key).
+                            match ai::client::AiClient::new(&cfg.api) {
+                                Err(e) => {
+                                    warn!("Rejected settings: {e}");
+                                    st.error = Some(format!("Settings not applied — {e}"));
+                                    if let Ok(reloaded) = config::load("config.toml") {
+                                        cfg = reloaded; // discard the invalid change
+                                    }
+                                    st.settings = Some(cfg.to_ui_settings());
+                                    pipe.broadcast_status(build_status(&st));
                                 }
-                                st.settings = Some(cfg.to_ui_settings());
-                                pipe.broadcast_status(build_status(&st));
-                            } else {
-                                st.settings = Some(cfg.to_ui_settings());
-                                match config::save(&cfg, "config.toml") {
-                                    Ok(()) => {
-                                        info!("Settings saved — restarting service to apply");
+                                Ok(new_ai) => {
+                                    st.settings = Some(cfg.to_ui_settings());
+                                    if let Err(e) = config::save(&cfg, "config.toml") {
+                                        error!("Failed to save settings: {e}");
+                                        st.error = Some(format!("Save settings: {e}"));
+                                        pipe.broadcast_status(build_status(&st));
+                                    } else if needs_restart {
+                                        info!("Settings saved — restarting service to apply collector changes");
                                         st.status = "Restarting".to_string();
                                         st.error = None;
                                         pipe.broadcast_status(build_status(&st));
@@ -1906,10 +1913,28 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                             "Settings saved, but the restart helper failed to launch — restart the EirSvc service manually to apply them.".to_string(),
                                         );
                                         pipe.broadcast_status(build_status(&st));
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to save settings: {e}");
-                                        st.error = Some(format!("Save settings: {e}"));
+                                    } else {
+                                        info!("Settings applied live");
+                                        // Swap in the newly-validated client and update the
+                                        // live policy threshold + decision ticker so the
+                                        // common settings (provider/model/key/effort/interval)
+                                        // take effect immediately without a service restart.
+                                        ai = Some(std::sync::Arc::new(new_ai));
+                                        pol.execution.confidence_threshold =
+                                            cfg.monitoring.confidence_threshold;
+                                        ticker =
+                                            interval(Duration::from_secs(cfg.monitoring.decision_interval_secs));
+                                        ticker.reset();
+                                        // A stale AI-provider error is now resolved.
+                                        if st
+                                            .error
+                                            .as_ref()
+                                            .map(|s| s.starts_with("AI provider not configured"))
+                                            .unwrap_or(false)
+                                        {
+                                            st.error = None;
+                                        }
+                                        st.status = resting_status(&st);
                                         pipe.broadcast_status(build_status(&st));
                                     }
                                 }
@@ -2241,6 +2266,10 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 let db_a = db.clone();
                                 let ai_a = ai_ref.clone();
                                 let done = ask_done_tx.clone();
+                                // Feed the last few Q&A pairs into the prompt so follow-ups
+                                // keep context; clone here because the closure can't borrow `st`.
+                                let ask_history: Vec<eir_proto::AskEntry> =
+                                    st.ask_entries.iter().cloned().collect();
                                 tokio::spawn(async move {
                                     // Bound the whole answer in a nested task + timeout,
                                     // mirroring the analysis/digest tasks, so a wedged AI
@@ -2268,7 +2297,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                         let attach_section =
                                             ask::format_text_attachments(&text_files);
                                         let prompt =
-                                            ask::build_prompt(&ctx, &question, &attach_section);
+                                            ask::build_prompt(&ctx, &question, &attach_section, &ask_history);
                                         // Drop images the provider can't read (CLI providers);
                                         // the answer gets a note so the user isn't misled.
                                         let imgs = if images_dropped { Vec::new() } else { images };
@@ -2305,6 +2334,14 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                     let _ = done.send((q, labels_c, result));
                                 });
                             }
+                        }
+                        UiMsg::ClearAsk => {
+                            // Wipe the in-memory history and reset the spend guard so the
+                            // next question starts a fresh conversation.
+                            st.ask_entries.clear();
+                            st.last_ask_at = 0;
+                            refresh_ask(&mut st, None);
+                            pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::ScanDisk => {
                             // Gate on the scan-in-flight flag and pause (a paused guardian

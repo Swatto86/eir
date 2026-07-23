@@ -7,12 +7,13 @@
 use crate::ai::client::{extract_json, AiClient};
 use crate::updater::config::UpdaterConfig;
 use crate::updater::domain::{Method, UpdateCandidate};
-use crate::updater::methods::{choco, msstore, scoop, winget};
+use crate::updater::methods::{choco, detect, msstore, scoop, winget};
 use crate::updater::names::{clean_app_name, match_installed};
 use crate::updater::proc::{self, LIST};
 use crate::updater::version::is_newer;
 use crate::updater::winget_parse::parse_unmanaged;
 use serde::Deserialize;
+use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 
 /// Cap on apps sent to the AI in one batch, to bound cost/latency.
@@ -98,6 +99,7 @@ fn push_candidate(
 /// Collect every update candidate across the available methods, de-duplicated by app
 /// identity (earlier, more-preferred managers win) and filtered by the ignore list.
 pub async fn collect(
+    pool: &SqlitePool,
     ai: Option<&AiClient>,
     cfg: &UpdaterConfig,
     model_override: &str,
@@ -184,7 +186,19 @@ pub async fn collect(
     // The AI web-search pass over apps no manager covers -> native candidates.
     if native_avail {
         if let Some(ai) = ai {
-            match check_unmanaged(ai, cfg, model_override, &managed, learned_skips).await {
+            let winget_list_available =
+                available.contains(&Method::Winget) && detect::winget_available();
+            match check_unmanaged(
+                pool,
+                ai,
+                cfg,
+                model_override,
+                &managed,
+                learned_skips,
+                winget_list_available,
+            )
+            .await
+            {
                 Ok((native_cands, c, note)) => {
                     cost += c;
                     if let Some(n) = note {
@@ -196,9 +210,17 @@ pub async fn collect(
                         }
                     }
                 }
-                Err(e) => notes.push(format!("couldn't check non-winget apps: {e}")),
+                Err(e) => notes.push(format!("couldn't check non-manager apps: {e}")),
             }
+        } else {
+            notes.push(
+                "AI provider not configured — only package-manager apps are checked.".to_string(),
+            );
         }
+    } else {
+        notes.push(
+            "AI-found installers disabled — only package-manager apps are checked.".to_string(),
+        );
     }
 
     CheckResult {
@@ -220,38 +242,94 @@ struct AiUpdateRaw {
     latest: String,
 }
 
+/// Pure: sort unmanaged apps stalest-first by last AI-check time and return up to
+/// `cap` of them. Never-checked apps sort first (key 0), then oldest checks.
+pub fn select_unmanaged_batch(
+    apps: &mut Vec<(String, String)>,
+    last_check: &HashMap<String, i64>,
+    cap: usize,
+) -> Vec<(String, String)> {
+    apps.sort_by_key(|(n, _)| last_check.get(&n.to_lowercase()).copied().unwrap_or(0));
+    apps.drain(..cap.min(apps.len())).collect()
+}
+
 /// Ask the AI which unmanaged apps have a newer version, and turn the verified ones
-/// into native candidates.
+/// into native candidates. The installed-app inventory is built from the registry
+/// Uninstall keys (HKLM, Wow6432Node, per-user) and merged with `winget list` when
+/// winget is present. The batch is sorted stalest-first by last AI-check time, capped
+/// at `AI_CHECK_CAP`, and each checked app is recorded so the tail is reached across
+/// cycles.
 async fn check_unmanaged(
+    pool: &SqlitePool,
     ai: &AiClient,
     cfg: &UpdaterConfig,
     model_override: &str,
     managed: &HashSet<String>,
     learned_skips: &HashSet<String>,
+    winget_list_available: bool,
 ) -> Result<(Vec<UpdateCandidate>, f64, Option<String>), String> {
-    let mut cmd = std::process::Command::new("winget");
-    cmd.args([
-        "list",
-        "--accept-source-agreements",
-        "--disable-interactivity",
-    ]);
-    let (_code, list_text) = proc::run_capped_cmd(cmd, LIST).await;
+    // Build the installed-app inventory from winget (when available) and the registry.
+    let mut apps: Vec<(String, String)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
 
-    let mut apps = parse_unmanaged(&list_text, managed);
-    apps.retain(|(n, _)| !should_skip(cfg, learned_skips, &n.to_lowercase()));
+    let note = if winget_list_available {
+        let mut cmd = std::process::Command::new("winget");
+        cmd.args([
+            "list",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+        ]);
+        let (_code, list_text) = proc::run_capped_cmd(cmd, LIST).await;
+        let winget_apps = parse_unmanaged(&list_text, managed);
+        for (n, v) in winget_apps {
+            if seen.insert(n.to_lowercase()) {
+                apps.push((n, v));
+            }
+        }
+        None
+    } else {
+        Some(
+            "winget not available — using registry inventory only for non-manager apps."
+                .to_string(),
+        )
+    };
+
+    // Merge in registry inventory as a fallback/supplement. Registry version is
+    // authoritative for installed version, so it takes precedence when a name exists
+    // in both sources (we skip the winget duplicate here).
+    for (n, v) in crate::updater::inventory::list_installed().await {
+        let key = n.to_lowercase();
+        if managed.contains(&key) || should_skip(cfg, learned_skips, &key) || !seen.insert(key) {
+            continue;
+        }
+        apps.push((n, v));
+    }
+
+    // Fair rotation: stalest check time first, never-checked first, so the tail isn't
+    // permanently starved. The cap is applied here, not at collection, because the
+    // AI call is the expensive step and we want it to sweep across the whole set.
+    let last_check = crate::updater::history::last_check_times(pool)
+        .await
+        .unwrap_or_default();
     let total = apps.len();
-    let mut note = None;
-    if apps.len() > AI_CHECK_CAP {
-        apps.truncate(AI_CHECK_CAP);
-        note = Some(format!(
-            "Checked the first {AI_CHECK_CAP} of {total} apps winget doesn't manage."
-        ));
-    }
-    if apps.is_empty() {
-        return Ok((vec![], 0.0, None));
+    let checked = select_unmanaged_batch(&mut apps, &last_check, AI_CHECK_CAP);
+    let note = if total > AI_CHECK_CAP {
+        let cap_note = format!(
+            "Checking {} of {total} non-manager apps — stalest first.",
+            checked.len()
+        );
+        Some(match note {
+            Some(n) => format!("{n} {cap_note}"),
+            None => cap_note,
+        })
+    } else {
+        note
+    };
+    if checked.is_empty() {
+        return Ok((vec![], 0.0, note));
     }
 
-    let app_lines = apps
+    let app_lines = checked
         .iter()
         .map(|(n, v)| match cfg.notes.get(&n.to_lowercase()) {
             Some(note) if !note.is_empty() => format!("- {n} ({v}) [user note: {note}]"),
@@ -261,14 +339,14 @@ async fn check_unmanaged(
         .join("\n");
     let prompt = format!(
         "You are an application update checker. Below are installed Windows applications with their \
-current versions. Use web search to find each one's latest STABLE release from its official source. \
-Return ONLY the apps that have a NEWER version available.\n\n\
-Respect any [user note]: it may say an app is custom/self-built or give its real release source — \
-follow that guidance and do NOT report an update that contradicts the note.\n\n\
-Respond ONLY with JSON, no markdown:\n\
-{{\"updates\":[{{\"name\":\"<app>\",\"current\":\"<installed>\",\"latest\":\"<newer version>\",\"url\":\"<official download or releases page URL>\"}}]}}\n\
-Omit apps that are already current or that you cannot verify. Only include real, verified versions.\n\n\
-INSTALLED APPS:\n{app_lines}"
+ current versions. Use web search to find each one's latest STABLE release from its official source. \
+ Return ONLY the apps that have a NEWER version available.\n\n\
+ Respect any [user note]: it may say an app is custom/self-built or give its real release source — \
+ follow that guidance and do NOT report an update that contradicts the note.\n\n\
+ Respond ONLY with JSON, no markdown:\n\
+ {{\"updates\":[{{\"name\":\"<app>\",\"current\":\"<installed>\",\"latest\":\"<newer version>\",\"url\":\"<official download or releases page URL>\"}}]}}\n\
+ Omit apps that are already current or that you cannot verify. Only include real, verified versions.\n\n\
+ INSTALLED APPS:\n{app_lines}"
     );
 
     let (content, usage) = ai
@@ -276,13 +354,20 @@ INSTALLED APPS:\n{app_lines}"
         .await
         .map_err(|e| e.to_string())?;
     let cost = usage.map(|u| u.cost_usd).unwrap_or(0.0);
-    let resp: AiResp = serde_json::from_str(extract_json(&content))
-        .map_err(|e| format!("could not parse update list: {e}"))?;
 
-    let installed: HashMap<String, String> = apps
+    // Record the check time for every app we sent, so the next cycle rotates past them
+    // even if the AI reports no update.
+    for (n, _) in &checked {
+        let _ = crate::updater::history::record_check(pool, &n.to_lowercase()).await;
+    }
+
+    let installed: HashMap<String, String> = checked
         .iter()
         .map(|(n, v)| (n.to_lowercase(), v.clone()))
         .collect();
+    let resp: AiResp = serde_json::from_str(extract_json(&content))
+        .map_err(|e| format!("could not parse update list: {e}"))?;
+
     let candidates = native_candidates_from(&resp.updates, &installed, cfg, learned_skips);
     Ok((candidates, cost, note))
 }
@@ -414,5 +499,27 @@ mod tests {
         assert_eq!(cands[0].current, "1.5.0");
         assert_eq!(cands[0].available, "1.6.0");
         assert_eq!(cands[0].methods, vec![Method::Native]);
+    }
+
+    #[test]
+    fn unmanaged_batch_selects_stalest_first_and_caps() {
+        let mut apps = vec![
+            ("A".into(), "1".into()),
+            ("B".into(), "1".into()),
+            ("C".into(), "1".into()),
+            ("D".into(), "1".into()),
+        ];
+        // A checked most recently, B checked recently, C never checked, D checked oldest.
+        let last_check: HashMap<String, i64> =
+            [("a".into(), 300), ("b".into(), 200), ("d".into(), 100)]
+                .into_iter()
+                .collect();
+        let picked = select_unmanaged_batch(&mut apps, &last_check, 2);
+        // Never-checked (C) and oldest-checked (D) come first.
+        assert_eq!(picked.len(), 2);
+        assert_eq!(picked[0].0, "C");
+        assert_eq!(picked[1].0, "D");
+        // The remaining apps are drained from the input vector.
+        assert_eq!(apps.len(), 2);
     }
 }

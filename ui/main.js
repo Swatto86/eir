@@ -532,6 +532,13 @@ async function submitAsk() {
 }
 
 document.getElementById('ask-send').addEventListener('click', submitAsk);
+document.getElementById('clear-ask').addEventListener('click', async () => {
+  try {
+    await invoke('clear_ask');
+    toast('Chat cleared', 'ok');
+  } catch (e) { console.error('clear_ask failed', e); toast('Could not clear chat', 'err'); }
+  refresh();
+});
 document.getElementById('ask-input').addEventListener('keydown', (e) => {
   // Enter sends (chat convention); Shift+Enter inserts a newline. isComposing
   // guards the Enter that confirms an IME composition.
@@ -1389,10 +1396,10 @@ async function saveSettings() {
     }
   }
 
-  st.textContent = 'Saving… the service will restart (~15s).';
+  st.textContent = 'Saving…';
   try {
     await invoke('update_settings', { settings });
-    st.textContent = 'Saved. Service restarting — it will reconnect shortly.';
+    st.textContent = 'Saved — applies immediately.';
     document.getElementById('set-or-key').value = '';
     document.getElementById('set-an-key').value = '';
     document.getElementById('set-kilo-profile').value = '';
@@ -1479,8 +1486,8 @@ async function saveUpdaterSettings() {
 }
 
 // Disable a Settings save button while its save is in flight, so a double-click can't
-// fire two saves — update_settings restarts the service (~15s), so a second one lands
-// mid-restart. Matches the disable-on-click pattern used by every other action button.
+// fire two saves. Previously this also guarded a service restart; now settings apply
+// live, but the guard still prevents duplicate invocations.
 function saveGuarded(btnId, fn) {
   const btn = document.getElementById(btnId);
   btn.disabled = true;

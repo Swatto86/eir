@@ -553,6 +553,8 @@ pub enum UiMsg {
         #[serde(default)]
         attachments: Vec<AskAttachment>,
     },
+    /// Clear the "Ask Eir" chat history and reset its context.
+    ClearAsk,
     /// Run an on-demand disk-space scan.
     ScanDisk,
     /// Clean one disk-scan entry by its id. The service maps the id to a safe

@@ -256,6 +256,15 @@ impl Config {
         }
     }
 
+    /// Whether applying this update would change fields that can only be picked up
+    /// by restarting the service process (collector spawn parameters).
+    pub fn settings_update_needs_restart(&self, u: &SettingsUpdate) -> bool {
+        self.monitoring.event_log_channels != u.event_log_channels
+            || self.monitoring.log_directories != u.log_directories
+            || self.monitoring.event_log_poll_interval_secs != u.event_log_poll_interval_secs
+            || self.monitoring.wmi_poll_interval_secs != u.wmi_poll_interval_secs
+    }
+
     /// Apply an update from the UI. Empty/None secret fields keep the stored value.
     pub fn apply_update(&mut self, u: SettingsUpdate) {
         self.api.provider = ApiProvider::parse(&u.provider);
@@ -418,6 +427,44 @@ audit_db = "./eir.db"
         assert_eq!(reparsed.monitoring.event_log_channels.len(), 2);
         // Blank api key keeps the prior value (None here).
         assert!(reparsed.api.anthropic_api_key.is_none());
+    }
+
+    #[test]
+    fn settings_restart_needed_only_for_collector_fields() {
+        let cfg: Config = toml::from_str(SAMPLE).unwrap();
+        // Provider/model/key/effort/threshold/decision-interval do NOT need restart.
+        let no_restart = SettingsUpdate {
+            provider: "openrouter".into(),
+            model: "x".into(),
+            update_check_model: "y".into(),
+            effort: "high".into(),
+            openrouter_api_key: Some("sk-xxx".into()),
+            anthropic_api_key: None,
+            kilo_cli_user_profile: None,
+            kilo_cli_path: None,
+            decision_interval_secs: 900,
+            event_log_poll_interval_secs: 30,
+            wmi_poll_interval_secs: 300,
+            event_log_channels: vec!["System".into()],
+            log_directories: vec![],
+            confidence_threshold: 0.7,
+            game_mode_auto: true,
+            game_mode_power_boost: false,
+        };
+        assert!(!cfg.settings_update_needs_restart(&no_restart));
+        // Each collector field individually triggers restart.
+        let mut changed = no_restart.clone();
+        changed.event_log_channels = vec!["System".into(), "Application".into()];
+        assert!(cfg.settings_update_needs_restart(&changed));
+        changed = no_restart.clone();
+        changed.log_directories = vec!["C:\\Logs".into()];
+        assert!(cfg.settings_update_needs_restart(&changed));
+        changed = no_restart.clone();
+        changed.event_log_poll_interval_secs = 60;
+        assert!(cfg.settings_update_needs_restart(&changed));
+        changed = no_restart.clone();
+        changed.wmi_poll_interval_secs = 600;
+        assert!(cfg.settings_update_needs_restart(&changed));
     }
 
     #[test]

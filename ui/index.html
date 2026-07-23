@@ -458,7 +458,7 @@
     <!-- ── Ask Eir ── -->
     <section class="view" id="view-ask">
       <div class="card">
-        <div class="card-header">Ask about your PC</div>
+        <div class="card-header">Ask about your PC<span class="hspacer"></span><button class="btn small" id="clear-ask">Clear</button></div>
         <div class="ask-compose">
           <textarea id="ask-input" maxlength="1000" rows="3"
             placeholder="e.g. Why is my PC slow right now?  Is my disk OK?  What was that error about?  (Enter to send · Shift+Enter for a new line)"></textarea>
@@ -619,7 +619,7 @@
         </div>
         <div class="set-note">Eir reacts to errors the moment they land (debounced ~10&nbsp;s); the decision interval is just the background sweep. Game Mode pauses the updater &amp; housekeeping while a fullscreen game runs.</div>
         <div class="set-actions">
-          <button class="btn primary" id="set-save">Save &amp; restart service</button>
+          <button class="btn primary" id="set-save">Save settings</button>
           <span class="set-status" id="set-status"></span>
         </div>
       </div>

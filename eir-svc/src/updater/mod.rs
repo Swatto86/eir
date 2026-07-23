@@ -16,6 +16,7 @@ pub mod diagnose;
 pub mod domain;
 pub mod download;
 pub mod history;
+pub mod inventory;
 pub mod methods;
 pub mod names;
 pub mod orchestrator;

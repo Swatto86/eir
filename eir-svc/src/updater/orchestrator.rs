@@ -334,6 +334,7 @@ pub async fn run_cycle(
         .unwrap_or_default();
     let learned = crate::learn::LearnedFacts::load(pool).await;
     let check = check::collect(
+        pool,
         ctx.ai,
         ctx.config,
         ctx.model_override,

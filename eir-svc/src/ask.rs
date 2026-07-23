@@ -25,6 +25,11 @@ const MAX_QUESTION_CHARS: usize = 1000;
 /// Minimum gap between questions (seconds) — a spend guard, since the command pipe is
 /// writable by any authenticated user.
 const MIN_GAP_SECS: i64 = 15;
+/// Number of previous Q&A pairs fed into the prompt for context.
+const MAX_HISTORY_ENTRIES: usize = 5;
+/// How much of each previous answer to keep (characters), so a long earlier answer
+/// doesn't dominate the current question's budget.
+const MAX_HISTORY_ANSWER_CHARS: usize = 1500;
 
 /// Why an Ask request should be rejected, or `None` to proceed. Pure, unit-tested.
 pub fn ask_rejection_reason(
@@ -55,7 +60,13 @@ pub fn ask_rejection_reason(
 
 /// Build the bounded prompt (pure, testable). Grounds the answer in current context and
 /// forbids proposing actions — Eir applies fixes only through its own policy engine.
-pub fn build_prompt(ctx: &AskContext, question: &str, attachments: &str) -> String {
+/// `history` is the newest-first Ask entry list; only the most recent entries are used.
+pub fn build_prompt(
+    ctx: &AskContext,
+    question: &str,
+    attachments: &str,
+    history: &[eir_proto::AskEntry],
+) -> String {
     let mut s = String::new();
     s.push_str(
         "You are Eir, an autonomous Windows guardian, answering the PC owner's question in \
@@ -93,6 +104,21 @@ pub fn build_prompt(ctx: &AskContext, question: &str, attachments: &str) -> Stri
     }
     if let Some(t) = &ctx.trend {
         s.push_str(&format!("- {t}\n"));
+    }
+    if !history.is_empty() {
+        s.push_str("\nPREVIOUS CONVERSATION (for context only — answered earlier):\n");
+        // history is newest-first; render oldest of the kept entries first for a natural
+        // chat flow.
+        for e in history.iter().take(MAX_HISTORY_ENTRIES).rev() {
+            let q: String = e.question.trim().chars().take(MAX_QUESTION_CHARS).collect();
+            let a: String = e
+                .answer
+                .trim()
+                .chars()
+                .take(MAX_HISTORY_ANSWER_CHARS)
+                .collect();
+            s.push_str(&format!("Q: {q}\nA: {a}\n\n"));
+        }
     }
     if !ctx.last_analysis.trim().is_empty() {
         let a: String = ctx.last_analysis.trim().chars().take(600).collect();
@@ -147,6 +173,7 @@ pub fn format_text_attachments(files: &[(String, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eir_proto::AskEntry;
 
     fn ctx() -> AskContext {
         AskContext {
@@ -164,7 +191,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_context_and_forbids_actions() {
-        let p = build_prompt(&ctx(), "why is my disk so full?", "");
+        let p = build_prompt(&ctx(), "why is my disk so full?", "", &[]);
         assert!(p.contains("disk 88% used"));
         assert!(p.contains("Failed services: Spooler"));
         assert!(p.contains("disk usage trending up"));
@@ -181,6 +208,42 @@ mod tests {
     }
 
     #[test]
+    fn prompt_includes_recent_history_bounded() {
+        let history = vec![
+            AskEntry {
+                question: "what failed?".into(),
+                answer: "The Spooler service failed.".into(),
+                at: 1,
+                attachments: vec![],
+            },
+            AskEntry {
+                question: "is it fixed?".into(),
+                answer: "It restarted successfully.".into(),
+                at: 2,
+                attachments: vec![],
+            },
+        ];
+        let p = build_prompt(&ctx(), "why did it fail?", "", &history);
+        assert!(p.contains("PREVIOUS CONVERSATION"));
+        assert!(p.contains("Q: what failed?"));
+        assert!(p.contains("A: The Spooler service failed."));
+        assert!(p.contains("Q: is it fixed?"));
+        // Older entries beyond the cap are ignored.
+        let many: Vec<AskEntry> = (0..10)
+            .rev() // newest first, like the real service state
+            .map(|i| AskEntry {
+                question: format!("q{i}"),
+                answer: format!("a{i}"),
+                at: i,
+                attachments: vec![],
+            })
+            .collect();
+        let p2 = build_prompt(&ctx(), "latest?", "", &many);
+        assert!(!p2.contains("q0")); // dropped by the cap
+        assert!(p2.contains("q9")); // kept
+    }
+
+    #[test]
     fn attachments_section_is_included_and_bounded() {
         let files = vec![
             ("app.log".to_string(), "line one\nERROR boom".to_string()),
@@ -190,7 +253,7 @@ mod tests {
         assert!(section.contains("----- app.log -----"));
         assert!(section.contains("ERROR boom"));
         assert!(section.contains("----- cfg.ini -----"));
-        let p = build_prompt(&ctx(), "what's wrong?", &section);
+        let p = build_prompt(&ctx(), "what's wrong?", &section, &[]);
         assert!(p.contains("ATTACHED FILES"));
         assert!(p.contains("ERROR boom"));
 

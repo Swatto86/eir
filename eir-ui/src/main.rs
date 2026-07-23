@@ -298,6 +298,12 @@ fn remove_ask_attachment(
 }
 
 #[tauri::command]
+async fn clear_ask(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
+    tx.0.try_send(UiMsg::ClearAsk).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn scan_disk(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> Result<(), String> {
     ensure_connected(&conn.0)?;
     tx.0.try_send(UiMsg::ScanDisk).map_err(|e| e.to_string())
@@ -941,6 +947,7 @@ fn main() {
             toggle_pause,
             undo_registry,
             ask_eir,
+            clear_ask,
             scan_disk,
             clean_disk_entry,
             scan_startup,

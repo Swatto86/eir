@@ -71,6 +71,39 @@ pub async fn last_attempt_times(
     Ok(map)
 }
 
+/// Latest AI-check time (unix secs) per `app_id`, so the unmanaged inventory can be
+/// rotated stalest-first instead of always re-checking the same leading apps.
+pub async fn last_check_times(pool: &SqlitePool) -> Result<std::collections::HashMap<String, i64>> {
+    let rows = sqlx::query("SELECT app_id, checked_at FROM update_checks")
+        .fetch_all(pool)
+        .await?;
+    let mut map = std::collections::HashMap::new();
+    for r in rows {
+        let id: String = r.try_get("app_id")?;
+        let at: String = r.try_get("checked_at")?;
+        let ts = chrono::DateTime::parse_from_rfc3339(&at)
+            .map(|d| d.timestamp())
+            .unwrap_or(0);
+        map.insert(id, ts);
+    }
+    Ok(map)
+}
+
+/// Record that an app was AI-checked now. Called for every app in the unmanaged batch
+/// (including those with no update), so the next cycle knows it was reached.
+pub async fn record_check(pool: &SqlitePool, app_id: &str) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO update_checks (app_id, checked_at) VALUES (?, ?) \
+         ON CONFLICT(app_id) DO UPDATE SET checked_at = excluded.checked_at",
+    )
+    .bind(app_id)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Delete the whole attempt history (the UI's "Clear" on the App Updates card).
 /// Returns the number of rows removed.
 pub async fn clear(pool: &SqlitePool) -> Result<u64> {

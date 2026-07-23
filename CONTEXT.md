@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.27.5. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.29.0. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.27.5. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-23 | Eir | v0.29.0 settings hot-apply, Ask history, and registry app inventory | Three user-facing fixes. (1) Provider/model/key/effort/decision-interval settings now apply live without restarting the service; only event-log channels, poll intervals, and log-directory changes still trigger a restart, via a pure `settings_update_needs_restart` diff. (2) Ask Eir keeps context across follow-ups by feeding the last 5 Q&A pairs into the prompt, and a `ClearAsk` command resets the chat. (3) The updater now enumerates HKLM + Wow6432Node + per-user Uninstall registry keys as an inventory independent of winget, merges it with `winget list` when available, and rotates the unmanaged AI-check batch stalest-first using a new `update_checks` table so the tail is reached across cycles; degraded coverage (winget missing / native path disabled) is surfaced in UI notes instead of staying silent. Compile+unit-verified; not live-exercised.
 
 2026-07-18 | Eir | v0.27.5 live-incident fixes: claude CLI resolution + restart resilience | A real settings-save (kilo_cli → claude_cli) surfaced two defects. (1) `resolve_claude_binary` only knew the native installer's `.local\bin\claude.exe`; an npm-installed CLI fell back to bare `claude`, which LocalSystem's PATH can't resolve — every AI call failed with "Failed to spawn the claude CLI". Now probes npm's bundled exe (`AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe`) and the `claude.cmd` shim, mirroring the kilo resolver; precedence unit-tested. (2) The settings-restart helper stopped the service but never brought it back (~2m40s outage until a manual reinstall); the helper's spawn result was swallowed, it retried `sc start` for only ~10s, and left no trace. Now: helper output redirects to `eir-restart.log`, start retries every 5s over a 60s window, spawn result is logged, and a spawn *failure* keeps the service alive on the old settings instead of stopping with nothing to start it again. Root cause of the original non-return was not recoverable from evidence (SCM event logging is minimal on the machine); the log file makes any recurrence diagnosable.
 
