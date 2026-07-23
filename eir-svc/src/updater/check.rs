@@ -290,10 +290,9 @@ async fn check_unmanaged(
         }
         None
     } else {
-        Some(
-            "winget not available — using registry inventory only for non-manager apps."
-                .to_string(),
-        )
+        Some(detect::winget_unavailability_reason().unwrap_or_else(|| {
+            "winget not available — using registry inventory only for non-manager apps.".to_string()
+        }))
     };
 
     // Merge in registry inventory as a fallback/supplement. Registry version is

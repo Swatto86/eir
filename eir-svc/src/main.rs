@@ -439,6 +439,7 @@ fn build_status(st: &SvcState) -> StatusPayload {
         disk_insights: st.disk_insights.clone(),
         startup: st.startup.clone(),
         gaming: is_gaming(st),
+        svc_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     }
 }
 
@@ -3103,6 +3104,10 @@ mod status_tests {
         assert_eq!(
             payload.failed_services,
             vec!["Spooler".to_string(), "W32Time".to_string()]
+        );
+        assert_eq!(
+            payload.svc_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
         );
     }
 }

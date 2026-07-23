@@ -454,6 +454,11 @@ fn get_app_version(handle: AppHandle) -> String {
     handle.package_info().version.to_string()
 }
 
+#[tauri::command]
+fn get_service_version(status: State<'_, SharedStatus>) -> Option<String> {
+    pipe_client::lock_status(&status).svc_version.clone()
+}
+
 /// On-demand update check for the About view. Installs and relaunches when a
 /// newer signed release exists (mirroring the background checker), otherwise
 /// reports the current state as a string for the UI to display.
@@ -967,6 +972,7 @@ fn main() {
             set_learned_fact,
             set_advisor_settings,
             get_app_version,
+            get_service_version,
             check_updates_now,
             get_autostart_enabled,
             set_autostart_enabled,

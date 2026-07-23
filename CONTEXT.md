@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.29.2. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.29.3. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.29.2. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-23 | Eir | v0.29.3 service-version observability + self-diagnosing winget note | After three winget-resolution fixes shipped without live LocalSystem verification, the persistent "winget not available" note was suspected to be a stale deployed binary rather than a code defect. Added `StatusPayload.svc_version` (service reports `CARGO_PKG_VERSION`), a UI About-box warning when it differs from the UI version, and `detect::winget_unavailability_reason` that threads the real resolver failure into the updater note. The generic fallback string is now only shown by pre-resolution service binaries, making stale deployments observable. Compile+unit-verified; not live-exercised as LocalSystem.
 
 2026-07-23 | Eir | v0.29.2 LocalSystem winget resolution fallback | v0.29.1's WindowsApps directory enumeration still failed for some LocalSystem profiles because the `C:\Program Files\WindowsApps` folder is not always listable as SYSTEM. Added a third fallback via `Get-AppxPackage -AllUsers` (PowerShell) to read the registered `Microsoft.DesktopAppInstaller` install location; cached with `OnceLock` so the resolution is performed once per process and logged at every step. `winget_available` now only reports false when PATH, directory enumeration, and the AppX repository all fail. Compile+unit-verified; not live-exercised as LocalSystem.
 

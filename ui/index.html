@@ -304,6 +304,7 @@
     .about-ver { font-size: 12.5px; color: var(--muted); }
     .about-body { padding: 0 20px 18px; font-size: 13px; color: var(--muted); line-height: 1.65; max-width: 640px; }
     .about-actions { display: flex; gap: 8px; padding: 0 20px 20px; align-items: center; }
+    .about-warning { display: none; margin: 0 20px 14px; padding: 10px 14px; border-radius: 8px; background: color-mix(in srgb, var(--err) 12%, transparent); color: var(--err); font-size: 13px; line-height: 1.5; }
 
     /* ── Service disconnected: freeze interaction so a click can't be silently dropped ── */
     /* #dash-approvals-go is excluded — it's a pure client-side view switch, not a pipe command. */
@@ -693,8 +694,10 @@
           <div>
             <div class="about-name">Eir</div>
             <div class="about-ver" id="about-version">Version —</div>
+            <div class="about-ver" id="about-service-version">Service: —</div>
           </div>
         </div>
+        <div id="about-version-warning" class="about-warning" style="display:none"></div>
         <div class="about-body">
           Eir is an autonomous Windows system guardian. A LocalSystem service watches the
           event log, application logs, services and security posture; an AI model diagnoses

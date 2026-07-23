@@ -65,6 +65,11 @@ pub struct StatusPayload {
     /// decodable.
     #[serde(default)]
     pub gaming: bool,
+    /// Service binary version, surfaced in the About dialog so users can verify the
+    /// running service matches the installed UI. `#[serde(default)]` keeps an older
+    /// payload decodable.
+    #[serde(default)]
+    pub svc_version: Option<String>,
 }
 
 /// One point of the dashboard resource timeline. Percentages, unix-seconds `at`.

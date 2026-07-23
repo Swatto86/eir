@@ -1519,9 +1519,20 @@ document.getElementById('game-btn').addEventListener('click', async () => {
 
 // ── About ─────────────────────────────────────────────────────────────────────
 
-invoke('get_app_version')
-  .then((v) => { document.getElementById('about-version').textContent = `Version ${v}`; })
-  .catch(() => {});
+Promise.all([
+  invoke('get_app_version').catch(() => null),
+  invoke('get_service_version').catch(() => null),
+]).then(([appVer, svcVer]) => {
+  document.getElementById('about-version').textContent = `Version ${appVer || '—'}`;
+  document.getElementById('about-service-version').textContent = `Service: ${svcVer || 'unknown'}`;
+  const warnEl = document.getElementById('about-version-warning');
+  if (appVer && svcVer && appVer !== svcVer) {
+    warnEl.textContent = `Warning: UI (${appVer}) and service (${svcVer}) versions differ — restart the service or reinstall Eir.`;
+    warnEl.style.display = 'block';
+  } else {
+    warnEl.style.display = 'none';
+  }
+});
 
 document.getElementById('about-github').addEventListener('click', () => {
   invoke('open_url', { url: 'https://github.com/Swatto86/eir' }).catch(() => {});
