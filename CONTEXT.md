@@ -61,3 +61,12 @@ The resource-trend thresholds (audit `summarise_trend`) and disk-health/SMART wo
 Primary target is Windows with the MSVC Rust toolchain. CI runs on `windows-latest` and pins Rust 1.95.0 to match `rust-toolchain.toml`.
 
 No JavaScript package manager is part of the build; frontend assets are committed static HTML/JS.
+
+## Operational notes (migrated from mem0, 2026-07-23)
+
+_Facts recovered from the decommissioned shared mem0 store. May overlap existing docs above; integrate/prune as you touch these areas._
+
+### eir-local-linux-gtk-deps
+
+In `/home/ubuntu/repos/eir`, local `cargo clippy --all-targets -- -D warnings` and `cargo test --workspace` on this Linux host fail before project code because Tauri pulls GTK and `gdk-3.0.pc` is not installed. The authoritative CI gate currently runs on `windows-latest`, stages `eir-svc.exe`, then runs fmt, clippy, tests, and full Tauri build successfully there. Why: avoid misreading local Linux GTK dependency failures as regressions in Eir code when debugging Windows CI.
+
