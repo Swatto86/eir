@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.30.0. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.30.1. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.30.0. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-24 | Eir | v0.30.1 transient CLI-exit no longer latches the cycle red | An "update all apps" run turned the service/analysis state red: two analysis cycles failed with `claude CLI exited with exit code: 1` and *empty* stderr while the concurrent update run was also driving the Claude CLI (a brief API/overload blip the CLI swallowed to a bare non-zero exit). `is_transient_ai_error` only matched HTTP-shaped markers, so this was treated as permanent — no retry, `st.error` latched "Error". Root cause fixed in `ai::client`: `call_claude_cli`/`call_kilo_cli` now split a non-zero exit on whether stderr carried a diagnostic — empty → a distinct "…and no error output (transient)" message that `is_transient_ai_error` recognises (retried by `analyze_with`'s backoff loop); non-empty (auth/config, e.g. "Invalid API key") still surfaces immediately without retry. The CLI itself was never broken (verified exit 0 post-incident). Unit-verified (extended `transient_error_classification`); the concurrency race is not deterministically reproducible so the retry is reasoned, not live-burned.
 
 2026-07-24 | Eir | v0.30.0 installer service upgrade + About install button + budget removal | Three related changes. (1) The NSIS installer now explicitly `sc delete EirSvc` in PREINSTALL after stopping the existing service, so any prior registration is torn down before files are written; POSTINSTALL drops the now-redundant stop/uninstall and relies on the service's own `install` verb. (2) The service `install` verb now starts the service automatically after registering it, so fresh installs and the new UI install path don't need a separate `sc start`. (3) The About view queries SCM directly via a new `get_service_state` command and shows an "Install service" button when the service is not installed; `install_service` re-runs the bundled `eir-svc.exe install` elevated through a UAC prompt. (4) The advisor daily USD budget and updater per-run USD budget are removed entirely (fields, gates, settings UI, proto, config template); the hard 24-escalations/day count backstop remains. Spend visibility (usage card, "escalation spend today" chip) and unrelated caps (max apps/attempts per run, max installer size) are kept. Compile+unit-verified; installer/service-install-button paths are not live-exercised.
 

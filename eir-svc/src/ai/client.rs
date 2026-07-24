@@ -718,11 +718,16 @@ impl AiClient {
             wait_capped(child, "claude CLI", Some(prompt.as_bytes().to_vec())).await?;
 
         if !status.success() {
-            bail!(
-                "claude CLI exited with {}: {}",
-                status,
-                char_preview(stderr_raw.trim(), 2000)
-            );
+            let err = char_preview(stderr_raw.trim(), 2000);
+            if err.is_empty() {
+                // Non-zero exit with NO diagnostic output: the CLI swallowed a
+                // transient API/overload blip (an auth/config failure prints to
+                // stderr instead). Marked transient (see is_transient_ai_error)
+                // so analyze_with retries rather than latching the cycle red on a
+                // one-off hiccup — the class that turned Eir red mid update run.
+                bail!("claude CLI exited with {status} and no error output (transient)");
+            }
+            bail!("claude CLI exited with {status}: {err}");
         }
 
         let stdout = stdout_raw.trim().to_string();
@@ -832,11 +837,12 @@ impl AiClient {
             // Exit 124 = kilo's own timeout (treat like ours); 1 = init/runtime
             // error. Surface stderr so the user can diagnose (e.g. "Not
             // authenticated — run `kilo` once interactively to log in").
-            bail!(
-                "kilo CLI exited with {}: {}",
-                status,
-                char_preview(stderr_raw.trim(), 2000)
-            );
+            let err = char_preview(stderr_raw.trim(), 2000);
+            if err.is_empty() {
+                // No diagnostic output → transient hiccup, not a config error; retry.
+                bail!("kilo CLI exited with {status} and no error output (transient)");
+            }
+            bail!("kilo CLI exited with {status}: {err}");
         }
 
         let (text, usage) = parse_kilo_ndjson(&stdout)?;
@@ -1499,6 +1505,9 @@ fn is_transient_ai_error(e: &anyhow::Error) -> bool {
         "connection",
         "stream read error",
         "stream error",
+        // A CLI subprocess that exited non-zero with empty stderr (see
+        // call_claude_cli / call_kilo_cli) — an ambiguous hiccup, worth a retry.
+        "no error output",
     ];
     MARKERS.iter().any(|m| s.contains(m))
 }
@@ -1733,6 +1742,17 @@ mod tests {
         )));
         assert!(is_transient_ai_error(&anyhow!(
             "Anthropic stream read error"
+        )));
+        // A CLI subprocess exit with empty stderr is an ambiguous hiccup — retry.
+        assert!(is_transient_ai_error(&anyhow!(
+            "claude CLI exited with exit code: 1 and no error output (transient)"
+        )));
+        assert!(is_transient_ai_error(&anyhow!(
+            "kilo CLI exited with exit code: 1 and no error output (transient)"
+        )));
+        // But a CLI exit that DID print a diagnostic (auth/config) is permanent.
+        assert!(!is_transient_ai_error(&anyhow!(
+            "claude CLI exited with exit code: 1: Invalid API key"
         )));
         // Permanent conditions must NOT be retried.
         assert!(!is_transient_ai_error(&anyhow!(
