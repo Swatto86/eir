@@ -456,10 +456,8 @@ fn refresh_ask(st: &mut SvcState, error: Option<String>) {
     });
 }
 
-/// Hard backstop on escalations per UTC day. The USD budget bounds providers
-/// that report or estimate cost (OpenRouter's usage chunk, Anthropic's estimated
-/// pricing); Kilo Code may report tokens without cost, so this count is the
-/// floor guarantee. Always applied so the cap holds regardless of provider.
+/// Hard backstop on escalations per UTC day. Applied regardless of provider or
+/// whether the provider reports cost, so a runaway agent cannot exceed this count.
 const MAX_ESCALATIONS_PER_DAY: u32 = 24;
 
 /// Decide whether the advisor should re-analyse at a higher tier, and why. Pure.

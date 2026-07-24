@@ -298,8 +298,8 @@ pub fn app_rows(summary: &CycleSummary) -> Vec<eir_proto::UpdaterAppRow> {
 }
 
 /// Run one full cycle: check for candidates, heal each (bounded by the per-run app
-/// and budget caps), and persist every attempt. The cycle id groups this run's
-/// attempts in the history table.
+/// cap), and persist every attempt. The cycle id groups this run's attempts in the
+/// history table.
 pub async fn run_cycle(
     pool: &SqlitePool,
     ctx: &EngineCtx<'_>,
