@@ -266,6 +266,10 @@
     .upd-badge { font-size: 11px; padding: 1px 8px; border-radius: 20px; font-weight: 600; margin-left: 6px; white-space: nowrap; }
     .upd-result { flex-basis: 100%; padding: 2px 0 0; font-size: 11px; color: var(--muted); white-space: normal; user-select: text; }
     .upd-note { padding: 6px 15px; font-size: 11px; color: var(--muted); user-select: text; }
+    .upd-note-editor { flex-basis: 100%; display: flex; gap: 7px; align-items: flex-end; }
+    .upd-note-input { flex: 1; min-height: 54px; resize: vertical; padding: 7px 9px; background: var(--bg); border: 1px solid var(--border); border-radius: 7px; color: var(--text); font: inherit; font-size: 12px; line-height: 1.4; }
+    .upd-note-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .upd-note-actions { display: flex; gap: 5px; }
     /* AI/service free text can contain one long unbroken token (a deep path, URL, or hash)
        — wrap it so it can't overflow the card horizontally (same treatment as .appr-details). */
     .ask-a, .ai-now-text, .act-why, .di-note, .upd-note, .upd-result { overflow-wrap: break-word; }
@@ -319,6 +323,8 @@
     body.svc-down .disk-clean,
     body.svc-down .startup-toggle,
     body.svc-down .upd-ignore,
+    body.svc-down .upd-note-save,
+    body.svc-down .upd-note-delete,
     body.svc-down .learned-act,
     body.svc-down #refresh-status,
     body.svc-down .act-undo { pointer-events: none; opacity: .5; }
@@ -511,6 +517,11 @@
         </div>
         <div id="updater-meta" class="upd-summary" style="display:none"></div>
         <div id="updater-apps"><div class="empty">Enable auto-updates in Settings, or click “Update now”.</div></div>
+        <div class="set-note" style="padding:9px 15px">Use “Guide AI” to correct a same-name product match, explain what the software is, or provide its official download link. Eir remembers the guidance for future checks.</div>
+        <div id="updater-guidance-wrap" style="display:none">
+          <div class="upd-note" style="border-top:1px solid var(--border)">Saved AI guidance</div>
+          <div id="updater-guidance"></div>
+        </div>
         <div id="updater-notes"></div>
         <div id="updater-history-wrap" style="display:none">
           <div class="upd-note" style="border-top:1px solid var(--border); margin-top:6px; padding-top:8px;">Recent attempts</div>

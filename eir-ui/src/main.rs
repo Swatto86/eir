@@ -432,6 +432,24 @@ async fn set_app_ignore(
 }
 
 #[tauri::command]
+async fn set_app_note(
+    id: String,
+    note: String,
+    tx: State<'_, UiCmdTx>,
+    conn: State<'_, ConnState>,
+) -> Result<(), String> {
+    ensure_connected(&conn.0)?;
+    if id.trim().is_empty() || id.chars().count() > 200 {
+        return Err("invalid app id".to_string());
+    }
+    if note.chars().count() > 2_000 {
+        return Err("app note is too long".to_string());
+    }
+    tx.0.try_send(UiMsg::SetAppNote { id, note })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn set_learned_fact(
     id: i64,
     op: String,
@@ -1048,6 +1066,7 @@ fn main() {
             clear_update_history,
             set_updater_settings,
             set_app_ignore,
+            set_app_note,
             set_learned_fact,
             set_advisor_settings,
             get_app_version,

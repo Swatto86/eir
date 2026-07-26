@@ -261,12 +261,23 @@ pub struct UpdaterStatus {
     pub last_cost_usd: f64,
     /// Notes from the last cycle (truncation, check failures).
     pub notes: Vec<String>,
+    /// Persistent per-app guidance the user can read, edit, or delete even when
+    /// that app is absent from the latest cycle.
+    #[serde(default)]
+    pub app_notes: Vec<UpdaterAppNote>,
     /// Per-app result of the last cycle.
     pub apps: Vec<UpdaterAppRow>,
     /// Recent attempt history (newest first).
     pub recent: Vec<UpdateAttemptRow>,
     /// Editable updater settings, surfaced for the Settings panel.
     pub settings: UpdaterSettingsView,
+}
+
+/// One persisted instruction included in future AI checks for this app.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct UpdaterAppNote {
+    pub id: String,
+    pub note: String,
 }
 
 /// One app's result in the last update cycle.
@@ -289,6 +300,10 @@ pub struct UpdaterAppRow {
     /// forward/backward wire-compat with a peer that predates the field.
     #[serde(default)]
     pub ignored: bool,
+    /// Persisted user guidance included in future AI update checks and native
+    /// installer searches. `#[serde(default)]` keeps older peers compatible.
+    #[serde(default)]
+    pub note: String,
 }
 
 /// One persisted attempt, for the history view.
@@ -539,6 +554,11 @@ pub enum UiMsg {
     SetAppIgnore {
         id: String,
         ignore: bool,
+        note: String,
+    },
+    /// Save, replace, or clear persistent AI guidance for a detected app.
+    SetAppNote {
+        id: String,
         note: String,
     },
     /// Apply advisor settings live (no service restart).

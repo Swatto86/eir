@@ -5,7 +5,7 @@
 //! the AI check should cover (the ones winget can't actually upgrade). Ported
 //! verbatim with its tests. Pure.
 
-use super::names::clean_app_name;
+use super::names::{app_id, clean_app_name};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -215,7 +215,7 @@ pub fn parse_unmanaged(text: &str, already_managed: &HashSet<String>) -> Vec<(St
         if is_msstore || (is_winget && is_winget_catalog_id(&id)) {
             continue;
         }
-        if already_managed.contains(&name.to_lowercase()) {
+        if already_managed.contains(&app_id(&name)) {
             continue;
         }
         // Strip any version baked into the DisplayName so the note/ignore key and

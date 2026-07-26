@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.31.0. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.32.0. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.31.0. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-26 | Eir | v0.32.0 persistent updater AI guidance | App Updates now supports full CRUD for per-product AI guidance: create from a detected update, read/edit/delete from a persistent saved-guidance list even after the app leaves current results. Guidance can correct same-name product matches or point at official downloads and is reused in future unmanaged-version and native-installer prompts. Candidate/note identity is anchored to the stable installed-product key rather than an AI-returned alias. Inputs are bounded and guidance never relaxes URL/hash/signature/installer safety gates. Gate green (fmt, clippy, 240 tests, JS/version checks, release + NSIS builds); CRUD renderer/event payloads passed in the packaged WebView against mutable service snapshots. The installed service is v0.31.0, so a live v0.32.0 service persistence/AI round-trip was not exercised before release.
 
 2026-07-26 | Eir | v0.31.0 Codex CLI + provider-aware model picker | Settings now groups API and signed-in CLI providers, hides irrelevant credentials, and uses the native searchable `datalist` for the main, updater, and Advisor models. Model catalogues are provider-specific: Codex (`codex debug models`), Kilo (`kilo models --pure`), OpenRouter's public models endpoint, and small Claude fallbacks; typed custom IDs remain valid. Added `codex_cli`, using the active user's ChatGPT login through constrained `codex exec --json` arguments. Because the service runs as LocalSystem, all subscription CLIs now resolve and launch under the active desktop user's token; user-profile scratch I/O is impersonated to prevent privileged reparse-point file access. Release packaging also publishes and hashes the raw portable `eir.exe`. Gate green (fmt, clippy, 238 tests, release build, version/JS checks); the packaged Settings flow and live Codex catalogue/filter/select were visually exercised, and the exact Codex CLI contract returned a live benign response. The LocalSystem-to-Codex end-to-end call remains not live-exercised.
 

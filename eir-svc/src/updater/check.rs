@@ -8,7 +8,7 @@ use crate::ai::client::{extract_json, AiClient};
 use crate::updater::config::UpdaterConfig;
 use crate::updater::domain::{Method, UpdateCandidate};
 use crate::updater::methods::{choco, detect, msstore, scoop, winget};
-use crate::updater::names::{clean_app_name, match_installed};
+use crate::updater::names::{app_id, match_installed_entry};
 use crate::updater::proc::LIST;
 use crate::updater::version::is_newer;
 use crate::updater::winget_parse::parse_unmanaged;
@@ -78,7 +78,7 @@ fn push_candidate(
     package_id: Option<String>,
     primary: Method,
 ) {
-    let id = clean_app_name(name).to_lowercase();
+    let id = app_id(name);
     if id.is_empty() || should_skip(cfg, learned, &id) || !seen.insert(id.clone()) {
         return;
     }
@@ -116,7 +116,7 @@ pub async fn collect(
 
     if available.contains(&Method::Winget) {
         for u in winget::list_updates().await {
-            managed.insert(u.name.to_lowercase());
+            managed.insert(app_id(&u.name));
             push_candidate(
                 &mut candidates,
                 &mut seen,
@@ -133,7 +133,7 @@ pub async fn collect(
     }
     if available.contains(&Method::Choco) {
         for u in choco::list_outdated().await {
-            managed.insert(u.name.to_lowercase());
+            managed.insert(app_id(&u.name));
             push_candidate(
                 &mut candidates,
                 &mut seen,
@@ -150,7 +150,7 @@ pub async fn collect(
     }
     if available.contains(&Method::Scoop) {
         for u in scoop::list_outdated().await {
-            managed.insert(u.name.to_lowercase());
+            managed.insert(app_id(&u.name));
             push_candidate(
                 &mut candidates,
                 &mut seen,
@@ -167,7 +167,7 @@ pub async fn collect(
     }
     if available.contains(&Method::MsStore) {
         for u in msstore::list_updates().await {
-            managed.insert(u.name.to_lowercase());
+            managed.insert(app_id(&u.name));
             push_candidate(
                 &mut candidates,
                 &mut seen,
@@ -249,7 +249,7 @@ pub fn select_unmanaged_batch(
     last_check: &HashMap<String, i64>,
     cap: usize,
 ) -> Vec<(String, String)> {
-    apps.sort_by_key(|(n, _)| last_check.get(&n.to_lowercase()).copied().unwrap_or(0));
+    apps.sort_by_key(|(n, _)| last_check.get(&app_id(n)).copied().unwrap_or(0));
     apps.drain(..cap.min(apps.len())).collect()
 }
 
@@ -284,7 +284,7 @@ async fn check_unmanaged(
         .await;
         let winget_apps = parse_unmanaged(&list_text, managed);
         for (n, v) in winget_apps {
-            if seen.insert(n.to_lowercase()) {
+            if seen.insert(app_id(&n)) {
                 apps.push((n, v));
             }
         }
@@ -299,7 +299,7 @@ async fn check_unmanaged(
     // authoritative for installed version, so it takes precedence when a name exists
     // in both sources (we skip the winget duplicate here).
     for (n, v) in crate::updater::inventory::list_installed().await {
-        let key = n.to_lowercase();
+        let key = app_id(&n);
         if managed.contains(&key) || should_skip(cfg, learned_skips, &key) || !seen.insert(key) {
             continue;
         }
@@ -332,7 +332,7 @@ async fn check_unmanaged(
 
     let app_lines = checked
         .iter()
-        .map(|(n, v)| match cfg.notes.get(&n.to_lowercase()) {
+        .map(|(n, v)| match cfg.notes.get(&app_id(n)) {
             Some(note) if !note.is_empty() => format!("- {n} ({v}) [user note: {note}]"),
             _ => format!("- {n} ({v})"),
         })
@@ -343,7 +343,8 @@ async fn check_unmanaged(
  current versions. Use web search to find each one's latest STABLE release from its official source. \
  Return ONLY the apps that have a NEWER version available.\n\n\
  Respect any [user note]: it may say an app is custom/self-built or give its real release source — \
- follow that guidance and do NOT report an update that contradicts the note.\n\n\
+ follow that guidance and do NOT report an update that contradicts the note. In the response's \
+ name field, copy the installed app name exactly even when its note gives another product or vendor name.\n\n\
  Respond ONLY with JSON, no markdown:\n\
  {{\"updates\":[{{\"name\":\"<app>\",\"current\":\"<installed>\",\"latest\":\"<newer version>\",\"url\":\"<official download or releases page URL>\"}}]}}\n\
  Omit apps that are already current or that you cannot verify. Only include real, verified versions.\n\n\
@@ -359,12 +360,12 @@ async fn check_unmanaged(
     // Record the check time for every app we sent, so the next cycle rotates past them
     // even if the AI reports no update.
     for (n, _) in &checked {
-        let _ = crate::updater::history::record_check(pool, &n.to_lowercase()).await;
+        let _ = crate::updater::history::record_check(pool, &app_id(n)).await;
     }
 
     let installed: HashMap<String, String> = checked
         .iter()
-        .map(|(n, v)| (n.to_lowercase(), v.clone()))
+        .map(|(n, v)| (app_id(n), v.clone()))
         .collect();
     let resp: AiResp = serde_json::from_str(extract_json(&content))
         .map_err(|e| format!("could not parse update list: {e}"))?;
@@ -395,14 +396,13 @@ fn native_candidates_from(
             continue;
         }
         // Only a genuinely-installed app is a valid native UPDATE target.
-        let cur = match match_installed(installed, &u.name) {
-            Some(v) => v.clone(),
+        let (id, cur) = match match_installed_entry(installed, &u.name) {
+            Some((id, version)) => (id.clone(), version.clone()),
             None => continue,
         };
         if !is_newer(&u.latest, &cur) {
             continue;
         }
-        let id = u.name.to_lowercase();
         if should_skip(cfg, learned_skips, &id) {
             continue;
         }

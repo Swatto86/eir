@@ -6,6 +6,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub const MAX_APP_NOTES: usize = 500;
+pub const MAX_APP_NOTE_CHARS: usize = 2_000;
+pub const MAX_APP_ID_CHARS: usize = 200;
+
 /// How strictly a downloaded AI-found native installer must be signed before it
 /// is allowed to run. Decided in Rust *before* the installer is staged, never by
 /// the AI. Defaults to the safe choice for an unattended SYSTEM install.
@@ -101,6 +105,39 @@ impl UpdaterConfig {
         self.native_enabled = u.native_enabled;
         self.native_signature_policy = SignaturePolicy::from_token(&u.native_signature_policy);
     }
+
+    /// Save, replace, or clear one app's AI guidance. Returns whether config changed.
+    pub fn set_app_note(&mut self, id: &str, note: &str) -> Result<bool, &'static str> {
+        let key = id.trim().to_lowercase();
+        if key.is_empty() || key.chars().count() > MAX_APP_ID_CHARS {
+            return Err("invalid app id");
+        }
+        let note = note.trim();
+        if note.chars().count() > MAX_APP_NOTE_CHARS {
+            return Err("app note is too long");
+        }
+        if note.is_empty() {
+            return Ok(self.notes.remove(&key).is_some());
+        }
+        if !self.notes.contains_key(&key) && self.notes.len() >= MAX_APP_NOTES {
+            return Err("app note limit reached");
+        }
+        if self.notes.get(&key).map(String::as_str) == Some(note) {
+            return Ok(false);
+        }
+        self.notes.insert(key, note.to_string());
+        Ok(true)
+    }
+
+    pub fn note_views(&self) -> Vec<eir_proto::UpdaterAppNote> {
+        self.notes
+            .iter()
+            .map(|(id, note)| eir_proto::UpdaterAppNote {
+                id: id.clone(),
+                note: note.clone(),
+            })
+            .collect()
+    }
 }
 
 impl Default for UpdaterConfig {
@@ -161,5 +198,28 @@ mod tests {
         assert_eq!(back.methods, cfg.methods);
         assert_eq!(back.native_signature_policy, cfg.native_signature_policy);
         assert_eq!(back.max_apps_per_run, cfg.max_apps_per_run);
+    }
+
+    #[test]
+    fn app_note_can_be_saved_replaced_and_cleared() {
+        let mut cfg = UpdaterConfig::default();
+        assert!(cfg
+            .set_app_note(
+                "Example App",
+                "Official downloads: https://example.com/download"
+            )
+            .expect("save"));
+        assert_eq!(
+            cfg.notes.get("example app").map(String::as_str),
+            Some("Official downloads: https://example.com/download")
+        );
+        assert!(cfg
+            .set_app_note("example app", "Not the unrelated namesake")
+            .expect("replace"));
+        assert!(cfg.set_app_note("example app", " ").expect("clear"));
+        assert!(!cfg.notes.contains_key("example app"));
+        assert!(cfg
+            .set_app_note("example app", &"x".repeat(MAX_APP_NOTE_CHARS + 1))
+            .is_err());
     }
 }

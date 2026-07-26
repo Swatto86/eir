@@ -1049,6 +1049,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     st.updater = UpdaterStatus {
         enabled: cfg.updater.enabled,
         settings: cfg.updater.to_view(),
+        app_notes: cfg.updater.note_views(),
         ..Default::default()
     };
     if let Ok(recent) = updater::history::recent(&db, 50).await {
@@ -1283,7 +1284,8 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         st.updater.last_run = chrono::Utc::now().timestamp();
                         st.updater.last_cost_usd = summary.cost_usd;
                         st.updater.notes = summary.notes.clone();
-                        st.updater.apps = updater::orchestrator::app_rows(&summary);
+                        st.updater.apps =
+                            updater::orchestrator::app_rows(&summary, &cfg.updater);
                         st.updater.phase = "idle".to_string();
                         if let Ok(recent) = updater::history::recent(&db, 50).await {
                             st.updater.recent = recent;
@@ -2094,16 +2096,19 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 cfg.updater.ignored.retain(|x| !x.eq_ignore_ascii_case(&key));
                                 changed = true;
                             }
-                            // A blank note means "unchanged" — never "clear". The UI has
-                            // no notes editor and always sends an empty note with an
-                            // ignore toggle, so treating blank as delete would wipe a
-                            // note hand-set in config.toml on every Ignore/Unignore click.
+                            // A blank note means "unchanged" here because ignore toggles
+                            // carry one; SetAppNote owns explicit create/update/delete.
                             let n = note.trim();
-                            if !n.is_empty()
-                                && cfg.updater.notes.get(&key).map(String::as_str) != Some(n)
-                            {
-                                cfg.updater.notes.insert(key.clone(), n.to_string());
-                                changed = true;
+                            let known = st
+                                .updater
+                                .apps
+                                .iter()
+                                .any(|a| a.id.eq_ignore_ascii_case(&key));
+                            if !n.is_empty() && known {
+                                match cfg.updater.set_app_note(&key, n) {
+                                    Ok(note_changed) => changed |= note_changed,
+                                    Err(e) => warn!("Refusing app note for '{key}': {e}"),
+                                }
                             }
                             if changed {
                                 if let Err(e) = config::save(&cfg, "config.toml") {
@@ -2117,9 +2122,44 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             for a in st.updater.apps.iter_mut() {
                                 if a.id.eq_ignore_ascii_case(&key) {
                                     a.ignored = ignore;
+                                    if !n.is_empty() {
+                                        a.note = n.to_string();
+                                    }
                                 }
                             }
+                            st.updater.app_notes = cfg.updater.note_views();
                             pipe.broadcast_status(build_status(&st));
+                        }
+                        UiMsg::SetAppNote { id, note } => {
+                            let key = id.trim().to_lowercase();
+                            let known = st
+                                .updater
+                                .apps
+                                .iter()
+                                .any(|a| a.id.eq_ignore_ascii_case(&key))
+                                || cfg.updater.notes.contains_key(&key);
+                            if !known {
+                                warn!("Refusing app note for unknown id '{key}'");
+                                continue;
+                            }
+                            match cfg.updater.set_app_note(&key, &note) {
+                                Ok(true) => {
+                                    if let Err(e) = config::save(&cfg, "config.toml") {
+                                        warn!("Failed to save app note: {e}");
+                                    }
+                                    let saved =
+                                        cfg.updater.notes.get(&key).cloned().unwrap_or_default();
+                                    for app in st.updater.apps.iter_mut() {
+                                        if app.id.eq_ignore_ascii_case(&key) {
+                                            app.note = saved.clone();
+                                        }
+                                    }
+                                    st.updater.app_notes = cfg.updater.note_views();
+                                    pipe.broadcast_status(build_status(&st));
+                                }
+                                Ok(false) => {}
+                                Err(e) => warn!("Refusing app note for '{key}': {e}"),
+                            }
                         }
                         UiMsg::SetAdvisorSettings(update) => {
                             // Applied live — no service restart.

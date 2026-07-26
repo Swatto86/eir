@@ -5,6 +5,11 @@
 
 use std::collections::HashMap;
 
+/// Stable key used for notes, ignores, and history across display-name version changes.
+pub fn app_id(name: &str) -> String {
+    clean_app_name(name).to_lowercase()
+}
+
 /// True when a token is a version designator we can safely strip: a dotted-numeric
 /// core (>= 2 dot-separated numeric groups, optionally `v`-prefixed or parenthesised)
 /// with an optional trailing build/pre-release qualifier — so "2.9.0", "v2.9",
@@ -147,43 +152,28 @@ fn contiguous_sublist(small: &[String], big: &[String]) -> bool {
     big.windows(small.len()).any(|w| w == small)
 }
 
-/// Resolve the installed version of an AI-returned app name against the apps we
-/// actually queried (keyed lowercased name -> version). Display names are fuzzy —
-/// the model may echo "Revision Tool" for a winget "Revision Tool version 2.9.0" —
-/// so after an exact hit fails, fall back to a WHOLE-TOKEN containment match (not a
-/// raw substring). A raw `contains` let a short AI name like "note" resolve to an
-/// unrelated "Notepad++", which — since the resolved candidate's name feeds the
-/// download host gate — could anchor a malicious vendor domain to a real installed
-/// app. Whole-token matching closes that. When the fuzzy match is AMBIGUOUS — an AI
-/// name like "Studio" whole-token-matching both "OBS Studio" and "Visual Studio" —
-/// we must NOT arbitrarily pick one (the old longest-key rule fed a wrong installed
-/// version into the update decision and the install-plan prompt). Mirror
-/// `winget_installed_version_by_name`: return a version only when every containment
-/// match agrees on it, else `None` (skip the guess this cycle).
-pub fn match_installed<'a>(
+/// Resolve an AI-returned name to one unambiguous installed identity and version.
+/// Display names are fuzzy, so an exact stable-key hit falls back to whole-token
+/// containment. Multiple matches are rejected even when their versions coincide:
+/// the updater needs the product identity, not merely a plausible version.
+pub fn match_installed_entry<'a>(
     installed: &'a HashMap<String, String>,
     name: &str,
-) -> Option<&'a String> {
-    let n = name.to_lowercase();
-    if let Some(v) = installed.get(&n) {
-        return Some(v);
+) -> Option<(&'a String, &'a String)> {
+    let n = app_id(name);
+    if let Some(entry) = installed.get_key_value(&n) {
+        return Some(entry);
     }
-    let nt = name_tokens(name);
+    let nt = name_tokens(&n);
     if nt.is_empty() {
         return None;
     }
-    let versions: Vec<&'a String> = installed
-        .iter()
-        .filter(|(k, _)| {
-            let kt = name_tokens(k);
-            !kt.is_empty() && (contiguous_sublist(&nt, &kt) || contiguous_sublist(&kt, &nt))
-        })
-        .map(|(_, v)| v)
-        .collect();
-    match versions.first() {
-        Some(&first) if versions.iter().all(|v| *v == first) => Some(first),
-        _ => None,
-    }
+    let mut matches = installed.iter().filter(|(key, _)| {
+        let kt = name_tokens(key);
+        !kt.is_empty() && (contiguous_sublist(&nt, &kt) || contiguous_sublist(&kt, &nt))
+    });
+    let found = matches.next()?;
+    matches.next().is_none().then_some(found)
 }
 
 #[cfg(test)]
@@ -200,18 +190,18 @@ mod tests {
         );
         m.insert("brave".to_string(), "1.60".to_string());
         // The attack: a short AI name must NOT substring-resolve to an unrelated app.
-        assert_eq!(match_installed(&m, "note"), None);
+        assert_eq!(match_installed_entry(&m, "note"), None);
         // Legit fuzzy display-name match still works (whole-token subset).
         assert_eq!(
-            match_installed(&m, "Revision Tool").map(String::as_str),
+            match_installed_entry(&m, "Revision Tool").map(|(_, v)| v.as_str()),
             Some("2.9.0")
         );
         // Exact match and a genuinely-unrelated name.
         assert_eq!(
-            match_installed(&m, "Brave").map(String::as_str),
+            match_installed_entry(&m, "Brave").map(|(_, v)| v.as_str()),
             Some("1.60")
         );
-        assert_eq!(match_installed(&m, "Firefox"), None);
+        assert_eq!(match_installed_entry(&m, "Firefox"), None);
     }
 
     #[test]
@@ -284,23 +274,32 @@ mod tests {
     #[test]
     fn match_installed_resolves_fuzzy_names() {
         let mut installed = HashMap::new();
-        installed.insert(
-            "revision tool version 2.9.0".to_string(),
-            "2.9.0".to_string(),
-        );
+        installed.insert("revision tool".to_string(), "2.9.0".to_string());
         installed.insert("krita".to_string(), "5.2.0".to_string());
         // The AI echoes a clean "Revision Tool"; it must still resolve to 2.9.0.
         assert_eq!(
-            match_installed(&installed, "Revision Tool"),
-            Some(&"2.9.0".to_string())
+            match_installed_entry(&installed, "Revision Tool").map(|(_, v)| v.as_str()),
+            Some("2.9.0")
         );
         // Exact (case-insensitive) hit.
         assert_eq!(
-            match_installed(&installed, "Krita"),
-            Some(&"5.2.0".to_string())
+            match_installed_entry(&installed, "Krita").map(|(_, v)| v.as_str()),
+            Some("5.2.0")
         );
         // No overlap -> no match (caller falls back to the AI's own `current`).
-        assert_eq!(match_installed(&installed, "Obsidian"), None);
+        assert_eq!(match_installed_entry(&installed, "Obsidian"), None);
+    }
+
+    #[test]
+    fn match_installed_entry_returns_the_stable_installed_identity() {
+        let installed: HashMap<String, String> =
+            [("revision tool".to_string(), "2.9.0".to_string())]
+                .into_iter()
+                .collect();
+        let (id, version) =
+            match_installed_entry(&installed, "Revision Tool Desktop").expect("fuzzy match");
+        assert_eq!(id, "revision tool");
+        assert_eq!(version, "2.9.0");
     }
 
     #[test]
@@ -310,13 +309,10 @@ mod tests {
         installed.insert("visual studio".to_string(), "17.9.0".to_string());
         // "Studio" whole-token-matches both, and their versions disagree — must NOT
         // arbitrarily pick one (the old longest-key rule silently chose Visual Studio).
-        assert_eq!(match_installed(&installed, "Studio"), None);
-        // But if every containment match agrees on the version, it still resolves.
+        assert_eq!(match_installed_entry(&installed, "Studio"), None);
+        // Even equal versions remain ambiguous identities and are rejected.
         installed.insert("obs studio helper".to_string(), "30.0.2".to_string());
         installed.remove("visual studio");
-        assert_eq!(
-            match_installed(&installed, "Studio"),
-            Some(&"30.0.2".to_string())
-        );
+        assert_eq!(match_installed_entry(&installed, "Studio"), None);
     }
 }

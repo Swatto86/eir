@@ -244,7 +244,7 @@ pub struct CycleSummary {
 
 /// Flatten a cycle's per-candidate attempts into one UI row each: the winning attempt
 /// (the verified/installed one if any, else the last tried) decides the row's state.
-pub fn app_rows(summary: &CycleSummary) -> Vec<eir_proto::UpdaterAppRow> {
+pub fn app_rows(summary: &CycleSummary, config: &UpdaterConfig) -> Vec<eir_proto::UpdaterAppRow> {
     summary
         .results
         .iter()
@@ -292,6 +292,7 @@ pub fn app_rows(summary: &CycleSummary) -> Vec<eir_proto::UpdaterAppRow> {
                 detail,
                 signature,
                 ignored: false,
+                note: config.notes.get(&cand.id).cloned().unwrap_or_default(),
             }
         })
         .collect()
