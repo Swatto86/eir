@@ -40,10 +40,10 @@ jobs:
         run: powershell -NoProfile -ExecutionPolicy Bypass -File eir-ui/build-svc.ps1
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --all-targets
 
       # The full bundle build runs beforeBuildCommand (stages eir-svc.exe) and signs
       # the updater artefacts, so a broken bundle can't ship green. Build-only — no
@@ -55,3 +55,14 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: eir-ui
+
+      - name: Smoke standalone executable
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target/release/eir.exe).Path
+          $process = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 5
+          if ($process.HasExited) {
+            throw "Standalone Eir exited with code $($process.ExitCode)"
+          }
+          Stop-Process -Id $process.Id

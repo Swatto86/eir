@@ -287,6 +287,10 @@
       font-size: 13px; font-family: inherit;
     }
     .set-grid input:focus, .set-grid select:focus { outline: none; border-color: var(--accent); }
+    .set-grid input:focus-visible, .set-grid select:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 1px;
+    }
+    [hidden] { display: none !important; }
     .set-grid input[type="checkbox"] { width: auto; justify-self: start; accent-color: var(--accent); }
     .set-actions { display: flex; align-items: center; gap: 12px; padding: 4px 15px 14px; }
     .set-status { font-size: 11.5px; color: var(--muted); }
@@ -570,18 +574,25 @@
 
       <div class="card" id="card-provider">
         <div class="card-header">AI provider &amp; monitoring</div>
-        <div class="set-section-desc">Which AI model Eir uses to diagnose problems, plus how often it polls Windows for signals. Saving these restarts the service (~15&nbsp;s).</div>
+        <div class="set-section-desc">Choose the AI Eir uses to diagnose problems. Provider and model changes apply immediately; collector changes restart the service.</div>
         <div class="set-grid">
           <label for="set-provider">AI provider</label>
           <select id="set-provider">
-            <option value="openrouter">OpenRouter (free models available)</option>
-            <option value="claude_cli">Claude — your subscription (Claude CLI, no key)</option>
-            <option value="anthropic">Claude — Anthropic API key</option>
-            <option value="kilo_cli">Kilo Code — your subscription (Kilo CLI, no key)</option>
+            <optgroup label="API services">
+              <option value="openrouter">OpenRouter — free models available</option>
+              <option value="anthropic">Anthropic — API key</option>
+            </optgroup>
+            <optgroup label="Signed-in subscription CLIs">
+              <option value="claude_cli">Claude CLI — Claude subscription</option>
+              <option value="codex_cli">Codex CLI — ChatGPT subscription</option>
+              <option value="kilo_cli">Kilo CLI — Kilo subscription</option>
+            </optgroup>
           </select>
-          <span class="set-hint" id="provider-hint"></span>
+          <span class="set-hint" id="provider-hint" aria-live="polite"></span>
           <label for="set-model">Model</label>
-          <input id="set-model" type="text" placeholder="openrouter/free (auto-routes to a free model)">
+          <input id="set-model" type="search" list="provider-models" autocomplete="off" spellcheck="false" aria-describedby="provider-hint model-hint" placeholder="openrouter/free (auto-routes to a free model)">
+          <datalist id="provider-models"></datalist>
+          <span class="set-hint" id="model-hint" aria-live="polite"></span>
           <label for="set-effort">Reasoning effort</label>
           <select id="set-effort">
             <option value="">Provider default</option>
@@ -592,15 +603,15 @@
             <option value="max">Max</option>
           </select>
           <label for="set-upd-model">App-update model</label>
-          <input id="set-upd-model" type="text" placeholder="blank = a cheap default with web search where supported">
-          <label for="set-or-key">OpenRouter key</label>
-          <input id="set-or-key" type="password" autocomplete="off">
-          <label for="set-an-key">Anthropic key</label>
-          <input id="set-an-key" type="password" autocomplete="off">
-          <label for="set-kilo-profile">Kilo CLI user profile</label>
-          <input id="set-kilo-profile" type="text" placeholder="C:\Users\You  (blank = auto-detect)">
-          <label for="set-kilo-path">Kilo CLI binary path</label>
-          <input id="set-kilo-path" type="text" placeholder="kilo  (blank = on PATH)">
+          <input id="set-upd-model" type="search" list="provider-models" autocomplete="off" spellcheck="false" aria-describedby="model-hint" placeholder="blank = a cheap default with web search where supported">
+          <label for="set-or-key" data-provider-only="openrouter">OpenRouter key</label>
+          <input id="set-or-key" data-provider-only="openrouter" type="password" autocomplete="off">
+          <label for="set-an-key" data-provider-only="anthropic" hidden>Anthropic key</label>
+          <input id="set-an-key" data-provider-only="anthropic" type="password" autocomplete="off" hidden>
+          <label for="set-kilo-profile" data-provider-only="kilo_cli" hidden>Kilo CLI user profile</label>
+          <input id="set-kilo-profile" data-provider-only="kilo_cli" type="text" placeholder="C:\Users\You  (blank = auto-detect)" hidden>
+          <label for="set-kilo-path" data-provider-only="kilo_cli" hidden>Kilo CLI binary path</label>
+          <input id="set-kilo-path" data-provider-only="kilo_cli" type="text" placeholder="kilo  (blank = on PATH)" hidden>
           <label for="set-conf">Auto-fix confidence (%)</label>
           <input id="set-conf" type="number" min="50" max="95" step="5" placeholder="80">
           <label for="set-decint">Decision interval (s)</label>
@@ -632,7 +643,7 @@
           <label for="set-adv-enabled">Enable advisor mode</label>
           <input id="set-adv-enabled" type="checkbox">
           <label for="set-adv-model">Escalation model</label>
-          <input id="set-adv-model" type="text" placeholder="e.g. claude-opus-4-8, or a stronger model id (blank = keep base)">
+          <input id="set-adv-model" type="search" list="provider-models" autocomplete="off" spellcheck="false" aria-describedby="model-hint" placeholder="blank = keep the base model">
           <label for="set-adv-effort">Escalation effort</label>
           <select id="set-adv-effort">
             <option value="">Keep base</option>

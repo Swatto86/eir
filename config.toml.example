@@ -1,5 +1,5 @@
 [api]
-# Four providers: "openrouter", "claude_cli", "anthropic", "kilo_cli".
+# Five providers: "openrouter", "claude_cli", "codex_cli", "anthropic", "kilo_cli".
 # Everything here is editable in the app's Settings panel — no need to touch
 # this file after install.
 
@@ -13,49 +13,57 @@ model = "openrouter/free" # auto-routes to a free model; or pin one from https:/
 
 # Model for the on-demand app-update check. OpenRouter/Kilo: blank = the main
 # model (OpenRouter adds live web search via its web plugin). Anthropic: blank =
-# claude-haiku-4-5 with native web search. Claude CLI: blank = haiku with the
-# CLI's built-in search. Editable in Settings.
+# claude-haiku-4-5 with native web search. Claude CLI: blank = haiku. Codex
+# CLI: blank = the main model. Both CLIs use their built-in search. Editable
+# in Settings.
 update_check_model = ""
 
 # Reasoning effort: low|medium|high|xhigh|max (blank = provider default).
 # Anthropic → output_config.effort; OpenRouter → reasoning.effort;
-# Claude CLI → --effort; Kilo CLI → --variant.
+# Claude CLI → --effort; Codex CLI → model_reasoning_effort; Kilo CLI → --variant.
 effort = ""
 
 # ── Option B: Claude via your subscription (Claude CLI — no API key) ──────────
 # Uses the machine's logged-in `claude` session; nothing is billed beyond your
-# Claude plan. The service runs as LocalSystem, so leave user_profile and
-# claude_cli_path blank and it auto-detects: it scans C:\Users for the profile
-# holding a logged-in session (~/.claude/.credentials.json) and finds claude.exe
-# under it.
+# Claude plan. Leave user_profile and claude_cli_path blank to auto-detect them.
+# The service launches the CLI with the active desktop user's Windows token,
+# never with LocalSystem authority.
 # provider = "claude_cli"
 # model = ""   # blank = the CLI's configured default, or e.g. "sonnet" / "claude-opus-4-8"
 # user_profile = "C:\\Users\\YourName"                              # optional override
 # claude_cli_path = "C:\\Users\\YourName\\.local\\bin\\claude.exe"  # optional override
 
-# ── Option C: Anthropic native API ────────────────────────────────────────────
+# ── Option C: Codex via your ChatGPT subscription (Codex CLI — no API key) ────
+# Uses the active desktop user's logged-in `codex` session. Run `codex login`
+# once; Eir finds codex.exe under that profile and launches it with that user's
+# Windows token (never with LocalSystem authority).
+# provider = "codex_cli"
+# model = ""   # blank = the CLI default, or e.g. "gpt-5.6-terra"
+# codex_cli_path = "C:\\Users\\YourName\\.codex\\packages\\standalone\\current\\bin\\codex.exe"
+
+# ── Option D: Anthropic native API ────────────────────────────────────────────
 # Key from https://console.anthropic.com — token usage is tracked and cost is
 # estimated from list pricing.
 # provider = "anthropic"
 # anthropic_api_key = "sk-ant-..."
 # model = "claude-opus-4-8"   # or claude-sonnet-4-6 / claude-haiku-4-5
 
-# ── Option D: Kilo Code CLI — your Kilo Pass / Token-Plan subscription ─────────
+# ── Option E: Kilo Code CLI — your Kilo Pass / Token-Plan subscription ─────────
 # No API key. Borrows the machine's logged-in `kilo` session, so Kilo Pass
 # credits, Token-Plan addons (e.g. "MiniMax Token Plan Plus"), and BYOK all
 # flow through transparently — exactly like the Claude CLI borrows your
 # Claude subscription.
 #
 # Install: `npm install -g @kilocode/cli`, then run `kilo` once interactively
-# to sign in. The service (running as LocalSystem) auto-detects your Windows
-# profile by scanning C:\Users for .local\share\kilo\auth.json.
+# to sign in. Eir auto-detects the profile holding .local\share\kilo\auth.json
+# and launches the CLI with the active desktop user's Windows token.
 #
 # The "kilo/" model prefix is what routes a call through your subscription/
 # Token-Plan/BYOK; a bare provider/model id instead requires your own
 # credentials with that upstream provider.
 #
 # provider = "kilo_cli"
-# model = "kilo/minimax/minimax-m2.5"                   # "kilo/" + any provider/model id from https://kilo.ai/models
+# model = "kilo/minimax/minimax-m3"                     # "kilo/" + any provider/model id from https://kilo.ai/models
 # kilo_cli_user_profile = "C:\\Users\\You"              # optional — blank = auto-detect
 # kilo_cli_path = "C:\\Users\\You\\AppData\\Roaming\\npm\\kilo.cmd"  # optional — blank = on PATH
 

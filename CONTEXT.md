@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.30.1. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.31.0. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.30.1. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-26 | Eir | v0.31.0 Codex CLI + provider-aware model picker | Settings now groups API and signed-in CLI providers, hides irrelevant credentials, and uses the native searchable `datalist` for the main, updater, and Advisor models. Model catalogues are provider-specific: Codex (`codex debug models`), Kilo (`kilo models --pure`), OpenRouter's public models endpoint, and small Claude fallbacks; typed custom IDs remain valid. Added `codex_cli`, using the active user's ChatGPT login through constrained `codex exec --json` arguments. Because the service runs as LocalSystem, all subscription CLIs now resolve and launch under the active desktop user's token; user-profile scratch I/O is impersonated to prevent privileged reparse-point file access. Release packaging also publishes and hashes the raw portable `eir.exe`. Gate green (fmt, clippy, 238 tests, release build, version/JS checks); the packaged Settings flow and live Codex catalogue/filter/select were visually exercised, and the exact Codex CLI contract returned a live benign response. The LocalSystem-to-Codex end-to-end call remains not live-exercised.
 
 2026-07-24 | Eir | v0.30.1 transient CLI-exit no longer latches the cycle red | An "update all apps" run turned the service/analysis state red: two analysis cycles failed with `claude CLI exited with exit code: 1` and *empty* stderr while the concurrent update run was also driving the Claude CLI (a brief API/overload blip the CLI swallowed to a bare non-zero exit). `is_transient_ai_error` only matched HTTP-shaped markers, so this was treated as permanent — no retry, `st.error` latched "Error". Root cause fixed in `ai::client`: `call_claude_cli`/`call_kilo_cli` now split a non-zero exit on whether stderr carried a diagnostic — empty → a distinct "…and no error output (transient)" message that `is_transient_ai_error` recognises (retried by `analyze_with`'s backoff loop); non-empty (auth/config, e.g. "Invalid API key") still surfaces immediately without retry. The CLI itself was never broken (verified exit 0 post-incident). Unit-verified (extended `transient_error_classification`); the concurrency race is not deterministically reproducible so the retry is reasoned, not live-burned.
 

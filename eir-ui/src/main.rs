@@ -3,6 +3,7 @@
 mod ask_attach;
 mod game_detect;
 mod pipe_client;
+mod provider_models;
 mod util;
 
 use eir_proto::{
@@ -1056,6 +1057,7 @@ fn main() {
             check_updates_now,
             get_autostart_enabled,
             set_autostart_enabled,
+            provider_models::list_provider_models,
             util::gbp_per_usd,
             util::open_url
         ])

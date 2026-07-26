@@ -332,8 +332,8 @@ pub struct UiSettings {
     /// supports it). Empty = a provider-appropriate default.
     pub update_check_model: String,
     /// Reasoning effort: one of low, medium, high, xhigh, max. Empty = the
-    /// provider default. Maps to `output_config.effort` (Anthropic) or
-    /// `reasoning.effort` (OpenRouter / Kilo Code).
+    /// provider default. Maps to the equivalent Anthropic, OpenRouter,
+    /// Claude CLI, Codex CLI, or Kilo CLI reasoning control.
     #[serde(default)]
     pub effort: String,
     pub decision_interval_secs: u64,

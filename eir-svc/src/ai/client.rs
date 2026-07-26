@@ -5,7 +5,36 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+#[cfg(windows)]
+use std::{ffi::OsStr, io::Read, mem::size_of, os::windows::ffi::OsStrExt};
 use tracing::{debug, info, warn};
+#[cfg(windows)]
+use windows::{
+    core::{PCWSTR, PWSTR},
+    Win32::{
+        Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Security::{
+            CreateWellKnownSid, EqualSid, GetTokenInformation, ImpersonateLoggedOnUser,
+            RevertToSelf, TokenUser, WinLocalSystemSid, PSID, SECURITY_MAX_SID_SIZE, TOKEN_QUERY,
+            TOKEN_USER,
+        },
+        System::{
+            Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+            RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken},
+            Threading::{
+                CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
+                ResumeThread, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW,
+                CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+            },
+        },
+        UI::Shell::GetUserProfileDirectoryW,
+    },
+};
 
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -157,9 +186,17 @@ enum AiClientConfig {
     /// Claude via the local `claude` CLI — no API key; borrows the machine's
     /// logged-in Claude subscription session.
     ClaudeCli {
-        binary: String,
+        configured_binary: Option<String>,
         model: String,
         user_profile: Option<String>,
+    },
+    /// Codex via the local CLI — no API key; borrows the user's logged-in
+    /// ChatGPT subscription session. The configured path stays optional until
+    /// call time because a LocalSystem service resolves and launches Codex in
+    /// the active desktop user's security context.
+    CodexCli {
+        configured_binary: Option<String>,
+        model: String,
     },
     OpenRouter {
         api_key: String,
@@ -169,7 +206,7 @@ enum AiClientConfig {
     /// Kilo session (Kilo Pass / Token-Plan addons / BYOK all flow through
     /// it transparently); no API key to paste.
     KiloCli {
-        binary: String,
+        configured_binary: Option<String>,
         model: String,
         user_profile: Option<String>,
     },
@@ -196,18 +233,30 @@ impl AiClient {
                 // No key required — the CLI carries the user's Claude
                 // subscription session. Profile and binary are auto-detected
                 // when not configured.
-                let user_profile = resolve_user_profile(cfg.user_profile.as_deref());
-                let binary =
-                    resolve_claude_binary(cfg.claude_cli_path.as_deref(), user_profile.as_deref());
+                let user_profile = resolve_cli_user_profile(
+                    cfg.user_profile.as_deref(),
+                    running_as_local_system(),
+                    resolve_user_profile,
+                );
                 info!(
-                    binary = %binary,
+                    configured_binary = cfg.claude_cli_path.as_deref().unwrap_or("<auto>"),
                     user_profile = user_profile.as_deref().unwrap_or("<not found>"),
                     "claude_cli provider configured"
                 );
                 AiClientConfig::ClaudeCli {
-                    binary,
+                    configured_binary: cfg.claude_cli_path.clone().filter(|path| is_real(path)),
                     model: cfg.model.clone(),
                     user_profile,
+                }
+            }
+            ApiProvider::CodexCli => {
+                info!(
+                    configured_binary = cfg.codex_cli_path.as_deref().unwrap_or("<auto>"),
+                    "codex_cli provider configured"
+                );
+                AiClientConfig::CodexCli {
+                    configured_binary: cfg.codex_cli_path.clone().filter(|path| is_real(path)),
+                    model: cfg.model.clone(),
                 }
             }
             ApiProvider::OpenRouter => {
@@ -234,19 +283,21 @@ impl AiClient {
                 // session (Kilo Pass / Token-Plan addons / BYOK all flow
                 // through it transparently). Profile and binary are
                 // auto-detected when not configured.
-                let user_profile = resolve_kilo_cli_profile(cfg.kilo_cli_user_profile.as_deref());
-                let binary =
-                    resolve_kilo_cli_binary(cfg.kilo_cli_path.as_deref(), user_profile.as_deref());
+                let user_profile = resolve_cli_user_profile(
+                    cfg.kilo_cli_user_profile.as_deref(),
+                    running_as_local_system(),
+                    resolve_kilo_cli_profile,
+                );
                 if cfg.model.trim().is_empty() {
-                    bail!("[api] a model is required for provider = \"kilo_cli\" (e.g. kilo/minimax/minimax-m2.5 or anthropic/claude-sonnet-4.6)");
+                    bail!("[api] a model is required for provider = \"kilo_cli\" (e.g. kilo/minimax/minimax-m3 or kilo/anthropic/claude-sonnet-5)");
                 }
                 info!(
-                    binary = %binary,
+                    configured_binary = cfg.kilo_cli_path.as_deref().unwrap_or("<auto>"),
                     user_profile = user_profile.as_deref().unwrap_or("<not found>"),
                     "kilo_cli provider configured"
                 );
                 AiClientConfig::KiloCli {
-                    binary,
+                    configured_binary: cfg.kilo_cli_path.clone().filter(|path| is_real(path)),
                     model: cfg.model.clone(),
                     user_profile,
                 }
@@ -317,12 +368,26 @@ impl AiClient {
                     .await
                 }
                 AiClientConfig::ClaudeCli {
-                    binary,
+                    configured_binary,
                     model,
                     user_profile,
                 } => {
                     let m = model_ov.unwrap_or(model);
-                    self.call_claude_cli(binary, m, effort, user_profile.as_deref(), &prompt)
+                    self.call_claude_cli(
+                        configured_binary.as_deref(),
+                        m,
+                        effort,
+                        user_profile.as_deref(),
+                        &prompt,
+                    )
+                    .await
+                }
+                AiClientConfig::CodexCli {
+                    configured_binary,
+                    model,
+                } => {
+                    let m = model_ov.unwrap_or(model);
+                    self.call_codex_cli(configured_binary.as_deref(), m, effort, &prompt, false)
                         .await
                 }
                 AiClientConfig::OpenRouter { api_key, model } => {
@@ -331,13 +396,19 @@ impl AiClient {
                         .await
                 }
                 AiClientConfig::KiloCli {
-                    binary,
+                    configured_binary,
                     model,
                     user_profile,
                 } => {
                     let m = model_ov.unwrap_or(model);
-                    self.call_kilo_cli(binary, m, effort, user_profile.as_deref(), &prompt)
-                        .await
+                    self.call_kilo_cli(
+                        configured_binary.as_deref(),
+                        m,
+                        effort,
+                        user_profile.as_deref(),
+                        &prompt,
+                    )
+                    .await
                 }
             };
             match result {
@@ -669,68 +740,91 @@ impl AiClient {
 
     async fn call_claude_cli(
         &self,
-        binary: &str,
+        configured_binary: Option<&str>,
         model: &str,
         effort: &str,
         user_profile: Option<&str>,
         prompt: &str,
     ) -> Result<(String, Option<CallUsage>)> {
-        let mut cmd = tokio::process::Command::new(binary);
-        // JSON output gives us the response text plus token/cost usage.
-        cmd.args(["--print", "--output-format", "json"]);
+        validate_cli_model_id(model, "Claude")?;
+        let mut args = vec![
+            "--print".to_string(),
+            "--output-format".to_string(),
+            "json".to_string(),
+        ];
         if !model.is_empty() {
-            cmd.args(["--model", model]);
+            args.extend(["--model".to_string(), model.to_string()]);
         }
-        // Reasoning effort (low|medium|high|xhigh|max); validated upstream.
         if !effort.is_empty() {
-            cmd.args(["--effort", effort]);
+            args.extend(["--effort".to_string(), effort.to_string()]);
         }
-        // Reap the (large) claude process if this future is dropped on timeout.
-        cmd.kill_on_drop(true);
+        static CLAUDE_CALL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = CLAUDE_CALL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let output = if running_as_local_system() {
+            let binary = configured_binary.map(str::to_owned);
+            let args = args.clone();
+            let prompt = prompt.to_string();
+            tokio::task::spawn_blocking(move || {
+                run_cli_as_active_user(
+                    UserCliSpec {
+                        configured_binary: binary.as_deref(),
+                        resolve_binary: resolve_claude_binary,
+                        what: "claude CLI",
+                        scratch_prefix: "eir-claude",
+                        workspace_flag: None,
+                    },
+                    &args,
+                    &prompt,
+                    seq,
+                )
+            })
+            .await
+            .context("Join Claude user-process task")??
+        } else {
+            let binary = resolve_claude_binary(configured_binary, user_profile);
+            let mut command = cli_process(&binary);
+            command
+                .args(&args)
+                .kill_on_drop(true)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            if let Some(profile) = user_profile {
+                command
+                    .env("USERPROFILE", profile)
+                    .env("HOME", profile)
+                    .env("APPDATA", format!("{profile}\\AppData\\Roaming"))
+                    .env("LOCALAPPDATA", format!("{profile}\\AppData\\Local"));
+            }
+            let child = command.spawn().context(
+                "Failed to spawn the claude CLI — is it installed and logged in on this machine?",
+            )?;
+            let (status, stdout, stderr) =
+                wait_capped(child, "claude CLI", Some(prompt.as_bytes().to_vec())).await?;
+            CliProcessOutput {
+                code: status.code().map(|code| code as u32).unwrap_or(u32::MAX),
+                stdout,
+                stderr,
+            }
+        };
 
-        // When the service runs as LocalSystem, set user-space env vars so the CLI
-        // can locate the logged-in session stored in the user's AppData.
-        if let Some(profile) = user_profile {
-            let appdata = format!("{profile}\\AppData\\Roaming");
-            let localappdata = format!("{profile}\\AppData\\Local");
-            let homepath = profile.strip_prefix("C:").unwrap_or(profile);
-            cmd.env("USERPROFILE", profile)
-                .env("HOMEPATH", homepath)
-                .env("HOMEDRIVE", "C:")
-                .env("APPDATA", &appdata)
-                .env("LOCALAPPDATA", &localappdata);
-        }
-
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        let child = cmd.spawn().context(
-            "Failed to spawn the claude CLI — is it installed and logged in on this machine?",
-        )?;
-
-        // The claude CLI is a large binary with a cold Node start plus full
-        // model inference and no streaming, so allow a generous window. The prompt is
-        // written to stdin concurrently with draining stdout/stderr (inside
-        // wait_capped) so a large prompt can't deadlock the pipes. Output is read with
-        // a memory cap so a runaway CLI can't OOM the service.
-        let (status, stdout_raw, stderr_raw) =
-            wait_capped(child, "claude CLI", Some(prompt.as_bytes().to_vec())).await?;
-
-        if !status.success() {
-            let err = char_preview(stderr_raw.trim(), 2000);
+        if output.code != 0 {
+            let err = char_preview(output.stderr.trim(), 2000);
             if err.is_empty() {
                 // Non-zero exit with NO diagnostic output: the CLI swallowed a
                 // transient API/overload blip (an auth/config failure prints to
                 // stderr instead). Marked transient (see is_transient_ai_error)
                 // so analyze_with retries rather than latching the cycle red on a
                 // one-off hiccup — the class that turned Eir red mid update run.
-                bail!("claude CLI exited with {status} and no error output (transient)");
+                bail!(
+                    "claude CLI exited with code {} and no error output (transient)",
+                    output.code
+                );
             }
-            bail!("claude CLI exited with {status}: {err}");
+            bail!("claude CLI exited with code {}: {err}", output.code);
         }
 
-        let stdout = stdout_raw.trim().to_string();
+        let stdout = output.stdout.trim().to_string();
         if stdout.is_empty() {
             bail!("claude CLI returned empty output");
         }
@@ -758,6 +852,38 @@ impl AiClient {
         }
     }
 
+    // ── Codex CLI subprocess (no API key — uses the logged-in ChatGPT session) ──
+
+    async fn call_codex_cli(
+        &self,
+        configured_binary: Option<&str>,
+        model: &str,
+        effort: &str,
+        prompt: &str,
+        web_search: bool,
+    ) -> Result<(String, Option<CallUsage>)> {
+        static CODEX_CALL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = CODEX_CALL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let args = codex_cli_args(model, effort, web_search)?;
+        let output = run_codex_cli(configured_binary, &args, prompt, seq).await?;
+
+        if output.code != 0 {
+            if let Some(err) = codex_event_error(&output.stdout) {
+                bail!("codex CLI exited with code {}: {err}", output.code);
+            }
+            let err = char_preview(output.stderr.trim(), 2000);
+            if err.is_empty() {
+                bail!(
+                    "codex CLI exited with code {} and no error output (transient)",
+                    output.code
+                );
+            }
+            bail!("codex CLI exited with code {}: {err}", output.code);
+        }
+
+        parse_codex_ndjson(&output.stdout)
+    }
+
     // ── Kilo CLI subprocess (no API key — borrows the user's logged-in Kilo session) ──
 
     /// Run a prompt through the user's installed `kilo` CLI. The CLI carries
@@ -767,85 +893,99 @@ impl AiClient {
     /// token/cost accounting.
     async fn call_kilo_cli(
         &self,
-        binary: &str,
+        configured_binary: Option<&str>,
         model: &str,
         effort: &str,
         user_profile: Option<&str>,
         prompt: &str,
     ) -> Result<(String, Option<CallUsage>)> {
-        // Give the agent a writable workspace so it doesn't refuse to start.
-        // Each call gets a fresh empty dir — the agent has nothing to operate
-        // on, so it just answers the prompt. Key it per-call (pid + a monotonic
-        // sequence), not just per-process, so a concurrent analysis and labeller call
-        // don't point two `kilo` processes at the same workspace; cleaned up after the
-        // call so it doesn't litter %TEMP%.
+        validate_cli_model_id(model, "Kilo")?;
         static KILO_CALL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = KILO_CALL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let workspace =
-            std::env::temp_dir().join(format!("eir-kilo-{}-{}", std::process::id(), seq));
-        let _ = std::fs::create_dir_all(&workspace);
-
-        let mut cmd = tokio::process::Command::new(binary);
-        cmd.args(["run", "--auto", "--format", "json", "--agent", "ask"]);
+        let mut args = ["run", "--auto", "--format", "json", "--agent", "ask"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
         if !model.is_empty() {
-            cmd.args(["-m", model]);
+            args.extend(["-m".to_string(), model.to_string()]);
         }
         if let Some(variant) = kilo_cli_variant(effort) {
-            cmd.args(["--variant", variant]);
+            args.extend(["--variant".to_string(), variant.to_string()]);
         }
-        cmd.arg("--dir").arg(&workspace);
-        // Reap the subprocess if the future is dropped on timeout.
-        cmd.kill_on_drop(true);
+        let output = if running_as_local_system() {
+            let binary = configured_binary.map(str::to_owned);
+            let args = args.clone();
+            let prompt = prompt.to_string();
+            tokio::task::spawn_blocking(move || {
+                run_cli_as_active_user(
+                    UserCliSpec {
+                        configured_binary: binary.as_deref(),
+                        resolve_binary: resolve_kilo_cli_binary,
+                        what: "kilo CLI",
+                        scratch_prefix: "eir-kilo",
+                        workspace_flag: Some("--dir"),
+                    },
+                    &args,
+                    &prompt,
+                    seq,
+                )
+            })
+            .await
+            .context("Join Kilo user-process task")??
+        } else {
+            let binary = resolve_kilo_cli_binary(configured_binary, user_profile);
+            let workspace =
+                std::env::temp_dir().join(format!("eir-kilo-{}-{seq}", std::process::id()));
+            std::fs::create_dir_all(&workspace).context("Create Kilo scratch workspace")?;
+            let mut command = cli_process(&binary);
+            command
+                .args(&args)
+                .arg("--dir")
+                .arg(&workspace)
+                .current_dir(&workspace)
+                .kill_on_drop(true)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            if let Some(profile) = user_profile {
+                command
+                    .env("USERPROFILE", profile)
+                    .env("HOME", profile)
+                    .env("APPDATA", format!("{profile}\\AppData\\Roaming"))
+                    .env("LOCALAPPDATA", format!("{profile}\\AppData\\Local"));
+            }
+            let child = command.spawn().context(
+                "Failed to spawn the kilo CLI — is it installed (`npm install -g @kilocode/cli`) and logged in on this machine?",
+            );
+            let waited = match child {
+                Ok(child) => wait_capped(child, "kilo CLI", Some(prompt.as_bytes().to_vec())).await,
+                Err(error) => Err(error),
+            };
+            let _ = std::fs::remove_dir_all(&workspace);
+            let (status, stdout, stderr) = waited?;
+            CliProcessOutput {
+                code: status.code().map(|code| code as u32).unwrap_or(u32::MAX),
+                stdout,
+                stderr,
+            }
+        };
 
-        // Borrow the user's logged-in Kilo session when running as
-        // LocalSystem. Same pattern as `call_claude_cli` — APPDATA /
-        // LOCALAPPDATA are what the Node CLI uses to locate its session.
-        if let Some(profile) = user_profile {
-            let appdata = format!("{profile}\\AppData\\Roaming");
-            let localappdata = format!("{profile}\\AppData\\Local");
-            let homepath = profile.strip_prefix("C:").unwrap_or(profile);
-            cmd.env("USERPROFILE", profile)
-                .env("HOMEPATH", homepath)
-                .env("HOMEDRIVE", "C:")
-                .env("APPDATA", &appdata)
-                .env("LOCALAPPDATA", &localappdata)
-                // The kilo CLI is a Bun-compiled binary; Bun tooling can
-                // consult HOME on Windows for some path resolution.
-                .env("HOME", profile);
-        }
-
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        let child = cmd.spawn().context(
-            "Failed to spawn the kilo CLI — is it installed (`npm install -g @kilocode/cli`) and logged in on this machine?",
-        )?;
-
-        // The kilo CLI is a Node binary with a cold start plus agent loop
-        // (--auto) and JSON event emission, so allow a generous window. The prompt is
-        // written to stdin concurrently with draining stdout/stderr (inside
-        // wait_capped) so a large prompt can't deadlock the pipes; dropping stdin
-        // afterwards signals EOF so kilo exits. Output is read with a memory cap so a
-        // runaway agent loop can't OOM the service.
-        let waited = wait_capped(child, "kilo CLI", Some(prompt.as_bytes().to_vec())).await;
-        // Reclaim the scratch workspace whether the call succeeded or errored.
-        let _ = std::fs::remove_dir_all(&workspace);
-        let (status, stdout, stderr_raw) = waited?;
-
-        if !status.success() {
+        if output.code != 0 {
             // Exit 124 = kilo's own timeout (treat like ours); 1 = init/runtime
             // error. Surface stderr so the user can diagnose (e.g. "Not
             // authenticated — run `kilo` once interactively to log in").
-            let err = char_preview(stderr_raw.trim(), 2000);
+            let err = char_preview(output.stderr.trim(), 2000);
             if err.is_empty() {
                 // No diagnostic output → transient hiccup, not a config error; retry.
-                bail!("kilo CLI exited with {status} and no error output (transient)");
+                bail!(
+                    "kilo CLI exited with code {} and no error output (transient)",
+                    output.code
+                );
             }
-            bail!("kilo CLI exited with {status}: {err}");
+            bail!("kilo CLI exited with code {}: {err}", output.code);
         }
 
-        let (text, usage) = parse_kilo_ndjson(&stdout)?;
+        let (text, usage) = parse_kilo_ndjson(&output.stdout)?;
         if text.trim().is_empty() {
             bail!("kilo CLI returned no assistant text");
         }
@@ -932,18 +1072,32 @@ impl AiClient {
                 self.call_anthropic_web(api_key, &m, prompt).await
             }
             AiClientConfig::ClaudeCli {
-                binary,
+                configured_binary,
                 user_profile,
                 ..
             } => {
                 // The CLI's built-in web search does the grounding; blank or
                 // non-Claude override models coerce to the cheap haiku alias.
                 let m = claude_cli_model(ov);
-                self.call_claude_cli(binary, &m, &self.effort, user_profile.as_deref(), prompt)
+                self.call_claude_cli(
+                    configured_binary.as_deref(),
+                    &m,
+                    &self.effort,
+                    user_profile.as_deref(),
+                    prompt,
+                )
+                .await
+            }
+            AiClientConfig::CodexCli {
+                configured_binary,
+                model,
+            } => {
+                let m = if ov.is_empty() { model.as_str() } else { ov };
+                self.call_codex_cli(configured_binary.as_deref(), m, &self.effort, prompt, true)
                     .await
             }
             AiClientConfig::KiloCli {
-                binary,
+                configured_binary,
                 model,
                 user_profile,
             } => {
@@ -951,8 +1105,14 @@ impl AiClient {
                 // asked). For our app-update-check we use the same model the
                 // main loop uses, with no reasoning-effort override.
                 let m = if ov.is_empty() { model.as_str() } else { ov };
-                self.call_kilo_cli(binary, m, "", user_profile.as_deref(), prompt)
-                    .await
+                self.call_kilo_cli(
+                    configured_binary.as_deref(),
+                    m,
+                    "",
+                    user_profile.as_deref(),
+                    prompt,
+                )
+                .await
             }
         }
     }
@@ -974,12 +1134,26 @@ impl AiClient {
                     .await
             }
             AiClientConfig::ClaudeCli {
-                binary,
+                configured_binary,
                 user_profile,
                 ..
             } => {
                 let m = claude_cli_model(ov);
-                self.call_claude_cli(binary, &m, "", user_profile.as_deref(), prompt)
+                self.call_claude_cli(
+                    configured_binary.as_deref(),
+                    &m,
+                    "",
+                    user_profile.as_deref(),
+                    prompt,
+                )
+                .await
+            }
+            AiClientConfig::CodexCli {
+                configured_binary,
+                model,
+            } => {
+                let m = if ov.is_empty() { model.as_str() } else { ov };
+                self.call_codex_cli(configured_binary.as_deref(), m, "", prompt, false)
                     .await
             }
             AiClientConfig::OpenRouter { api_key, model } => {
@@ -988,13 +1162,19 @@ impl AiClient {
                     .await
             }
             AiClientConfig::KiloCli {
-                binary,
+                configured_binary,
                 model,
                 user_profile,
             } => {
                 let m = if ov.is_empty() { model.as_str() } else { ov };
-                self.call_kilo_cli(binary, m, "", user_profile.as_deref(), prompt)
-                    .await
+                self.call_kilo_cli(
+                    configured_binary.as_deref(),
+                    m,
+                    "",
+                    user_profile.as_deref(),
+                    prompt,
+                )
+                .await
             }
         }
     }
@@ -1214,6 +1394,68 @@ pub(crate) fn claude_cli_model(model: &str) -> String {
     }
 }
 
+/// Build the fixed, non-interactive Codex argv. The model is the only
+/// user-configurable argument that may pass through an npm `cmd /C` shim, so
+/// keep it to the model-id character set before it reaches a shell.
+fn codex_cli_args(model: &str, effort: &str, web_search: bool) -> Result<Vec<String>> {
+    let model = model.trim();
+    validate_cli_model_id(model, "Codex")?;
+
+    let mut args = Vec::new();
+    if web_search {
+        args.push("--search".into());
+    }
+    args.extend(
+        [
+            "--ask-for-approval",
+            "never",
+            "exec",
+            "--json",
+            "--sandbox",
+            "read-only",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--color",
+            "never",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    if !model.is_empty() {
+        args.extend(["-m".into(), model.into()]);
+    }
+    if let Some(level) = codex_cli_effort(model, effort) {
+        args.extend(["-c".into(), format!("model_reasoning_effort={level}")]);
+    }
+    args.push("-".into());
+    Ok(args)
+}
+
+fn validate_cli_model_id(model: &str, provider: &str) -> Result<()> {
+    if model.len() > 256
+        || (!model.is_empty()
+            && !model.chars().all(|character| {
+                character.is_ascii_alphanumeric() || "._:/@~,+=-".contains(character)
+            }))
+    {
+        bail!("{provider} model id contains unsupported characters");
+    }
+    Ok(())
+}
+
+/// Current Codex models before GPT-5.6 top out at xhigh. Blank model means the
+/// CLI chooses, so xhigh is the safe interpretation of Eir's `max`.
+fn codex_cli_effort<'a>(model: &str, effort: &'a str) -> Option<&'a str> {
+    match effort {
+        "low" | "medium" | "high" | "xhigh" => Some(effort),
+        "max" if model.starts_with("gpt-5.6") => Some("max"),
+        "max" => Some("xhigh"),
+        _ => None,
+    }
+}
+
 /// Map Eir's reasoning-effort levels onto the kilo CLI's `--variant` values
 /// (low|medium|high). The CLI rejects unknown variants, so we collapse
 /// xhigh/max to high and ignore anything else (empty = don't pass the flag).
@@ -1231,6 +1473,18 @@ fn kilo_cli_variant(effort: &str) -> Option<&'static str> {
 fn is_real(value: &str) -> bool {
     let v = value.trim();
     !v.is_empty() && !v.contains("YourName")
+}
+
+fn resolve_cli_user_profile(
+    configured: Option<&str>,
+    running_as_local_system: bool,
+    resolver: fn(Option<&str>) -> Option<String>,
+) -> Option<String> {
+    if running_as_local_system {
+        None
+    } else {
+        resolver(configured)
+    }
 }
 
 /// Resolve the Windows user profile whose logged-in `claude` session the service
@@ -1276,6 +1530,499 @@ fn resolve_claude_binary(configured: Option<&str>, user_profile: Option<&str>) -
         }
     }
     "claude".into()
+}
+
+/// Resolve a native Codex executable under the logged-in user's profile. Full
+/// paths are required for the LocalSystem service, whose PATH does not contain
+/// per-user installs.
+fn resolve_codex_binary(configured: Option<&str>, user_profile: Option<&str>) -> String {
+    if let Some(p) = configured.filter(|p| is_real(p)) {
+        return p.trim().to_string();
+    }
+    if let Some(up) = user_profile {
+        for candidate in [
+            format!("{up}\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe"),
+            format!("{up}\\.codex\\packages\\standalone\\current\\bin\\codex.exe"),
+            format!(
+                "{up}\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe"
+            ),
+            format!(
+                "{up}\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\codex\\codex.exe"
+            ),
+            format!("{up}\\AppData\\Roaming\\npm\\codex.cmd"),
+        ] {
+            if std::path::Path::new(&candidate).is_file() {
+                return candidate;
+            }
+        }
+    }
+    "codex".into()
+}
+
+/// Windows npm shims are batch files and need cmd.exe; native installs run
+/// directly. All values appended after this point are fixed or model-id gated.
+fn cli_process(binary: &str) -> tokio::process::Command {
+    let lower = binary.to_ascii_lowercase();
+    if cfg!(windows) && (lower.ends_with(".cmd") || lower.ends_with(".bat")) {
+        let mut command = tokio::process::Command::new("cmd.exe");
+        command.arg("/C").arg(binary);
+        command
+    } else {
+        tokio::process::Command::new(binary)
+    }
+}
+
+struct CliProcessOutput {
+    code: u32,
+    stdout: String,
+    stderr: String,
+}
+
+async fn run_codex_cli(
+    configured_binary: Option<&str>,
+    args: &[String],
+    prompt: &str,
+    seq: u64,
+) -> Result<CliProcessOutput> {
+    if running_as_local_system() {
+        let binary = configured_binary.map(str::to_owned);
+        let args = args.to_vec();
+        let prompt = prompt.to_owned();
+        return tokio::task::spawn_blocking(move || {
+            run_cli_as_active_user(
+                UserCliSpec {
+                    configured_binary: binary.as_deref(),
+                    resolve_binary: resolve_codex_binary,
+                    what: "codex CLI",
+                    scratch_prefix: "eir-codex",
+                    workspace_flag: None,
+                },
+                &args,
+                &prompt,
+                seq,
+            )
+        })
+        .await
+        .context("Join Codex user-process task")?;
+    }
+
+    let profile = std::env::var("USERPROFILE").ok();
+    let binary = resolve_codex_binary(configured_binary, profile.as_deref());
+    let workspace = std::env::temp_dir().join(format!("eir-codex-{}-{seq}", std::process::id()));
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .context("Create Codex CLI scratch workspace")?;
+    let mut command = cli_process(&binary);
+    command
+        .args(args)
+        .current_dir(&workspace)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = command.spawn().context(
+        "Failed to spawn the codex CLI — is it installed and logged in (`codex login`) on this machine?",
+    );
+    let waited = match child {
+        Ok(child) => wait_capped(child, "codex CLI", Some(prompt.as_bytes().to_vec())).await,
+        Err(error) => Err(error),
+    };
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    let (status, stdout, stderr) = waited?;
+    Ok(CliProcessOutput {
+        code: status.code().map(|code| code as u32).unwrap_or(u32::MAX),
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(windows)]
+struct WinHandle(HANDLE);
+
+#[cfg(windows)]
+impl Drop for WinHandle {
+    fn drop(&mut self) {
+        if self.0 != HANDLE::default() {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct UserImpersonation;
+
+#[cfg(windows)]
+impl UserImpersonation {
+    fn new(token: HANDLE) -> Result<Self> {
+        unsafe {
+            ImpersonateLoggedOnUser(token).context("Impersonate active desktop user")?;
+        }
+        Ok(Self)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for UserImpersonation {
+    fn drop(&mut self) {
+        if let Err(error) = unsafe { RevertToSelf() } {
+            warn!(%error, "Failed to end active desktop user impersonation");
+        }
+    }
+}
+
+#[cfg(windows)]
+fn running_as_local_system() -> bool {
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return true;
+        }
+        let _token = WinHandle(token);
+        let mut bytes = 0;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut bytes);
+        if bytes == 0 {
+            return true;
+        }
+        let mut info = vec![0u8; bytes as usize];
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            Some(info.as_mut_ptr().cast()),
+            bytes,
+            &mut bytes,
+        )
+        .is_err()
+        {
+            return true;
+        }
+        let user = &*(info.as_ptr().cast::<TOKEN_USER>());
+        let mut sid = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut sid_bytes = SECURITY_MAX_SID_SIZE;
+        if CreateWellKnownSid(
+            WinLocalSystemSid,
+            PSID::default(),
+            PSID(sid.as_mut_ptr().cast()),
+            &mut sid_bytes,
+        )
+        .is_err()
+        {
+            return true;
+        }
+        EqualSid(user.User.Sid, PSID(sid.as_mut_ptr().cast())).is_ok()
+    }
+}
+
+#[cfg(not(windows))]
+fn running_as_local_system() -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn user_profile_for_token(token: HANDLE) -> Result<String> {
+    let mut chars = 0;
+    unsafe {
+        let _ = GetUserProfileDirectoryW(token, PWSTR::null(), &mut chars);
+    }
+    if chars == 0 {
+        bail!("Could not resolve the active desktop user's profile");
+    }
+    let mut buffer = vec![0u16; chars as usize];
+    unsafe {
+        GetUserProfileDirectoryW(token, PWSTR(buffer.as_mut_ptr()), &mut chars)
+            .context("Resolve active desktop user profile")?;
+    }
+    if buffer.last() == Some(&0) {
+        buffer.pop();
+    }
+    String::from_utf16(&buffer).context("Decode active desktop user profile")
+}
+
+#[cfg(windows)]
+fn wide_null(value: impl AsRef<OsStr>) -> Vec<u16> {
+    value
+        .as_ref()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// Quote one argv element using the Windows CommandLineToArgvW rules.
+#[cfg(windows)]
+fn quote_windows_arg(value: &str) -> String {
+    if !value.is_empty()
+        && !value
+            .chars()
+            .any(|character| character.is_whitespace() || "\"&|<>^()!".contains(character))
+    {
+        return value.to_string();
+    }
+    let mut quoted = String::from("\"");
+    let mut slashes = 0;
+    for character in value.chars() {
+        match character {
+            '\\' => slashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat(slashes * 2 + 1));
+                quoted.push('"');
+                slashes = 0;
+            }
+            _ => {
+                quoted.push_str(&"\\".repeat(slashes));
+                slashes = 0;
+                quoted.push(character);
+            }
+        }
+    }
+    quoted.push_str(&"\\".repeat(slashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(windows)]
+struct CliRedirections<'a> {
+    profile: &'a str,
+    stdin: &'a std::path::Path,
+    stdout: &'a std::path::Path,
+    stderr: &'a std::path::Path,
+}
+
+#[cfg(windows)]
+fn user_cli_command_line(
+    application: &str,
+    binary: &str,
+    args: &[String],
+    files: CliRedirections<'_>,
+) -> Result<String> {
+    let paths = [
+        binary.to_string(),
+        files.profile.to_string(),
+        files.stdin.to_string_lossy().into_owned(),
+        files.stdout.to_string_lossy().into_owned(),
+        files.stderr.to_string_lossy().into_owned(),
+    ];
+    if paths.iter().chain(args.iter()).any(|value| {
+        value
+            .chars()
+            .any(|character| "\"%\r\n\0".contains(character))
+    }) {
+        bail!("CLI argument contains characters unsafe for Windows redirection");
+    }
+    let invocation = std::iter::once(binary)
+        .chain(args.iter().map(String::as_str))
+        .map(quote_windows_arg)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let inner = format!(
+        "set \"HOME={}\" && set \"CODEX_HOME={}\\.codex\" && \
+         {invocation} <{} >{} 2>{}",
+        files.profile,
+        files.profile,
+        quote_windows_arg(&files.stdin.to_string_lossy()),
+        quote_windows_arg(&files.stdout.to_string_lossy()),
+        quote_windows_arg(&files.stderr.to_string_lossy())
+    );
+    Ok(format!(
+        "{} /D /Q /V:OFF /S /C \"{inner}\"",
+        quote_windows_arg(application)
+    ))
+}
+
+#[cfg(windows)]
+fn read_file_capped(path: &std::path::Path) -> Result<String> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(CLI_OUTPUT_CAP as u64).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// LocalSystem must never execute a user-writable CLI with SYSTEM authority.
+/// Launch subscription CLIs with the active desktop user's primary token instead.
+/// Cross-session handle inheritance is unsupported on Windows, so a hidden user-
+/// scoped cmd process redirects through bounded scratch files in that user's profile.
+#[cfg(windows)]
+struct UserCliSpec<'a> {
+    configured_binary: Option<&'a str>,
+    resolve_binary: fn(Option<&str>, Option<&str>) -> String,
+    what: &'a str,
+    scratch_prefix: &'a str,
+    workspace_flag: Option<&'a str>,
+}
+
+#[cfg(windows)]
+fn run_cli_as_active_user(
+    spec: UserCliSpec<'_>,
+    args: &[String],
+    prompt: &str,
+    seq: u64,
+) -> Result<CliProcessOutput> {
+    let UserCliSpec {
+        configured_binary,
+        resolve_binary,
+        what,
+        scratch_prefix,
+        workspace_flag,
+    } = spec;
+    let session = unsafe { WTSGetActiveConsoleSessionId() };
+    if session == u32::MAX {
+        bail!("No active desktop user is available for {what}");
+    }
+    let mut token = HANDLE::default();
+    unsafe {
+        WTSQueryUserToken(session, &mut token).context("Get active desktop user token")?;
+    }
+    let token_guard = WinHandle(token);
+    let profile = user_profile_for_token(token)?;
+    let binary = {
+        let _user = UserImpersonation::new(token)?;
+        let binary = resolve_binary(configured_binary, Some(&profile));
+        if !std::path::Path::new(&binary).is_file() {
+            bail!("{what} was not found for the active desktop user");
+        }
+        binary
+    };
+
+    let workspace = std::path::Path::new(&profile)
+        .join("AppData\\Local\\Temp")
+        .join(format!("{scratch_prefix}-{}-{seq}", std::process::id()));
+    let result = (|| {
+        let stdin = workspace.join("stdin.txt");
+        let stdout = workspace.join("stdout.txt");
+        let stderr = workspace.join("stderr.txt");
+        {
+            // Every operation beneath the user's writable profile must use the
+            // user's token. Otherwise a reparse point could turn these SYSTEM
+            // file operations into privileged overwrite/read/delete primitives.
+            let _user = UserImpersonation::new(token)?;
+            std::fs::create_dir_all(&workspace)
+                .with_context(|| format!("Create {what} user scratch workspace"))?;
+            std::fs::write(&stdin, prompt)?;
+            std::fs::File::create(&stdout)?;
+            std::fs::File::create(&stderr)?;
+        }
+
+        let application = format!(
+            "{}\\System32\\cmd.exe",
+            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string())
+        );
+        let mut process_args = args.to_vec();
+        if let Some(flag) = workspace_flag {
+            process_args.push(flag.to_string());
+            process_args.push(workspace.to_string_lossy().into_owned());
+        }
+        let command_line = user_cli_command_line(
+            &application,
+            &binary,
+            &process_args,
+            CliRedirections {
+                profile: &profile,
+                stdin: &stdin,
+                stdout: &stdout,
+                stderr: &stderr,
+            },
+        )
+        .with_context(|| format!("Build {what} command line"))?;
+        let application_w = wide_null(&application);
+        let mut command_w = wide_null(&command_line);
+        let workspace_w = wide_null(workspace.as_os_str());
+
+        let mut environment = std::ptr::null_mut();
+        unsafe {
+            CreateEnvironmentBlock(&mut environment, token, false)
+                .context("Create active desktop user environment")?;
+        }
+        let startup = STARTUPINFOW {
+            cb: size_of::<STARTUPINFOW>() as u32,
+            ..Default::default()
+        };
+        let mut process = PROCESS_INFORMATION::default();
+        let spawned = unsafe {
+            CreateProcessAsUserW(
+                token,
+                PCWSTR(application_w.as_ptr()),
+                PWSTR(command_w.as_mut_ptr()),
+                None,
+                None,
+                false,
+                CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                Some(environment),
+                PCWSTR(workspace_w.as_ptr()),
+                &startup,
+                &mut process,
+            )
+        };
+        unsafe {
+            let _ = DestroyEnvironmentBlock(environment);
+        }
+        spawned.with_context(|| format!("Launch {what} as the active desktop user"))?;
+
+        let process_guard = WinHandle(process.hProcess);
+        let thread_guard = WinHandle(process.hThread);
+        let job = match unsafe { CreateJobObjectW(None, PCWSTR::null()) } {
+            Ok(job) => job,
+            Err(error) => {
+                unsafe {
+                    let _ = TerminateProcess(process.hProcess, 1);
+                }
+                return Err(error).with_context(|| format!("Create {what} process job"));
+            }
+        };
+        let _job_guard = WinHandle(job);
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let job_ready = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .and_then(|()| AssignProcessToJobObject(job, process.hProcess))
+        };
+        if let Err(error) = job_ready {
+            unsafe {
+                let _ = TerminateProcess(process.hProcess, 1);
+            }
+            return Err(error).with_context(|| format!("Contain {what} process tree"));
+        }
+        if unsafe { ResumeThread(thread_guard.0) } == u32::MAX {
+            unsafe {
+                let _ = TerminateProcess(process.hProcess, 1);
+            }
+            bail!("Resume {what} process failed");
+        }
+        match unsafe { WaitForSingleObject(process.hProcess, 300_000) } {
+            WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => {
+                unsafe {
+                    let _ = TerminateProcess(process.hProcess, 1);
+                    let _ = WaitForSingleObject(process.hProcess, 5_000);
+                }
+                bail!("{what} timed out after 300s");
+            }
+            _ => bail!("Wait for {what} failed"),
+        }
+        let mut code = 0;
+        unsafe {
+            GetExitCodeProcess(process_guard.0, &mut code)
+                .with_context(|| format!("Read {what} exit code"))?;
+        }
+        let output = {
+            let _user = UserImpersonation::new(token)?;
+            CliProcessOutput {
+                code,
+                stdout: read_file_capped(&stdout)?,
+                stderr: read_file_capped(&stderr)?,
+            }
+        };
+        Ok(output)
+    })();
+    if let Ok(_user) = UserImpersonation::new(token) {
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+    drop(token_guard);
+    result
 }
 
 /// Resolve the Windows user profile whose logged-in Kilo session the service
@@ -1408,6 +2155,67 @@ fn extract_json_object(s: &str) -> &str {
     }
 }
 
+/// Pull the concise failure message out of Codex's JSONL stream.
+fn codex_event_error(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let event = serde_json::from_str::<Value>(line).ok()?;
+        match event["type"].as_str()? {
+            "turn.failed" => event["error"]["message"]
+                .as_str()
+                .map(|s| char_preview(s, 2000)),
+            "error" => event["message"].as_str().map(|s| char_preview(s, 2000)),
+            _ => None,
+        }
+    })
+}
+
+/// Parse `codex exec --json`: assistant text arrives on completed agent
+/// messages and usage on `turn.completed`.
+fn parse_codex_ndjson(stdout: &str) -> Result<(String, Option<CallUsage>)> {
+    if let Some(error) = codex_event_error(stdout) {
+        bail!("codex CLI: {error}");
+    }
+
+    let mut text = String::new();
+    let mut usage = None;
+    for line in stdout.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match event["type"].as_str() {
+            Some("item.completed") if event["item"]["type"].as_str() == Some("agent_message") => {
+                if let Some(part) = event["item"]["text"].as_str().filter(|s| !s.is_empty()) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(part);
+                }
+            }
+            Some("turn.completed") => {
+                let u = &event["usage"];
+                let cached = u["cached_input_tokens"].as_u64().unwrap_or(0);
+                usage = Some(CallUsage {
+                    // Codex input_tokens includes the cached subset; Eir stores
+                    // cache reads separately, so subtract it to avoid double-counting.
+                    input_tokens: u["input_tokens"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .saturating_sub(cached),
+                    output_tokens: u["output_tokens"].as_u64().unwrap_or(0),
+                    cache_creation: u["cache_write_input_tokens"].as_u64().unwrap_or(0),
+                    cache_read: cached,
+                    cost_usd: 0.0,
+                });
+            }
+            _ => {}
+        }
+    }
+    if text.trim().is_empty() {
+        bail!("codex CLI returned no assistant text");
+    }
+    Ok((text, usage))
+}
+
 /// Parse the kilo CLI's `--format json` NDJSON output. The CLI nests each
 /// event's actual payload under a `part` object (e.g.
 /// `{"type":"text","part":{"type":"text","text":"..."}}`); we read fields
@@ -1506,7 +2314,8 @@ fn is_transient_ai_error(e: &anyhow::Error) -> bool {
         "stream read error",
         "stream error",
         // A CLI subprocess that exited non-zero with empty stderr (see
-        // call_claude_cli / call_kilo_cli) — an ambiguous hiccup, worth a retry.
+        // call_claude_cli / call_codex_cli / call_kilo_cli) — an ambiguous
+        // hiccup, worth a retry.
         "no error output",
     ];
     MARKERS.iter().any(|m| s.contains(m))
@@ -1648,6 +2457,14 @@ mod tests {
     }
 
     #[test]
+    fn local_system_does_not_bind_a_subscription_cli_to_another_profile() {
+        assert_eq!(
+            resolve_cli_user_profile(Some(r"C:\Users\WrongProfile"), true, resolve_user_profile),
+            None
+        );
+    }
+
+    #[test]
     fn claude_binary_resolution_prefers_real_installs() {
         // Configured value wins outright; placeholder is ignored.
         assert_eq!(
@@ -1701,6 +2518,107 @@ mod tests {
     }
 
     #[test]
+    fn codex_cli_args_are_safe_and_provider_appropriate() {
+        let args = codex_cli_args("gpt-5.6-sol", "max", true).unwrap();
+        assert_eq!(args.first().map(String::as_str), Some("--search"));
+        assert!(args.windows(2).any(|w| w == ["-m", "gpt-5.6-sol"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["-c", "model_reasoning_effort=max"]));
+        assert_eq!(args.last().map(String::as_str), Some("-"));
+
+        let older = codex_cli_args("gpt-5.4", "max", false).unwrap();
+        assert!(older
+            .windows(2)
+            .any(|w| w == ["-c", "model_reasoning_effort=xhigh"]));
+        assert!(codex_cli_args("gpt-5.4 & whoami", "high", false).is_err());
+        assert!(codex_cli_args(&"a".repeat(257), "high", false).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn user_cli_command_line_quotes_metacharacters_and_rejects_expansion() {
+        let args = vec!["--model".to_string(), "safe&literal".to_string()];
+        let line = user_cli_command_line(
+            r"C:\Windows\System32\cmd.exe",
+            r"C:\Program Files\Codex\codex.exe",
+            &args,
+            CliRedirections {
+                profile: r"C:\Users\Owner",
+                stdin: std::path::Path::new(r"C:\Users\Owner\in.txt"),
+                stdout: std::path::Path::new(r"C:\Users\Owner\out.txt"),
+                stderr: std::path::Path::new(r"C:\Users\Owner\err.txt"),
+            },
+        )
+        .unwrap();
+        assert!(line.contains(r#""safe&literal""#));
+        assert!(user_cli_command_line(
+            r"C:\Windows\System32\cmd.exe",
+            r"C:\Users\%USERNAME%\codex.exe",
+            &[],
+            CliRedirections {
+                profile: r"C:\Users\Owner",
+                stdin: std::path::Path::new(r"C:\in"),
+                stdout: std::path::Path::new(r"C:\out"),
+                stderr: std::path::Path::new(r"C:\err"),
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn codex_ndjson_parses_text_usage_and_errors() {
+        let stream = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"id\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"hello\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,",
+            "\"cached_input_tokens\":40,\"cache_write_input_tokens\":3,\"output_tokens\":12}}\n"
+        );
+        let (text, usage) = parse_codex_ndjson(stream).unwrap();
+        assert_eq!(text, "hello");
+        let usage = usage.unwrap();
+        assert_eq!(usage.input_tokens, 60);
+        assert_eq!(usage.cache_read, 40);
+        assert_eq!(usage.cache_creation, 3);
+        assert_eq!(usage.output_tokens, 12);
+
+        let failed = r#"{"type":"turn.failed","error":{"message":"login required"}}"#;
+        assert!(parse_codex_ndjson(failed)
+            .unwrap_err()
+            .to_string()
+            .contains("login required"));
+    }
+
+    #[test]
+    fn codex_binary_resolution_prefers_real_installs() {
+        assert_eq!(
+            resolve_codex_binary(Some("D:\\tools\\codex.exe"), None),
+            "D:\\tools\\codex.exe"
+        );
+
+        let root = std::env::temp_dir().join(format!("eir-codex-resolve-{}", std::process::id()));
+        let profile = root.to_string_lossy().into_owned();
+        assert_eq!(resolve_codex_binary(None, Some(&profile)), "codex");
+
+        let standalone = root.join(".codex\\packages\\standalone\\current\\bin\\codex.exe");
+        std::fs::create_dir_all(standalone.parent().unwrap()).unwrap();
+        std::fs::write(&standalone, b"x").unwrap();
+        assert_eq!(
+            resolve_codex_binary(None, Some(&profile)),
+            standalone.to_string_lossy()
+        );
+
+        let app = root.join("AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&app, b"x").unwrap();
+        assert_eq!(
+            resolve_codex_binary(None, Some(&profile)),
+            app.to_string_lossy()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn openai_effort_mapping() {
         assert_eq!(openai_effort(""), None);
         assert_eq!(openai_effort("low"), Some("low"));
@@ -1749,6 +2667,9 @@ mod tests {
         )));
         assert!(is_transient_ai_error(&anyhow!(
             "kilo CLI exited with exit code: 1 and no error output (transient)"
+        )));
+        assert!(is_transient_ai_error(&anyhow!(
+            "codex CLI exited with exit code: 1 and no error output (transient)"
         )));
         // But a CLI exit that DID print a diagnostic (auth/config) is permanent.
         assert!(!is_transient_ai_error(&anyhow!(

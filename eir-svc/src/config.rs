@@ -80,6 +80,10 @@ pub enum ApiProvider {
     /// logged-in Claude subscription session.
     #[serde(rename = "claude_cli")]
     ClaudeCli,
+    /// Codex via the local `codex` CLI — no API key, uses the machine's
+    /// logged-in ChatGPT subscription session.
+    #[serde(rename = "codex_cli")]
+    CodexCli,
     /// OpenRouter (openrouter.ai) — OpenAI-compatible; supports free models.
     #[serde(rename = "openrouter", alias = "open_router")]
     OpenRouter,
@@ -97,6 +101,7 @@ impl ApiProvider {
         match self {
             ApiProvider::Anthropic => "anthropic",
             ApiProvider::ClaudeCli => "claude_cli",
+            ApiProvider::CodexCli => "codex_cli",
             ApiProvider::OpenRouter => "openrouter",
             ApiProvider::KiloCli => "kilo_cli",
         }
@@ -105,6 +110,7 @@ impl ApiProvider {
     fn parse(s: &str) -> ApiProvider {
         match s {
             "claude_cli" => ApiProvider::ClaudeCli,
+            "codex_cli" => ApiProvider::CodexCli,
             "openrouter" | "open_router" => ApiProvider::OpenRouter,
             "kilo_cli" | "kilocode" | "kilo" => ApiProvider::KiloCli,
             _ => ApiProvider::Anthropic,
@@ -128,7 +134,8 @@ pub struct ApiConfig {
     pub update_check_model: String,
     /// Reasoning effort: low|medium|high|xhigh|max, empty = provider default.
     /// Maps to `output_config.effort` (Anthropic), `reasoning.effort`
-    /// (OpenRouter), `--effort` (Claude CLI), or `--variant` (kilo CLI);
+    /// (OpenRouter), `--effort` (Claude CLI), `model_reasoning_effort`
+    /// (Codex CLI), or `--variant` (kilo CLI);
     /// models without a reasoning dial may reject it.
     #[serde(default)]
     pub effort: String,
@@ -141,6 +148,10 @@ pub struct ApiConfig {
     /// auto-detect by scanning C:\Users for `.claude\.credentials.json`.
     #[serde(default)]
     pub user_profile: Option<String>,
+    /// codex_cli: path to the codex binary. Blank = auto-detect under the
+    /// resolved user profile, then PATH.
+    #[serde(default)]
+    pub codex_cli_path: Option<String>,
     /// kilo_cli: path to the `kilo` binary (from `npm install -g @kilocode/cli`
     /// or the standalone Windows zip). Blank = "kilo" on PATH.
     #[serde(default)]
@@ -262,7 +273,13 @@ impl Config {
 
     /// Apply an update from the UI. Empty/None secret fields keep the stored value.
     pub fn apply_update(&mut self, u: SettingsUpdate) {
-        self.api.provider = ApiProvider::parse(&u.provider);
+        let provider = ApiProvider::parse(&u.provider);
+        if provider != self.api.provider {
+            // An escalation model belongs to the old provider and may be invalid
+            // for the new one. Blank safely means "keep the base model".
+            self.advisor.escalation_model.clear();
+        }
+        self.api.provider = provider;
         self.api.model = u.model;
         self.api.update_check_model = u.update_check_model;
         self.api.effort = normalize_effort(&u.effort);
@@ -559,13 +576,43 @@ audit_db = "./eir.db"
     }
 
     #[test]
+    fn codex_cli_provider_round_trips_with_no_key_or_model() {
+        let src = SAMPLE.replace(
+            "provider = \"anthropic\"",
+            "provider = \"codex_cli\"\ncodex_cli_path = 'C:\\tools\\codex.exe'",
+        );
+        let cfg: Config = toml::from_str(&src).unwrap();
+        assert_eq!(cfg.api.provider, ApiProvider::CodexCli);
+
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.api.provider, ApiProvider::CodexCli);
+        assert_eq!(
+            reparsed.api.codex_cli_path.as_deref(),
+            Some("C:\\tools\\codex.exe")
+        );
+        assert_eq!(reparsed.to_ui_settings().provider, "codex_cli");
+    }
+
+    #[test]
+    fn changing_provider_drops_the_old_escalation_model() {
+        let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
+        cfg.advisor.escalation_model = "claude-opus-4-8".into();
+        cfg.apply_update(SettingsUpdate {
+            provider: "codex_cli".into(),
+            ..Default::default()
+        });
+        assert!(cfg.advisor.escalation_model.is_empty());
+    }
+
+    #[test]
     fn kilocode_provider_alias_loads_as_kilo_cli() {
         // The removed API-key "kilocode" gateway provider aliases to the
         // surviving subscription path (kilo_cli) rather than failing to parse.
         let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
         cfg.apply_update(SettingsUpdate {
             provider: "kilocode".into(),
-            model: "kilo/anthropic/claude-sonnet-4.6".into(),
+            model: "kilo/anthropic/claude-sonnet-5".into(),
             ..Default::default()
         });
         let serialized = toml::to_string_pretty(&cfg).unwrap();

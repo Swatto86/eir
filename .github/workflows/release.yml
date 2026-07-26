@@ -40,14 +40,35 @@ jobs:
             disk pressure, log corruption, driver issues, and more.
 
             ### Install
-            1. Run **`Eir_${{ github.ref_name }}_x64-setup.exe`** as Administrator.
+            1. Download and run the Windows setup `.exe` below as Administrator.
                The installer registers and starts the `EirSvc` Windows service and seeds `config.toml` automatically.
-            2. Pick your AI provider in the app's **Settings** panel — a free OpenRouter model (no cost), your logged-in Claude CLI session, or an API key.
+            2. Pick your AI provider and model in **Settings** — use OpenRouter, a logged-in Claude/Codex/Kilo CLI subscription, or an Anthropic API key.
             3. Launch **Eir** from the Start Menu — the tray icon appears once the service connects.
 
             Already running an earlier version? It updates itself automatically.
+
+            ### Portable
+            `Eir_${{ github.ref_name }}_windows-x64.exe` launches directly with no installer.
+            Installing the background service still requires the setup package.
 
             ### Uninstall
             Use **Add or Remove Programs** — the uninstaller stops and unregisters the service automatically.
           releaseDraft: false
           prerelease: false
+
+      - name: Upload portable executable and checksums
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $portable = "target/release/Eir_${env:GITHUB_REF_NAME}_windows-x64.exe"
+          Copy-Item target/release/eir.exe $portable
+          $installer = Get-ChildItem target/release/bundle/nsis -Filter '*-setup.exe' |
+            Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer not found' }
+          $checksums = "target/release/Eir_${env:GITHUB_REF_NAME}_SHA256SUMS.txt"
+          @($portable, $installer.FullName) | ForEach-Object {
+            $hash = (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $(Split-Path $_ -Leaf)"
+          } | Set-Content $checksums -Encoding ascii
+          gh release upload $env:GITHUB_REF_NAME $portable $checksums --clobber

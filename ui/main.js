@@ -192,6 +192,7 @@ function providerName(p) {
   return ({
     openrouter: 'OpenRouter',
     claude_cli: 'Claude CLI',
+    codex_cli: 'Codex CLI',
     anthropic: 'Claude (Anthropic)',
     kilo_cli: 'Kilo CLI',
   })[p] || p || '';
@@ -204,6 +205,7 @@ function analysisLabel(s) {
   if (!model) {
     model = s.provider === 'openrouter' ? 'openrouter/free'
       : s.provider === 'claude_cli' ? 'default model'
+      : s.provider === 'codex_cli' ? 'default model'
       : s.provider === 'kilo_cli' ? 'default model'
       : '(no model set)';
   }
@@ -224,6 +226,10 @@ function updateCheckLabel(s) {
     const lower = m.toLowerCase();
     const isClaude = ['haiku', 'sonnet', 'opus'].includes(lower) || lower.startsWith('claude');
     return `Claude CLI · ${isClaude ? m : 'haiku'} + web`;
+  }
+  if (s.provider === 'codex_cli') {
+    const main = (s.model || '').trim();
+    return `Codex CLI · ${m || main || 'default model'} + web`;
   }
   if (s.provider === 'kilo_cli') {
     return `Kilo CLI · ${m || 'main model'} + web`;
@@ -1039,12 +1045,14 @@ function renderUsage(u) {
   lastUsageSig = usageSig;
   // Claude CLI runs on the subscription: no charge, so cost cells show a dash
   // (the CLI's figures are only the equivalent API cost).
-  const free = provider === 'claude_cli';
+  const free = provider === 'claude_cli' || provider === 'codex_cli';
   const costCell = (c) => (free ? '—' : fmtGbp(c));
   const note = provider === 'openrouter'
     ? 'OpenRouter-reported cost — £0.00 on free models.'
     : provider === 'claude_cli'
       ? 'No charge — uses your Claude subscription. Token counts shown for transparency.'
+      : provider === 'codex_cli'
+        ? 'No charge — uses your ChatGPT subscription. Token counts shown for transparency.'
       : provider === 'anthropic'
         ? 'Estimated from Anthropic list pricing.'
         : provider === 'kilo_cli'
@@ -1266,26 +1274,102 @@ function numVal(id, def, min, max) {
 }
 
 const PROVIDER_HINTS = {
-  openrouter: 'One key, hundreds of models — free ones included. Blank model auto-routes to a free model. Key: openrouter.ai/keys',
+  openrouter: 'One key, hundreds of models — free ones included. Blank model uses openrouter/free. Key: openrouter.ai/keys',
   claude_cli: 'Uses your Claude subscription via the logged-in claude CLI — no API key. Auto-detects your profile and claude.exe. Blank model = the CLI default; aliases like haiku/sonnet/opus work.',
+  codex_cli: 'Uses your ChatGPT subscription via the logged-in Codex CLI — no API key. Install Codex and run `codex login` once; Eir auto-detects your profile and codex.exe.',
   anthropic: 'Claude direct from Anthropic. A model is required (e.g. claude-opus-4-8, claude-haiku-4-5). Key: console.anthropic.com',
-  kilo_cli: 'Kilo CLI (your Kilo subscription) — no API key; borrows your logged-in Kilo session. Install with `npm install -g @kilocode/cli`, then run `kilo` once to sign in. Model needs the kilo/ prefix to route through your subscription/BYOK, e.g. kilo/minimax/minimax-m2.5.',
+  kilo_cli: 'Uses your Kilo subscription via the logged-in Kilo CLI — no API key. Install with `npm install -g @kilocode/cli`, then run `kilo` once to sign in. Subscription models use the kilo/ prefix.',
 };
 
 const PROVIDER_MODEL_PLACEHOLDERS = {
-  openrouter: 'blank = a free model, or e.g. mistralai/mistral-small',
+  openrouter: 'Choose a model; blank uses openrouter/free',
   claude_cli: 'blank = CLI default, or haiku / sonnet / opus',
+  codex_cli: 'blank = CLI default, or choose a Codex model',
   anthropic: 'required, e.g. claude-opus-4-8 or claude-haiku-4-5',
-  kilo_cli: 'kilo/ prefix, e.g. kilo/minimax/minimax-m2.5',
+  kilo_cli: 'Choose a kilo/ subscription model',
 };
 
-function updateProviderHint() {
-  const p = document.getElementById('set-provider').value;
-  document.getElementById('provider-hint').textContent = PROVIDER_HINTS[p] || '';
-  const model = document.getElementById('set-model');
-  if (model) model.placeholder = PROVIDER_MODEL_PLACEHOLDERS[p] || '';
+const PROVIDER_UPDATE_PLACEHOLDERS = {
+  openrouter: 'blank = main model, with web search',
+  claude_cli: 'blank = Haiku, with web search',
+  codex_cli: 'blank = main model, with web search',
+  anthropic: 'blank = Claude Haiku, with web search',
+  kilo_cli: 'blank = main model, with web search',
+};
+
+const MODEL_INPUT_IDS = ['set-model', 'set-upd-model', 'set-adv-model'];
+const modelValuesByProvider = new Map();
+let activeModelProvider = '';
+let savedProvider = '';
+let modelListRequest = 0;
+
+function currentModelValues() {
+  return MODEL_INPUT_IDS.map((id) => document.getElementById(id).value);
 }
-document.getElementById('set-provider').addEventListener('change', updateProviderHint);
+
+function rememberModelValues(provider) {
+  if (provider) modelValuesByProvider.set(provider, currentModelValues());
+}
+
+function restoreModelValues(provider) {
+  const values = modelValuesByProvider.get(provider) || ['', '', ''];
+  MODEL_INPUT_IDS.forEach((id, index) => {
+    document.getElementById(id).value = values[index] || '';
+  });
+}
+
+async function loadProviderModels(provider) {
+  const request = ++modelListRequest;
+  const list = document.getElementById('provider-models');
+  const hint = document.getElementById('model-hint');
+  list.replaceChildren();
+  hint.textContent = 'Loading models…';
+  MODEL_INPUT_IDS.forEach((id) => document.getElementById(id).setAttribute('aria-busy', 'true'));
+  try {
+    const models = await invoke('list_provider_models', { provider });
+    if (request !== modelListRequest || provider !== document.getElementById('set-provider').value) return;
+    const selected = currentModelValues().filter(Boolean);
+    const values = [...new Set([...selected, ...(models || [])])];
+    const fragment = document.createDocumentFragment();
+    values.forEach((value) => {
+      const option = document.createElement('option');
+      option.value = value;
+      fragment.appendChild(option);
+    });
+    list.replaceChildren(fragment);
+    hint.textContent = `${values.length} models available — open the list or type to filter.`;
+  } catch (e) {
+    if (request === modelListRequest) {
+      hint.textContent = 'Model list unavailable — the current model is still preserved.';
+      console.error('list_provider_models failed', e);
+    }
+  } finally {
+    if (request === modelListRequest) {
+      MODEL_INPUT_IDS.forEach((id) => document.getElementById(id).removeAttribute('aria-busy'));
+    }
+  }
+}
+
+function updateProviderHint() {
+  const provider = document.getElementById('set-provider').value;
+  document.getElementById('provider-hint').textContent = PROVIDER_HINTS[provider] || '';
+  document.getElementById('set-model').placeholder = PROVIDER_MODEL_PLACEHOLDERS[provider] || '';
+  document.getElementById('set-upd-model').placeholder =
+    PROVIDER_UPDATE_PLACEHOLDERS[provider] || '';
+  document.querySelectorAll('[data-provider-only]').forEach((field) => {
+    field.hidden = field.dataset.providerOnly !== provider;
+  });
+  loadProviderModels(provider);
+}
+
+function switchProvider() {
+  const provider = document.getElementById('set-provider').value;
+  rememberModelValues(activeModelProvider);
+  activeModelProvider = provider;
+  restoreModelValues(provider);
+  updateProviderHint();
+}
+document.getElementById('set-provider').addEventListener('change', switchProvider);
 
 async function fillAutostartSetting() {
   const box = document.getElementById('set-autostart');
@@ -1323,7 +1407,10 @@ function fillSettings() {
   fillAutostartSetting();
   const s = lastStatus && lastStatus.settings;
   if (!s) return;
-  document.getElementById('set-provider').value = s.provider || 'openrouter';
+  const provider = s.provider || 'openrouter';
+  document.getElementById('set-provider').value = provider;
+  activeModelProvider = provider;
+  savedProvider = provider;
   updateProviderHint();
   document.getElementById('set-model').value = s.model || '';
   document.getElementById('set-effort').value = s.effort || '';
@@ -1346,6 +1433,7 @@ function fillSettings() {
     s.kilo_cli_path_set ? '•••••• set — blank keeps it' : 'kilo  (blank = on PATH)';
   fillUpdaterSettings(lastStatus.updater && lastStatus.updater.settings);
   fillAdvisorSettings(lastStatus.advisor && lastStatus.advisor.settings);
+  rememberModelValues(provider);
   dirtyCards.clear();
 }
 
@@ -1376,6 +1464,7 @@ async function saveSettings() {
   const st = document.getElementById('set-status');
 
   const s = (lastStatus && lastStatus.settings) || {};
+  const providerChanged = !!savedProvider && savedProvider !== settings.provider;
   if (settings.provider === 'openrouter' && !settings.model) {
     settings.model = 'openrouter/free';
   }
@@ -1391,7 +1480,7 @@ async function saveSettings() {
   }
   if (settings.provider === 'kilo_cli') {
     if (!settings.model) {
-      st.textContent = 'Kilo CLI needs a model — e.g. kilo/minimax/minimax-m2.5 or anthropic/claude-sonnet-4.6';
+      st.textContent = 'Kilo CLI needs a model — e.g. kilo/minimax/minimax-m3 or kilo/anthropic/claude-sonnet-5';
       return;
     }
   }
@@ -1405,6 +1494,15 @@ async function saveSettings() {
     document.getElementById('set-kilo-profile').value = '';
     document.getElementById('set-kilo-path').value = '';
     dirtyCards.delete('card-provider');
+    savedProvider = settings.provider;
+    if (providerChanged) {
+      const advisorModel = document.getElementById('set-adv-model').value.trim();
+      document.getElementById('set-adv-status').textContent = advisorModel
+        ? 'Provider changed — save Advisor to apply its selected model.'
+        : 'Provider changed — escalation model reset to the main model.';
+      if (advisorModel) dirtyCards.add('card-advisor');
+    }
+    rememberModelValues(settings.provider);
   } catch (e) {
     st.textContent = 'Failed: ' + e;
   }
@@ -1423,6 +1521,11 @@ function fillAdvisorSettings(s) {
 }
 
 async function saveAdvisorSettings() {
+  const st = document.getElementById('set-adv-status');
+  if (document.getElementById('set-provider').value !== savedProvider) {
+    st.textContent = 'Save the AI provider first, then save Advisor.';
+    return;
+  }
   // A blank confidence field defaults to 60; an explicit 0 is "never escalate on low
   // confidence". Use trim + parse so 0 is preserved.
   const confRaw = document.getElementById('set-adv-conf').value.trim();
@@ -1433,7 +1536,6 @@ async function saveAdvisorSettings() {
     escalation_effort: document.getElementById('set-adv-effort').value,
     low_confidence_threshold: Math.min(95, Math.max(0, Number.isFinite(confPct) ? confPct : 60)) / 100,
   };
-  const st = document.getElementById('set-adv-status');
   st.textContent = 'Saving…';
   try {
     await invoke('set_advisor_settings', { settings });
