@@ -29,19 +29,20 @@ For GitHub-hosted software, open https://github.com/<owner>/<repo>/releases/late
 redirects it to the current stable release and its assets. \
 Respond with JSON only — no markdown, no prose.\n\n\
 Return exactly this shape:\n\
-{{\"installer_url\":\"<https URL ENDING in .exe, .msi, or .zip — the actual 64-bit Windows release \
+{{\"installer_url\":\"<https URL ENDING in .exe, .msi, .zip, .7z, .tar, or .tar.gz — the actual 64-bit Windows release \
 asset; prefer a machine-wide installer; NOT a landing/download page; null if you cannot find one \
 with high confidence>\",\"releases_url\":\"<official https releases/download page, or null>\",\
-\"archive_installer_path\":\"<exact relative path of the .exe or .msi inside a ZIP, or null>\",\
-\"expected_version\":\"<version this installer produces>\",\"installer_kind\":\"exe|msi|zip\",\
+\"archive_installer_path\":\"<exact relative path of the .exe or .msi inside an archive, or null>\",\
+\"expected_version\":\"<version this installer produces>\",\"installer_kind\":\"exe|msi|zip|7z|tar|tar.gz\",\
 \"silent_args\":[<documented silent switches: NSIS [\\\"/S\\\"]; Inno [\\\"/VERYSILENT\\\",\\\"/NORESTART\\\"]; \
 MSI [\\\"/qn\\\",\\\"/norestart\\\"]>],\"sha256\":\"<vendor-published 64-hex hash, or null>\",\
 \"publisher\":\"<expected Authenticode signing subject, e.g. 'Mozilla Corporation', or null>\",\
 \"verify_exe\":\"<absolute path to an installed .exe whose version proves success, or null>\"}}\n\n\
 Rules: if winget can manage this app, set installer_url=null. Never return a URL behind a login, ad \
 redirect, or file-locker. If unsure of a direct release asset, set installer_url=null and give \
-releases_url only. Prefer a direct .msi or setup .exe; if neither exists, use a ZIP when it contains \
-a Windows .exe/.msi installer. Do not return source-code or portable-only archives. Respect any \
+releases_url only. Prefer a direct .msi or setup .exe; if neither exists, use a ZIP, 7z, TAR, or \
+TAR.GZ archive when it contains a Windows .exe/.msi installer. Do not return source-code or \
+portable-only archives. Respect any \
 [user note] and never contradict it.\n\n\
 APP: {name} ({current}){note_line}"
     )
@@ -282,7 +283,9 @@ async fn run_installer(staged: &Staged, kind: InstallerKind, args: &[String]) ->
             c.arg("/i").arg(&staged.file).args(args);
             c
         }
-        InstallerKind::Zip => return -3,
+        InstallerKind::Zip | InstallerKind::SevenZ | InstallerKind::Tar | InstallerKind::TarGz => {
+            return -3
+        }
     };
     cmd.creation_flags(CREATE_NO_WINDOW).kill_on_drop(true);
     let mut child = match cmd.spawn() {
@@ -308,11 +311,11 @@ mod tests {
         let p = install_plan_prompt("Krita", "5.2.0", " [user note: official site]");
         assert!(p.contains("Krita (5.2.0)"));
         assert!(p.contains("user note: official site"));
-        assert!(p.contains(".exe, .msi, or .zip"));
+        assert!(p.contains(".exe, .msi, .zip, .7z, .tar, or .tar.gz"));
         assert!(p.contains("web search"));
         assert!(p.contains("https://github.com/<owner>/<repo>/releases/latest"));
         assert!(p.contains("archive_installer_path"));
-        assert!(p.contains("if neither exists, use a ZIP"));
+        assert!(p.contains("if neither exists, use a ZIP, 7z, TAR, or"));
     }
 
     #[test]

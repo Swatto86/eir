@@ -13,6 +13,17 @@ pub enum InstallerKind {
     Exe,
     Msi,
     Zip,
+    #[serde(rename = "7z")]
+    SevenZ,
+    Tar,
+    #[serde(rename = "tar.gz")]
+    TarGz,
+}
+
+impl InstallerKind {
+    pub fn is_archive(self) -> bool {
+        matches!(self, Self::Zip | Self::SevenZ | Self::Tar | Self::TarGz)
+    }
 }
 
 /// Untrusted AI output — never used directly; sanitised by [`validate_plan`].
@@ -244,7 +255,7 @@ pub fn sanitise_args(kind: InstallerKind, raw: &[String]) -> Vec<String> {
         "/passive",
         "REBOOT=ReallySuppress",
     ];
-    const ALLOW_ZIP: &[&str] = &[
+    const ALLOW_ARCHIVE: &[&str] = &[
         "/S",
         "/silent",
         "/verysilent",
@@ -259,7 +270,9 @@ pub fn sanitise_args(kind: InstallerKind, raw: &[String]) -> Vec<String> {
     let allow: &[&str] = match kind {
         InstallerKind::Exe => ALLOW_EXE,
         InstallerKind::Msi => ALLOW_MSI,
-        InstallerKind::Zip => ALLOW_ZIP,
+        InstallerKind::Zip | InstallerKind::SevenZ | InstallerKind::Tar | InstallerKind::TarGz => {
+            ALLOW_ARCHIVE
+        }
     };
     let mut out: Vec<String> = Vec::new();
     for a in raw {
@@ -338,10 +351,16 @@ pub fn validate_plan(
         InstallerKind::Msi
     } else if path.ends_with(".exe") {
         InstallerKind::Exe
+    } else if path.ends_with(".tar.gz") || path.ends_with(".tgz") {
+        InstallerKind::TarGz
+    } else if path.ends_with(".tar") {
+        InstallerKind::Tar
+    } else if path.ends_with(".7z") {
+        InstallerKind::SevenZ
     } else if path.ends_with(".zip") {
         InstallerKind::Zip
     } else {
-        return Err("installer URL does not end in .exe, .msi, or .zip".into());
+        return Err("installer URL does not end in .exe, .msi, .zip, .7z, .tar, or .tar.gz".into());
     };
     let sha256 = match raw
         .sha256
@@ -369,7 +388,7 @@ pub fn validate_plan(
         let p = raw.archive_installer_path.trim().replace('\\', "/");
         if p.is_empty() || p.eq_ignore_ascii_case("null") {
             None
-        } else if kind != InstallerKind::Zip
+        } else if !kind.is_archive()
             || p.starts_with('/')
             || p.contains(':')
             || p.split('/')
@@ -483,6 +502,26 @@ mod tests {
         let mut unsafe_zip = raw("https://github.com/foo/bar/releases/download/v2/Bar-setup.zip");
         unsafe_zip.archive_installer_path = "../Bar.exe".to_string();
         assert!(validate_plan(unsafe_zip, "Bar App", "1.0.0").is_err());
+    }
+
+    #[test]
+    fn validate_plan_accepts_supported_release_archives() {
+        for (suffix, kind) in [
+            ("7z", InstallerKind::SevenZ),
+            ("tar", InstallerKind::Tar),
+            ("tar.gz", InstallerKind::TarGz),
+        ] {
+            let mut archive = raw(&format!(
+                "https://github.com/foo/bar/releases/download/v2/Bar-setup.{suffix}"
+            ));
+            archive.archive_installer_path = "setup/Bar.exe".to_string();
+            let plan = validate_plan(archive, "Bar App", "1.0.0").unwrap();
+            assert_eq!(plan.kind, kind);
+            assert_eq!(
+                plan.archive_installer_path.as_deref(),
+                Some("setup/Bar.exe")
+            );
+        }
     }
 
     #[test]

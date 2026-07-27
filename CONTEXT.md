@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.33.2. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.33.3. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.33.2. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-27 | Eir | v0.33.3 expanded release-archive support | Native app updates now accept GitHub `.7z`, `.tar`, `.tar.gz`, and `.tgz` assets as well as ZIP. The same exact-or-sole EXE/MSI selection, fixed locked staging filename, traversal rejection, entry/decompressed-size caps, archive hash, Authenticode, silent-install, pre-launch rehash, and post-install version gates apply. TAR/GZIP and 7z extraction are pure Rust; encrypted archives and portable-only deployments remain unsupported.
 
 2026-07-27 | Eir | v0.33.2 archive-contained Windows installers | Native app updates may now use a GitHub `.zip` release asset containing an EXE/MSI installer. The AI may identify the exact relative member; otherwise the archive must contain exactly one installer. Eir writes only that member to its locked staging directory, rejects traversal and ambiguous archives, caps entry count and decompressed bytes, checks any published hash against the ZIP, then applies the existing Authenticode, silent-argument, pre-launch rehash, and post-install version gates to the extracted installer. Arbitrary archive formats and portable ZIP deployment remain unsupported.
 

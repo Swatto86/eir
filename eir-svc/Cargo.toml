@@ -1,6 +1,6 @@
 [package]
 name = "eir-svc"
-version = "0.33.2"
+version = "0.33.3"
 edition = "2021"
 authors = ["Swatto <claude.ai@swatto.co.uk>"]
 description = "Eir system monitor service — runs as LocalSystem"
@@ -51,7 +51,13 @@ tracing-appender = "0.2"
 toml = "0.8"
 tokio-stream = "0.1"
 futures-util = "0.3"
-# Update subsystem: hash staged installers, validate URLs, and safely read ZIP assets.
+# Update subsystem: hash staged installers, validate URLs, and safely read release archives.
 sha2 = "0.10"
 url = "2"
 zip = { version = "4", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+tar = { version = "0.4", default-features = false }
+sevenz-rust2 = { version = "0.21", default-features = false, features = ["util", "bzip2", "ppmd", "deflate"] }
+
+[dev-dependencies]
+sevenz-rust2 = { version = "0.21", default-features = false, features = ["util", "compress"] }

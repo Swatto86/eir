@@ -342,22 +342,137 @@ pub struct Staged {
     pub signature: Signature,
 }
 
+const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+
+#[derive(Clone)]
+struct ArchiveCandidate {
+    index: usize,
+    name: String,
+    kind: InstallerKind,
+    size: u64,
+}
+
+fn candidate(index: usize, name: String, size: u64) -> Option<ArchiveCandidate> {
+    let normalized = name.replace('\\', "/");
+    if normalized.starts_with('/')
+        || normalized.contains(':')
+        || normalized
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        return None;
+    }
+    let lower = normalized.to_lowercase();
+    let kind = if lower.ends_with(".msi") {
+        InstallerKind::Msi
+    } else if lower.ends_with(".exe") {
+        InstallerKind::Exe
+    } else {
+        return None;
+    };
+    Some(ArchiveCandidate {
+        index,
+        name: normalized,
+        kind,
+        size,
+    })
+}
+
+fn select_candidate(
+    candidates: Vec<ArchiveCandidate>,
+    requested_path: Option<&str>,
+    archive: &str,
+    max_bytes: u64,
+) -> Result<ArchiveCandidate, String> {
+    let selected = match requested_path {
+        Some(requested) => {
+            let mut matches = candidates
+                .into_iter()
+                .filter(|entry| entry.name.eq_ignore_ascii_case(requested));
+            let selected = matches.next().ok_or_else(|| {
+                format!("installer not found in {archive}: no entry named '{requested}'")
+            })?;
+            if matches.next().is_some() {
+                return Err(format!(
+                    "{archive} contains multiple matches for '{requested}'"
+                ));
+            }
+            selected
+        }
+        None => {
+            let mut candidates = candidates.into_iter();
+            let selected = candidates.next().ok_or_else(|| {
+                format!("installer not found in {archive}: no .exe or .msi entry")
+            })?;
+            if candidates.next().is_some() {
+                return Err(format!(
+                    "{archive} contains multiple .exe/.msi files; no exact installer path was provided"
+                ));
+            }
+            selected
+        }
+    };
+    if selected.size > max_bytes {
+        return Err(format!(
+            "installer inside {archive} is too large ({} bytes)",
+            selected.size
+        ));
+    }
+    Ok(selected)
+}
+
+fn write_installer(
+    reader: &mut dyn Read,
+    dir: &Path,
+    kind: InstallerKind,
+    max_bytes: u64,
+) -> std::io::Result<(PathBuf, InstallerKind, String)> {
+    let dest = dir.join(match kind {
+        InstallerKind::Msi => "installer.msi",
+        InstallerKind::Exe => "installer.exe",
+        _ => return Err(std::io::Error::other("nested archives are not supported")),
+    });
+    let mut output = std::fs::File::create(&dest)?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("installer exceeded the {max_bytes}-byte cap"),
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        output.write_all(&buffer[..read])?;
+    }
+    output.flush()?;
+    let sha256 = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok((dest, kind, sha256))
+}
+
 /// Extract one Windows installer from a ZIP into a fixed staging filename. Nothing
-/// else in the archive is written, so traversal entries cannot escape staging. The
-/// model may name the exact member; without one, only a single unambiguous installer
-/// is accepted. The decompressed-byte cap blocks ZIP bombs.
+/// else in the archive is written, so traversal entries cannot escape staging.
 fn extract_zip_installer(
     archive_path: &Path,
     dir: &Path,
     requested_path: Option<&str>,
     max_bytes: u64,
 ) -> Result<(PathBuf, InstallerKind, String), String> {
-    const MAX_ENTRIES: usize = 10_000;
     let file = std::fs::File::open(archive_path)
         .map_err(|e| format!("could not open downloaded ZIP: {e}"))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("download is not a valid ZIP: {e}"))?;
-    if archive.len() > MAX_ENTRIES {
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
         return Err(format!("ZIP contains too many entries ({})", archive.len()));
     }
 
@@ -369,91 +484,130 @@ fn extract_zip_installer(
         if entry.is_dir() || entry.enclosed_name().is_none() {
             continue;
         }
-        let name = entry.name().replace('\\', "/");
-        let lower = name.to_lowercase();
-        let kind = if lower.ends_with(".msi") {
-            InstallerKind::Msi
-        } else if lower.ends_with(".exe") {
-            InstallerKind::Exe
-        } else {
-            continue;
-        };
-        candidates.push((index, name, kind, entry.size()));
-    }
-
-    let selected =
-        match requested_path {
-            Some(requested) => {
-                let matches = candidates
-                    .iter()
-                    .filter(|(_, name, _, _)| name.eq_ignore_ascii_case(requested))
-                    .collect::<Vec<_>>();
-                match matches.as_slice() {
-                    [only] => (**only).clone(),
-                    [] => {
-                        return Err(format!(
-                            "installer not found in ZIP: no entry named '{requested}'"
-                        ))
-                    }
-                    _ => return Err(format!("ZIP contains multiple matches for '{requested}'")),
-                }
-            }
-            None => match candidates.as_slice() {
-                [only] => only.clone(),
-                [] => return Err("installer not found in ZIP: no .exe or .msi entry".into()),
-                _ => return Err(
-                    "ZIP contains multiple .exe/.msi files; no exact installer path was provided"
-                        .into(),
-                ),
-            },
-        };
-    let (index, _, kind, declared_size) = selected;
-    if declared_size > max_bytes {
-        return Err(format!(
-            "installer inside ZIP is too large ({declared_size} bytes)"
-        ));
-    }
-
-    let dest = dir.join(match kind {
-        InstallerKind::Msi => "installer.msi",
-        InstallerKind::Exe => "installer.exe",
-        InstallerKind::Zip => return Err("nested ZIP installers are not supported".into()),
-    });
-    let mut entry = archive
-        .by_index(index)
-        .map_err(|e| format!("could not read ZIP installer: {e}"))?;
-    let mut output = std::fs::File::create(&dest)
-        .map_err(|e| format!("could not create extracted installer: {e}"))?;
-    let mut hasher = Sha256::new();
-    let mut total = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = entry
-            .read(&mut buffer)
-            .map_err(|e| format!("could not extract ZIP installer: {e}"))?;
-        if read == 0 {
-            break;
+        if let Some(candidate) = candidate(index, entry.name().to_string(), entry.size()) {
+            candidates.push(candidate);
         }
-        total = total.saturating_add(read as u64);
-        if total > max_bytes {
+    }
+    let selected = select_candidate(candidates, requested_path, "ZIP", max_bytes)?;
+    let mut entry = archive
+        .by_index(selected.index)
+        .map_err(|e| format!("could not read ZIP installer: {e}"))?;
+    write_installer(&mut entry, dir, selected.kind, max_bytes)
+        .map_err(|e| format!("could not extract ZIP installer: {e}"))
+}
+
+fn tar_reader(path: &Path, gzip: bool) -> Result<Box<dyn Read>, String> {
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("could not open downloaded archive: {e}"))?;
+    if gzip {
+        Ok(Box::new(flate2::read::MultiGzDecoder::new(file)))
+    } else {
+        Ok(Box::new(file))
+    }
+}
+
+fn extract_tar_installer(
+    archive_path: &Path,
+    dir: &Path,
+    requested_path: Option<&str>,
+    max_bytes: u64,
+    gzip: bool,
+) -> Result<(PathBuf, InstallerKind, String), String> {
+    let label = if gzip { "TAR.GZ" } else { "TAR" };
+    let mut archive = tar::Archive::new(tar_reader(archive_path, gzip)?);
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("download is not a valid {label}: {e}"))?;
+    let mut candidates = Vec::new();
+    let mut expanded_size = 0u64;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_ARCHIVE_ENTRIES {
+            return Err(format!("{label} contains too many entries"));
+        }
+        let entry = entry.map_err(|e| format!("could not inspect {label} entry: {e}"))?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let size = entry.size();
+        expanded_size = expanded_size.saturating_add(size);
+        if expanded_size > max_bytes {
             return Err(format!(
-                "installer inside ZIP exceeded the {max_bytes}-byte cap"
+                "{label} expanded contents exceed the {max_bytes}-byte cap"
             ));
         }
-        hasher.update(&buffer[..read]);
-        output
-            .write_all(&buffer[..read])
-            .map_err(|e| format!("could not write extracted installer: {e}"))?;
+        let Some(name) = entry
+            .path()
+            .ok()
+            .and_then(|path| path.to_str().map(str::to_owned))
+        else {
+            continue;
+        };
+        if let Some(candidate) = candidate(index, name, size) {
+            candidates.push(candidate);
+        }
     }
-    output
-        .flush()
-        .map_err(|e| format!("could not flush extracted installer: {e}"))?;
-    let sha256 = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    Ok((dest, kind, sha256))
+    let selected = select_candidate(candidates, requested_path, label, max_bytes)?;
+
+    let mut archive = tar::Archive::new(tar_reader(archive_path, gzip)?);
+    for (index, entry) in archive
+        .entries()
+        .map_err(|e| format!("download is not a valid {label}: {e}"))?
+        .enumerate()
+    {
+        let mut entry = entry.map_err(|e| format!("could not read {label} installer: {e}"))?;
+        if index == selected.index {
+            return write_installer(&mut entry, dir, selected.kind, max_bytes)
+                .map_err(|e| format!("could not extract {label} installer: {e}"));
+        }
+    }
+    Err(format!("installer disappeared while reading {label}"))
+}
+
+fn extract_7z_installer(
+    archive_path: &Path,
+    dir: &Path,
+    requested_path: Option<&str>,
+    max_bytes: u64,
+) -> Result<(PathBuf, InstallerKind, String), String> {
+    let archive = sevenz_rust2::Archive::open(archive_path)
+        .map_err(|e| format!("download is not a valid 7z archive: {e}"))?;
+    if archive.files.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(format!(
+            "7z contains too many entries ({})",
+            archive.files.len()
+        ));
+    }
+    let mut candidates = Vec::new();
+    let mut expanded_size = 0u64;
+    for (index, entry) in archive.files.iter().enumerate() {
+        if entry.is_directory {
+            continue;
+        }
+        expanded_size = expanded_size.saturating_add(entry.size);
+        if expanded_size > max_bytes {
+            return Err(format!(
+                "7z expanded contents exceed the {max_bytes}-byte cap"
+            ));
+        }
+        if let Some(candidate) = candidate(index, entry.name.clone(), entry.size) {
+            candidates.push(candidate);
+        }
+    }
+    let selected = select_candidate(candidates, requested_path, "7z", max_bytes)?;
+    let mut extracted = None;
+    sevenz_rust2::decompress_file_with_extract_fn(
+        archive_path,
+        dir,
+        |entry, reader, _unused_path| {
+            if entry.name.eq_ignore_ascii_case(&selected.name) {
+                extracted = Some(write_installer(reader, dir, selected.kind, max_bytes)?);
+                return Ok(false);
+            }
+            Ok(true)
+        },
+    )
+    .map_err(|e| format!("could not extract 7z installer: {e}"))?;
+    extracted.ok_or_else(|| "installer disappeared while reading 7z".to_string())
 }
 
 /// Download the plan's installer, hard-fail on a provided-hash mismatch, then apply
@@ -469,21 +623,45 @@ pub async fn download_and_check(
         InstallerKind::Msi => "installer.msi",
         InstallerKind::Exe => "installer.exe",
         InstallerKind::Zip => "installer.zip",
+        InstallerKind::SevenZ => "installer.7z",
+        InstallerKind::Tar => "installer.tar",
+        InstallerKind::TarGz => "installer.tar.gz",
     });
 
     let result = async {
         let artifact_sha =
             stream_download(&plan.installer_url, &plan.name, &artifact, max_bytes).await?;
         verify_downloaded_hash(plan.sha256.as_deref(), &artifact_sha)?;
-        let (file, kind, sha) = if plan.kind == InstallerKind::Zip {
+        let (file, kind, sha) = if plan.kind.is_archive() {
             let archive = artifact.clone();
             let extract_dir = dir.clone();
             let requested = plan.archive_installer_path.clone();
-            tokio::task::spawn_blocking(move || {
-                extract_zip_installer(&archive, &extract_dir, requested.as_deref(), max_bytes)
+            let archive_kind = plan.kind;
+            tokio::task::spawn_blocking(move || match archive_kind {
+                InstallerKind::Zip => {
+                    extract_zip_installer(&archive, &extract_dir, requested.as_deref(), max_bytes)
+                }
+                InstallerKind::SevenZ => {
+                    extract_7z_installer(&archive, &extract_dir, requested.as_deref(), max_bytes)
+                }
+                InstallerKind::Tar => extract_tar_installer(
+                    &archive,
+                    &extract_dir,
+                    requested.as_deref(),
+                    max_bytes,
+                    false,
+                ),
+                InstallerKind::TarGz => extract_tar_installer(
+                    &archive,
+                    &extract_dir,
+                    requested.as_deref(),
+                    max_bytes,
+                    true,
+                ),
+                InstallerKind::Exe | InstallerKind::Msi => unreachable!(),
             })
             .await
-            .map_err(|e| format!("ZIP extraction task failed: {e}"))??
+            .map_err(|e| format!("archive extraction task failed: {e}"))??
         } else {
             (artifact.clone(), plan.kind, artifact_sha)
         };
@@ -613,6 +791,55 @@ mod tests {
             "9c0d294c05fc1d88d698034609bb81c0c69196327594e4c69d2915c80fd9850c"
         );
         assert!(extract_zip_installer(&archive_path, &dir, Some("setup/tool.msi"), 4).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_test_tar<W: Write>(writer: W) -> W {
+        let mut archive = tar::Builder::new(writer);
+        let contents = b"installer";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("setup/tool.exe").unwrap();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive.append(&header, contents.as_slice()).unwrap();
+        archive.finish().unwrap();
+        archive.into_inner().unwrap()
+    }
+
+    #[test]
+    fn extracts_installers_from_7z_tar_and_tar_gz() {
+        let dir = std::env::temp_dir().join(format!("eir-archive-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let tar_path = dir.join("release.tar");
+        let _ = write_test_tar(std::fs::File::create(&tar_path).unwrap());
+        let (file, kind, _) = extract_tar_installer(&tar_path, &dir, None, 100, false).unwrap();
+        assert_eq!(kind, InstallerKind::Exe);
+        assert_eq!(std::fs::read(file).unwrap(), b"installer");
+
+        let targz_path = dir.join("release.tar.gz");
+        let encoder = flate2::write::GzEncoder::new(
+            std::fs::File::create(&targz_path).unwrap(),
+            flate2::Compression::fast(),
+        );
+        write_test_tar(encoder).finish().unwrap();
+        let (file, kind, _) =
+            extract_tar_installer(&targz_path, &dir, Some("setup/tool.exe"), 100, true).unwrap();
+        assert_eq!(kind, InstallerKind::Exe);
+        assert_eq!(std::fs::read(file).unwrap(), b"installer");
+
+        let source = dir.join("seven-source");
+        std::fs::create_dir_all(source.join("setup")).unwrap();
+        std::fs::write(source.join("setup").join("tool.exe"), b"installer").unwrap();
+        let sevenz_path = dir.join("release.7z");
+        sevenz_rust2::compress_to_path(&source, &sevenz_path).unwrap();
+        let (file, kind, _) =
+            extract_7z_installer(&sevenz_path, &dir, Some("setup/tool.exe"), 100).unwrap();
+        assert_eq!(kind, InstallerKind::Exe);
+        assert_eq!(std::fs::read(file).unwrap(), b"installer");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
