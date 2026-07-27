@@ -25,6 +25,8 @@ fn install_plan_prompt(name: &str, current: &str, note_line: &str) -> String {
     format!(
         "You resolve the OFFICIAL direct download for ONE Windows app so it can be installed \
 unattended. Use web search. Use ONLY the vendor's official domain or its official GitHub releases. \
+For GitHub-hosted software, open https://github.com/<owner>/<repo>/releases/latest first; GitHub \
+redirects it to the current stable release and its assets. \
 Respond with JSON only — no markdown, no prose.\n\n\
 Return exactly this shape:\n\
 {{\"installer_url\":\"<https URL ENDING in .exe or .msi — the actual installer FILE for 64-bit \
@@ -293,6 +295,7 @@ mod tests {
         assert!(p.contains("user note: official site"));
         assert!(p.contains(".exe or .msi"));
         assert!(p.contains("web search"));
+        assert!(p.contains("https://github.com/<owner>/<repo>/releases/latest"));
     }
 
     #[test]

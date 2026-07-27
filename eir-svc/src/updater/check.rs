@@ -437,6 +437,8 @@ async fn check_unmanaged(
     let prompt = format!(
         "You are an application update checker. Below are installed Windows applications with their \
  current versions. Use web search to find each one's latest STABLE release from its official source. \
+ For GitHub-hosted software, open https://github.com/<owner>/<repo>/releases/latest first; GitHub \
+ redirects it to the current stable release. \
  Return ONLY the apps that have a NEWER version available.\n\n\
  Respect any [user note]: it may say an app is custom/self-built or give its real release source — \
  follow that guidance and do NOT report an update that contradicts the note. In the response's \

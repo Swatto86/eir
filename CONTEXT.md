@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.33.0. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.33.1. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.33.0. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-27 | Eir | v0.33.1 GitHub latest-release discovery | The unmanaged-app version check and native-installer lookup now direct the AI to GitHub's canonical `/owner/repo/releases/latest` redirect before general search, so GitHub-hosted updates resolve the current stable release without guessing a tag. Rust's existing direct-file, repository-correlation, redirect, hash, and Authenticode gates are unchanged.
 
 2026-07-27 | Eir | v0.33 owner burn-in and v0.34 Trust Loop direction | v0.33.0 is now in normal-use owner burn-in; dangerous faults or disruptive actions will not be manufactured solely for testing. Acceptance evidence is an actual upgrade with matching UI/service versions, a LocalSystem provider test, and at least one scheduled updater cycle with honest persisted clean/partial state. The next release prioritises a previous-version upgrade CI gate, structured verified action receipts with narrow guarded undo, broader conservative learning inputs, locally anchored updater publisher identity, and versioned config migration. No new repair authority or policy-aggression path is planned during burn-in. `PLAN.md` is the current operational roadmap; old release plans are not retained there.
 
