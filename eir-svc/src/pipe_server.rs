@@ -10,12 +10,15 @@ use tokio::{
     time::Duration,
 };
 use tracing::{info, warn};
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
-use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId};
+use windows::Win32::System::RemoteDesktop::{
+    ProcessIdToSessionId, WTSActive, WTSConnectState, WTSFreeMemory, WTSQuerySessionInformationW,
+    WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SERVER_HANDLE,
+};
 
 /// Largest UI→service line accepted before the connection is treated as hostile and
 /// dropped. Most `UiMsg`s are a few KiB, but an `AskEir` can carry file/image attachments
@@ -155,7 +158,7 @@ async fn listener_task(
             warn!("Could not identify pipe client session");
             continue;
         };
-        if !client_session_allowed(client_session, unsafe { WTSGetActiveConsoleSessionId() }) {
+        if !client_session_allowed(client_session, query_session_state(client_session)) {
             warn!("Rejected pipe client outside the active interactive session");
             continue;
         }
@@ -170,7 +173,7 @@ async fn listener_task(
         // Writer: push current value immediately, then push on every change.
         let write_task = tokio::spawn(async move {
             // Send current status immediately so the UI gets a snapshot on connect.
-            if !client_session_allowed(client_session, unsafe { WTSGetActiveConsoleSessionId() }) {
+            if !client_session_allowed(client_session, query_session_state(client_session)) {
                 return;
             }
             let payload = status_rx.borrow().clone();
@@ -185,9 +188,7 @@ async fn listener_task(
             }
 
             loop {
-                if !client_session_allowed(client_session, unsafe {
-                    WTSGetActiveConsoleSessionId()
-                }) {
+                if !client_session_allowed(client_session, query_session_state(client_session)) {
                     break;
                 }
                 let (message, delivered) = tokio::select! {
@@ -211,9 +212,7 @@ async fn listener_task(
                 // The active desktop can change while this task is waiting for a
                 // status/result. Re-check immediately before every write so the
                 // prior session cannot receive data after fast user switching.
-                if !client_session_allowed(client_session, unsafe {
-                    WTSGetActiveConsoleSessionId()
-                }) {
+                if !client_session_allowed(client_session, query_session_state(client_session)) {
                     break;
                 }
                 let mut line = serde_json::to_string(&message).unwrap_or_default();
@@ -247,9 +246,8 @@ async fn listener_task(
                     break;
                 }
                 Ok(_) => {
-                    if !client_session_allowed(client_session, unsafe {
-                        WTSGetActiveConsoleSessionId()
-                    }) {
+                    if !client_session_allowed(client_session, query_session_state(client_session))
+                    {
                         warn!("Pipe client session is no longer active — disconnecting");
                         break;
                     }
@@ -333,8 +331,33 @@ fn result_envelope(
     })
 }
 
-fn client_session_allowed(client_session: u32, active_session: u32) -> bool {
-    client_session != u32::MAX && active_session != u32::MAX && client_session == active_session
+fn query_session_state(session_id: u32) -> Option<WTS_CONNECTSTATE_CLASS> {
+    if session_id == u32::MAX {
+        return None;
+    }
+    let mut buffer = PWSTR::null();
+    let mut bytes = 0u32;
+    unsafe {
+        WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            session_id,
+            WTSConnectState,
+            &mut buffer,
+            &mut bytes,
+        )
+    }
+    .ok()?;
+    let state = (!buffer.0.is_null()
+        && bytes as usize >= std::mem::size_of::<WTS_CONNECTSTATE_CLASS>())
+    .then(|| unsafe { buffer.0.cast::<WTS_CONNECTSTATE_CLASS>().read() });
+    if !buffer.0.is_null() {
+        unsafe { WTSFreeMemory(buffer.0.cast()) };
+    }
+    state
+}
+
+fn client_session_allowed(client_session: u32, state: Option<WTS_CONNECTSTATE_CLASS>) -> bool {
+    client_session != u32::MAX && state == Some(WTSActive)
 }
 
 fn pipe_client_session(server: &tokio::net::windows::named_pipe::NamedPipeServer) -> Option<u32> {
@@ -363,13 +386,14 @@ mod tests {
 
     #[test]
     fn only_the_active_interactive_session_is_accepted() {
-        let connected_session = 4;
-        assert!(client_session_allowed(connected_session, 4));
-        // The same established client is rejected after fast-user-switching.
-        assert!(!client_session_allowed(connected_session, 5));
-        assert!(!client_session_allowed(3, 4));
-        assert!(!client_session_allowed(u32::MAX, 4));
-        assert!(!client_session_allowed(4, u32::MAX));
+        assert!(client_session_allowed(2, Some(WTSActive)));
+        // A disconnected session is rejected after fast-user-switching or RDP disconnect.
+        assert!(!client_session_allowed(
+            2,
+            Some(windows::Win32::System::RemoteDesktop::WTSDisconnected)
+        ));
+        assert!(!client_session_allowed(u32::MAX, Some(WTSActive)));
+        assert!(!client_session_allowed(2, None));
     }
 
     /// A client's Approve message is forwarded to the command channel, where the

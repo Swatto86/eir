@@ -1,5 +1,7 @@
 use crate::config::{ApiConfig, ApiProvider};
 use crate::models::{CallUsage, ClaudeDecision, PastDecision, SignalSnapshot};
+#[cfg(windows)]
+use crate::session::active_user_session_id;
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -25,7 +27,7 @@ use windows::{
                 SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
                 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             },
-            RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken},
+            RemoteDesktop::WTSQueryUserToken,
             Threading::{
                 CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
                 ResumeThread, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW,
@@ -1864,10 +1866,8 @@ fn run_cli_as_active_user(
         scratch_prefix,
         workspace_flag,
     } = spec;
-    let session = unsafe { WTSGetActiveConsoleSessionId() };
-    if session == u32::MAX {
-        bail!("No active desktop user is available for {what}");
-    }
+    let session = active_user_session_id()
+        .ok_or_else(|| anyhow::anyhow!("No single active desktop user is available for {what}"))?;
     let mut token = HANDLE::default();
     unsafe {
         WTSQueryUserToken(session, &mut token).context("Get active desktop user token")?;

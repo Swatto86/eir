@@ -1,4 +1,5 @@
 use crate::models::FileChange;
+use crate::session::active_user_session_id;
 use chrono::Utc;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashSet, VecDeque};
@@ -9,7 +10,7 @@ use tracing::{info, warn};
 use windows::Win32::{
     Foundation::{CloseHandle, HANDLE},
     Security::{ImpersonateLoggedOnUser, RevertToSelf},
-    System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken},
+    System::RemoteDesktop::WTSQueryUserToken,
 };
 
 const RING_SIZE: usize = 50;
@@ -54,10 +55,7 @@ struct ActiveUserImpersonation(HANDLE);
 
 impl ActiveUserImpersonation {
     fn new() -> Option<Self> {
-        let session = unsafe { WTSGetActiveConsoleSessionId() };
-        if session == u32::MAX {
-            return None;
-        }
+        let session = active_user_session_id()?;
         let mut token = HANDLE::default();
         unsafe {
             WTSQueryUserToken(session, &mut token).ok()?;

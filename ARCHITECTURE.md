@@ -207,7 +207,7 @@ A pipe created by a LocalSystem service defaults to granting only SYSTEM + Admin
 D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;NW;;;ME)
 ```
 
-- **DACL**: SYSTEM (`SY`) and Administrators (`BA`) get full control; Interactive Users (`IU`) get read/write. Every accepted connection is also resolved to a client process/session and rejected unless it belongs to the current active interactive session; the session is rechecked during reads and writes, so a user switch invalidates the old client.
+- **DACL**: SYSTEM (`SY`) and Administrators (`BA`) get full control; Interactive Users (`IU`) get read/write. Every accepted connection is resolved to its client process/session and its own WTS state must be `WTSActive` (covering active console or RDP desktops); the state is rechecked during reads and writes, so disconnecting or switching users invalidates the old client.
 - **SACL mandatory label**: `S:(ML;;NW;;;ME)` sets a **Medium** integrity label with the no-write-up (`NW`) policy. Without this the pipe inherits the creator's System integrity and Windows' no-write-up rule would silently let the medium-integrity UI *read* but block its *writes* (Approve/Reject/Pause). Labelling the pipe Medium permits the UI's writes while still blocking Low-integrity (sandboxed) processes.
 
 Implementation details: the descriptor is **intentionally leaked** and returned as a `usize` (not a raw pointer) so it can cross the listener's `.await` points (a raw pointer is not `Send`); `pipe_server.rs:32,47`. The `SECURITY_ATTRIBUTES` is constructed inside a block that ends before the first `.await`, so the non-`Send` pointer is never held across an await (`pipe_server.rs:83-104`), and the pipe is created via `create_with_security_attributes_raw`. If descriptor construction fails the server falls back to a default-ACL pipe and warns (`pipe_server.rs:77-79, 102`).
@@ -705,6 +705,8 @@ may use the command pipe, and a UI message never carries a `FixAction` or a raw 
 carries an **opaque id**. The service maps that id to an action *from its own last-scan state*
 (`st.disk_targets` / `st.startup_targets`) and routes it through the same `pol.evaluate`
 gate as an AI-proposed fix (`route_user_action`, `main.rs`). An unknown/stale id is ignored.
+Active-user operations use `session::active_user_session_id`, which accepts exactly one
+`WTSActive` console or RDP session and fails closed if none or multiple are active.
 
 ### F11 — Health timeline (`audit::metric_history` + `ui` sparklines)
 
@@ -803,7 +805,7 @@ This is the durable substrate Eir learns from. The original feedback loop still 
 
 ### Database bootstrap
 
-`audit::init_db(path)` builds `SqliteConnectOptions` with `create_if_missing(true)`, connects a pool, and runs the embedded migrations. The DB path comes from `config.persistence.audit_db`. Migrations are currently versioned `0001`–`0019` and apply in order on every start.
+`audit::init_db(path)` builds `SqliteConnectOptions` with `create_if_missing(true)`, connects a pool, and runs the embedded migrations. The DB path comes from `config.persistence.audit_db`. Migrations are currently versioned `0001`–`0019` and apply in order on every start. Before SQLx's integrity check, a stored checksum may be rewritten to the current embedded checksum only when it exactly matches the same migration SQL under CRLF/LF normalization; any semantic edit remains a fatal mismatch.
 
 ### Full schema (every table)
 

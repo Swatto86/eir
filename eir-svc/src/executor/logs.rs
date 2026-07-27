@@ -1,4 +1,5 @@
 use crate::policy::{is_network_path, is_within, normalize_path_lexical};
+use crate::session::active_user_session_id;
 use anyhow::{bail, Context, Result};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::time::{Duration, Instant, SystemTime};
@@ -6,7 +7,7 @@ use tracing::{info, warn};
 use windows::Win32::{
     Foundation::{CloseHandle, HANDLE},
     Security::{ImpersonateLoggedOnUser, RevertToSelf},
-    System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken},
+    System::RemoteDesktop::WTSQueryUserToken,
 };
 
 const CLEANABLE_EXTENSIONS: &[&str] = &["log", "tmp", "dmp", "etl", "blf", "regtrans-ms"];
@@ -15,10 +16,9 @@ struct ActiveUserImpersonation(HANDLE);
 
 impl ActiveUserImpersonation {
     fn new() -> Result<Self> {
-        let session = unsafe { WTSGetActiveConsoleSessionId() };
-        if session == u32::MAX {
-            bail!("No active desktop user is available for this file action");
-        }
+        let session = active_user_session_id().ok_or_else(|| {
+            anyhow::anyhow!("No active desktop user is available for this file action")
+        })?;
         let mut token = HANDLE::default();
         unsafe {
             WTSQueryUserToken(session, &mut token).context("Get active desktop user token")?;

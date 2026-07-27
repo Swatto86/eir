@@ -13,6 +13,7 @@ mod models;
 mod pipe_server;
 mod policy;
 mod safety;
+mod session;
 mod signals;
 mod startup_scan;
 mod updater;

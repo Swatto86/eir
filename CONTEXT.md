@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.33.3. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.33.4. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.33.3. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-27 | Eir | v0.33.4 active-RDP service recovery | The LocalSystem pipe gate no longer equates “active interactive session” with `WTSGetActiveConsoleSessionId`, which can point at a stale physical-console session while the real user is active over RDP. It now queries the connecting process's own WTS state and accepts only `WTSActive`; disconnected and switched-away sessions are rejected on every read/write recheck as before. A shared WTS enumerator also supplies the sole active console-or-RDP session to Codex/Claude CLI launch, per-user startup/file actions, and configured log watching. Database startup narrowly reconciles SQLx migration checksums only when they differ solely by CRLF/LF checkout normalization; real SQL changes still fail closed. Reproduced from installed v0.33.3 logs, then live-verified on the affected machine: the existing config remained byte-identical, the service stayed running, the RDP UI connected, and a real Codex analysis completed.
 
 2026-07-27 | Eir | v0.33.3 expanded release-archive support | Native app updates now accept GitHub `.7z`, `.tar`, `.tar.gz`, and `.tgz` assets as well as ZIP. The same exact-or-sole EXE/MSI selection, fixed locked staging filename, traversal rejection, entry/decompressed-size caps, archive hash, Authenticode, silent-install, pre-launch rehash, and post-install version gates apply. TAR/GZIP and 7z extraction are pure Rust; encrypted archives and portable-only deployments remain unsupported.
 

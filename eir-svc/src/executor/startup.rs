@@ -5,12 +5,13 @@
 //! The `location` selector is a CLOSED SET mapped to a hard-coded key here — the caller
 //! never supplies a raw registry path — and any user SID is validated before use.
 
+use crate::session::active_user_session_id;
 use anyhow::{bail, Context, Result};
 use windows::core::PWSTR;
 use windows::Win32::{
     Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL},
     Security::{Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_USER},
-    System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken},
+    System::RemoteDesktop::WTSQueryUserToken,
 };
 
 const APPROVED_BASE: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved";
@@ -30,10 +31,8 @@ pub(crate) fn valid_sid(sid: &str) -> bool {
 /// SID of the user attached to the active interactive session. The service uses this
 /// both when listing per-user startup entries and immediately before changing one.
 pub(crate) fn active_user_sid() -> Result<String> {
-    let session = unsafe { WTSGetActiveConsoleSessionId() };
-    if session == u32::MAX {
-        bail!("No active interactive user session");
-    }
+    let session = active_user_session_id()
+        .ok_or_else(|| anyhow::anyhow!("No active interactive user session"))?;
 
     let mut token = HANDLE::default();
     unsafe { WTSQueryUserToken(session, &mut token) }

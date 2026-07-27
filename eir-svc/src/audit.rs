@@ -5,6 +5,8 @@ use crate::models::{
 use anyhow::{Context, Result};
 use chrono::Utc;
 use eir_proto::{ApprovalInfo, UsageSummary};
+use sha2::{Digest, Sha384};
+use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
@@ -57,9 +59,75 @@ pub async fn init_db(path: &str) -> Result<SqlitePool> {
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(Duration::from_secs(15));
     let pool = SqlitePool::connect_with(opts).await?;
-    sqlx::migrate!("../migrations").run(&pool).await?;
+    let migrator = sqlx::migrate!("../migrations");
+    reconcile_migration_line_endings(&pool, &migrator).await?;
+    migrator.run(&pool).await?;
     info!("Audit database initialised at {path}");
     Ok(pool)
+}
+
+/// SQLx hashes migration files byte-for-byte, so the same SQL checked out with
+/// CRLF on Windows and LF in release CI looks modified. Reconcile only that exact
+/// newline-only difference; any real content change still fails SQLx's checksum gate.
+async fn reconcile_migration_line_endings(pool: &SqlitePool, migrator: &Migrator) -> Result<()> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = '_sqlx_migrations')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !exists {
+        return Ok(());
+    }
+
+    let applied = sqlx::query("SELECT version, checksum FROM _sqlx_migrations WHERE success = 1")
+        .fetch_all(pool)
+        .await?;
+    for migration in migrator.migrations.iter() {
+        let Some(row) = applied
+            .iter()
+            .find(|row| row.get::<i64, _>("version") == migration.version)
+        else {
+            continue;
+        };
+        let recorded: Vec<u8> = row.try_get("checksum")?;
+        if recorded == migration.checksum.as_ref() {
+            continue;
+        }
+        let [lf, crlf] = migration_eol_checksums(&migration.sql);
+        if recorded != lf && recorded != crlf {
+            continue;
+        }
+        let changed = sqlx::query(
+            "UPDATE _sqlx_migrations SET checksum = ? \
+             WHERE version = ? AND checksum = ? AND success = 1",
+        )
+        .bind(migration.checksum.as_ref())
+        .bind(migration.version)
+        .bind(&recorded)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        anyhow::ensure!(
+            changed == 1,
+            "migration {} checksum changed while reconciling line endings",
+            migration.version
+        );
+        warn!(
+            "Reconciled CRLF/LF checksum for migration {}",
+            migration.version
+        );
+    }
+    Ok(())
+}
+
+fn migration_eol_checksums(sql: &str) -> [Vec<u8>; 2] {
+    let lf = sql.replace("\r\n", "\n");
+    let crlf = lf.replace('\n', "\r\n");
+    [
+        Sha384::digest(lf.as_bytes()).to_vec(),
+        Sha384::digest(crlf.as_bytes()).to_vec(),
+    ]
 }
 
 pub async fn log_decision(
@@ -952,6 +1020,14 @@ pub async fn prune_old(pool: &SqlitePool, days: i64) -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_checksum_reconciliation_allows_only_line_endings() {
+        let variants = migration_eol_checksums("SELECT 1;\n");
+        assert_eq!(variants[0], Sha384::digest(b"SELECT 1;\n").to_vec());
+        assert_eq!(variants[1], Sha384::digest(b"SELECT 1;\r\n").to_vec());
+        assert!(!variants.contains(&Sha384::digest(b"SELECT 2;\r\n").to_vec()));
+    }
 
     fn samples(vals: &[(f64, f64, f64)]) -> Vec<MetricSample> {
         vals.iter()
