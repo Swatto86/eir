@@ -59,7 +59,7 @@ which is the substrate the self-improvement layer learns from (see
 - [User-facing on-demand tools (Ask / Timeline / Disk / Startup)](#user-facing-on-demand-tools-ask--timeline--disk--startup)
 - [Persistence, audit DB & the existing feedback loop](#persistence-audit-db--the-existing-feedback-loop)
 - [Self-improvement: machine-pattern learning](#self-improvement-machine-pattern-learning)
-- [Known limitations & backlog](#known-limitations--backlog)
+- [Current limitations and roadmap](#current-limitations-and-roadmap)
 
 ---
 
@@ -146,9 +146,9 @@ Because `tagName` is set, `tauri-action` builds, signs, and creates a **draft** 
 `https://github.com/Swatto86/eir/releases/latest/download/latest.json`. It points at the **`/latest/`** redirect, so the installed app always fetches whichever release is newest — the single-rolling-release model. `createUpdaterArtifacts: true` ensures `latest.json` + `.sig` ship beside the installer. The unauthenticated `/latest/download/` fetch requires the release repo to be public.
 
 The NSIS install hooks (`eir-ui/installer-hooks.nsh`, wired via `bundle.windows.nsis.installerHooks`, `installMode: perMachine`) make self-update actually work over a running service:
-- **PREINSTALL**: `sc stop EirSvc`, then poll for STOPPED for up to ~40 s before deleting the old registration — Windows cannot replace `eir-svc.exe` while it runs.
-- **POSTINSTALL**: stop + `eir-svc.exe uninstall` (tear down prior registration), seed `config.toml` from `config.toml.example` on first install then delete the template, then `eir-svc.exe install` + `sc start EirSvc`.
-- **PREUNINSTALL**: `sc stop EirSvc` + `eir-svc.exe uninstall`.
+- **PREINSTALL**: `sc stop EirSvc`, poll for STOPPED for up to ~40 s, then `sc delete EirSvc` before files are replaced.
+- **POSTINSTALL**: seed `config.toml` from `config.toml.example` on first install, delete the template, then run `eir-svc.exe install`; the install verb registers and starts the service.
+- **PREUNINSTALL**: stop/unregister the service, then remove the current user's Eir autostart values and Tauri config directory.
 - **POSTUNINSTALL**: empty.
 
 `bundle.windows.allowDowngrades: false`; targets `["nsis"]` only; main window `visible: false`. Manual launches show/focus it during Tauri setup; Windows-login autostart passes `--hidden` so it stays in the tray.
@@ -197,7 +197,7 @@ Supporting types:
 
 **Backward-compat invariant**: additive status fields use `#[serde(default)]`, and `UiRequest.request_id` is optional + flattened. This keeps the original top-level command JSON valid across the installer’s UI/service skew window; capabilities tell the tray when it may rely on command results or provider testing.
 
-**Secret-handling invariant**: `UiSettings` never carries secret values, only booleans (`openrouter_key_set`, `anthropic_key_set`) so the UI shows "configured" without exposing keys. **OpenRouter is now the only provider that takes a pasted API key** (the default `anthropic` provider also needs one but is otherwise out of scope here); `claude_cli`, `codex_cli`, and `kilo_cli` borrow a locally logged-in subscription session instead. Inbound `SettingsUpdate` uses `Option<String>` for secrets where `None` = "unchanged" and a non-empty value replaces the stored secret; the JS sends `null` to preserve.
+**Secret-handling invariant**: `UiSettings` never carries secret values, only booleans (`openrouter_key_set`, `anthropic_key_set`) so the UI shows "configured" without exposing keys. OpenRouter and native Anthropic take pasted API keys; `claude_cli`, `codex_cli`, and `kilo_cli` borrow a locally logged-in subscription session instead. Inbound `SettingsUpdate` uses `Option<String>` for secrets where `None` = "unchanged" and a non-empty value replaces the stored secret; the JS sends `null` to preserve.
 
 ### Named-pipe security / ACL model (`pipe_server.rs:16-48`)
 
@@ -246,11 +246,11 @@ Commands (`main.rs:28-112`, plus `util.rs`):
 - `set_app_ignore { id, ignore, note }` → `SetAppIgnore`; `set_app_note { id, note }` → `SetAppNote`.
 - `set_advisor_settings(AdvisorSettingsUpdate)` → `SetAdvisorSettings`.
 - `get_autostart_enabled` / `set_autostart_enabled { enabled }` — UI-local commands backed by `tauri-plugin-autostart`; they never cross the service pipe.
-- `ask_eir { question }`, `clear_ask`, `scan_disk`, `clean_disk_entry { id }`, `scan_startup`, `set_startup_entry { id, enable }` (v0.24.0 / v0.29.0) — the on-demand-tools commands, each a fire-and-forget `UiMsg` (`AskEir`/`ClearAsk`/`ScanDisk`/`CleanDiskEntry`/`ScanStartup`/`SetStartupEntry`). The clean/toggle commands carry only an opaque id; the service reconstructs the action from its own last-scan state.
+- `ask_eir { question }`, `clear_ask`, `scan_disk`, `clean_disk_entry { id }`, `scan_startup`, `set_startup_entry { id, enable }` (v0.24.0 / v0.29.0) — the on-demand-tools commands, each sent as a correlated `UiMsg` (`AskEir`/`ClearAsk`/`ScanDisk`/`CleanDiskEntry`/`ScanStartup`/`SetStartupEntry`). The clean/toggle commands carry only an opaque id; the service reconstructs the action from its own last-scan state.
 - `get_app_version` (About view; reads the package version from the build), `get_service_state`/`install_service` (About view queries SCM and can re-run the bundled `eir-svc.exe install` elevated), and `check_updates_now` (About view's on-demand update check — installs and relaunches when a newer signed release exists; guarded by a shared `UPDATE_IN_PROGRESS` AtomicBool so it can't race the 6-hourly background checker into two concurrent installers) — UI-local.
 - `util::gbp_per_usd` (USD→GBP rate via a hidden PowerShell `Invoke-RestMethod`, with a `0.79` offline fallback) and `util::open_url` (validates `http(s)://` then `Start-Process`) — UI-local helpers, not pipe traffic (`util.rs`).
 
-Every service-facing command is `async`, first calls `ensure_connected` (v0.24.1), then sends one `UiMsg` on `UiCmdTx`, mapping a send error to `Err(String)`. Those commands are **fire-and-forget**: a successful send means "queued to the pipe writer," not "applied by the service." The UI observes the effect only on the next polled snapshot. `get_status`, the autostart commands, and `util::*` are UI-local and do not use the pipe.
+Every service-facing command routes through the common async correlated sender: it checks the connection, adds a request id, and waits for the matching protocol-v2 `CommandResult`. Normal commands use 30 seconds; provider testing allows 135 seconds around the service's 120-second provider deadline. Applied, rejected, disconnected, and timed-out outcomes therefore reach the caller. During UI/service version skew, a protocol-v1 service receives the original flattened command and the UI returns the neutral result “Queued — this service cannot confirm application.” Long operations such as scans and updater cycles confirm that work started, then publish completion through status/activity. `get_status`, the autostart commands, and `util::*` are UI-local and do not use the pipe.
 
 ### Tray (`main.rs:114-323`)
 
@@ -276,7 +276,7 @@ The frontend was fully rebuilt in v0.17 (still hand-written vanilla HTML/CSS/JS,
 - **XSS hygiene**: all service-supplied strings go through `esc()` / `escAttr()` before insertion into `innerHTML`; applied consistently across approvals, activity, updater rows, and service chips.
 - **Activity feed** merges `recent_problems` + `recent_executions` into one list sorted by `at` descending, with emoji/tag per kind (`activityItems`).
 - **v0.24.3 UX pass**: Escape hides the window (blurs first when a field has focus); Ask Eir sends on plain Enter (Shift+Enter = newline, IME composition guarded); every `data-ts` relative age gets an absolute local-time tooltip (set once per element); the sidebar Pause button turns amber with a ▶ icon while paused; a config-shaped `status.error` (provider/key/model/config) surfaces an "Open Settings" quick link in the hero; the Disk/Startup card headers summarise the last scan ("2.1 GB cleanable" / "12 entries, 3 disabled"); the "What the agent is thinking" meta line shows "analysed Xm ago" from the new `last_analysis_at` wire field; and numeric settings inputs are clamped to their declared min/max on save (`numVal`).
-- **v0.25.1 UX pass** (frontend-only, no wire/service change): **toasts** (`toast(msg, kind)` → `#toast-wrap`, `textContent` only, auto-dismiss 2.6 s / 5 s for errors, click-to-dismiss, stack capped at 4) give fire-and-forget commands (approve/reject, disk clean, startup toggle, undo, clear, run-updates, pause) an immediate acknowledgement instead of waiting on the next 2 s poll — the UX answer to the ack-less pipe (a resolved `invoke` still only means "queued", so toasts say "queued"/"sent"/"sent to Approvals", not "done"). **Copy-to-clipboard** (`copyText`, `navigator.clipboard` with a textarea/`execCommand` fallback) on the hero error and per-approval target+details, for pasting a diagnosis elsewhere. **Activity filter chips** (All / Fixes / Diagnoses / Failures): `activityItems` tags each row `type` (`fix`/`diag`) + `fail`; `renderActivity` filters via `matchesActivityFilter`, folds `activityFilter` into the signature so a chip switch forces one rebuild, and keeps the undo bookkeeping keyed on the *unfiltered* list so a hidden row can't drop its in-flight Undo. All three are pure client-side (no `invoke`), so they stay live under the `svc-down` class.
+- **v0.25.1 UX pass** (frontend-only, no wire/service change): **toasts** (`toast(msg, kind)` → `#toast-wrap`, `textContent` only, auto-dismiss 2.6 s / 5 s for errors, click-to-dismiss, stack capped at 4) originally gave the then-fire-and-forget commands a neutral acknowledgement. Protocol v2 supersedes that constraint: current toasts use the returned command outcome, while neutral “queued” wording remains only for an older service during version skew. **Copy-to-clipboard** (`copyText`, `navigator.clipboard` with a textarea/`execCommand` fallback) on the hero error and per-approval target+details supports pasting a diagnosis elsewhere. **Activity filter chips** (All / Fixes / Diagnoses / Failures): `activityItems` tags each row `type` (`fix`/`diag`) + `fail`; `renderActivity` filters via `matchesActivityFilter`, folds `activityFilter` into the signature so a chip switch forces one rebuild, and keeps undo bookkeeping keyed on the *unfiltered* list so a hidden row cannot drop its in-flight Undo.
 - **Settings** is a full view (no modal) populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. Since v0.24.3 the view guards unsaved edits; v0.24.4 made the tracking **per-card** (`dirtyCards` set keyed on the four card ids `card-autostart`/`card-provider`/`card-advisor`/`card-updater`): any input marks its enclosing card dirty, a successful save clears only that card, a fill clears all, and re-entering the view refills only when no card is dirty — so saving the advisor card no longer discards unsaved edits still sitting in the provider card. The grouped provider select offers OpenRouter / Anthropic API / Claude CLI / Codex CLI / Kilo CLI and hides fields irrelevant to the selected provider. All three model controls use one native filterable `datalist`; `list_provider_models` reads OpenRouter's live catalogue, `codex debug models`, or `kilo models`, with static Claude and offline fallbacks. A request sequence rejects stale provider-A results after a switch to B, while per-provider in-memory selections and persisted-but-vanished ids remain visible. Changing provider clears incompatible model controls; the service also clears the old advisor escalation model at the authoritative config boundary. JS pre-validates key/model requirements before sending (`AiClient::new` remains authoritative). Provider/model settings apply live; only collector channels/poll intervals/log directories trigger the restart helper.
 
 ### Clear / Approve / Ignore / Update-now flows
@@ -357,7 +357,7 @@ The outer `tokio::select!` races the main loop future against the `shutdown` fut
 - `RefreshStatus` → force a fast services-only rescan (`wmi::rescan_failed_services`, no PowerShell), overwrite `failed_services`, re-settle `resting_status`, and broadcast — clears a recovered service on demand. Deliberately does **not** touch `st.error` (that is a live AI/config error, not stale status).
 - `UpdateSettings` → `apply_update`, compute `settings_update_needs_restart` **before** mutating config, **validate by constructing a fresh `AiClient`**; on failure reject and reload config from disk (never apply a bricked provider); on success save config. If the update changed collector spawn parameters (event-log channels, event-log/WMI poll intervals, log directories), `restart_self()` then `return`; otherwise the new AI client, policy confidence threshold, and decision ticker are swapped live without a restart. If the restart helper fails to spawn, the service stays alive on the old settings and surfaces an error instead of stopping with nothing to start it again.
 - `Approve { id, approved }` atomically claims a still-pending database row. An accepted row remains durable as `approved` until the executor transaction either completes it or requeues it; startup replays claimed rows after a crash. Current policy and target preflight are rechecked before execution. A rejection is recorded for learning and then retired. Always resettle status + broadcast.
-- `RunUpdatesNow` → **gated on the same controls as the scheduled run** (`enabled && !paused && !updater_running`) — the pipe is writable by any authenticated user, so a manual run must not override admin state.
+- `RunUpdatesNow` → requires monitoring to be resumed and no cycle already running, but deliberately bypasses the updater's enabled/schedule gate so the user can request a one-off check.
 - `ClearUpdateHistory`, `UpdateUpdaterSettings`, `SetAppIgnore`, `SetAdvisorSettings` → applied **live, no restart** (unlike provider settings), each persisting via `config::save`.
 
 ### Off-loop executor (lines 378-458)
@@ -390,7 +390,7 @@ Identical fingerprints across cycles mean nothing changed → skipped until the 
 ### `resting_status` & `should_escalate` & `restart_self`
 
 - `resting_status` (363-374): the non-cycle status with precedence **Paused > PendingApproval > Executing > Active**. Asserted by `status_tests::resting_status_precedence`.
-- `should_escalate` (271-302): pure. Returns `Some(reason)` only when advisor `enabled`, a deeper tier is configured (`escalation_model` or `escalation_effort` non-empty), `escalations_today < MAX_ESCALATIONS_PER_DAY` (=24, the provider-agnostic backstop), USD budget not spent, AND either `needs_deeper_analysis` ("the agent flagged the signals as ambiguous") or non-empty problems whose max confidence < `low_confidence_threshold` ("confidence was low"). Covered by `advisor_tests`.
+- `should_escalate` (271-302): pure. Returns `Some(reason)` only when advisor `enabled`, a deeper tier is configured (`escalation_model` or `escalation_effort` non-empty), `escalations_today < MAX_ESCALATIONS_PER_DAY` (=24, the provider-agnostic backstop), and either `needs_deeper_analysis` ("the agent flagged the signals as ambiguous") or non-empty problems whose max confidence < `low_confidence_threshold` ("confidence was low"). Spend is retained for visibility, not gating. Covered by `advisor_tests`.
 - `restart_self`: spawns a detached PowerShell helper (LocalSystem, no UAC, survives this process exiting) that waits for EirSvc to stop cleanly, then retries `sc start` every 5s over a 60s window checking for Running each second; all helper streams redirect to `eir-restart.log`. The caller flushes the correlated settings result to the UI before returning and reporting STOPPED. A helper spawn failure keeps the service alive instead of stopping into the void.
 - `spawn_update_cycle` (307-359): runs a cycle on a detached task with a nested inner `tokio::spawn` + `CYCLE_MAX = 60 min` timeout watchdog, so a panic (JoinError) or hang still produces a `CycleSummary` and releases `updater_running` — the updater can never latch "running" forever.
 
@@ -401,7 +401,7 @@ Eir's signal layer is three independent background collectors that each maintain
 ### Data model (`eir-svc/src/models.rs`)
 
 - **`SignalSnapshot`** (lines 5–12) is the per-cycle bundle handed to the AI: `timestamp`, `event_log: Vec<EventLogEntry>`, `file_changes: Vec<FileChange>`, `system_state: SystemState`, `decision_history: Vec<PastDecision>`. The first three come from the three collectors; `decision_history` is loaded separately from the audit DB (`audit::get_recent_decisions(&db, 5)`, `main.rs:1022`), not from a signal source.
-- **`SystemState`** (lines 50–68): `uptime_secs`, `cpu_usage_percent`, `memory_usage_percent`, `memory_available_gb`, `disk_usage_percent`, `disk_free_gb`, `running_services_count`, `failed_services: Vec<String>`, `network_interfaces`, `network_errors` (hardcoded `0`), `disk_health` (hardcoded `"unknown"`), `windows_update_status`, and `security: SecurityPosture` (`#[serde(default)]` so old persisted snapshots without the field still deserialise).
+- **`SystemState`** (lines 50–68): `uptime_secs`, CPU/memory/system-drive metrics, service state, network interfaces/errors, disk health, Windows Update status, security posture, plus `collected_at` and `collector_errors`. Network errors and disk health are best-effort measurements; a failed probe retains the last-good value and names the source error instead of publishing a healthy zero.
 - **`SecurityPosture`** (lines 72–76) = `FirewallStatus` + `DefenderStatus`, both `Default`. `FirewallStatus` (80–85) holds `domain/private/public: Option<bool>` (`true`=on, `None`=unreadable, deliberately not a fault). `DefenderStatus` (90–98): `realtime_enabled`, `antivirus_enabled`, `signature_age_days`, all `Option`, `None` when Defender is absent or the query fails.
 - **`EventLogEntry`** (14–21): `timestamp`, `level`, `source`, `message`, `event_id`. **`FileChange`** (23–31): `path`, `kind`, `size_bytes`, `timestamp`, `log_event: Option<LogEvent>`. **`LogEvent`** (34–48): `program`, `log_path`, `severity` (FATAL/ERROR/WARN/INFO), `error_snippets` (≤5), `content_excerpt` (capped raw text so the AI can disambiguate a benign `"error"` JSON field from real corruption).
 
@@ -456,7 +456,7 @@ The AI layer lives in `eir-svc/src/ai/` (`mod.rs` re-exports `client` and `promp
 
 All three subscription CLIs share one privilege boundary: when EirSvc is LocalSystem, it obtains the active console user's primary token with `WTSQueryUserToken` and starts a hidden process with `CreateProcessAsUserW`. Scratch-file redirection replaces standard-handle inheritance, which Windows forbids across sessions. User-owned CLI binaries therefore never execute as SYSTEM.
 
-- **`Anthropic`** — native `/v1/messages`, streaming SSE, `x-api-key` + `anthropic-version: 2023-06-01`. Requires `anthropic_api_key` and a non-empty model or `new()` bails. Sends `output_config.effort` when an effort is configured — except for Haiku models, which don't support the dial and would 400. Parses per-call usage from the stream (`message_start` input/cache tokens, `message_delta` output tokens) and **estimates** cost from a small list-price table (`anthropic_price_per_mtok` / `estimate_anthropic_cost` — prices drift; it's an estimate) so the usage card and advisor budget work on this provider.
+- **`Anthropic`** — native `/v1/messages`, streaming SSE, `x-api-key` + `anthropic-version: 2023-06-01`. Requires `anthropic_api_key` and a non-empty model or `new()` bails. Sends `output_config.effort` when an effort is configured — except for Haiku models, which do not support the dial. Parses per-call usage from the stream (`message_start` input/cache tokens, `message_delta` output tokens) and **estimates** cost from a small list-price table (`anthropic_price_per_mtok` / `estimate_anthropic_cost` — prices drift) for the usage card and advisor spend visibility.
 - **`OpenRouter`** — OpenAI-compatible streaming against `https://openrouter.ai/api/v1`. Key comes from config or is auto-detected from `~/.openrouter/config.json` under any `C:\Users` profile (`resolve_openrouter_key`); blank model defaults to `"openrouter/free"`. Adds `HTTP-Referer`/`X-Title` attribution and requests a final usage chunk (tokens + provider-reported cost). Effort maps to `reasoning.effort` (`xhigh`/`max` collapse to `high`).
 - **`ClaudeCli`** — Claude on the user's **subscription**: spawns the local `claude` binary (`--print --output-format json`, optional `--model`, `--effort`), **no API key**. `resolve_user_profile` uses the configured profile or scans `C:\Users\*\.claude\.credentials.json`; `resolve_claude_binary` tries the configured path, then `<profile>\.local\bin\claude.exe` (native installer), then npm's install layout under the profile — `AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe` (the exe the `claude.cmd` shim dispatches to), then the `claude.cmd` shim itself (npm's stable entry point, covering package-layout drift) — then PATH. Usage comes from the CLI's JSON envelope (`result`, `total_cost_usd`, cache-token fields — the cost is the *equivalent* API cost; the call itself is covered by the subscription, and the UI shows "—"/no-charge). Blank model = the CLI's configured default.
 - **`CodexCli`** — Codex on the active desktop user's **ChatGPT subscription**, **no API key**. `resolve_codex_binary` tries the configured override, OpenAI desktop install, Codex standalone package, npm native layouts/shim, then PATH. Each call gets a fresh empty scratch cwd and runs `codex [--search] --ask-for-approval never exec --json --sandbox read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules --color never`, with the prompt on stdin. `-m` selects a model; reasoning uses `-c model_reasoning_effort=…` (`max` clamps to `xhigh` before GPT-5.6). `parse_codex_ndjson` takes final `agent_message` text and `turn.completed` usage, subtracting cached input from the base input bucket to avoid double-counting; subscription cost is unknown/zero. Only the update-check path adds global `--search`.
@@ -634,7 +634,7 @@ One full cycle is `run_cycle` (`orchestrator.rs:303`), driven from `main.rs:307`
 3. **Heal each candidate** (bounded by `max_apps_per_run` and `max_attempts_per_app`) — `heal` (`orchestrator.rs:134`).
 4. **Record** every attempt to the `update_attempts` table under `cycle_id` (`history::record_attempts`).
 
-`CheckResult`/`CycleSummary` carry candidates, per-cycle AI cost, and human notes (truncation, AI-check failures, budget stop). `app_rows` (`orchestrator.rs:248`) flattens each candidate's attempts into one UI row, the winning attempt (first success, else last) deciding state: `verified` / `installed` / `failed` / `skipped`.
+`CheckResult`/`CycleSummary` carry candidates, per-cycle AI cost, coverage state, and human notes for truncation, source/check failures, or deferred work. `app_rows` flattens each candidate's attempts into one UI row, the winning attempt (first success, else last) deciding state: `current` / `verified` / `installed` / `failed` / `skipped`.
 
 ### Per-app multi-method self-heal
 
@@ -683,25 +683,26 @@ Per-app AI guidance reuses the updater's existing `[updater.notes]` config map. 
 
 ### update_attempts history
 
-`history::record_attempts` inserts one row per attempt into `update_attempts`: app identity, from/to versions, method, outcome/category, exit code, signature/hash evidence, detail, cost, and timestamp. `recent` exposes that evidence to the UI. Separate durable state records the last completed run and last fully clean run; clearing history removes both so the scheduler/UI cannot resurrect stale timestamps. `AlreadyCurrent` is a successful `current` state, distinct from an update Eir installed.
+`history::record_attempts` inserts one row per attempt into `update_attempts`: app identity, from/to versions, method, outcome/category, exit code, signature/hash evidence, detail, cost, and timestamp. `recent` exposes the useful result evidence to the UI. Separate durable state records current-cycle evidence, the last completed run, and the last fully clean run. Clear writes a display cutoff: it hides older attempt rows but preserves scheduler fairness, last-run/last-clean timestamps, and cycle evidence. `AlreadyCurrent` is a successful `current` state, distinct from an update Eir installed.
 
 ### update_checks rotation (unmanaged AI sweep)
 
-The unmanaged AI check is capped at `AI_CHECK_CAP` (20) apps per cycle. The inventory merges bounded HKLM, 32-bit, and real per-user uninstall hives with `winget list`; service-account hives and malformed/oversized rows are excluded, while partial-source failures remain visible as warnings. `update_checks` (migration 0016) stores the last successfully parsed AI check per app. `check_unmanaged` sorts stalest/never-checked first and records a batch only after a valid response, so the tail rotates without presenting a failed parse as completed coverage. Any failed/enabled source, deferred candidate, or incomplete native coverage prevents the run from being labelled clean.
+The unmanaged AI check is capped at `AI_CHECK_CAP` (20) apps per cycle. The inventory merges bounded HKLM, 32-bit, and real per-user uninstall hives with `winget list`; service-account hives and malformed/oversized rows are excluded, while partial-source failures remain visible as warnings. `update_checks` (migration 0016) stores the last successfully parsed AI check per app. `check_unmanaged` sorts stalest/never-checked first and records a batch only after a valid response, so the tail rotates without presenting a failed parse as completed coverage. Any recorded source failure, deferred candidate, or incomplete native coverage prevents the run from being labelled clean. Availability probing can omit an enabled but missing manager when another source is usable; see the current limitations.
 
 ## User-facing on-demand tools (Ask / Timeline / Disk / Startup)
 
 Added in v0.24.0 (features F10–F13), these turn the existing signal/AI/executor stack into
 things the user *opens on purpose*. All four follow the same seams: new `#[serde(default)]`
-`StatusPayload` fields + `UiMsg` variants in `eir-proto`; a thin fire-and-forget Tauri
-command in `eir-ui`; a `ui/main.js` renderer (all service strings through `esc()`/`escAttr()`);
+`StatusPayload` fields + `UiMsg` variants in `eir-proto`; a correlated Tauri command in
+`eir-ui` (with neutral protocol-v1 fallback); a `ui/main.js` renderer (all service strings
+through `esc()`/`escAttr()`);
 and — where a scan is involved — an **off-loop task** mirroring the analysis/digest hardening
 (inner `tokio::spawn` under `tokio::time::timeout`, a `*_running` flag released on success,
 panic, *and* timeout, result over a dedicated mpsc arm).
 
-**The trust invariant they all share:** the command pipe is writable by any authenticated
-local user, so a UI message never carries a `FixAction` or a raw path — it carries an
-**opaque id**. The service maps that id to an action *from its own last-scan state*
+**The trust invariant they all share:** only a client in the active interactive session
+may use the command pipe, and a UI message never carries a `FixAction` or a raw path—it
+carries an **opaque id**. The service maps that id to an action *from its own last-scan state*
 (`st.disk_targets` / `st.startup_targets`) and routes it through the same `pol.evaluate`
 gate as an AI-proposed fix (`route_user_action`, `main.rs`). An unknown/stale id is ignored.
 
@@ -802,7 +803,7 @@ This is the durable substrate Eir learns from. The original feedback loop still 
 
 ### Database bootstrap
 
-`audit::init_db(path)` builds `SqliteConnectOptions` with `create_if_missing(true)`, connects a pool, and runs the embedded migrations. The DB path comes from `config.persistence.audit_db`. Migrations are currently versioned `0001`–`0018` and apply in order on every start.
+`audit::init_db(path)` builds `SqliteConnectOptions` with `create_if_missing(true)`, connects a pool, and runs the embedded migrations. The DB path comes from `config.persistence.audit_db`. Migrations are currently versioned `0001`–`0019` and apply in order on every start.
 
 ### Full schema (every table)
 
@@ -819,7 +820,7 @@ Written by `audit::log_decision`; `executed` is flipped inside the same `persist
 
 **`system_state_history`** (`0001_initial.sql:11`) — a metrics time-series row written alongside every decision.
 - `id`, `timestamp TEXT`, `cpu_usage REAL`, `memory_usage REAL`, `disk_usage REAL`, `failed_services_count INTEGER`, `snapshot TEXT` (full `SystemState` JSON).
-- Written inside `audit::log_decision` (`audit.rs:51`). **Never read anywhere** — pure write-only history, currently unused as a learning signal.
+- Written inside `audit::log_decision`; CPU/memory/disk columns feed the dashboard timeline and resource-trend detector. The full JSON snapshot is retained but not mined.
 
 **`execution_log`** (`migrations/0002_execution_log.sql`) — one row per fix-action execution.
 - `id`, `decision_id INTEGER NOT NULL → decisions(id)`, `action TEXT` (the executed action string), `success INTEGER`, `output TEXT` (stdout/stderr or error text), `executed_at TEXT`.
@@ -827,11 +828,11 @@ Written by `audit::log_decision`; `executed` is flipped inside the same `persist
 
 **`execution_feedback`** (`migrations/0003_feedback.sql`) — the before/after outcome record; the heart of the feedback loop.
 - `id`, `execution_log_id INTEGER → execution_log(id)`, `action TEXT`, `succeeded INTEGER`
-- `cpu_before REAL`, `memory_before REAL`, `failed_services_before INTEGER` — captured at execution time
-- `cpu_after REAL`, `memory_after REAL`, `failed_services_after INTEGER` — filled on the **next** decision cycle (NULL until then)
+- `cpu_before REAL`, `memory_before REAL`, `disk_before REAL`, `failed_services_before INTEGER`, and `target TEXT` — captured at execution time
+- matching after metrics plus nullable `resolved` — filled once the row is at least 120 seconds old; `resolved` records whether a targeted service fault cleared
 - `improvement_score REAL` — computed when after-state is filled
 - `recorded_at TEXT`
-- Written by `feedback::record` after the execution transaction commits; after-states + score are filled by `feedback::update_after_states`; read by `feedback::recent_summary`.
+- Written by `feedback::record` after the execution transaction commits; after-states, score, and targeted outcome are filled by `feedback::update_after_states`; read by `feedback::recent_summary` and the conservative fix-effectiveness detector.
 
 **`usage_log`** (`migrations/0005_usage.sql`) — per-call AI token/cost accounting (populated for every provider as of v0.17: OpenRouter and the Kilo CLI report cost, Anthropic's is estimated, both subscription CLIs' cost is an equivalent-cost figure with no actual charge).
 - `id`, `timestamp TEXT`, `input_tokens`, `output_tokens`, `cache_creation`, `cache_read` (all INTEGER), `cost_usd REAL`.
@@ -848,7 +849,7 @@ Written by `audit::log_decision`; `executed` is flipped inside the same `persist
 
 **`update_attempts`** (`migrations/0007_update_history.sql`) — append-only log of every autonomous-updater attempt, grouped by `cycle_id`.
 - `id`, `cycle_id INTEGER` (groups one run), `app_id TEXT` (version-stripped identity), `name TEXT`, `from_version TEXT`, `to_version TEXT`, `method TEXT` (winget|choco|scoop|msstore|native), `success INTEGER`, `category TEXT` (failure `ErrorCategory` token, NULL on success), `exit_code INTEGER`, `signature TEXT` (Authenticode result, native), `sha256 TEXT` (installer hash, native), `detail TEXT` (cleaned reason), `cost_usd REAL` (AI spend attributable to the attempt), `created_at TEXT`.
-- Written by `updater::history::record_attempts` (`updater/history.rs:17`); read by `updater::history::recent` (limit 50, `history.rs:61`, → `eir_proto::UpdateAttemptRow{name, method, success, detail, at}`); wiped by `updater::history::clear` (`history.rs:53`, UI "Clear" button). Note: `from_version`, `category`, `exit_code`, `signature`, `sha256`, `cost_usd` are **stored but not surfaced** by `recent` — available for analysis but unused.
+- Written by `updater::history::record_attempts`; `recent` surfaces name, method, success, detail, versions, failure category, exit code, and time. Clear records `updater_history_cleared_at` and filters older display rows rather than deleting attempts, preserving fair-rotation inputs and durable run state. Signature, SHA-256, and cost remain persisted evidence but are not copied into the compact recent-attempt row.
 
 **Indexes** (`migrations/0004_indexes.sql`, `0005`, `0007`): `execution_log(action)`, `execution_log(executed_at)`, `execution_feedback(cpu_after)`, `usage_log(timestamp)`, `update_attempts(app_id, created_at)`, `update_attempts(cycle_id)`.
 
@@ -857,13 +858,13 @@ Written by `audit::log_decision`; `executed` is flipped inside the same `persist
 1. **Decision logged.** Each cycle, after the AI returns, `audit::log_decision` writes the `decisions` row (returning `decision_id`) plus a `system_state_history` row (`main.rs:1181`).
 2. **Approval or execution routed per problem.** For each problem, the proposed fix is policy-gated (`main.rs:1205`+). `RequireApproval` → `insert_pending_approval` persists it (`main.rs:1317`); auto-approve → handed to the executor worker.
 3. **Execution + baseline capture.** The executor worker runs the action panic-isolated and timeout-bounded. `persist_execution` atomically writes `execution_log`, marks the decision executed, stores any required registry undo, and transitions its approved row. Only after that commit does `feedback::record` write the "before" row using the `SystemState` captured when the action was proposed.
-4. **After-state measurement.** On the *next* cycle, once fresh signals are collected, `feedback::update_after_states` (`main.rs:1060`) finds up to 50 rows with `cpu_after IS NULL`, fills `cpu_after`/`memory_after`/`failed_services_after`, and computes `improvement_score`.
-5. **Scoring.** `improvement_score` (`feedback/mod.rs:75`) = `cpu_delta*0.3 + mem_delta*0.3 + fs_delta*10.0`, where each delta is `before - after` (a drop in CPU/memory/failed-service count is positive). Fixed weights; heavily favours reducing failed services. Positive = improved, negative = degraded.
-6. **Feedback into the AI.** `feedback::recent_summary(db, 10)` (`main.rs:1064`) builds a human-readable bullet list of the last 10 outcomes — `"- {ts}: {action} -> SUCCESS, improved (+N)"` or `FAILURE ... [reason: …]`. For failures it `LEFT JOIN`s `execution_log.output` and condenses it to one whitespace-normalised line capped at 200 chars (`condense_reason`, `feedback/mod.rs:94`) so the model can avoid re-proposing a fix that already failed. This string is passed to `ai.analyze(snapshot, history, Some(&feedback_summary))` (`main.rs:1092`).
+4. **Settled after-state measurement.** Once a row is at least 120 seconds old, `feedback::update_after_states` fills its CPU/memory/disk/failed-service after metrics. Service actions also record, case-insensitively, whether the specific target left the failed-services set; non-service actions keep `resolved = NULL`.
+5. **Scoring.** `improvement_score` = `cpu_delta*0.3 + mem_delta*0.3 + disk_delta*0.3 + failed_services_delta*10.0`, where each delta is `before - after`. The targeted `resolved` result, not this blended score, drives service-fix effectiveness learning.
+6. **Feedback into the AI and learning.** `feedback::recent_summary(db, 10)` prefers “cleared/did not clear the targeted fault,” then falls back to the resource score; failures include a whitespace-normalised, bounded reason from `execution_log.output`. The summary enters the next diagnosis prompt. Separately, only measured service-target outcomes feed `FixIneffective`; non-service outcomes do not yet produce structured learned facts.
 7. **Decision history into the AI.** Separately, `audit::get_recent_decisions(db, 5)` (`main.rs:1022`) reconstructs the last 5 decisions as `PastDecision { timestamp, diagnosis, confidence, fix_proposed }` (one entry per problem) and is embedded in the `SignalSnapshot.decision_history` *and* passed as `history` to `analyze`.
 8. **Success-rate telemetry.** `safety::success_rate` (`safety.rs:24`) = `SUM(success)/COUNT(*)` over all of `execution_log`; logged each cycle (`main.rs:1195`) and warns below 85%. It is **observability only** today — it does not gate or auto-adjust anything. (`policy.toml`'s `auto_approve_on_success_rate = 0.95` and `max_retries_per_issue` are parsed but marked dead-code "Phase 4", `policy/mod.rs:14`.)
 
-So the entire closed loop is: execute → record before → next-cycle record after + score → summarise into prompt. The AI is the only consumer of the learning; everything else is for the UI or unused.
+The closed loop is: execute → record before/target → wait for settlement → verify target and resource effects → summarise into the prompt and conservative detectors. Learning can only make Eir less aggressive.
 
 ### Config load/save and `to_ui_settings`
 
@@ -1060,447 +1061,94 @@ one app already known to behave this way.
 
 ### Residual implementation notes
 
-- Make thresholds/windows/half-lives config (`policy.toml`/`UpdaterConfig` with
-  `#[serde(default)]`) rather than consts, per the project's config-over-magic-numbers bias.
-- `improvement_score` is noisy (cpu/mem weighted 0.3 vs failed_services 10.0) — prefer the
-  failed-services component for `FixIneffective`.
+- The weighted resource `improvement_score` remains a prompt fallback; targeted service
+  resolution is the authoritative input to `FixIneffective`.
 - `RecurringFingerprint` remains deferred; it overlaps `FixIneffective` and still needs
   per-decision fingerprint identity before it can be applied cleanly.
 
 
 ---
 
-## Known limitations & backlog
+## Current limitations and roadmap
 
-**Fixed in v0.27.4 (bug sweep of the v0.26–v0.27.3 features):** four fixes from a focused
-review of the post-v0.25.4 diff. (1) **Manual Game Mode OFF now works mid-game**: the
-sidebar toggle only cleared the manual latch, so with the auto-detector's 90 s lease live
-the click did nothing (toast said "off", status stayed Gaming). `apply_set_gaming`
-(extracted pure + unit-tested) makes a manual OFF also withdraw the auto lease — the
-documented "next heartbeat may re-enable it" behaviour is now real. An auto off still never
-clears the manual latch, and the power-plan restore still keys off the overall transition.
-(2) **`#game-btn` joins the `svc-down` freeze list** so a disconnected-service click is
-visibly blocked like Pause, not answered with an error toast. (3) **Ask attachment loss on
-the 15 s rate limit**: the tray consumes pending attachments when it queues `AskEir`
-(fire-and-forget pipe), so a service-side rejection silently discarded them; `submitAsk`
-now mirrors the 15 s guard client-side (newest entry timestamp + observed running→idle
-transition) and blocks before sending. Residual: a rejection can still slip through in rare
-paths (e.g. failed previous ask + tray restart inside the window) and still drops
-attachments. (4) **UTF-8 boundary truncation in `as_text`**: a >1 MiB text attachment whose
-capped read cut a multi-byte char mid-sequence was rejected as binary; an
-incomplete-final-sequence error (`error_len() == None`) now keeps the valid prefix. Known
-residuals accepted this sweep: rapid manual double-toggle can interleave the off-loop
-powercfg restore/boost tasks (self-corrects next session); the ≤35 s heartbeat vs 90 s
-lease leaves a few-second gaming-false window if a game re-enters fullscreen just as the
-lease lapses (a decision tick landing inside it could start an update cycle mid-game).
+This section is authoritative for v0.33.0. [PLAN.md](PLAN.md) holds the operational
+burn-in checklist and ordered v0.34 work; [CONTEXT.md](CONTEXT.md) records release history.
 
-**Fixed in v0.27.3 (semantic approval dedup):** duplicate approval cards no longer build up
-across analysis runs. The duplicate guards compared the exact Debug label of the proposed
-action, but the AI regenerates free-text parameters every cycle (a PowerShell script body,
-a registry `value_data`, a cleanup `days_old`) — so a persistent fault queued a new,
-textually-different card each run. `FixAction::dedup_key()` (models.rs) now identifies the
-*issue* an action addresses — variant + the target it acts on, ASCII-case-folded, excluding
-regenerable parameters — and all three guard sites (the AI RequireApproval path, the AI
-auto-exec path, and `route_user_action`) match pending cards on that key.
-`PowerShellDiagnostic` keys on the variant alone (at most one SYSTEM-script card pending at
-a time; a different issue re-surfaces on a later cycle). `StartupSet` keeps its `enable`
-flag in the key — enable vs disable are distinct user intents. `load_pending_approvals`
-also sweeps pre-existing duplicates on startup: newest card per key survives, older ones
-are deleted (same pattern as the unreadable-row cleanup). Known residual: `in_flight`
-matching is still exact-label, so a re-proposal during the seconds-wide execution window of
-an approved action can still queue once — self-correcting next cycle.
+### Verification baseline
 
-**Improved in v0.27.2 (learning-loop deepening — targeted-outcome attribution):** Eir now
-judges each fix by whether the *specific fault it targeted* actually cleared, instead of a
-noisy global metric. Previously `detect_fix_ineffective` judged a service fix by whether the
-global `failed_services` **count** dropped — so a restart that cleared service X was branded
-ineffective if an unrelated service Y newly failed in the same window, and
-`update_after_states` stamped the current snapshot onto all pending rows at an arbitrary cycle.
-Now: (1) `feedback::record` stores the fix's `target` (the service name for service actions,
-via `action_target`); (2) `update_after_states` only measures a row once a **settle window**
-(`SETTLE_SECS = 120`) has passed since execution, and records `resolved` — whether that target
-is no longer in `failed_services` (case-insensitive), `NULL` when not metric-checkable; (3)
-`detect_fix_ineffective` keys off `resolved` (a type is penalised only if it *never* clears a
-target it's applied to, ≥quorum, zero-effective guard intact). `improvement_score` now
-includes disk; `recent_summary` reports "cleared / didn't clear the targeted fault". Migration
-0015 adds `target/disk_before/disk_after/resolved` (additive + defaulted — an existing DB
-upgrades cleanly, old rows read as unmeasured and are never mis-penalised). **The
-conservative-only invariant is unchanged**: learning still only Skip / DeprioritiseMethod /
-ConfidencePenalty — nothing raises confidence, auto-approves, or unblocks. Deliberately still
-**not** done (out of scope, would break that invariant): auto-tuning `confidence_threshold`
-upward or promoting a fix to auto-approve. Also: the Game Mode sidebar toggle now shows a
-filled-purple ON state with an explicit "Game Mode: ON / Off" label (previously a subtle
-border + ambiguous label).
+- The v0.33 local gate passed formatting, clippy, 299 tests, JavaScript/version checks,
+  release compilation, and the NSIS build.
+- Release CI gates the exact commit with a fresh LocalSystem service install, a real
+  protocol-v2 correlated command, signed Tauri/NSIS artifacts, and a standalone-app smoke.
+- The packaged v0.33 WebView was exercised against the installed v0.32 service: version
+  skew and the unsupported provider-test capability rendered correctly, and a live Codex
+  Ask round-trip completed. The installed v0.33 LocalSystem provider test remains a burn-in
+  check, not a claimed live result.
 
-**Added in v0.27.1 (Ask Eir scope guard):** the Ask prompt now opens with an on-purpose rule
-— Ask Eir only helps with THIS PC (health, performance, errors, software, updates, storage,
-security, settings) and the attached files/images, and politely declines off-topic questions
-(general knowledge, coding help, creative writing, opinions), so it isn't used as a general
-chatbot burning the user's AI budget. A carve-out keeps the PC's own software/app/error-message
-questions explicitly in scope (no over-refusal). It's a **soft** guard (a prompt instruction, no
-classifier) — proportionate for a single-user tool; a determined user can still reframe an
-off-topic ask, which is a non-issue (self-inflicted). The only other Ask throttle remains the
-15 s inter-question rate limit + 1000-char cap; there is still no per-day Ask cap.
+### Delivery and persistence
 
-**Added in v0.27.0 (Ask Eir attachments):** Ask Eir can now take file, folder, and image
-attachments for context.
-- **Security invariant — the tray reads, the service never does.** All file I/O
-  (`eir-ui/src/ask_attach.rs`) happens in the tray (the user's session), so it can only read
-  what the user can already read; it sends the service *content* (`AskAttachment`), never a
-  path. The LocalSystem service never opens a wire-supplied path (that would be a
-  SYSTEM-privileged arbitrary-file-read escalation). A native `tauri-plugin-dialog` picker,
-  called from a Rust command, selects the files.
-- **Bounds (tray-side):** images are decoded with dimension/allocation limits (≤20000px,
-  ≤512 MB decode), downscaled to ≤1568px, re-encoded JPEG q80, base64'd; text files are read
-  ≤1 MiB then char-capped at 100k; folder picks are top-level only, skip symlinks and
-  dotfiles/secrets (`.env`, `id_rsa`, `*.key/pem/pfx`, `*.exe/dll`, …) and are bounded by file
-  count + total bytes. The pending list is capped at **12 items and 8 MiB total** — under the
-  raised `MAX_UI_LINE_BYTES` (64 KiB → **12 MiB**, to carry attachments over the pipe) so an
-  AskEir line can't be silently dropped.
-- **Multimodal AI:** `AiClient::complete_multimodal` sends image blocks to the Anthropic API
-  (base64 `image` blocks) and OpenRouter (`image_url` data-URIs); `supports_images()` is false
-  for the CLI providers (Claude/Codex/Kilo CLI), which answer text-only with a prepended note that
-  the images weren't read. Text attachments fold into the prompt (fenced, inside the existing
-  untrusted-content framing, char-budget 200k); the text-only path is unchanged (byte-identical
-  request for the analysis/completion callers, which pass no images).
-- **Known limitations:** OpenRouter images need a vision-capable model (a non-vision model
-  surfaces a per-call API error); the CLI providers can't read images at all; folder picks
-  don't recurse into subfolders; the 8 MiB/12-item cap silently truncates a larger pick.
-  Pre-release review: one adversarial agent + self-review (found/fixed a missing aggregate
-  byte-budget on multi-file picks, a byte/char cap mix, and symlink-following in folder picks).
-  The live dialog, image transcode, and multimodal API calls are reasoning/compile-verified,
-  not live-exercised.
+- CI proves a fresh install, not an upgrade from the previous release with representative
+  config and database state. An exact-SHA upgrade gate is the first v0.34 priority.
+- Config has no explicit schema version. Serde defaults load older files, but saving
+  serialises known fields and can discard unknown keys from a newer config.
+- A corrupt audit database fails closed instead of being deleted automatically; recovery is
+  intentionally manual to avoid destroying approvals or history.
 
-**Added in v0.26.0 (Game Mode):** while a fullscreen game/app is running, Eir gets out of
-the way — it suppresses its own disruptive background work and can optionally boost the power
-plan. It deliberately does **not** kill apps/services for FPS (assessed and rejected: placebo
-benefit on modern hardware, breaks real setups, security regression, crash-unsafe restore,
-fights the guardian).
-- **Detection is tray-side.** `EirSvc` (session 0) can't see the interactive desktop's
-  fullscreen state, so the tray (`eir-ui/src/game_detect.rs`) polls `SHQueryUserNotificationState`
-  every 5 s (`QUNS_RUNNING_D3D_FULL_SCREEN`/`QUNS_BUSY` → fullscreen) and reports over the pipe.
-  It heartbeats `SetGaming{on:true,manual:false}` every 30 s while a game runs and, after a
-  60 s exit-debounce, sends `on:false`. **Windowed (non-fullscreen) games aren't detected — use
-  the manual toggle.**
-- **Lease vs latch.** The service tracks two independent inputs: `gaming_until` (the auto
-  detector's 90 s lease, so a crashed/closed tray auto-expires it and Eir resumes) and
-  `gaming_manual` (the user's explicit toggle — a latch that persists until toggled off).
-  `is_gaming_at = gaming_manual || gaming_until > now`. Status tier: **Paused > Gaming >
-  PendingApproval > Executing > Active**.
-- **What it suppresses:** the scheduled updater (`updater_due` now includes `!is_gaming_at`)
-  and the weekly digest. The manual "update now" is **not** suppressed. The reactive fix loop
-  keeps running (it only fires on an actual fault, rare during a game, and the auto-whitelisted
-  actions are non-disruptive/sub-second) — deferring it was judged not worth the defer/resume
-  machinery for v1.
-- **Optional power boost (Phase 2, opt-in, off by default):** on the gaming start-edge, if
-  `game_mode_power_boost` is on, `game_mode.rs` saves the current `powercfg` scheme GUID to the
-  `app_state` DB table and switches to High Performance; on the end-edge it restores + clears.
-  The powercfg calls run **off-loop** (`tokio::spawn`) so the ≤10 s `powercfg` can't stall the
-  decision loop. Crash-safe: `game_mode::restore` runs on service startup, and a per-tick
-  reconcile restores the plan if the lease lapses with no explicit off (bounding a crashed-tray
-  boost to one decision tick). Restore/boost are driven off the *overall* `is_gaming` transition
-  (not the raw `on` flag), so turning off one input while the other is still active never
-  restores mid-game.
-- **Known v1 limitations:** windowed games need the manual toggle; a fullscreen video player
-  also triggers it (arguably desirable — don't update mid-movie); if auto is on and the user
-  manually toggles Game Mode *off* mid-game, the detector's next heartbeat re-enables it (turn
-  auto off for full manual control); the Game Mode *settings* (`game_mode_auto`,
-  `game_mode_power_boost`) save via the provider card and restart the service (they're set-once,
-  unlike the live manual toggle). The 8-agent-style pre-release review was one adversarial agent
-  + self-review; the frontend, the live `SHQueryUserNotificationState` detection, and the live
-  `powercfg` boost/restore are reasoning/compile-verified, not live-exercised.
+### Pipe and UI
 
-**Resolved in v0.25.4 (third adversarial sweep, F1–F16):** 8-agent sweep + regression pass
-(70/70 prior fixes held). **Two P1s:** (F1) the v0.25.3 manual "Refresh status" wrote
-`st.failed_services` but never updated the WMI cache, so the next decision tick re-populated
-the just-cleared service from the stale `wmi::current()` — `rescan_failed_services` now takes
-`&SharedState` and writes the result into the cache. (F2) UNC/network paths were unguarded in
-the auto-whitelisted `LogCleanup` and the `FileDelete` approval preview (`explain::file_facts`
-stats the path), so an AI-influenced `\\host\share\…` made the LocalSystem account authenticate
-to a remote host over SMB — now blocked in `policy::blocked_reason` (before the executor AND the
-preview) via `is_network_path`, with defense-in-depth bails in `logs::cleanup`, the `FileDelete`
-executor, and `file_facts`. **P2:** (F3) the `Approve`/`Reject` handler cleared `st.error`
-unconditionally (the D7/D14 hole in a different path) — now `!st.paused`-gated; (F4/F5) an
-unrecognised `DiskCleanup` target and a no-op/failed `process_kill` reported a fabricated
-success that poisoned `safety::rate_limited` — both now report real failure (F4 mirrors the
-`NetworkDiagnostic` branch; F5 verifies the process existed and was stopped); (F6) four
-AI-error paths (`Anthropic`/`OpenRouter` HTTP bodies, `claude`/`kilo` CLI stderr) rebroadcast
-unbounded text into `st.error` — now `char_preview`-truncated like the D12 parse path; (F7)
-Settings save buttons didn't disable in-flight (double-click → double restart). **P3:** (F8)
-advisor day-rollover stale read documented; (F9) added a `CRITICAL_SERVICES` adapter-level
-backstop in `services::stop` mirroring `driver.rs`/`process.rs`; (F10) startup-advisor and
-Ask-Eir prompts got the D11 untrusted-content framing; (F11) winget logs a warning when a table
-parses to zero rows (non-English-locale blind spot); (F12/F13) Ask "Send" in-flight guard and
-`overflow-wrap` on AI-text classes. Compile/test-verified (fmt + clippy `--all-targets -D
-warnings` + `cargo test --workspace`, new unit tests for F1/F2/F9); the frontend (F7/F12/F13),
-the F5 live kill, and the F2 live SMB path are reasoning/compile-verified, not live-exercised.
+- The pipe accepts one active-interactive-session client at a time; concurrent tray clients
+  are unsupported.
+- Protocol v2 correlates command results. During service/UI skew, protocol v1 retains the
+  flattened command shape and can only return a neutral queued result.
+- Long-running scans and updater cycles confirm that work started, then report completion
+  through status/activity. The frontend renders a local cache on a two-second poll.
 
-Accepted / deferred from this sweep (decided, not silently dropped):
-- **F14** — retried-and-discarded AI attempts' partial billed usage is still not logged
-  (`client.rs`'s retry loop returns `CallUsage` only from the final attempt). This was the
-  never-implemented D13; **accepted** as a subset of the existing "usage cost is indicative,
-  not exact billing" limitation — under flaky connectivity `advisor_spent_today`/`usage_log`
-  can under-count, bounded by `MAX_ESCALATIONS_PER_DAY` and the daily USD cap.
-- **F15** — version comparison drops prerelease suffixes (`1.0.0-rc1` == `1.0.0`), so an RC
-  never sees its stabilised release. **Accepted** (safe direction — a missed update, never a
-  spurious one; prerelease installs are rare in the target app population), alongside the
-  existing `is_newer` driver-false-positive note.
-- **F16** — a genuinely corrupt (not merely locked) `eir.db` routes to `fatal!` with no
-  recreate-fresh fallback (unlike `config.toml`'s D6 `.bak`). **Accepted**: it fails gracefully
-  (an Error status, no crash-loop) rather than auto-deleting the audit DB — which would risk
-  destroying recoverable data (incl. persisted pending approvals) on a false-positive corruption
-  detection. Documented rather than auto-recovered by design.
+### Signals
 
-**Resolved in v0.25.3 (stale-status fix + manual reset, E1–E2):** a recovered failed
-service could linger on the dashboard for up to ~10–15 min. Root cause: the WMI collector
-woke the decision loop only on a *new* fault, never on a fault *clearing*, so a recovery
-waited for the next scheduled decision tick (`decision_interval_secs`, default 10 min) on
-top of the ≤5 min WMI poll. **E1:** the collector now wakes the loop on any change to the
-fault set — including a clear — via the pure `fault_changed` (unit-tested); a pure recovery
-still hits the empty-fingerprint idle-skip so no AI *analysis* runs. **E2:** a manual
-"Refresh" button in the Dashboard *Failed Services* card sends `UiMsg::RefreshStatus`,
-which forces a fast services-only rescan (`wmi::rescan_failed_services`, no PowerShell),
-overwrites `failed_services`, re-settles `resting_status`, and broadcasts — clearing a
-recovered service on demand across every view + the tray from the single broadcast. It
-deliberately does **not** clear `st.error` (a live AI/config error, not stale status) or
-the Activity history (which has its own Clear). Compile/test-verified (fmt + clippy
-`--all-targets -D warnings` + `cargo test --workspace`, +1 `fault_changed` test); the
-end-to-end loop wake and the frontend are reasoning-verified, not live-exercised.
+- Event Log polling and the in-memory drain buffer each cap bursts at 100 records per
+  channel; excess older records are not replayed.
+- Automatic file discovery is one directory level deep, limited to recent files, and reads
+  the newest 64 KiB per change. Explicit watched directories bypass discovery, not the tail
+  limit.
+- Disk capacity covers the system drive. CPU and some security/disk/network probes depend on
+  bounded PowerShell or Windows APIs; probe failures retain last-good values and surface
+  source errors/freshness instead of publishing healthy zeroes.
 
-**Resolved in v0.25.2 (bug-fix sweep, D1–D22):** an 8-agent adversarial sweep + full
-regression pass (all 44 prior fixes held). Highlights:
-- **Scheduled-task target gate** (D1): `task_disable`/`task_enable` are auto-whitelisted
-  but previously had **no** target restriction at any layer, so the AI could disable a
-  Defender/BitLocker scheduled task with no human review. Now `policy.toml [blocklist]
-  tasks` blocks `\Microsoft\...` (Defender/BitLocker/backup/restore + a `\Microsoft\Windows`
-  catch-all), matched by the same normalised-component `is_within` used for paths; the
-  prompt also tells the model to use full `\Folder\Name` paths and never touch security/
-  maintenance tasks.
-- **Self-update stop-wait** (D2): the NSIS PREINSTALL replaced its fixed `Sleep 5000` with
-  a bounded (~40 s) poll for the service to reach STOPPED — the fixed sleep was shorter than
-  the C1 executor-drain window (up to 30 s), so an update firing mid-fix hit file-in-use on
-  `eir-svc.exe` and failed (the "what broke auto-updates" case).
-- **process_kill glob refusal** (D3) and **bare-task-name ambiguity refusal** (D4): a
-  wildcard process name (`lsass*`) could evade the exact-match blocklist; a bare task name
-  matched every same-named task across folders. Both now refuse up front (glob metachars;
-  a bare name resolving to >1 task).
-- **Stale-watch repair** (D5): a deleted+recreated log directory left its `notify` watch
-  dead until restart; the watcher now re-arms every known dir on rediscovery.
-- **Atomic config write + recovery** (D6): `config.toml` is written via temp-file + rename
-  with a `.bak` of the last parseable config, and `load` recovers from `.bak` on a parse
-  failure instead of going fatal — a crash mid-write no longer bricks the service.
-- **Uninstall leave-no-trace** (D8): the uninstaller now removes the autostart Run values
-  and `%APPDATA%\co.swatto.eir\` (previously orphaned, pointing at the deleted exe).
-- **Single-instance guard** (D9): a second launch now focuses the existing window and exits,
-  instead of a duplicate tray/process starving the single-client pipe.
-- Also: paused-status no longer latches on a late analysis failure (D7/D14); the analysis
-  watchdog was raised to 30 min to cover worst-case retry+escalation (D10); untrusted
-  log/file content is framed as data-not-instructions in the prompt (D11); the raw model
-  blob in a parse-failure error is truncated before broadcast (D12); the ask-rejection
-  notice survives an in-flight answer completing (D21); Scoop execution is fail-closed in
-  the SYSTEM service (D16); `prune_old` no longer orphans a decision with an outstanding approval (D17); the
-  registry-reset approval copy is honest about the best-effort undo (D15); and two frontend
-  UX-integrity gaps were closed (Ignore button feedback D19, stuck irreversible-confirm
-  button D20). Verification: `cargo fmt`/`clippy --all-targets -D warnings`/`test --workspace`
-  green, new unit tests for the pure gates (D1/D3/D4/D6/D16). The NSIS stop-wait (D2),
-  uninstall cleanup (D8), single-instance (D9), and stale-watch re-arm (D5) are
-  reasoning/compile-verified, not live-exercised. **Deferred (D18):** the `restart_self`
-  vs NSIS-update `sc stop/start` overlap is a narrow, self-healing race (SCM serialises the
-  calls and both sides retry) — a marker-file mechanism would add more failure surface than
-  the race is worth, so it stays documented rather than fixed, per the plan's own guidance.
+### AI and learning
 
-**Added in v0.25.1 (UX pass):** toasts, copy-to-clipboard, Activity filter chips —
-frontend-only, no wire or service change; see the UI "Layout, theming & rendering"
-section. Toasts are cosmetic acknowledgement of *queued* commands, not delivery
-confirmation — the underlying pipe is still ack-less (a resolved `invoke` means
-"queued to the writer", per "Pipe protocol & tray UI"), so a command lost to a
-mid-flight disconnect still shows a success toast; the `ensure_connected` gate and
-`svc-down` class remain the real backstops. Single frontend reviewer + self-review,
-no confirmed defects; not live-exercised in the running app.
+- Anthropic cost uses a list-price estimate; subscription CLI “cost” is an equivalent-value
+  estimate, so totals are visibility rather than billing.
+- CLI providers depend on the active user's installed binary layout and logged-in session.
+  Unsupported model/effort combinations surface as call errors rather than being fully
+  prevalidated.
+- Model JSON has a bounded extraction fallback, and decision/feedback context windows remain
+  fixed and small.
+- Verified targeted outcomes currently drive effectiveness learning only for service
+  actions. Other adapters verify effects for execution success, but do not yet emit
+  structured learned outcomes. Learning remains conservative-only: it can skip,
+  deprioritise, or reduce confidence, never expand authority.
 
-**Added in v0.25.0 (Autoruns-style startup advisor):** full ASEP coverage rebuild of F13 —
-see that section for design and guards. The pre-release sweep (three agents + live script
-runs on a real machine) caught and fixed: string-typed `approvedByte` from PowerShell
-argument binding silently blanking the whole scan (now coerced `[int]` + tolerant Rust
-deserializer + regression test); an unanchored `\Windows\` service filter that masquerade
-paths (`C:\Users\Public\Windows\`) could hide in; the `PS*` prefix note-property filter
-dropping (or letting malware hide behind) legitimately-named `PS…` Run values; UNC targets
-able to stall the scan and leak machine-account SMB auth (now skipped); and
-`Get-ScheduledTask` wildcard expansion letting a `*?[]`-named task fan one toggle across
-siblings (now refused, covering the AI path too). Verification level: unit/compile-verified
-plus the enumeration script live-run as the interactive user (20 entries, 6 categories);
-the LocalSystem run, task toggling, and the AI classify pass are not live-exercised.
+### Execution and undo
 
-**Resolved in v0.24.4 (bug sweep):** three review agents (frontend / UI-Rust+wire /
-service-interaction) + manual verification. Fixed: (1) **startup wiped the "AI provider
-not configured" error** before the first broadcast — the settle at the end of `eir_main`
-startup unconditionally set `Active`/`error=None`, and with `ai = None` no later path
-re-set it, so a broken provider looked healthy forever; the settle is now gated on
-`ai.is_some()`. (2) **Settings dirty flag was view-global** — saving one of the four
-cards cleared the flag for all, so unsaved edits in another card were refilled over on
-view re-entry; now per-card (`dirtyCards`). (3) **tray repaint failures were swallowed
-and never retried** — `last = current` advanced even when `set_icon`/`set_tooltip`
-failed, freezing the tray on a stale state; the guard now advances only on success
-(same for the pause menu label). (4) config-error regex tightened (see the v0.24.3 note
-below). Confirmed-correct in the same sweep: `ApprovalInfo.reversible` is derived from
-an exhaustive non-wildcard match over `FixAction` (never AI-supplied), and
-`open_url`'s single-quoted PowerShell interpolation does not expand `$()`/backticks.
-Known-and-accepted (not fixed): the `ensure_connected`→`try_send` TOCTOU (a command
-accepted in the instant the pipe dies is drained without an ack — inherent to the
-fire-and-forget design, already documented under "Pipe protocol & tray UI"), and a
-`log_decision` failure delaying (not losing) the `last_analysis_at` broadcast until
-the next cycle.
+- Registry reset has crash-durable, exact-type undo guarded by a comparison with the value
+  Eir applied. Other action families do not yet have durable undo receipts; startup and task
+  toggles are the next narrow candidates.
+- Rate limits and circuit breakers bound repeated failures, but there is no success-driven
+  auto-approval promotion.
 
-**Added in v0.24.3 (UI/UX pass):** two-step confirm on irreversible approvals, settings
-dirty-guard, Enter-to-send Ask, Escape-to-hide, absolute-time tooltips, paused-state
-emphasis, config-error → Settings quick link, disk/startup scan summaries, clamped
-numeric saves, and the `last_analysis_at` wire field ("analysed Xm ago" trust signal).
-UI-only except the wire field (`#[serde(default)]`, skew-safe both directions). The
-config-error quick link keys off error text — a heuristic, not a typed error class; a
-false positive merely shows a harmless button. (v0.24.4 tightened the pattern to the
-service's actual config-shaped strings + auth failures, after a sweep showed bare
-"model"/"key" matched transient errors like "model API error: rate-limited".)
+### App updater
 
-**Resolved in v0.24.2 (correctness & hardening sweep, C1–C21):**
-- **Executor drain on stop/restart** (C1): the off-loop executor worker's `JoinHandle` is now held
-  and drained (`drop(exec_tx)` + a 30 s bounded join) before `eir_main` returns, so an approved fix
-  that was queued/executing finishes and logs instead of being aborted when the runtime drops (the
-  self-updater's `sc stop` and settings-save restart are the common triggers). The SCM handler reports
-  `StopPending` + a 35 s `wait_hint` so SCM waits for the drain. Best-effort only for a repair longer
-  than the window (SFC/DISM) — SCM can still force-kill.
-- **`verify_exe` UNC guard** (C2): `exe_file_version` now requires a drive-letter path, rejecting a
-  UNC path that would force LocalSystem to authenticate to an attacker SMB share.
-- **GitHub host correlation** (C4): a `github.com` native-install URL must now have its `/owner/repo/`
-  correlate with the app name (narrows, doesn't eliminate — the Authenticode/SHA gate is the backstop;
-  see `github_repo_correlates`).
-- **`FileDelete` canonicalisation** (C6), **native-install ACL retry** (C5), **`strip_fences` /
-  raw-JSON fallback** (C3), **advisor midnight day-rollover** (C8), **`LogCleanup` deadline + canonical
-  walk** (C9/C19), **audit-table retention** (C7, above), **updater fair-rotation** (C13),
-  **`match_installed` ambiguity** (C12), **`SetAppIgnore` cap** (C15), and UI fixes (advisor 0-value
-  handling C10, tray-pause connected-gate C11) round out the sweep. Compile/test-verified
-  (fmt + `clippy --all-targets` + `cargo test --workspace`); the shutdown-drain and live SMB/SCM paths
-  are reasoning-verified, not live-exercised.
+- A native install's expected publisher is currently AI-sourced, so publisher matching is a
+  tripwire against mismatch, not a durable vendor pin. v0.34 should anchor it in signed
+  installed software or a curated local mapping.
+- Scoop stays disabled under LocalSystem; Microsoft Store updates remain best-effort because
+  entitlement and installs are user-scoped.
+- Unmanaged AI checks rotate the stalest 20 apps per cycle. Recorded failures or deferred
+  coverage block a clean-cycle claim, but an enabled package manager that is unavailable
+  can be omitted when another source is usable; “clean” is not proof that every configured
+  manager was available.
+- Version normalisation still has edge cases around prereleases and vendor-specific version
+  shapes. Native installer execution under the released LocalSystem service remains part of
+  normal-use burn-in.
 
-**Added in v0.24.0 (F10–F13 user-facing tools)** — with deliberate v1 deferrals:
-- **Disk insights**: cleanup maps only to *existing* safe actions (`DiskCleanup{temp|prefetch}`
-  auto; a stray `MEMORY.DMP` via `FileDelete`, approval). Emptying the Recycle Bin, `powercfg /h off`,
-  DISM component cleanup, and clearing an arbitrary per-user temp/cache directory each need a **new**
-  fix-action with its own blast radius — deferred until the report-only entries prove worth acting on.
-- **Startup advisor**: ~~enumerates HKCU/HKLM Run + Startup folders only~~ **resolved in
-  v0.25.0** — now Autoruns-style (Wow6432Node Run via `StartupApproved\Run32`, RunOnce,
-  policy keys, Winlogon anomalies, logon scheduled tasks via `TaskDisable`/`TaskEnable`,
-  auto-start services report-only), with per-entry Authenticode signer and AI origin
-  explanations; see F13. Still true: per-user data is read only from *loaded*
-  interactive-user hives (a signed-out user's entries aren't seen), `\Microsoft\*` task
-  folders are excluded wholesale, and IFEO/AppInit/shell-extension ASEPs remain out of
-  scope.
-- **Ask Eir** history is memory-only (lost on service restart) by design — it's UI state, not audit data.
-- **On-demand actions & feedback**: `DiskCleanup("temp")` clears the *service account's* `%TEMP%`
-  (`C:\Windows\Temp`), which is what the "Windows temp" entry sizes — a per-user temp clean would need
-  a new action. A rate-limited/deduped user click now surfaces a reason in the activity feed, and the
-  clean/toggle buttons self-recover (the command is fire-and-forget); a fuller per-action ack channel
-  is still not implemented (the pipe remains fire-and-forget).
-- `system_state_history` is now *read* by the dashboard timeline (`metric_history`) as well as the
-  trend detector. **Resolved in v0.24.2:** it — along with `decisions` and `execution_log` — is now
-  pruned to a 90-day window by `audit::prune_old` (called from the per-cycle retention block beside
-  `feedback::prune_old`), so none of the three high-frequency audit tables grows without bound.
-
-**Resolved in v0.23.0** (bullets below may still describe the pre-fix state):
-- Registry `registry_reset` gate now uses component-boundary matching (a sibling key sharing a name prefix could bypass the old `starts_with` allowlist), denies persistence subkeys (Run/RunOnce/Winlogon/IFEO), and the policy layer has real registry blocklist entries. Registry resets are now **reversible**: the prior value is snapshotted and can be reverted with one click (`registry_undo` table).
-- `LogCleanup` refuses a drive-root/Windows-tree scan root and `days_old == 0`, and skips files under protected system dirs (it previously recursed past the policy-checked root).
-- The CLI providers no longer deadlock on a large prompt — stdin is written concurrently with draining stdout/stderr (in `wait_capped`).
-- Audit DB opens with **WAL + busy_timeout** so concurrent writers don't silently drop rows.
-- Choco `Force`/`ClearManagerLock` remedy is now actually applied (`--force`).
-- Anthropic path sends the static system prompt as a **cached** block (prompt caching); text-only completions (labeller, digest) correctly omit it.
-- `disk_health` (SMART, via `Get-PhysicalDisk`) and `network_errors` are now measured, not hardcoded; a Warning/Unhealthy disk feeds the actionable fingerprint.
-- New **`sfc_scan`** / **`dism_restore_health`** actions (approval-gated, never whitelisted, own long timeout).
-- `system_state_history` is now read: a resource-**trend** note (disk filling, sustained CPU/mem rise) is folded into the prompt context.
-- New **weekly health digest** (one bounded AI call over aggregated audit counts; UI card + OS notification), and an **approval OS notification**.
-- Advisor day-counters are persisted (`advisor_daily_spend`) for the escalation count backstop only (USD budget removed), a **version-sync CI check** was added, and the stale root `tauri.conf.json`/`build.rs` were removed.
-
-Current gaps surfaced while mapping each subsystem (the self-improvement plan above addresses several).
-
-**Workspace, build & delivery pipeline**
-
-- The repo still contains a root `tauri.conf.json` that is not the documented/canonical build config. The supported build path uses `cargo tauri build --config eir-ui/tauri.conf.json`; the root config is stale enough to confuse contributors and should either be removed or made an explicit compatibility shim.
-- This documentation pass did not execute a full `cargo tauri build` to observe the bundle being produced, nor the release workflow end-to-end (compile/static-verified, not run-verified). Whether the signing secrets are configured in the GitHub repo is unverifiable from the source tree.
-- The release process is described as manual version-bump + tag push inferred from CLAUDE.md conventions and git history ([release] markers); there is no scripted bump tool in the read files, so the exact human steps are convention, not enforced by code.
-- No automated check verifies the four version locations stay in sync (Cargo.toml x3 + tauri.conf.json); a drift would not be caught by the CI gate as currently written.
-
-**Pipe protocol & tray UI**
-
-- Single-client only: the listener serves one UI connection at a time and aborts/re-accepts on disconnect; concurrent UIs are not supported (pipe_server.rs:126-184).
-- No authentication beyond the ACL: any Authenticated User at Medium+ integrity on the machine can open the pipe and send commands (approve fixes, change settings, trigger updates). The trust boundary is the local interactive logon, not the specific user (pipe_server.rs:33).
-- Command delivery is fire-and-forget with no per-command ack/result: a Tauri command returning Ok only means the UiMsg was queued to the writer, not that the service applied it; the UI infers success only from the next polled snapshot. Since v0.24.1 the handler at least refuses to queue when the pipe is disconnected (`ensure_connected`), so a click during a service outage/restart returns an error instead of vanishing — but a command accepted while connected then lost to a mid-flight drop still has no ack.
-- Optimistic UI can drift from truth: Approve/Reject disable buttons and 'Ignore' dims the row immediately, but if the service rejects or never applies the command there is no negative feedback beyond the row reappearing on the next 2s poll. The disconnected case is now handled (the `svc-down` class plus the Rust gate), but a command dropped while *connected* is still silent.
-- Status freshness is bounded by the 2s UI poll plus the service's broadcast cadence; the UI cannot request an on-demand refresh from the service (it only re-reads the local cache) (main.js:636-637).
-- mpsc command channels are bounded (service 8, UI 16); a stalled writer could in principle apply backpressure, though commands are low-volume (pipe_server.rs:60, main.rs:244).
-- Byte-mode pipe relies entirely on the newline delimiter for framing; a payload containing a literal newline would break framing, but serde_json::to_string emits single-line JSON so this is not currently reachable.
-- The app has two Tauri config files in the repo; protocol/UI references in this doc assume the canonical `eir-ui/tauri.conf.json`.
-
-**Service decision loop, state & off-loop executor**
-
-- The dedupe key is format!("{action:?}") (Debug of FixAction). Correctness of dedupe and the activity-feed label depends entirely on the Debug impl being stable and uniquely identifying actions; two semantically distinct actions with the same Debug string would collide, and a Debug change would break matching against persisted pending.info.action strings.
-- exec_done_rx feedback record uses result.action (the executed Debug form) while in_flight/pending were keyed on the pre-execution label; the code assumes these match — not verified here whether executor::execute can alter the action's Debug form.
-- build_status clones the full recent_problems/recent_executions deques and pending vec on every broadcast; at the 20-item caps this is cheap, but every state mutation triggers a full snapshot clone+broadcast.
-- Standalone (non-SCM) mode runs the same eir_main but with a Ctrl-C shutdown; behavior parity with service mode (e.g. restart_self issuing sc commands) is not exercised in dev unless the service is actually registered.
-- I read only eir-svc/src/main.rs as instructed; the contracts it depends on (policy::evaluate verdict semantics, executor::execute, ai::analyze/analyze_with usage reporting, audit/* DB schema, explain::*, signals::*) are referenced but not verified in this pass.
-- The pipe is stated to be writable by any authenticated user; RunUpdatesNow and Approve are gated, but this section did not audit whether every other UI command (e.g. UpdateSettings -> restart_self, SetAdvisorSettings) is adequately privilege-checked against a Medium-integrity caller.
-
-**Signal sources**
-
-- Event log captures only Error/Warning/Information levels and no message body (just 'EventID <n>'); Critical/Verbose levels and event descriptions are not collected. event_id is truncated to 16 bits.
-- Each event-log poll collects at most `MAX_PER_POLL = 100` records per channel and the shared drain buffer holds `BUFFER_CAP = 100`; a single-poll burst beyond that keeps the freshest 100 (the cursor still advances, so nothing below it is re-read), and there is no durable event history beyond the buffer.
-- CPU usage depends on a PowerShell WMI call; if powershell.exe is unavailable, slow, or wedged past 15s, cpu_usage_percent silently becomes 0.0 (indistinguishable from an idle CPU). Same single-point dependency for Defender.
-- network_errors is hardcoded 0 and disk_health is hardcoded 'unknown' — neither is actually measured; disk metrics only cover the C: volume.
-- File discovery only scans fixed roots + a small env-var root set, one subdirectory level deep, with a 30-day recency window; logs outside those roots/age or deeper than one level are not auto-watched (only explicit config log_directories extras bypass this).
-- File parsing reads only the last 64KB (`MAX_READ_BYTES`) of each changed file, so an error written more than 64KB before the newest byte *within a single write burst* can be missed; ordinary append-and-watch sees new lines as they land.
-- Keyword-based severity classification (log_parser) is substring matching with no structured-log awareness, so it can over- or under-flag (the content_excerpt is provided to let the AI correct this downstream).
-- ps_capped uses sleep-poll at 100ms granularity rather than async wait; acceptable but each probe blocks a spawn_blocking thread for up to 15s.
-- Several Win32 calls (event log record parsing, service enum, adapter enum) use unsafe pointer walking; correctness depends on OS-supplied buffer layout and is not covered by tests (only firewall and Defender parsing are unit-tested).
-
-**AI layer & prompts**
-
-- Anthropic cost is an **estimate** from a hardcoded list-price table (`anthropic_price_per_mtok`) — prices drift over time and new model tiers default to Opus pricing; a Kilo CLI call whose event stream carries no cost falls back to the MAX_ESCALATIONS_PER_DAY=24 count cap for escalation spend there.
-- `resolve_kilo_cli_binary`'s npm install-layout probe (`cli-windows-x64` / `cli-windows-x64-baseline`) is Windows-specific and version-pinned to how `@kilocode/cli` currently lays out its platform packages; an upstream npm restructure would silently fall through to the PATH-reliant `"kilo"` fallback (which still fails under LocalSystem, same failure mode this fix replaced).
-- The `effort` setting is model-dependent: Anthropic skips it for Haiku models (no effort support), but other unsupported model/effort combinations (e.g. xhigh on older Sonnets, reasoning on non-reasoning OpenRouter models) surface as per-call API errors rather than being validated up front.
-- FixAction still contains a `SoftwareUninstall` variant (models.rs:181) even though the prompt explicitly forbids uninstalling software ('there is no reinstall path'); the variant is reachable if a model emits it, gated only downstream by policy/parse, not by the type.
-- JSON parsing relies on first-{ to last-} extraction as a fallback (extract_json_object); a model that emits multiple JSON objects or stray braces in prose could be mis-parsed, and a hard parse failure aborts the whole cycle (main.rs:1105-1111).
-- The prompt is a single monolithic format! string mixing schema, action catalogue, and ~110 lines of guardrail prose (prompt.rs:28-186); there is no prompt-level test verifying the action examples stay in sync with the FixAction enum tags.
-- No prompt caching is requested on the Anthropic native path (no cache_control breakpoints), so the large static guardrail prose is re-sent uncached every cycle on that provider — a cost-optimisation opportunity.
-- needs_deeper_analysis and the confidence threshold are the only escalation triggers; there is no escalation on outright AI-call failure or on a parse failure — those just error the cycle.
-- Advisor day-counters (spent_today / escalations_today) are in-memory process state reset only on a UTC date flip; the count ceiling is now the only backstop after budget removal.
-- The 'last 5 decision history' (prompt) and 'feedback last 10' windows are hard-coded at the call sites (main.rs:1023, feedback recent_summary(db,10)) rather than configurable.
-
-**Executor, policy, safety & explanations**
-
-- max_retries_per_issue and auto_approve_on_success_rate (policy/mod.rs:17,19) are dead code — deserialized and used only in policy tests; no production code reads them. The #[allow(dead_code)] comment's 'used in Phase 4' claim is inaccurate.
-- The failure circuit breaker (3 failures/window in safety.rs) is window-scoped: a persistently failing action still retries once per rate-limit window rather than backing off exponentially or alerting.
-- No success-rate-driven auto-approval promotion is implemented; success_rate() only feeds a log/warning, never a verdict.
-- (Resolved) registry.rs and tasks.rs now route through the timed `powershell::run_diagnostic` helper like every other PS adapter; there is no longer an untimed `std::process::Command` executor path.
-- No generic undo: RegistryReset is marked reversible=false because the prior value is never snapshotted (explain.rs:92).
-- Rate-limit and dedupe correctness depend on the action's Debug format being stable; any change to FixAction's derived Debug silently breaks both.
-- I did not exercise any action in a running service — findings are read-from-source only (compile/run not verified here).
-
-**Autonomous app updater**
-
-- RequirePublisherMatch's expected_publisher is AI-sourced, so it is a tripwire (valid signature whose CN equals the claimed publisher), not a true vendor pin; the code itself notes a trusted per-app publisher map would harden it.
-- Scoop is disabled under SYSTEM because its user-owned shim is an elevation boundary; msstore remains best-effort because Store apps are per-user and may require the signed-in user's entitlement.
-- clean_app_name folds same-base products that differ only by a dotted major (e.g. Python 3.11 vs 3.12) to one identity key — a documented, accepted limitation tolerated because heavyweight runtimes are filtered as noise upstream.
-- is_newer cannot distinguish a legitimate bare-major bump from a driver cross-product false positive (e.g. 551.86.0.0 -> 552); the marketing-truncation guard deliberately leaves those alone, and the only recourse for the residual case is the per-app Ignore list.
-- SELF_UPDATING is a hard-coded single entry ('discord'); other genuinely self-updating apps would need code changes or a user Ignore entry rather than configuration.
-- AI web-search check is capped at AI_CHECK_CAP = 20 apps per cycle (check.rs:19); beyond that, only the first 20 unmanaged apps are checked (surfaced as a UI note).
-- The native signature/install path is download/hash/signature compile- and unit-verified (pure gates exhaustively tested), but running an installer as SYSTEM and the live AI plan/web-search path are not exercised in the test suite — verification level is compile/unit, not live-run.
-
-**Persistence, audit DB & the existing feedback loop**
-
-- No model/policy learning: feedback is purely prompt injection of a text summary. Nothing in the DB auto-tunes confidence_threshold or policy; success_rate only logs/warns.
-- system_state_history (full per-cycle metrics + SystemState JSON) is written every cycle; its cpu/mem/disk columns are now read by the trend detector (v0.23.0) and the dashboard timeline (`metric_history`, v0.24.0), but the full `SystemState` JSON snapshot column is still unused for any learning.
-- decisions.execution_output column is declared but never written or read (dead column; executions live in execution_log).
-- update_attempts stores from_version, category, exit_code, signature, sha256, cost_usd but updater::history::recent surfaces only name/method/success/detail/created_at; per-attempt AI cost and failure category are persisted yet unused for any learning or aggregation.
-- improvement_score uses fixed hand-tuned weights and only 3 dimensions (cpu/mem/failed-services); it ignores disk and any other signal, and an action whose effect lands beyond one cycle is mis-scored.
-- after-state attribution is coarse: update_after_states stamps the SAME current system state onto ALL pending feedback rows, so concurrent/overlapping fixes share one after-snapshot and cannot be individually credited.
-- recent_summary/get_recent_decisions are small fixed windows (10 and 5); long-horizon patterns across the full history are not mined.
-- improvement_score / feedback math have no unit tests in feedback/mod.rs (only updater::history has a round-trip test); scoring correctness is unverified.
-- config has no schema versioning/migration mechanism; forward-compat relies on per-field serde(default) and would silently drop unknown keys on save (toml round-trips only known fields).
-- usage_log cost mixes provider-reported (OpenRouter, Kilo CLI), estimated (Anthropic list pricing), and equivalent-cost/no-charge (both subscription CLIs) figures, so usage_summary totals are indicative rather than exact billing.
+No new repair authority is planned until these trust-loop gaps are closed.

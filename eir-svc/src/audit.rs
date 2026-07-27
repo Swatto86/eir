@@ -197,8 +197,8 @@ pub async fn load_advisor_day(pool: &SqlitePool, day: &str) -> Result<(f64, u32)
     }
 }
 
-/// Persist the advisor's escalation spend + count for `day` (upsert), so the daily
-/// budget / escalation caps survive a service restart.
+/// Persist the advisor's escalation spend + count for `day` (upsert), so spend
+/// visibility and the daily count cap survive a service restart.
 pub async fn save_advisor_day(
     pool: &SqlitePool,
     day: &str,

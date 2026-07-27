@@ -22,8 +22,8 @@ pub struct AskContext {
 }
 
 const MAX_QUESTION_CHARS: usize = 1000;
-/// Minimum gap between questions (seconds) — a spend guard, since the command pipe is
-/// writable by any authenticated user.
+/// Minimum gap between questions (seconds) — a spend guard against rapid repeated
+/// active-session requests.
 const MIN_GAP_SECS: i64 = 15;
 /// Number of previous Q&A pairs fed into the prompt for context.
 const MAX_HISTORY_ENTRIES: usize = 5;

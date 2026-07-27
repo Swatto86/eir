@@ -217,8 +217,7 @@ pub struct StepContext<'a> {
 }
 
 /// The deterministic fallback: the first available, not-yet-tried method, else
-/// give up. This is what runs when the AI is unavailable, over budget, or proposes
-/// something invalid.
+/// give up. This runs when the AI is unavailable or proposes something invalid.
 pub fn deterministic_next(ctx: &StepContext) -> NextStep {
     if ctx.failed.is_terminal() {
         return NextStep::GiveUp("integrity check failed".to_string());

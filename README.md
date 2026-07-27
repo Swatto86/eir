@@ -47,7 +47,8 @@ The two talk over a secured local named pipe (`\\.\pipe\EirSvc`).
                                                        ┌────────▼─────────┐
                                                        │   AI provider    │
                                                        │  OpenRouter /    │
-                                                       │  Claude / API    │
+                                                       │ Claude / Codex / │
+                                                       │      Kilo        │
                                                        └──────────────────┘
 ```
 
@@ -78,9 +79,8 @@ Each decision cycle (default every 10 minutes):
    reorder actions, never make Eir more aggressive, and every fact is visible in the
    UI with Pin / Disable / Forget controls.
 
-> **Architecture & design:** see [ARCHITECTURE.md](ARCHITECTURE.md) — a living document
-> covering every subsystem (signals, decision loop, executor/policy, updater,
-> persistence) and the design for Eir's planned machine-pattern self-improvement.
+> **Architecture & design:** see [ARCHITECTURE.md](ARCHITECTURE.md). Current burn-in
+> guidance and the next release priorities are in [PLAN.md](PLAN.md).
 
 ## AI providers
 
@@ -131,7 +131,8 @@ are reported instead of being silently treated as queued.
   instead of on the next scheduled sweep.
 - **Advisor mode** — optional bounded escalation that lets Eir re-run one analysis at
   a stronger model or higher reasoning effort when the base model flags ambiguity or
-  reports low confidence. Daily spend and attempt caps keep it bounded.
+  reports low confidence. A hard cap of 24 escalations per day keeps it bounded; spend
+  remains visible but is not a policy gate.
 - **App updates, applied for you** — one panel updates everything. `winget`-managed
   apps update in a single batch; apps no package manager tracks are handled by the
   AI: it finds the official installer via web search, and Eir validates it
@@ -167,6 +168,12 @@ are reported instead of being silently treated as queued.
 
 Already installed? Eir updates itself automatically.
 
+After an upgrade, open **About** and confirm the UI and service show the same version.
+Then use **Settings → Test provider** to exercise the saved provider through the installed
+LocalSystem service. In **App Updates**, “last run” means a cycle completed; “last clean”
+means the cycle recorded no source/check/app failure or deferred candidate. It is not proof
+that every configured package manager was available.
+
 ## Configuration
 
 All settings live in the in-app **Settings** panel: start-with-Windows, AI provider
@@ -195,11 +202,12 @@ powershell -NoProfile -File icons\gen-icon.ps1
 cargo tauri build --config eir-ui/tauri.conf.json
 ```
 
-Run the checks the way CI does:
+Run the core local checks:
 
 ```powershell
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
 ```
 
 ## Project layout
@@ -215,9 +223,11 @@ cargo test --workspace
 - The service runs as **LocalSystem**; the UI runs at **Medium** integrity (normal
   user). They communicate only over the local named pipe `\\.\pipe\EirSvc`.
 - The pipe is created with an explicit security descriptor —
-  `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)S:(ML;;NW;;;ME)` — granting authenticated
-  users read/write while a Medium mandatory-label SACL lets the Medium-integrity UI
-  write to it (no-write-up). No network listener is opened.
+  `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;NW;;;ME)` — granting Interactive
+  Users read/write while a Medium mandatory-label SACL lets the Medium-integrity UI
+  write to it (no-write-up). The service also requires the pipe client to belong to
+  the active interactive session and rechecks that session during I/O, so switching
+  users invalidates the old client. No network listener is opened.
 - Destructive actions are blocked at the policy layer and require explicit approval;
   software uninstalls are never permitted.
 - Claude, Codex, and Kilo CLI providers run under the active desktop user's

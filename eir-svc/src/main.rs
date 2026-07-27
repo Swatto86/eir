@@ -227,8 +227,7 @@ struct SvcState {
     advisor: Option<AdvisorStatus>,
     /// Escalation AI spend accumulated today (reset at the UTC day boundary).
     advisor_spent_today: f64,
-    /// Escalations performed today — a provider-agnostic backstop, since the USD
-    /// budget can't bound providers that report no cost.
+    /// Escalations performed today — the hard provider-agnostic backstop.
     advisor_escalations_today: u32,
     /// The UTC date (YYYY-MM-DD) that the advisor day-counters belong to.
     advisor_spend_date: String,
@@ -1239,9 +1238,8 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         settings: cfg.advisor.to_view(),
         ..Default::default()
     });
-    // Seed the advisor's daily spend from the DB so its budget / escalation caps
-    // survive a restart (a settings change restarts the service) instead of resetting
-    // to zero and letting escalation resume after the day's budget was spent.
+    // Seed today's advisor spend/count so visibility and the count cap survive a
+    // settings-triggered service restart.
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     if let Ok((spent, escalations)) = audit::load_advisor_day(&db, &today).await {
         st.advisor_spent_today = spent;
@@ -1816,9 +1814,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         // If the UTC day rolled over WHILE this analysis was in flight, the
                         // per-cycle rollover (bottom of the loop body) never ran — it's gated
                         // behind `if analysis_running`. Folding the task's totals back in would
-                        // restore yesterday's (possibly near-budget) spend onto the new day and
-                        // wrongly block a legitimate new-day escalation. Detect the straddle here
-                        // and attribute only THIS analysis's own escalation to the new day.
+                        // restore yesterday's spend/count onto the new day, misreporting spend and
+                        // possibly blocking a legitimate new-day escalation at the count cap.
+                        // Detect the straddle and attribute only this analysis's escalation.
                         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
                         if st.advisor_spend_date != today {
                             st.advisor_spend_date = today;
@@ -1842,8 +1840,8 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             }
                             None => st.advisor = Some(advisor),
                         }
-                        // Persist the day's escalation spend so the budget/count caps
-                        // survive a restart (see load at startup).
+                        // Persist the day's escalation spend/count so visibility and the count
+                        // cap survive a restart (see load at startup).
                         if let Err(e) = audit::save_advisor_day(
                             &db,
                             &st.advisor_spend_date,

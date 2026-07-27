@@ -2081,9 +2081,9 @@ fn resolve_kilo_cli_binary(configured: Option<&str>, user_profile: Option<&str>)
     "kilo".into()
 }
 
-/// Approximate Anthropic pay-as-you-go pricing (USD per million tokens) so the
-/// usage display and advisor budget have a cost figure — the API reports token
-/// counts but not cost. Prices drift over time; treat as an estimate.
+/// Approximate Anthropic pay-as-you-go pricing (USD per million tokens) for usage
+/// and advisor spend visibility — the API reports token counts but not cost.
+/// Prices drift over time; treat this as an estimate.
 fn anthropic_price_per_mtok(model: &str) -> (f64, f64) {
     let m = model.to_lowercase();
     if m.contains("haiku") {
