@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub enum InstallerKind {
     Exe,
     Msi,
+    Zip,
 }
 
 /// Untrusted AI output — never used directly; sanitised by [`validate_plan`].
@@ -24,6 +25,8 @@ pub struct InstallPlanRaw {
     pub installer_url: String,
     #[serde(default, deserialize_with = "de_null_string")]
     pub releases_url: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    pub archive_installer_path: String,
     #[serde(default, deserialize_with = "de_null_string")]
     pub expected_version: String,
     #[serde(default, deserialize_with = "de_null_vec")]
@@ -55,6 +58,7 @@ pub struct InstallPlan {
     pub installer_url: String,
     pub host: String,
     pub releases_url: Option<String>,
+    pub archive_installer_path: Option<String>,
     pub expected_version: String,
     pub kind: InstallerKind,
     pub silent_args: Vec<String>,
@@ -240,9 +244,22 @@ pub fn sanitise_args(kind: InstallerKind, raw: &[String]) -> Vec<String> {
         "/passive",
         "REBOOT=ReallySuppress",
     ];
+    const ALLOW_ZIP: &[&str] = &[
+        "/S",
+        "/silent",
+        "/verysilent",
+        "/quiet",
+        "/q",
+        "/norestart",
+        "/passive",
+        "/suppressmsgboxes",
+        "/qn",
+        "REBOOT=ReallySuppress",
+    ];
     let allow: &[&str] = match kind {
         InstallerKind::Exe => ALLOW_EXE,
         InstallerKind::Msi => ALLOW_MSI,
+        InstallerKind::Zip => ALLOW_ZIP,
     };
     let mut out: Vec<String> = Vec::new();
     for a in raw {
@@ -321,8 +338,10 @@ pub fn validate_plan(
         InstallerKind::Msi
     } else if path.ends_with(".exe") {
         InstallerKind::Exe
+    } else if path.ends_with(".zip") {
+        InstallerKind::Zip
     } else {
-        return Err("installer URL does not end in .exe or .msi".into());
+        return Err("installer URL does not end in .exe, .msi, or .zip".into());
     };
     let sha256 = match raw
         .sha256
@@ -344,6 +363,22 @@ pub fn validate_plan(
             Some(r.to_string())
         } else {
             None
+        }
+    };
+    let archive_installer_path = {
+        let p = raw.archive_installer_path.trim().replace('\\', "/");
+        if p.is_empty() || p.eq_ignore_ascii_case("null") {
+            None
+        } else if kind != InstallerKind::Zip
+            || p.starts_with('/')
+            || p.contains(':')
+            || p.split('/')
+                .any(|part| part.is_empty() || matches!(part, "." | ".."))
+            || !(p.to_lowercase().ends_with(".exe") || p.to_lowercase().ends_with(".msi"))
+        {
+            return Err("archive installer path is not a safe relative .exe/.msi path".into());
+        } else {
+            Some(p)
         }
     };
     let expected_publisher = {
@@ -371,6 +406,7 @@ pub fn validate_plan(
         installer_url: url_str,
         host,
         releases_url,
+        archive_installer_path,
         expected_version,
         kind,
         silent_args,
@@ -383,7 +419,7 @@ pub fn validate_plan(
 /// Whether a validated plan can be installed unattended. An .exe with no known
 /// silent switch is refused (running it hidden would hang) — manual fallback.
 pub fn plan_runnable(plan: &InstallPlan) -> bool {
-    !(plan.kind == InstallerKind::Exe && plan.silent_args.is_empty())
+    plan.kind != InstallerKind::Exe || !plan.silent_args.is_empty()
 }
 
 #[cfg(test)]
@@ -394,6 +430,7 @@ mod tests {
         InstallPlanRaw {
             installer_url: url.to_string(),
             releases_url: String::new(),
+            archive_installer_path: String::new(),
             expected_version: "2.0.0".to_string(),
             silent_args: vec!["/S".to_string()],
             sha256: None,
@@ -433,6 +470,19 @@ mod tests {
         assert_eq!(p.kind, InstallerKind::Exe);
         assert_eq!(p.host, "github.com");
         assert_eq!(p.silent_args, vec!["/S".to_string()]);
+    }
+
+    #[test]
+    fn validate_plan_accepts_github_release_zip() {
+        let mut zip = raw("https://github.com/foo/bar/releases/download/v2/Bar-setup.zip");
+        zip.archive_installer_path = "setup\\Bar.msi".to_string();
+        let p = validate_plan(zip, "Bar App", "1.0.0").unwrap();
+        assert_eq!(p.kind, InstallerKind::Zip);
+        assert_eq!(p.archive_installer_path.as_deref(), Some("setup/Bar.msi"));
+
+        let mut unsafe_zip = raw("https://github.com/foo/bar/releases/download/v2/Bar-setup.zip");
+        unsafe_zip.archive_installer_path = "../Bar.exe".to_string();
+        assert!(validate_plan(unsafe_zip, "Bar App", "1.0.0").is_err());
     }
 
     #[test]
@@ -482,7 +532,6 @@ mod tests {
     fn validate_plan_rejects_unsafe_urls() {
         assert!(validate_plan(raw("http://github.com/a/b/x.exe"), "X App", "1").is_err()); // not https
         assert!(validate_plan(raw("https://1.2.3.4/x.exe"), "X App", "1").is_err()); // raw IP
-        assert!(validate_plan(raw("https://github.com/a/b/x.zip"), "X App", "1").is_err()); // bad extension
         assert!(validate_plan(
             raw("https://totally-unrelated.example/x.exe"),
             "Bar App",

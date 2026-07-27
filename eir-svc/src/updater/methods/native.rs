@@ -9,7 +9,7 @@ use crate::updater::config::SignaturePolicy;
 use crate::updater::domain::{classify_error, AttemptOutcome, ErrorCategory, Method, Verification};
 use crate::updater::download::{download_and_check, Staged};
 use crate::updater::plan::{
-    plan_runnable, validate_plan, InstallPlan, InstallPlanRaw, InstallerKind,
+    plan_runnable, sanitise_args, validate_plan, InstallPlan, InstallPlanRaw, InstallerKind,
 };
 use crate::updater::verify::{verify_app, VerifyTarget};
 use sha2::{Digest, Sha256};
@@ -29,17 +29,20 @@ For GitHub-hosted software, open https://github.com/<owner>/<repo>/releases/late
 redirects it to the current stable release and its assets. \
 Respond with JSON only — no markdown, no prose.\n\n\
 Return exactly this shape:\n\
-{{\"installer_url\":\"<https URL ENDING in .exe or .msi — the actual installer FILE for 64-bit \
-Windows, machine-wide; NOT a landing/download page; null if you cannot find a direct file with high \
-confidence>\",\"releases_url\":\"<official https releases/download page, or null>\",\
-\"expected_version\":\"<version this installer produces>\",\"installer_kind\":\"exe|msi\",\
+{{\"installer_url\":\"<https URL ENDING in .exe, .msi, or .zip — the actual 64-bit Windows release \
+asset; prefer a machine-wide installer; NOT a landing/download page; null if you cannot find one \
+with high confidence>\",\"releases_url\":\"<official https releases/download page, or null>\",\
+\"archive_installer_path\":\"<exact relative path of the .exe or .msi inside a ZIP, or null>\",\
+\"expected_version\":\"<version this installer produces>\",\"installer_kind\":\"exe|msi|zip\",\
 \"silent_args\":[<documented silent switches: NSIS [\\\"/S\\\"]; Inno [\\\"/VERYSILENT\\\",\\\"/NORESTART\\\"]; \
 MSI [\\\"/qn\\\",\\\"/norestart\\\"]>],\"sha256\":\"<vendor-published 64-hex hash, or null>\",\
 \"publisher\":\"<expected Authenticode signing subject, e.g. 'Mozilla Corporation', or null>\",\
 \"verify_exe\":\"<absolute path to an installed .exe whose version proves success, or null>\"}}\n\n\
 Rules: if winget can manage this app, set installer_url=null. Never return a URL behind a login, ad \
-redirect, or file-locker. If unsure of a DIRECT installer file, set installer_url=null and give \
-releases_url only. Respect any [user note] and never contradict it.\n\n\
+redirect, or file-locker. If unsure of a direct release asset, set installer_url=null and give \
+releases_url only. Prefer a direct .msi or setup .exe; if neither exists, use a ZIP when it contains \
+a Windows .exe/.msi installer. Do not return source-code or portable-only archives. Respect any \
+[user note] and never contradict it.\n\n\
 APP: {name} ({current}){note_line}"
     )
 }
@@ -170,7 +173,18 @@ pub async fn update_native(
     out.signature = Some(staged.signature.display());
     out.sha256 = Some(staged.sha256.clone());
 
-    let code = run_installer(&staged, plan.kind, &plan.silent_args).await;
+    let mut silent_args = sanitise_args(staged.kind, &plan.silent_args);
+    if staged.kind == InstallerKind::Msi && silent_args.is_empty() {
+        silent_args = vec!["/qn".to_string(), "/norestart".to_string()];
+    }
+    if staged.kind == InstallerKind::Exe && silent_args.is_empty() {
+        let _ = std::fs::remove_dir_all(&staged.dir);
+        out.category = Some(ErrorCategory::NotFound);
+        out.detail = "archive installer has no known silent-install switch".to_string();
+        return out;
+    }
+
+    let code = run_installer(&staged, staged.kind, &silent_args).await;
     let _ = std::fs::remove_dir_all(&staged.dir);
     out.exit_code = Some(code);
 
@@ -268,6 +282,7 @@ async fn run_installer(staged: &Staged, kind: InstallerKind, args: &[String]) ->
             c.arg("/i").arg(&staged.file).args(args);
             c
         }
+        InstallerKind::Zip => return -3,
     };
     cmd.creation_flags(CREATE_NO_WINDOW).kill_on_drop(true);
     let mut child = match cmd.spawn() {
@@ -293,9 +308,11 @@ mod tests {
         let p = install_plan_prompt("Krita", "5.2.0", " [user note: official site]");
         assert!(p.contains("Krita (5.2.0)"));
         assert!(p.contains("user note: official site"));
-        assert!(p.contains(".exe or .msi"));
+        assert!(p.contains(".exe, .msi, or .zip"));
         assert!(p.contains("web search"));
         assert!(p.contains("https://github.com/<owner>/<repo>/releases/latest"));
+        assert!(p.contains("archive_installer_path"));
+        assert!(p.contains("if neither exists, use a ZIP"));
     }
 
     #[test]
@@ -317,6 +334,19 @@ mod tests {
         assert_eq!(
             releases.as_deref(),
             Some("https://github.com/me/Tool/releases")
+        );
+    }
+
+    #[test]
+    fn plan_from_zip_json_validates() {
+        let content = r#"{"installer_url":"https://github.com/me/Tool/releases/download/v2.0.0/Tool-setup.zip","releases_url":"https://github.com/me/Tool/releases/latest","archive_installer_path":"setup/Tool.msi","expected_version":"2.0.0","installer_kind":"zip","silent_args":null,"sha256":null,"publisher":null,"verify_exe":null}"#;
+        let (plan, _, reason) = plan_from_response(content, "Tool", "1.0.0");
+        assert!(reason.is_none(), "{reason:?}");
+        let plan = plan.expect("ZIP plan should validate");
+        assert_eq!(plan.kind, InstallerKind::Zip);
+        assert_eq!(
+            plan.archive_installer_path.as_deref(),
+            Some("setup/Tool.msi")
         );
     }
 

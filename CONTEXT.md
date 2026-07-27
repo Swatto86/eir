@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.33.1. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.33.2. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.33.1. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-27 | Eir | v0.33.2 archive-contained Windows installers | Native app updates may now use a GitHub `.zip` release asset containing an EXE/MSI installer. The AI may identify the exact relative member; otherwise the archive must contain exactly one installer. Eir writes only that member to its locked staging directory, rejects traversal and ambiguous archives, caps entry count and decompressed bytes, checks any published hash against the ZIP, then applies the existing Authenticode, silent-argument, pre-launch rehash, and post-install version gates to the extracted installer. Arbitrary archive formats and portable ZIP deployment remain unsupported.
 
 2026-07-27 | Eir | v0.33.1 GitHub latest-release discovery | The unmanaged-app version check and native-installer lookup now direct the AI to GitHub's canonical `/owner/repo/releases/latest` redirect before general search, so GitHub-hosted updates resolve the current stable release without guessing a tag. Rust's existing direct-file, repository-correlation, redirect, hash, and Authenticode gates are unchanged.
 

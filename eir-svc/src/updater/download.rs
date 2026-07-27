@@ -13,6 +13,7 @@ use super::plan::{url_acceptable, InstallPlan, InstallerKind};
 use super::proc::{self, VERIFY};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -334,10 +335,125 @@ async fn stream_download(
 pub struct Staged {
     pub dir: PathBuf,
     pub file: PathBuf,
-    /// SHA-256 of the downloaded file; re-checked in the launch context (TOCTOU).
+    pub kind: InstallerKind,
+    /// SHA-256 of the executable installer; re-checked before launch (TOCTOU).
     pub sha256: String,
     /// Authenticode result (for audit/display; the gate already passed).
     pub signature: Signature,
+}
+
+/// Extract one Windows installer from a ZIP into a fixed staging filename. Nothing
+/// else in the archive is written, so traversal entries cannot escape staging. The
+/// model may name the exact member; without one, only a single unambiguous installer
+/// is accepted. The decompressed-byte cap blocks ZIP bombs.
+fn extract_zip_installer(
+    archive_path: &Path,
+    dir: &Path,
+    requested_path: Option<&str>,
+    max_bytes: u64,
+) -> Result<(PathBuf, InstallerKind, String), String> {
+    const MAX_ENTRIES: usize = 10_000;
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| format!("could not open downloaded ZIP: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("download is not a valid ZIP: {e}"))?;
+    if archive.len() > MAX_ENTRIES {
+        return Err(format!("ZIP contains too many entries ({})", archive.len()));
+    }
+
+    let mut candidates = Vec::new();
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|e| format!("could not inspect ZIP entry: {e}"))?;
+        if entry.is_dir() || entry.enclosed_name().is_none() {
+            continue;
+        }
+        let name = entry.name().replace('\\', "/");
+        let lower = name.to_lowercase();
+        let kind = if lower.ends_with(".msi") {
+            InstallerKind::Msi
+        } else if lower.ends_with(".exe") {
+            InstallerKind::Exe
+        } else {
+            continue;
+        };
+        candidates.push((index, name, kind, entry.size()));
+    }
+
+    let selected =
+        match requested_path {
+            Some(requested) => {
+                let matches = candidates
+                    .iter()
+                    .filter(|(_, name, _, _)| name.eq_ignore_ascii_case(requested))
+                    .collect::<Vec<_>>();
+                match matches.as_slice() {
+                    [only] => (**only).clone(),
+                    [] => {
+                        return Err(format!(
+                            "installer not found in ZIP: no entry named '{requested}'"
+                        ))
+                    }
+                    _ => return Err(format!("ZIP contains multiple matches for '{requested}'")),
+                }
+            }
+            None => match candidates.as_slice() {
+                [only] => only.clone(),
+                [] => return Err("installer not found in ZIP: no .exe or .msi entry".into()),
+                _ => return Err(
+                    "ZIP contains multiple .exe/.msi files; no exact installer path was provided"
+                        .into(),
+                ),
+            },
+        };
+    let (index, _, kind, declared_size) = selected;
+    if declared_size > max_bytes {
+        return Err(format!(
+            "installer inside ZIP is too large ({declared_size} bytes)"
+        ));
+    }
+
+    let dest = dir.join(match kind {
+        InstallerKind::Msi => "installer.msi",
+        InstallerKind::Exe => "installer.exe",
+        InstallerKind::Zip => return Err("nested ZIP installers are not supported".into()),
+    });
+    let mut entry = archive
+        .by_index(index)
+        .map_err(|e| format!("could not read ZIP installer: {e}"))?;
+    let mut output = std::fs::File::create(&dest)
+        .map_err(|e| format!("could not create extracted installer: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = entry
+            .read(&mut buffer)
+            .map_err(|e| format!("could not extract ZIP installer: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > max_bytes {
+            return Err(format!(
+                "installer inside ZIP exceeded the {max_bytes}-byte cap"
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        output
+            .write_all(&buffer[..read])
+            .map_err(|e| format!("could not write extracted installer: {e}"))?;
+    }
+    output
+        .flush()
+        .map_err(|e| format!("could not flush extracted installer: {e}"))?;
+    let sha256 = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok((dest, kind, sha256))
 }
 
 /// Download the plan's installer, hard-fail on a provided-hash mismatch, then apply
@@ -349,19 +465,34 @@ pub async fn download_and_check(
     policy: SignaturePolicy,
 ) -> Result<Staged, String> {
     let dir = stage_dir().map_err(|e| format!("could not create staging dir: {e}"))?;
-    let file = dir.join(match plan.kind {
+    let artifact = dir.join(match plan.kind {
         InstallerKind::Msi => "installer.msi",
         InstallerKind::Exe => "installer.exe",
+        InstallerKind::Zip => "installer.zip",
     });
 
     let result = async {
-        let sha = stream_download(&plan.installer_url, &plan.name, &file, max_bytes).await?;
-        verify_downloaded_hash(plan.sha256.as_deref(), &sha)?;
+        let artifact_sha =
+            stream_download(&plan.installer_url, &plan.name, &artifact, max_bytes).await?;
+        verify_downloaded_hash(plan.sha256.as_deref(), &artifact_sha)?;
+        let (file, kind, sha) = if plan.kind == InstallerKind::Zip {
+            let archive = artifact.clone();
+            let extract_dir = dir.clone();
+            let requested = plan.archive_installer_path.clone();
+            tokio::task::spawn_blocking(move || {
+                extract_zip_installer(&archive, &extract_dir, requested.as_deref(), max_bytes)
+            })
+            .await
+            .map_err(|e| format!("ZIP extraction task failed: {e}"))??
+        } else {
+            (artifact.clone(), plan.kind, artifact_sha)
+        };
         let signature = authenticode(&file).await;
         signature_gate(&signature, policy, plan.expected_publisher.as_deref())?;
         Ok::<_, String>(Staged {
             dir: dir.clone(),
             file: file.clone(),
+            kind,
             sha256: sha,
             signature,
         })
@@ -450,6 +581,39 @@ mod tests {
             Some("Mozilla Corporation")
         )
         .is_err());
+    }
+
+    #[test]
+    fn zip_extracts_only_the_named_bounded_installer() {
+        use zip::write::SimpleFileOptions;
+
+        let dir = std::env::temp_dir().join(format!("eir-zip-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive_path = dir.join("release.zip");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let mut writer = zip::ZipWriter::new(archive_file);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("../evil.exe", options).unwrap();
+        writer.write_all(b"evil").unwrap();
+        writer.start_file("portable/tool.exe", options).unwrap();
+        writer.write_all(b"portable").unwrap();
+        writer.start_file("setup/tool.msi", options).unwrap();
+        writer.write_all(b"installer").unwrap();
+        writer.finish().unwrap();
+
+        assert!(extract_zip_installer(&archive_path, &dir, None, 100).is_err());
+        let (file, kind, sha) =
+            extract_zip_installer(&archive_path, &dir, Some("setup/tool.msi"), 100).unwrap();
+        assert_eq!(kind, InstallerKind::Msi);
+        assert_eq!(std::fs::read(file).unwrap(), b"installer");
+        assert_eq!(
+            sha,
+            "9c0d294c05fc1d88d698034609bb81c0c69196327594e4c69d2915c80fd9850c"
+        );
+        assert!(extract_zip_installer(&archive_path, &dir, Some("setup/tool.msi"), 4).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A localhost HTTP/1.1 server that returns one fixed response, so the stream/

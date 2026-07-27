@@ -1,6 +1,6 @@
 [package]
 name = "eir-svc"
-version = "0.33.1"
+version = "0.33.2"
 edition = "2021"
 authors = ["Swatto <claude.ai@swatto.co.uk>"]
 description = "Eir system monitor service — runs as LocalSystem"
@@ -51,7 +51,7 @@ tracing-appender = "0.2"
 toml = "0.8"
 tokio-stream = "0.1"
 futures-util = "0.3"
-# Update subsystem: hash staged installers (sha2) and parse/validate installer
-# URLs (url). Both are already used in eir-ui; the update engine now lives here.
+# Update subsystem: hash staged installers, validate URLs, and safely read ZIP assets.
 sha2 = "0.10"
 url = "2"
+zip = { version = "4", default-features = false, features = ["deflate-flate2-zlib-rs"] }

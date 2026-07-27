@@ -982,7 +982,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "eir-proto"
-version = "0.33.1"
+version = "0.33.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "eir-svc"
-version = "0.33.1"
+version = "0.33.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1013,11 +1013,12 @@ dependencies = [
  "walkdir",
  "windows 0.58.0",
  "windows-service",
+ "zip",
 ]
 
 [[package]]
 name = "eir-ui"
-version = "0.33.1"
+version = "0.33.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1212,6 +1213,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -7015,9 +7017,16 @@ checksum = "caa8cd6af31c3b31c6631b8f483848b91589021b28fffe50adada48d4f4d2ed1"
 dependencies = [
  "arbitrary",
  "crc32fast",
+ "flate2",
  "indexmap 2.14.0",
  "memchr",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b142a20ec14a91d5bc708c1dc21b080c550113d8aa77afa29635673a65dd02c5"
 
 [[package]]
 name = "zmij"
