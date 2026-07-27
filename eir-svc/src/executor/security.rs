@@ -18,17 +18,36 @@ fn firewall_profile_arg(profile: &str) -> Result<&'static str> {
     }
 }
 
+fn build_firewall_script(arg: &str) -> String {
+    let names = match arg {
+        "domainprofile" => "Domain",
+        "privateprofile" => "Private",
+        "publicprofile" => "Public",
+        _ => "Domain,Private,Public",
+    };
+    format!(
+        "netsh advfirewall set {arg} state on; \
+         if ($LASTEXITCODE -ne 0) {{ throw 'netsh advfirewall failed' }}; \
+         $profiles = @(Get-NetFirewallProfile -Name {names} -ErrorAction Stop); \
+         if (@($profiles | Where-Object {{ -not $_.Enabled }}).Count -gt 0) {{ \
+           throw 'Firewall remained disabled after the enable command' }}; \
+         Write-Output 'Firewall enabled for {arg}'"
+    )
+}
+
 /// Turn the Windows Firewall on for the named profile (or all profiles).
 pub async fn firewall_enable(profile: &str) -> Result<String> {
     let arg = firewall_profile_arg(profile)?;
     // netsh is the most reliable way to set firewall state from a service.
-    let script = format!(
-        "netsh advfirewall set {arg} state on; \
-         if ($LASTEXITCODE -ne 0) {{ throw 'netsh advfirewall failed' }}; \
-         Write-Output 'Firewall enabled for {arg}'"
-    );
+    let script = build_firewall_script(arg);
     super::powershell::run_diagnostic(&script).await
 }
+
+const DEFENDER_SIGNATURE_UPDATE_SCRIPT: &str = "Update-MpSignature -ErrorAction Stop; \
+     $s = Get-MpComputerStatus -ErrorAction Stop; \
+     if (-not $s.AntivirusSignatureVersion -or $null -eq $s.AntivirusSignatureAge -or $s.AntivirusSignatureAge -gt 3) { \
+       throw 'Defender signatures remain missing or stale after update' }; \
+     Write-Output 'Defender signatures updated'";
 
 /// Refresh Windows Defender's signature definitions. Only ever pulls newer
 /// definitions, so it is always safe to run.
@@ -36,16 +55,19 @@ pub async fn defender_signature_update() -> Result<String> {
     // Use the default cap (120s) — the action runs inline in the decision loop, so a
     // longer ceiling would hold up other UI commands for that whole window. An update
     // that genuinely needs longer simply fails and retries on a later cycle.
-    let script = "Update-MpSignature -ErrorAction Stop; \
-                  Write-Output 'Defender signatures updated'";
-    super::powershell::run_diagnostic(script).await
+    super::powershell::run_diagnostic(DEFENDER_SIGNATURE_UPDATE_SCRIPT).await
 }
+
+const DEFENDER_REALTIME_ENABLE_SCRIPT: &str =
+    "Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop; \
+     $s = Get-MpComputerStatus -ErrorAction Stop; \
+     if (-not $s.RealTimeProtectionEnabled) { \
+       throw 'Defender real-time protection remained disabled' }; \
+     Write-Output 'Defender real-time protection enabled'";
 
 /// Re-enable Windows Defender real-time (on-access) protection.
 pub async fn defender_realtime_enable() -> Result<String> {
-    let script = "Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop; \
-                  Write-Output 'Defender real-time protection enabled'";
-    super::powershell::run_diagnostic(script).await
+    super::powershell::run_diagnostic(DEFENDER_REALTIME_ENABLE_SCRIPT).await
 }
 
 #[cfg(test)]
@@ -65,5 +87,15 @@ mod tests {
     #[test]
     fn unknown_firewall_profile_is_rejected() {
         assert!(firewall_profile_arg("dmz").is_err());
+    }
+
+    #[test]
+    fn security_actions_verify_the_observed_state() {
+        let firewall = build_firewall_script("privateprofile");
+        assert!(firewall.contains("Get-NetFirewallProfile"));
+        assert!(firewall.contains("throw 'Firewall remained disabled"));
+        assert!(DEFENDER_SIGNATURE_UPDATE_SCRIPT.contains("Get-MpComputerStatus"));
+        assert!(DEFENDER_SIGNATURE_UPDATE_SCRIPT.contains("AntivirusSignatureAge"));
+        assert!(DEFENDER_REALTIME_ENABLE_SCRIPT.contains("RealTimeProtectionEnabled"));
     }
 }

@@ -23,6 +23,11 @@ fn build_task_script(cmdlet: &str, task_name: &str) -> String {
     // `$(...)`/`$var`, and the escaping only neutralises quote-breakout inside a
     // single-quoted context — echoing the name back double-quoted would be injectable.
     let safe_name = task_name.replace('\'', "''");
+    let (mismatch, expected) = if cmdlet == "Disable-ScheduledTask" {
+        ("-ne", "Disabled")
+    } else {
+        ("-eq", "enabled")
+    };
     if let Some(pos) = task_name.rfind('\\') {
         let (path, name) = task_name.split_at(pos + 1); // path keeps its trailing '\'
         if task_name.starts_with('\\') && !name.is_empty() {
@@ -31,6 +36,9 @@ fn build_task_script(cmdlet: &str, task_name: &str) -> String {
             return format!(
                 "Get-ScheduledTask -TaskPath {path_q} -TaskName {name_q} -ErrorAction Stop \
                  | {cmdlet} -ErrorAction Stop | Out-Null; \
+                 $actual = @(Get-ScheduledTask -TaskPath {path_q} -TaskName {name_q} -ErrorAction Stop); \
+                 if (@($actual | Where-Object {{ $_.State {mismatch} 'Disabled' }}).Count -gt 0) {{ \
+                   throw 'Scheduled task state did not change to {expected}' }}; \
                  Write-Output '{cmdlet} succeeded for {safe_name}'"
             );
         }
@@ -38,9 +46,14 @@ fn build_task_script(cmdlet: &str, task_name: &str) -> String {
     let name_q = super::powershell::ps_single_quote(task_name);
     format!(
         "$t = @(Get-ScheduledTask -TaskName {name_q} -ErrorAction Stop); \
+         if ($t.Count -eq 0) {{ throw 'Scheduled task was not found' }}; \
          if ($t.Count -gt 1) {{ throw 'Ambiguous scheduled task — more than one folder \
          has a task with this name; specify the full \\Folder\\Name path' }}; \
          $t | {cmdlet} -ErrorAction Stop | Out-Null; \
+         $actual = @($t | ForEach-Object {{ \
+           Get-ScheduledTask -TaskPath $_.TaskPath -TaskName $_.TaskName -ErrorAction Stop }}); \
+         if (@($actual | Where-Object {{ $_.State {mismatch} 'Disabled' }}).Count -gt 0) {{ \
+           throw 'Scheduled task state did not change to {expected}' }}; \
          Write-Output '{cmdlet} succeeded for {safe_name}'"
     )
 }
@@ -52,6 +65,9 @@ async fn run_task_cmd(cmdlet: &str, task_name: &str) -> Result<String> {
     // covers the legacy bare -TaskName form, which globs the same way.
     if task_name.contains(['*', '?', '[', ']']) {
         bail!("Task name '{task_name}' contains wildcard characters — refusing");
+    }
+    if !task_name.starts_with('\\') {
+        bail!("Scheduled task must use a full \\Folder\\Name path — refusing bare name");
     }
     let script = build_task_script(cmdlet, task_name);
     // Route through the timed, kill_on_drop PowerShell helper. A bare synchronous
@@ -94,6 +110,17 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn bare_task_names_are_refused_before_policy_can_be_bypassed() {
+        let err = run_task_cmd(
+            "Disable-ScheduledTask",
+            "Windows Defender Cache Maintenance",
+        )
+        .await
+        .expect_err("bare task name");
+        assert!(err.to_string().contains("full"));
+    }
+
     #[test]
     fn full_path_names_target_path_and_name_separately() {
         let script = build_task_script("Disable-ScheduledTask", r"\Vendor\Sub\Updater");
@@ -109,9 +136,10 @@ mod tests {
         // (a same-named task in multiple folders) instead of toggling all of them.
         let bare = build_task_script("Disable-ScheduledTask", "JustAName");
         assert!(bare.contains("Get-ScheduledTask -TaskName 'JustAName'"));
+        assert!(bare.contains("$t.Count -eq 0"));
         assert!(bare.contains("$t.Count -gt 1"));
         assert!(bare.contains("throw '"));
-        assert!(!bare.contains("-TaskPath"));
+        assert!(bare.contains("Get-ScheduledTask -TaskPath $_.TaskPath -TaskName $_.TaskName"));
         assert!(
             !bare.contains('"'),
             "bare-name script has no double quotes: {bare}"
@@ -120,5 +148,17 @@ mod tests {
         let inj = build_task_script("Disable-ScheduledTask", r"\Foo\$(calc)");
         assert!(inj.contains(r"'$(calc)'"));
         assert!(!inj.contains('"'));
+    }
+
+    #[test]
+    fn task_scripts_verify_the_resulting_state() {
+        let disabled = build_task_script("Disable-ScheduledTask", r"\Vendor\Updater");
+        assert!(disabled.contains("Get-ScheduledTask"));
+        assert!(disabled.contains("State -ne 'Disabled'"));
+        assert!(disabled.contains("throw 'Scheduled task state did not change"));
+
+        let enabled = build_task_script("Enable-ScheduledTask", "Updater");
+        assert!(enabled.contains("State -eq 'Disabled'"));
+        assert!(enabled.contains("throw 'Scheduled task state did not change"));
     }
 }

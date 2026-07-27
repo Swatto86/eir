@@ -65,13 +65,13 @@ Each decision cycle (default every 10 minutes):
    is *never* executed; a few catastrophic actions (boot-config edits, driver
    disabling, arbitrary PowerShell) always require approval.
 5. **Execute** — reversible whitelisted fixes (service restart/start/stop, log/disk
-   cleanup, task enable/disable, registry reset, firewall re-enable, Defender
-   signature update) run automatically at or above the confidence threshold. Anything disruptive or
-   irreversible is queued for approval in the tray UI — each item explains, in
-   plain English, exactly what it will do (and, for a file delete, the file's real
-   size, age, and what kind of file it is). The queue is persistent: it never
-   times out and survives a service restart, so an approval is always waiting for
-   you, not gone if you missed a pop-up.
+   cleanup, task enable/disable, firewall re-enable, Defender signature update) run
+   automatically at or above the confidence threshold. Every registry reset and
+   anything disruptive or irreversible is queued for approval in the tray UI — each
+   item explains, in plain English, exactly what it will do (and, for a file delete,
+   the file's real size, age, and what kind of file it is). The queue is persistent:
+   it never times out and survives a service restart, so an approval is always
+   waiting for you, not gone if you missed a pop-up.
 6. **Learn conservatively** — Eir mines its own audit history for repeated local
    patterns, such as package-manager methods that always fail for a specific app or
    fixes that never improve a recurring issue. Learned facts can only reduce or
@@ -103,19 +103,25 @@ Anthropic's native web-search tool, the Claude or Codex CLI's built-in search
 (`update_check_model`, blank = a provider default), or the Kilo CLI's own
 `--auto` agent-loop search.
 
+Settings includes a **Test provider** button that sends a real request through the
+service and reports its correlated result. Other UI commands also wait for their
+matching service outcome, so applied, rejected, disconnected, and timed-out actions
+are reported instead of being silently treated as queued.
+
 ## Features
 
 - **Autonomous diagnosis & repair** of common Windows faults, root-cause first —
   reversible fixes run automatically, no babysitting.
 - **Tunable autonomy** — set the auto-fix confidence threshold in Settings (default
   80%): lower to act on weaker hunches, higher to be more cautious.
-- **Approval backstop** — disruptive or irreversible actions (closing a program,
-  deleting a file, boot-config edits, driver disabling, arbitrary PowerShell) always
-  require your say-so; they're never auto-run. Each pending action shows a
-  plain-English summary of what it does, whether it can be undone, and — for a file
-  delete — the target's real size, last-modified date, and likely kind (regenerable
-  cache vs. irreplaceable data). The approval queue is persistent: it never expires
-  and survives restarts, so nothing slips away while you're not looking.
+- **Approval backstop** — registry resets and disruptive or irreversible actions
+  (closing a program, deleting a file, boot-config edits, driver disabling,
+  arbitrary PowerShell) always require your say-so; they're never auto-run. Each
+  pending action shows a plain-English summary of what it does, whether it can be
+  undone, and — for a file delete — the target's real size, last-modified date, and
+  likely kind (regenerable cache vs. irreplaceable data). The approval queue is
+  persistent: it never expires and survives restarts, so nothing slips away while
+  you're not looking.
 - **Never-uninstall guarantee** — software removal is a hard-blocked action.
 - **Machine-pattern learning** — repeated local evidence teaches Eir which app-update
   paths, signals, or fixes are not useful on this machine. Learning is conservative,
@@ -131,9 +137,13 @@ Anthropic's native web-search tool, the Claude or Codex CLI's built-in search
   AI: it finds the official installer via web search, and Eir validates it
   (https-only, trusted-host/vendor-domain gating, `.exe`/`.msi` only, size-bounded
   download, SHA-256 + Authenticode recorded), installs it silently, and **verifies
-  the new version is actually installed** — every result shown as Verified / Installed
-  (unverified) / Failed. One **⬆ Update everything** button does the lot; per-app
-  notes still let you correct or silence false positives for your own self-built apps.
+  the new version is actually installed**. Each result is shown as Current / Verified /
+  Installed (unverified) / Failed / Skipped, with method, versions, and available
+  signature or failure evidence; recent attempts retain category, exit code, detail,
+  and time. Partial inventories, deferred checks, and failed empty runs are shown as
+  warnings with their notes, never as “No updates found”. One **⬆ Update everything**
+  button does the lot; per-app notes still let you correct or silence false positives
+  for your own self-built apps.
 - **Usage transparency** — shows AI calls, tokens, and estimated cost in **GBP**.
   Free models are clearly marked as no-cost.
 - **Self-updating** — signed auto-updates via the GitHub releases feed.

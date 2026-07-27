@@ -7,17 +7,19 @@ mod provider_models;
 mod util;
 
 use eir_proto::{
-    AdvisorSettingsUpdate, SettingsUpdate, StatusPayload, UiMsg, UpdaterSettingsUpdate,
+    AdvisorSettingsUpdate, CommandResult, SettingsUpdate, StatusPayload, UiMsg, UiRequest,
+    UpdaterSettingsUpdate, CAP_COMMAND_RESULTS, CAP_PROVIDER_TEST,
 };
-use pipe_client::SharedStatus;
+use pipe_client::{CommandWaiters, SharedStatus};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
+    time::Duration,
 };
 use tauri::{
     image::Image,
@@ -36,8 +38,15 @@ use windows_service::{
 
 // ── Managed state ─────────────────────────────────────────────────────────────
 
-/// Sender for UI commands (approve, toggle_pause) to the pipe client.
-struct UiCmdTx(mpsc::Sender<UiMsg>);
+/// Pipe sender plus the minimum correlation state needed to distinguish
+/// "queued" on an old service from "applied" on a capable service.
+struct UiCmdTx {
+    sender: mpsc::Sender<UiRequest>,
+    connected: Arc<AtomicBool>,
+    status: SharedStatus,
+    waiters: CommandWaiters,
+    next_id: AtomicU64,
+}
 
 /// True while the pipe client holds a live connection to the service. Commands
 /// that cross the pipe are refused when this is false, so a click made while the
@@ -53,6 +62,79 @@ fn ensure_connected(conn: &AtomicBool) -> Result<(), String> {
         Ok(())
     } else {
         Err("Eir service is not connected".to_string())
+    }
+}
+
+fn supports(status: &SharedStatus, capability: &str) -> bool {
+    pipe_client::lock_status(status)
+        .capabilities
+        .iter()
+        .any(|x| x == capability)
+}
+
+fn command_result(result: CommandResult) -> Result<String, String> {
+    let fallback = if result.ok {
+        "Applied"
+    } else {
+        "Service rejected the command"
+    };
+    let message = if result.message.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        result.message
+    };
+    if result.ok {
+        Ok(message)
+    } else {
+        Err(message)
+    }
+}
+
+fn request_id_seed() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    now.as_secs()
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(u64::from(now.subsec_nanos()))
+        .wrapping_add(u64::from(std::process::id()))
+}
+
+async fn send_command(tx: &UiCmdTx, command: UiMsg) -> Result<String, String> {
+    send_command_with_timeout(tx, command, Duration::from_secs(30)).await
+}
+
+async fn send_command_with_timeout(
+    tx: &UiCmdTx,
+    command: UiMsg,
+    timeout: Duration,
+) -> Result<String, String> {
+    ensure_connected(&tx.connected)?;
+    if !supports(&tx.status, CAP_COMMAND_RESULTS) {
+        tx.sender
+            .try_send(command.into())
+            .map_err(|e| e.to_string())?;
+        return Ok("Queued — this service cannot confirm application".to_string());
+    }
+
+    let request_id = tx.next_id.fetch_add(1, Ordering::Relaxed);
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    pipe_client::lock_waiters(&tx.waiters).insert(request_id, reply_tx);
+    if let Err(e) = tx.sender.try_send(UiRequest {
+        request_id: Some(request_id),
+        command,
+    }) {
+        pipe_client::lock_waiters(&tx.waiters).remove(&request_id);
+        return Err(e.to_string());
+    }
+
+    match tokio::time::timeout(timeout, reply_rx).await {
+        Ok(Ok(result)) => command_result(result),
+        Ok(Err(_)) => Err("Service disconnected before confirming the command".to_string()),
+        Err(_) => {
+            pipe_client::lock_waiters(&tx.waiters).remove(&request_id);
+            Err("Service did not confirm the command in time".to_string())
+        }
     }
 }
 
@@ -174,47 +256,38 @@ async fn decide_approval(
     id: u64,
     approved: bool,
     tx: State<'_, UiCmdTx>,
-    conn: State<'_, ConnState>,
-) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::Approve { id, approved })
-        .map_err(|e| e.to_string())
+) -> Result<String, String> {
+    send_command(&tx, UiMsg::Approve { id, approved }).await
 }
 
 #[tauri::command]
-async fn toggle_pause(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::TogglePause).map_err(|e| e.to_string())
+async fn toggle_pause(tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    send_command(&tx, UiMsg::TogglePause).await
 }
 
 #[tauri::command]
-async fn undo_registry(
-    id: i64,
-    tx: State<'_, UiCmdTx>,
-    conn: State<'_, ConnState>,
-) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::UndoRegistry { id })
-        .map_err(|e| e.to_string())
+async fn undo_registry(id: i64, tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    send_command(&tx, UiMsg::UndoRegistry { id }).await
 }
 
 #[tauri::command]
 async fn ask_eir(
     question: String,
     tx: State<'_, UiCmdTx>,
-    conn: State<'_, ConnState>,
     atts: State<'_, AskAttachments>,
-) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
+) -> Result<String, String> {
     let attachments = atts.0.lock().map_err(|e| e.to_string())?.clone();
-    tx.0.try_send(UiMsg::AskEir {
-        question,
-        attachments,
-    })
-    .map_err(|e| e.to_string())?;
-    // Consume the pending attachments only after a successful queue.
+    let result = send_command(
+        &tx,
+        UiMsg::AskEir {
+            question,
+            attachments,
+        },
+    )
+    .await?;
+    // Keep attachments when a capable service rejects the question.
     atts.0.lock().map_err(|e| e.to_string())?.clear();
-    Ok(())
+    Ok(result)
 }
 
 /// Pending Ask attachments, collected by the picker and consumed on the next `ask_eir`.
@@ -303,32 +376,23 @@ fn remove_ask_attachment(
 }
 
 #[tauri::command]
-async fn clear_ask(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::ClearAsk).map_err(|e| e.to_string())
+async fn clear_ask(tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    send_command(&tx, UiMsg::ClearAsk).await
 }
 
 #[tauri::command]
-async fn scan_disk(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::ScanDisk).map_err(|e| e.to_string())
+async fn scan_disk(tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    send_command(&tx, UiMsg::ScanDisk).await
 }
 
 #[tauri::command]
-async fn clean_disk_entry(
-    id: String,
-    tx: State<'_, UiCmdTx>,
-    conn: State<'_, ConnState>,
-) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::CleanDiskEntry { id })
-        .map_err(|e| e.to_string())
+async fn clean_disk_entry(id: String, tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    send_command(&tx, UiMsg::CleanDiskEntry { id }).await
 }
 
 #[tauri::command]
-async fn scan_startup(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::ScanStartup).map_err(|e| e.to_string())
+async fn scan_startup(tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    send_command(&tx, UiMsg::ScanStartup).await
 }
 
 #[tauri::command]
@@ -336,86 +400,66 @@ async fn set_startup_entry(
     id: String,
     enable: bool,
     tx: State<'_, UiCmdTx>,
-    conn: State<'_, ConnState>,
-) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::SetStartupEntry { id, enable })
-        .map_err(|e| e.to_string())
+) -> Result<String, String> {
+    send_command(&tx, UiMsg::SetStartupEntry { id, enable }).await
 }
 
 #[tauri::command]
-async fn clear_problems(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::ClearProblems)
-        .map_err(|e| e.to_string())
+async fn clear_problems(tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    send_command(&tx, UiMsg::ClearProblems).await
 }
 
 #[tauri::command]
-async fn clear_executions(
-    tx: State<'_, UiCmdTx>,
-    conn: State<'_, ConnState>,
-) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::ClearExecutions)
-        .map_err(|e| e.to_string())
+async fn clear_executions(tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    send_command(&tx, UiMsg::ClearExecutions).await
 }
 
 #[tauri::command]
-async fn refresh_status(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::RefreshStatus)
-        .map_err(|e| e.to_string())
+async fn refresh_status(tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    send_command(&tx, UiMsg::RefreshStatus).await
 }
 
 #[tauri::command]
-async fn set_gaming(
-    on: bool,
-    manual: bool,
-    tx: State<'_, UiCmdTx>,
-    conn: State<'_, ConnState>,
-) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::SetGaming { on, manual })
-        .map_err(|e| e.to_string())
+async fn set_gaming(on: bool, manual: bool, tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    send_command(&tx, UiMsg::SetGaming { on, manual }).await
 }
 
 #[tauri::command]
 async fn update_settings(
     settings: SettingsUpdate,
     tx: State<'_, UiCmdTx>,
-    conn: State<'_, ConnState>,
-) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::UpdateSettings(Box::new(settings)))
-        .map_err(|e| e.to_string())
+) -> Result<String, String> {
+    send_command(&tx, UiMsg::UpdateSettings(Box::new(settings))).await
 }
 
 #[tauri::command]
-async fn run_updates_now(tx: State<'_, UiCmdTx>, conn: State<'_, ConnState>) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::RunUpdatesNow)
-        .map_err(|e| e.to_string())
+async fn test_provider(tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    if !supports(&tx.status, CAP_PROVIDER_TEST) {
+        return Err(
+            "The running service does not support provider tests; update it first".to_string(),
+        );
+    }
+    // Leave room for the service's own 120-second provider deadline to produce
+    // and deliver its correlated timeout result.
+    send_command_with_timeout(&tx, UiMsg::TestProvider, Duration::from_secs(135)).await
 }
 
 #[tauri::command]
-async fn clear_update_history(
-    tx: State<'_, UiCmdTx>,
-    conn: State<'_, ConnState>,
-) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::ClearUpdateHistory)
-        .map_err(|e| e.to_string())
+async fn run_updates_now(tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    send_command(&tx, UiMsg::RunUpdatesNow).await
+}
+
+#[tauri::command]
+async fn clear_update_history(tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    send_command(&tx, UiMsg::ClearUpdateHistory).await
 }
 
 #[tauri::command]
 async fn set_updater_settings(
     settings: UpdaterSettingsUpdate,
     tx: State<'_, UiCmdTx>,
-    conn: State<'_, ConnState>,
-) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::UpdateUpdaterSettings(Box::new(settings)))
-        .map_err(|e| e.to_string())
+) -> Result<String, String> {
+    send_command(&tx, UiMsg::UpdateUpdaterSettings(Box::new(settings))).await
 }
 
 #[tauri::command]
@@ -424,52 +468,32 @@ async fn set_app_ignore(
     ignore: bool,
     note: String,
     tx: State<'_, UiCmdTx>,
-    conn: State<'_, ConnState>,
-) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::SetAppIgnore { id, ignore, note })
-        .map_err(|e| e.to_string())
+) -> Result<String, String> {
+    send_command(&tx, UiMsg::SetAppIgnore { id, ignore, note }).await
 }
 
 #[tauri::command]
-async fn set_app_note(
-    id: String,
-    note: String,
-    tx: State<'_, UiCmdTx>,
-    conn: State<'_, ConnState>,
-) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
+async fn set_app_note(id: String, note: String, tx: State<'_, UiCmdTx>) -> Result<String, String> {
     if id.trim().is_empty() || id.chars().count() > 200 {
         return Err("invalid app id".to_string());
     }
     if note.chars().count() > 2_000 {
         return Err("app note is too long".to_string());
     }
-    tx.0.try_send(UiMsg::SetAppNote { id, note })
-        .map_err(|e| e.to_string())
+    send_command(&tx, UiMsg::SetAppNote { id, note }).await
 }
 
 #[tauri::command]
-async fn set_learned_fact(
-    id: i64,
-    op: String,
-    tx: State<'_, UiCmdTx>,
-    conn: State<'_, ConnState>,
-) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::SetLearnedFact { id, op })
-        .map_err(|e| e.to_string())
+async fn set_learned_fact(id: i64, op: String, tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    send_command(&tx, UiMsg::SetLearnedFact { id, op }).await
 }
 
 #[tauri::command]
 async fn set_advisor_settings(
     settings: AdvisorSettingsUpdate,
     tx: State<'_, UiCmdTx>,
-    conn: State<'_, ConnState>,
-) -> Result<(), String> {
-    ensure_connected(&conn.0)?;
-    tx.0.try_send(UiMsg::SetAdvisorSettings(Box::new(settings)))
-        .map_err(|e| e.to_string())
+) -> Result<String, String> {
+    send_command(&tx, UiMsg::SetAdvisorSettings(Box::new(settings))).await
 }
 
 #[tauri::command]
@@ -858,10 +882,12 @@ fn main() {
         error: Some("Connecting to Eir service…".to_string()),
         ..Default::default()
     }));
-    let (ui_cmd_tx, ui_cmd_rx) = mpsc::channel::<UiMsg>(16);
+    let (ui_cmd_tx, ui_cmd_rx) = mpsc::channel::<UiRequest>(16);
+    let command_waiters: CommandWaiters = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     let connected: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let connected_for_pipe = connected.clone();
+    let waiters_for_pipe = command_waiters.clone();
 
     let status_for_loop = status.clone();
 
@@ -869,6 +895,13 @@ fn main() {
     let status_for_detect = status.clone();
     let connected_for_detect = connected.clone();
     let ui_cmd_tx_for_detect = ui_cmd_tx.clone();
+    let ui_cmd_state = UiCmdTx {
+        sender: ui_cmd_tx,
+        connected: connected.clone(),
+        status: status.clone(),
+        waiters: command_waiters,
+        next_id: AtomicU64::new(request_id_seed()),
+    };
 
     tauri::Builder::default()
         // Must be the FIRST plugin. Eir is tray-resident and auto-hides its window, so
@@ -898,7 +931,7 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(status)
-        .manage(UiCmdTx(ui_cmd_tx))
+        .manage(ui_cmd_state)
         .manage(ConnState(connected))
         .manage(AskAttachments(std::sync::Mutex::new(Vec::new())))
         .setup(move |app| {
@@ -930,7 +963,7 @@ fn main() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event({
-                    let tx = app.state::<UiCmdTx>().0.clone();
+                    let tx = app.state::<UiCmdTx>().sender.clone();
                     move |app, event| match event.id.as_ref() {
                         "open" => {
                             if let Some(w) = app.get_webview_window("main") {
@@ -948,7 +981,7 @@ fn main() {
                             if ensure_connected(&conn.0).is_ok() {
                                 let tx = tx.clone();
                                 tauri::async_runtime::spawn(async move {
-                                    let _ = tx.send(UiMsg::TogglePause).await;
+                                    let _ = tx.send(UiMsg::TogglePause.into()).await;
                                 });
                             }
                         }
@@ -982,7 +1015,8 @@ fn main() {
             // Background: pipe client + tray colour sync
             let status_pipe = status_for_loop.clone();
             tauri::async_runtime::spawn(async move {
-                pipe_client::run(status_pipe, ui_cmd_rx, connected_for_pipe).await;
+                pipe_client::run(status_pipe, ui_cmd_rx, connected_for_pipe, waiters_for_pipe)
+                    .await;
             });
 
             // Background: Game Mode fullscreen auto-detector (reports over the pipe).
@@ -1055,6 +1089,7 @@ fn main() {
             scan_startup,
             set_startup_entry,
             update_settings,
+            test_provider,
             clear_problems,
             clear_executions,
             refresh_status,
@@ -1105,5 +1140,17 @@ mod tests {
         assert!(ensure_connected(&flag).is_err());
         flag.store(true, Ordering::Relaxed);
         assert!(ensure_connected(&flag).is_ok());
+    }
+
+    #[test]
+    fn rejected_command_result_is_an_error() {
+        assert_eq!(
+            command_result(CommandResult {
+                request_id: 1,
+                ok: false,
+                message: "paused".to_string(),
+            }),
+            Err("paused".to_string())
+        );
     }
 }

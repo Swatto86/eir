@@ -139,9 +139,8 @@ impl ExecutionPolicy {
 
     /// True if `task_name` equals or sits under any blocklisted task-path prefix,
     /// compared on normalised components so case/separator tricks can't evade it.
-    /// Only matches fully-qualified names (`\Folder\Name`); a bare leaf name never
-    /// matches a `\Microsoft\…` prefix — the executor refuses ambiguous bare names
-    /// and the prompt tells the model to use full paths, so this is not an escape.
+    /// Only matches fully-qualified names (`\Folder\Name`); the executor rejects all
+    /// bare names before resolution so a leaf cannot hide a blocked Microsoft path.
     fn task_blocked(&self, task_name: &str) -> bool {
         self.blocklist.tasks.iter().any(|b| is_within(task_name, b))
     }

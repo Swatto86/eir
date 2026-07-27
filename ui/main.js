@@ -21,9 +21,9 @@ window.addEventListener('keydown', (e) => {
 });
 
 // ── Toasts (transient action feedback) ────────────────────────────────────────
-// Commands are fire-and-forget (a resolved invoke means "queued to the service", not
-// "applied"); a toast gives the click immediate acknowledgement instead of the user
-// waiting on the next 2s poll to infer anything happened.
+// New services return applied/rejected command results; older services return an
+// explicit queued-without-confirmation message. Toast the result instead of making
+// the user infer it from the next 2s poll.
 const toastWrap = document.getElementById('toast-wrap');
 function toast(msg, kind = '') {
   const t = document.createElement('div');
@@ -35,6 +35,10 @@ function toast(msg, kind = '') {
   toastWrap.appendChild(t);
   // Cap the stack so a burst of clicks can't fill the screen.
   while (toastWrap.children.length > 4) toastWrap.firstChild.remove();
+}
+
+function commandMessage(result, fallback) {
+  return (typeof result === 'string' && result.trim()) ? result : fallback;
 }
 
 // Copy to clipboard with a plain-DOM fallback for webviews where navigator.clipboard
@@ -255,6 +259,34 @@ function setBar(barId, value) {
   el.style.background = barColor(value);
 }
 
+function renderSignalHealth(status) {
+  const el = document.getElementById('signal-health');
+  const errors = status.signal_errors || [];
+  const ageSeconds = status.signals_at
+    ? Math.max(0, Math.floor(Date.now() / 1000 - status.signals_at))
+    : 0;
+  const poll = (status.settings && status.settings.wmi_poll_interval_secs) || 300;
+  const stale = !!status.signals_at && ageSeconds > Math.max(120, poll * 2);
+  if (!errors.length && !stale) {
+    el.style.display = 'none';
+    el.textContent = '';
+    return;
+  }
+  const labels = {
+    cpu: 'CPU', memory: 'memory', disk: 'disk', services: 'services',
+    network: 'network', network_interfaces: 'network interfaces',
+    network_errors: 'network error counters', disk_health: 'disk health',
+    windows_update: 'Windows Update', firewall: 'firewall', defender: 'Defender',
+    not_collected: 'waiting for the first collection',
+  };
+  const bits = [];
+  if (errors.length) bits.push('Unavailable: ' + errors.map((x) => labels[x] || x).join(', '));
+  if (stale) bits.push('readings stale');
+  if (status.signals_at) bits.push('collected ' + ago(status.signals_at));
+  el.textContent = bits.join(' · ');
+  el.style.display = 'block';
+}
+
 let refreshing = false;
 async function refresh() {
   // Skip a tick if the previous get_status is still in flight (slow pipe), so
@@ -279,6 +311,12 @@ async function refreshInner() {
   // command gate is the real backstop — clicks here would otherwise be dropped).
   const svcDown = ['ServiceDisconnected', 'Connecting', 'Restarting'].includes(status.status);
   document.body.classList.toggle('svc-down', svcDown);
+  const testProvider = document.getElementById('test-provider');
+  const canTestProvider = (status.capabilities || []).includes('provider_test');
+  testProvider.disabled = testProvider.dataset.busy === '1' || !canTestProvider || svcDown;
+  testProvider.title = canTestProvider && !svcDown
+    ? 'Tests the saved provider from the service account'
+    : (svcDown ? 'The Eir service is not connected' : 'Update the Eir service to enable provider testing');
 
   const [color, headline] = STATUS_META[status.status] ?? ['var(--gray)', status.status];
   document.getElementById('status-dot').style.background = color;
@@ -328,12 +366,15 @@ async function refreshInner() {
     ? 'Game Mode is ON — updates & housekeeping paused. Click to turn off.'
     : 'Game Mode is off. Click to pause Eir’s updates & housekeeping while you play.';
 
-  document.getElementById('cpu').textContent    = pct(status.cpu);
-  document.getElementById('memory').textContent = pct(status.memory);
-  document.getElementById('disk').textContent   = pct(status.disk);
-  setBar('cpu-bar',  status.cpu);
-  setBar('mem-bar',  status.memory);
-  setBar('disk-bar', status.disk);
+  const signalErrors = new Set(status.signal_errors || []);
+  const waitingForSignals = signalErrors.has('not_collected');
+  setText(document.getElementById('cpu'), waitingForSignals || signalErrors.has('cpu') ? '—' : pct(status.cpu));
+  setText(document.getElementById('memory'), waitingForSignals || signalErrors.has('memory') ? '—' : pct(status.memory));
+  setText(document.getElementById('disk'), waitingForSignals || signalErrors.has('disk') ? '—' : pct(status.disk));
+  setBar('cpu-bar', waitingForSignals || signalErrors.has('cpu') ? 0 : status.cpu);
+  setBar('mem-bar', waitingForSignals || signalErrors.has('memory') ? 0 : status.memory);
+  setBar('disk-bar', waitingForSignals || signalErrors.has('disk') ? 0 : status.disk);
+  renderSignalHealth(status);
 
   // Failed services
   const svcCard = document.getElementById('services-card');
@@ -358,7 +399,14 @@ async function refreshInner() {
   renderAiNow(status);
   renderActivity(status);
   renderUsage(status.usage);
-  renderUpdater(status.updater);
+  renderUpdater(status.updater, status.paused, status.protocol_version);
+  const settingsView = document.getElementById('view-settings');
+  if (!status.settings) {
+    settingsHydrated = false;
+  } else if (settingsView.classList.contains('active')
+      && !settingsHydrated && dirtyCards.size === 0) {
+    fillSettings();
+  }
   renderLearned(status.learned_facts);
   renderDigest(status.digest);
   renderHistory(status);
@@ -490,7 +538,7 @@ function renderAsk(ask) {
       <div class="ask-q"><span class="qmark">Q</span><span>${esc(e.question)}</span></div>
       ${(e.attachments && e.attachments.length) ? `<div class="ask-att-tag">📎 ${e.attachments.map(esc).join(', ')}</div>` : ''}
       <div class="ask-a">${esc(e.answer)}</div>
-      <div class="ask-when" data-ts="${e.at}">${ago(e.at)}</div>
+      <div class="ask-when"><span data-ts="${e.at}">${ago(e.at)}</span><button class="copy-btn ask-copy">Copy answer</button></div>
     </div>`).join('');
   list.innerHTML = html;
 }
@@ -505,9 +553,8 @@ async function submitAsk() {
   // before the service flips running. Re-enabled in finally.
   if (askSending) return;
   const statusEl = document.getElementById('ask-status');
-  // Mirror the service's 15s between-questions guard BEFORE sending: a rejected AskEir
-  // still consumes the pending attachments (fire-and-forget pipe), so pre-empting the
-  // rejection here keeps the user's attachments instead of silently dropping them.
+  // Mirror the service's 15s between-questions guard for an older service that cannot
+  // return a rejection before the tray consumes pending attachments.
   const entries = (lastStatus && lastStatus.ask && lastStatus.ask.entries) || [];
   const newestAt = entries.reduce((m, e) => Math.max(m, e.at || 0), 0) * 1000;
   if (Date.now() - Math.max(askLastDoneAt, newestAt) < 15000) {
@@ -519,7 +566,7 @@ async function submitAsk() {
   sendBtn.disabled = true;
   statusEl.textContent = 'Sending…';
   try {
-    await invoke('ask_eir', { question: q });
+    const result = await invoke('ask_eir', { question: q });
     // Remember the error currently on screen so renderAsk suppresses only it (not
     // a fresh rejection) until the service picks this question up.
     askBaselineErr = (lastStatus && lastStatus.ask && lastStatus.ask.error) || '';
@@ -528,6 +575,7 @@ async function submitAsk() {
     // The service consumed the pending attachments on a successful queue.
     askChips = [];
     renderAskChips();
+    statusEl.textContent = commandMessage(result, 'Question accepted');
   } catch (e) {
     statusEl.textContent = 'Failed: ' + e;
   } finally {
@@ -538,11 +586,15 @@ async function submitAsk() {
 }
 
 document.getElementById('ask-send').addEventListener('click', submitAsk);
+document.getElementById('ask-list').addEventListener('click', (e) => {
+  const btn = e.target.closest('.ask-copy');
+  if (btn) copyText(btn.closest('.ask-entry').querySelector('.ask-a').textContent, btn);
+});
 document.getElementById('clear-ask').addEventListener('click', async () => {
   try {
-    await invoke('clear_ask');
-    toast('Chat cleared', 'ok');
-  } catch (e) { console.error('clear_ask failed', e); toast('Could not clear chat', 'err'); }
+    const result = await invoke('clear_ask');
+    toast(commandMessage(result, 'Chat cleared'), 'ok');
+  } catch (e) { console.error('clear_ask failed', e); toast('Could not clear chat: ' + e, 'err'); }
   refresh();
 });
 document.getElementById('ask-input').addEventListener('keydown', (e) => {
@@ -636,20 +688,28 @@ function diskRow(e) {
   </div>`;
 }
 
-document.getElementById('disk-scan').addEventListener('click', () => {
-  invoke('scan_disk').catch((err) => console.error('scan_disk failed', err));
+document.getElementById('disk-scan').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  btn.textContent = 'Starting…';
+  try {
+    const result = await invoke('scan_disk');
+    toast(commandMessage(result, 'Disk scan started'), 'ok');
+  } catch (err) {
+    console.error('scan_disk failed', err);
+    toast('Could not start disk scan: ' + err, 'err');
+  }
+  refresh();
 });
 document.getElementById('disk-list').addEventListener('click', (e) => {
   const btn = e.target.closest('.disk-clean');
   if (!btn) return;
-  // Disable briefly to stop a double-submit, then re-enable — the command is
-  // fire-and-forget (resolves once queued, not once applied), and the row isn't
-  // repainted unless the entry set changes, so we must recover the button ourselves.
-  // Re-clicks are safe: the service dedupes via in_flight/pending and rate-limits.
+  // Disable briefly to stop a double-submit; the row may not repaint until the
+  // approval/activity state changes.
   btn.disabled = true;
   invoke('clean_disk_entry', { id: btn.dataset.id })
-    .then(() => toast('Cleanup queued — check Activity', 'ok'))
-    .catch((err) => { console.error('clean_disk_entry failed', err); toast('Could not queue cleanup', 'err'); })
+    .then((result) => toast(commandMessage(result, 'Cleanup accepted — check Activity'), 'ok'))
+    .catch((err) => { console.error('clean_disk_entry failed', err); toast('Could not clean up: ' + err, 'err'); })
     .finally(() => setTimeout(() => { btn.disabled = false; }, 2500));
 });
 
@@ -748,8 +808,18 @@ function startupRow(e) {
   </div>`;
 }
 
-document.getElementById('startup-scan').addEventListener('click', () => {
-  invoke('scan_startup').catch((err) => console.error('scan_startup failed', err));
+document.getElementById('startup-scan').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  btn.textContent = 'Starting…';
+  try {
+    const result = await invoke('scan_startup');
+    toast(commandMessage(result, 'Startup scan started'), 'ok');
+  } catch (err) {
+    console.error('scan_startup failed', err);
+    toast('Could not start startup scan: ' + err, 'err');
+  }
+  refresh();
 });
 document.getElementById('startup-list').addEventListener('click', (e) => {
   const btn = e.target.closest('.startup-toggle');
@@ -759,8 +829,8 @@ document.getElementById('startup-list').addEventListener('click', (e) => {
   // The toggle is approval-gated and server-side deduped, so a re-click is harmless.
   btn.disabled = true;
   invoke('set_startup_entry', { id: btn.dataset.id, enable })
-    .then(() => toast(`${enable ? 'Enable' : 'Disable'} sent to Approvals to confirm`, 'ok'))
-    .catch((err) => { console.error('set_startup_entry failed', err); toast('Could not send the change', 'err'); })
+    .then((result) => toast(commandMessage(result, `${enable ? 'Enable' : 'Disable'} accepted`), 'ok'))
+    .catch((err) => { console.error('set_startup_entry failed', err); toast('Could not change startup entry: ' + err, 'err'); })
     .finally(() => setTimeout(() => { btn.disabled = false; }, 2500));
 });
 
@@ -829,11 +899,11 @@ async function decide(id, approved, card) {
   decidingIds.add(id);
   if (card) card.querySelectorAll('button').forEach((b) => (b.disabled = true));
   try {
-    await invoke('decide_approval', { id, approved });
-    toast(approved ? 'Approved — running the fix' : 'Rejected', 'ok');
+    const result = await invoke('decide_approval', { id, approved });
+    toast(commandMessage(result, approved ? 'Approval applied' : 'Rejection applied'), 'ok');
   } catch (e) {
     console.error('decide_approval failed', e);
-    toast('Could not send — is the service connected?', 'err');
+    toast('Decision failed: ' + e, 'err');
     if (card) {
       card.querySelectorAll('button').forEach((b) => (b.disabled = false));
       // Disarm any armed irreversible-confirm button; otherwise it stays stuck showing
@@ -996,24 +1066,29 @@ document.getElementById('activity-list').addEventListener('click', (e) => {
   undoingIds.add(id);
   btn.disabled = true;
   invoke('undo_registry', { id })
-    .then(() => toast('Undo sent', 'ok'))
-    .catch((err) => { undoingIds.delete(id); btn.disabled = false; console.error('undo_registry failed', err); toast('Undo failed', 'err'); });
+    .then((result) => toast(commandMessage(result, 'Undo applied'), 'ok'))
+    .catch((err) => { undoingIds.delete(id); btn.disabled = false; console.error('undo_registry failed', err); toast('Undo failed: ' + err, 'err'); });
 });
 
 document.getElementById('clear-activity').addEventListener('click', async () => {
-  try { await invoke('clear_problems'); await invoke('clear_executions'); toast('Activity cleared', 'ok'); }
-  catch (e) { console.error(e); toast('Could not clear activity', 'err'); }
+  try {
+    await invoke('clear_problems');
+    const result = await invoke('clear_executions');
+    toast(commandMessage(result, 'Activity cleared'), 'ok');
+  }
+  catch (e) { console.error(e); toast('Could not clear activity: ' + e, 'err'); }
   refresh();
 });
 
-// Force a live-status refresh (fast services rescan on the service side) — clears a
-// service that has already recovered without waiting for the next poll. Fire-and-forget:
-// the effect lands on the next 2s poll, so the toast says "Refreshing", not "done".
+// Force a live-status refresh (fast services rescan on the service side).
 document.getElementById('refresh-status').addEventListener('click', async (e) => {
   const btn = e.currentTarget;
   btn.disabled = true;
-  try { await invoke('refresh_status'); toast('Refreshing service status…', 'ok'); }
-  catch (err) { console.error('refresh_status failed', err); toast('Could not refresh', 'err'); }
+  try {
+    const result = await invoke('refresh_status');
+    toast(commandMessage(result, 'Service status refreshed'), 'ok');
+  }
+  catch (err) { console.error('refresh_status failed', err); toast('Could not refresh: ' + err, 'err'); }
   finally { btn.disabled = false; }
 });
 
@@ -1075,6 +1150,7 @@ function renderUsage(u) {
 // ── App updates ───────────────────────────────────────────────────────────────
 
 const UPD_BADGE = {
+  current:   '<span class="upd-badge tag-ok">Current</span>',
   verified:  '<span class="upd-badge tag-ok">Verified</span>',
   installed: '<span class="upd-badge tag-warn">Installed</span>',
   failed:    '<span class="upd-badge tag-block">Failed</span>',
@@ -1096,8 +1172,14 @@ function updaterNoteEditor(id, note) {
 }
 
 function updaterAppRow(a) {
-  const ver = `${esc(a.from || '?')}${a.to ? ' → ' + esc(a.to) : ''}`;
   const badge = UPD_BADGE[a.state] || '';
+  if (a.id === 'update-check' && !a.from && !a.to && !a.method) {
+    return `<div class="upd-row" data-id="update-check">
+      <span class="upd-name">${esc(a.name)}</span>${badge}
+      <span class="upd-result">${esc(a.detail || '')}</span>
+    </div>`;
+  }
+  const ver = `${esc(a.from || '?')}${a.to ? ' → ' + esc(a.to) : ''}`;
   const meth = a.method ? `<span class="upd-status">via ${esc(methodLabel(a.method))}</span>` : '';
   const detailText = [a.detail, a.signature].filter(Boolean).join(' · ');
   const detail = detailText ? `<span class="upd-result">${esc(detailText)}</span>` : '';
@@ -1133,7 +1215,7 @@ let lastNotesSig = null;
 let lastHistSig = null;
 let lastGuidanceSig = null;
 
-function renderUpdater(u) {
+function renderUpdater(u, paused, protocolVersion) {
   const stateEl = document.getElementById('updater-state');
   const metaEl = document.getElementById('updater-meta');
   const appsEl = document.getElementById('updater-apps');
@@ -1143,17 +1225,40 @@ function renderUpdater(u) {
   const histWrap = document.getElementById('updater-history-wrap');
   const histEl = document.getElementById('updater-history');
   const nowBtn = document.getElementById('upd-now');
-  if (!u) { stateEl.textContent = ''; return; }
+  const clearBtn = document.getElementById('clear-updates');
+  if (!u) {
+    stateEl.textContent = '';
+    metaEl.textContent = '';
+    metaEl.style.display = 'none';
+    appsEl.innerHTML = '';
+    notesEl.innerHTML = '';
+    guidanceEl.innerHTML = '';
+    guidanceWrap.style.display = 'none';
+    histEl.innerHTML = '';
+    histWrap.style.display = 'none';
+    lastAppsSig = null;
+    lastNotesSig = null;
+    lastHistSig = null;
+    lastGuidanceSig = null;
+    nowBtn.disabled = true;
+    clearBtn.disabled = true;
+    nowBtn.textContent = '⬆ Update now';
+    nowBtn.title = 'The running service does not report updater status';
+    return;
+  }
 
-  stateEl.textContent = u.running ? '· running…' : (u.enabled ? '· auto' : '· off');
-  // The service ignores a manual run unless the updater is enabled (the master
-  // switch also gates the pipe-triggered run), so reflect that in the button.
-  nowBtn.disabled = !!u.running || !u.enabled;
+  const phase = (u.phase || 'idle').trim() || 'idle';
+  stateEl.textContent = `· ${phase} · ${u.enabled ? 'auto' : 'schedule off'}`;
+  // Manual runs remain useful with scheduling off; pause and an active run are
+  // the only blockers.
+  nowBtn.disabled = !!u.running || !!paused;
+  clearBtn.disabled = !!u.running;
   nowBtn.textContent = u.running ? 'Updating…' : '⬆ Update now';
-  nowBtn.title = u.enabled ? '' : 'Enable auto-updates in Settings first';
+  nowBtn.title = paused ? 'Resume monitoring before starting updates' : '';
 
   const bits = [];
   if (u.last_run) bits.push('last run ' + ago(u.last_run));
+  if (u.last_clean_run) bits.push('last clean run ' + ago(u.last_clean_run));
   if (u.enabled && u.next_run) bits.push('next in ' + until(u.next_run));
   if (u.last_cost_usd) bits.push('~' + fmtGbp(u.last_cost_usd));
   metaEl.style.display = bits.length ? 'block' : 'none';
@@ -1162,23 +1267,32 @@ function renderUpdater(u) {
   // Only rebuild the apps list when its content changes, so the 2s poll doesn't wipe
   // a text selection or the toggle you just clicked. The time-based meta above still
   // refreshes every poll. Phase/running are in the sig so the live stage still moves.
-  const appsSig = JSON.stringify({ a: u.apps || [], r: u.running, p: u.phase, lr: u.last_run, en: u.enabled });
-  if (appsSig !== lastAppsSig) {
+  const appsSig = JSON.stringify({
+    a: u.apps || [], r: u.running, p: u.phase, lr: u.last_run,
+    lc: u.last_clean_run, en: u.enabled,
+  });
+  const appsDirty = appsEl.querySelector('.upd-note-editor:not([hidden]) .upd-note-input[data-dirty="1"]');
+  if (appsSig !== lastAppsSig && !appsDirty) {
     lastAppsSig = appsSig;
     if (u.apps && u.apps.length) {
       appsEl.innerHTML = u.apps.map(updaterAppRow).join('');
     } else if (u.running) {
       const phase = (u.phase && u.phase !== 'idle') ? u.phase : 'Checking for updates…';
       appsEl.innerHTML = `<div class="empty">${esc(phase)}</div>`;
+    } else if (u.last_run && u.last_clean_run === u.last_run) {
+      appsEl.innerHTML = '<div class="empty">No updates found in this check.</div>';
+    } else if (u.last_run && protocolVersion >= 2) {
+      appsEl.innerHTML = '<div class="empty">The check finished with warnings — review the notes below.</div>';
     } else if (u.last_run) {
-      appsEl.innerHTML = '<div class="empty">Everything up to date.</div>';
+      appsEl.innerHTML = '<div class="empty">Last check completed.</div>';
     } else {
-      appsEl.innerHTML = '<div class="empty">Enable auto-updates in Settings, or click “Update now”.</div>';
+      appsEl.innerHTML = '<div class="empty">Click “Update now” for a one-off run, or enable the schedule in Settings.</div>';
     }
   }
 
   const guidanceSig = JSON.stringify(u.app_notes || []);
-  if (guidanceSig !== lastGuidanceSig) {
+  const guidanceDirty = guidanceEl.querySelector('.upd-note-editor:not([hidden]) .upd-note-input[data-dirty="1"]');
+  if (guidanceSig !== lastGuidanceSig && !guidanceDirty) {
     lastGuidanceSig = guidanceSig;
     const notes = u.app_notes || [];
     guidanceWrap.style.display = notes.length ? 'block' : 'none';
@@ -1197,11 +1311,19 @@ function renderUpdater(u) {
     lastHistSig = histSig;
     if (u.recent && u.recent.length) {
       histWrap.style.display = 'block';
-      histEl.innerHTML = u.recent.slice(0, 15).map((r) =>
-        `<div class="upd-note">${r.success ? '✓' : '✗'} ${esc(r.name)} ` +
-        `<span style="opacity:.7">(${esc(methodLabel(r.method))})</span>` +
-        `${r.detail ? ' — ' + esc(r.detail) : ''} <span class="row-age" data-ts="${r.at}">${ago(r.at)}</span></div>`
-      ).join('');
+      histEl.innerHTML = u.recent.slice(0, 15).map((r) => {
+        const version = [r.from_version, r.to_version].filter(Boolean).join(' → ');
+        const evidence = [
+          version,
+          r.category,
+          r.exit_code == null ? '' : `exit ${r.exit_code}`,
+        ].filter(Boolean).join(' · ');
+        const clean = r.success || r.category === 'already_current';
+        return `<div class="upd-note">${clean ? '✓' : '✗'} ${esc(r.name)} ` +
+          `<span style="opacity:.7">(${esc(methodLabel(r.method))})</span>` +
+          `${evidence ? ' · ' + esc(evidence) : ''}` +
+          `${r.detail ? ' — ' + esc(r.detail) : ''} <span class="row-age" data-ts="${r.at}">${ago(r.at)}</span></div>`;
+      }).join('');
     } else {
       histWrap.style.display = 'none';
     }
@@ -1209,12 +1331,18 @@ function renderUpdater(u) {
 }
 
 document.getElementById('upd-now').addEventListener('click', async () => {
-  try { await invoke('run_updates_now'); toast('Update run started', 'ok'); }
-  catch (e) { console.error('run_updates_now failed', e); toast('Could not start updates', 'err'); }
+  try {
+    const result = await invoke('run_updates_now');
+    toast(commandMessage(result, 'Update run started'), 'ok');
+  }
+  catch (e) { console.error('run_updates_now failed', e); toast('Could not start updates: ' + e, 'err'); }
 });
 document.getElementById('clear-updates').addEventListener('click', async () => {
-  try { await invoke('clear_update_history'); toast('Update history cleared', 'ok'); }
-  catch (e) { console.error('clear_update_history failed', e); toast('Could not clear history', 'err'); }
+  try {
+    const result = await invoke('clear_update_history');
+    toast(commandMessage(result, 'Update history cleared'), 'ok');
+  }
+  catch (e) { console.error('clear_update_history failed', e); toast('Could not clear history: ' + e, 'err'); }
   refresh();
 });
 
@@ -1227,16 +1355,19 @@ document.getElementById('updater-apps').addEventListener('click', (e) => {
   const ignore = ig.dataset.ignore !== '0';
   ig.disabled = true;
   invoke('set_app_ignore', { id: ig.dataset.id, ignore, note: '' })
-    .then(() => {
+    .then((result) => {
       const row = ig.closest('.upd-row'); if (row) row.style.opacity = ignore ? '.5' : '';
-      toast(ignore ? 'App ignored' : 'App unignored', 'ok');
+      toast(commandMessage(result, ignore ? 'App ignored' : 'App unignored'), 'ok');
     })
-    .catch((err) => { console.error('set_app_ignore failed', err); toast('Could not update ignore', 'err'); })
+    .catch((err) => { console.error('set_app_ignore failed', err); toast('Could not update ignore: ' + err, 'err'); })
     .finally(() => { ig.disabled = false; });
 });
 
 // Persistent per-app AI guidance: create from a detected row, then read/edit/delete
 // it either there or in the saved-guidance list after the app leaves recent results.
+document.getElementById('view-updates').addEventListener('input', (e) => {
+  if (e.target.classList.contains('upd-note-input')) e.target.dataset.dirty = '1';
+});
 document.getElementById('view-updates').addEventListener('click', (e) => {
   const edit = e.target.closest('.upd-guide');
   if (edit) {
@@ -1248,6 +1379,9 @@ document.getElementById('view-updates').addEventListener('click', (e) => {
   const cancel = e.target.closest('.upd-note-cancel');
   if (cancel) {
     cancel.closest('.upd-note-editor').hidden = true;
+    lastAppsSig = null;
+    lastGuidanceSig = null;
+    refresh();
     return;
   }
   const save = e.target.closest('.upd-note-save');
@@ -1259,11 +1393,11 @@ document.getElementById('view-updates').addEventListener('click', (e) => {
   const btn = save || del;
   btn.disabled = true;
   invoke('set_app_note', { id, note })
-    .then(() => {
+    .then((result) => {
       if (editor) editor.hidden = true;
-      toast(note ? 'AI guidance sent' : 'AI guidance deletion sent', 'ok');
+      toast(commandMessage(result, note ? 'AI guidance saved' : 'AI guidance deleted'), 'ok');
     })
-    .catch((err) => { console.error('set_app_note failed', err); toast('Could not update AI guidance', 'err'); })
+    .catch((err) => { console.error('set_app_note failed', err); toast('Could not update AI guidance: ' + err, 'err'); })
     .finally(() => { btn.disabled = false; });
 });
 
@@ -1280,10 +1414,11 @@ function learnedRow(f) {
   const dim = (f.status === 'user_disabled' || f.status === 'expired') ? ' style="opacity:.55"' : '';
   const ai = f.source === 'ai_labelled' ? '<span class="upd-status">AI</span>' : '';
   return `<div class="upd-row"${dim} data-id="${f.id}">
-    <span class="upd-name" title="${escAttr(f.detail)}">${esc(f.summary)}</span>${ai}${badge}
+    <span class="upd-name">${esc(f.summary)}</span>${ai}${badge}
     <button class="upd-mini learned-act" data-id="${f.id}" data-op="pin"     title="Always keep this">Pin</button>
     <button class="upd-mini learned-act" data-id="${f.id}" data-op="disable" title="Ignore this learned fact">Disable</button>
     <button class="upd-mini learned-act" data-id="${f.id}" data-op="forget"  title="Delete (re-learns if it recurs)">Forget</button>
+    ${f.detail ? `<details class="upd-result"><summary>Evidence</summary><div>${esc(f.detail)}</div></details>` : ''}
   </div>`;
 }
 
@@ -1313,9 +1448,10 @@ document.getElementById('learned-list').addEventListener('click', (e) => {
   const row = btn.parentElement;
   row.querySelectorAll('.learned-act').forEach((b) => { b.disabled = true; });
   invoke('set_learned_fact', { id, op: btn.dataset.op })
-    .then(refresh)
+    .then((result) => { toast(commandMessage(result, 'Learned fact updated'), 'ok'); refresh(); })
     .catch((err) => {
       console.error('set_learned_fact failed', err);
+      toast('Could not update learned fact: ' + err, 'err');
       row.querySelectorAll('.learned-act').forEach((b) => { b.disabled = false; });
     });
 });
@@ -1327,6 +1463,7 @@ document.getElementById('learned-list').addEventListener('click', (e) => {
 // enclosing card dirty; a successful save clears only that card; (re)filling from
 // the service clears all. Re-entering the view refills only when nothing is dirty.
 const dirtyCards = new Set();
+let settingsHydrated = false;
 document.getElementById('view-settings').addEventListener('input', (e) => {
   const card = e.target.closest('.card');
   if (card && card.id) dirtyCards.add(card.id);
@@ -1473,6 +1610,7 @@ function fillSettings() {
   fillAutostartSetting();
   const s = lastStatus && lastStatus.settings;
   if (!s) return;
+  settingsHydrated = true;
   const provider = s.provider || 'openrouter';
   document.getElementById('set-provider').value = provider;
   activeModelProvider = provider;
@@ -1553,8 +1691,8 @@ async function saveSettings() {
 
   st.textContent = 'Saving…';
   try {
-    await invoke('update_settings', { settings });
-    st.textContent = 'Saved — applies immediately.';
+    const result = await invoke('update_settings', { settings });
+    st.textContent = commandMessage(result, 'Settings applied.');
     document.getElementById('set-or-key').value = '';
     document.getElementById('set-an-key').value = '';
     document.getElementById('set-kilo-profile').value = '';
@@ -1604,8 +1742,8 @@ async function saveAdvisorSettings() {
   };
   st.textContent = 'Saving…';
   try {
-    await invoke('set_advisor_settings', { settings });
-    st.textContent = 'Saved — applies immediately.';
+    const result = await invoke('set_advisor_settings', { settings });
+    st.textContent = commandMessage(result, 'Advisor settings applied.');
     dirtyCards.delete('card-advisor');
   } catch (e) {
     st.textContent = 'Failed: ' + e;
@@ -1614,7 +1752,7 @@ async function saveAdvisorSettings() {
 
 // ── Updater settings (apply live — no service restart) ───────────────────────
 
-const METHOD_BOXES = [['m-winget', 'winget'], ['m-choco', 'choco'], ['m-scoop', 'scoop'], ['m-msstore', 'msstore']];
+const METHOD_BOXES = [['m-winget', 'winget'], ['m-choco', 'choco'], ['m-msstore', 'msstore']];
 
 function fillUpdaterSettings(s) {
   if (!s) return;
@@ -1623,6 +1761,8 @@ function fillUpdaterSettings(s) {
     Math.max(1, Math.round((s.schedule_interval_secs || 86400) / 3600));
   const methods = s.methods || [];
   for (const [id, name] of METHOD_BOXES) document.getElementById(id).checked = methods.includes(name);
+  document.getElementById('m-scoop').checked = false;
+  document.getElementById('m-scoop').disabled = true;
   document.getElementById('set-native-enabled').checked = !!s.native_enabled;
   document.getElementById('set-sigpol').value = s.native_signature_policy || 'require_valid';
 }
@@ -1639,8 +1779,8 @@ async function saveUpdaterSettings() {
   const st = document.getElementById('set-upd-status');
   st.textContent = 'Saving…';
   try {
-    await invoke('set_updater_settings', { settings });
-    st.textContent = 'Saved — applies immediately.';
+    const result = await invoke('set_updater_settings', { settings });
+    st.textContent = commandMessage(result, 'Updater settings applied.');
     dirtyCards.delete('card-updater');
   } catch (e) {
     st.textContent = 'Failed: ' + e;
@@ -1656,6 +1796,28 @@ function saveGuarded(btnId, fn) {
   Promise.resolve(fn()).finally(() => { btn.disabled = false; });
 }
 document.getElementById('set-save').addEventListener('click', () => saveGuarded('set-save', saveSettings));
+document.getElementById('test-provider').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  const st = document.getElementById('set-status');
+  if (dirtyCards.has('card-provider')) {
+    st.textContent = 'Save provider changes before testing them.';
+    return;
+  }
+  btn.dataset.busy = '1';
+  btn.disabled = true;
+  btn.textContent = 'Testing…';
+  st.textContent = 'Testing from the service account…';
+  try {
+    st.textContent = commandMessage(await invoke('test_provider'), 'Provider test passed.');
+  } catch (err) {
+    st.textContent = 'Test failed: ' + err;
+  } finally {
+    btn.dataset.busy = '';
+    btn.textContent = 'Test provider';
+    btn.disabled = !((lastStatus && lastStatus.capabilities) || []).includes('provider_test')
+      || ['ServiceDisconnected', 'Connecting', 'Restarting'].includes(lastStatus && lastStatus.status);
+  }
+});
 document.getElementById('set-adv-save').addEventListener('click', () => saveGuarded('set-adv-save', saveAdvisorSettings));
 document.getElementById('set-upd-save').addEventListener('click', () => saveGuarded('set-upd-save', saveUpdaterSettings));
 document.getElementById('set-autostart-save').addEventListener('click', () => saveGuarded('set-autostart-save', saveAutostartSetting));
@@ -1663,10 +1825,11 @@ document.getElementById('set-autostart-save').addEventListener('click', () => sa
 // ── Pause ─────────────────────────────────────────────────────────────────────
 
 document.getElementById('pause-btn').addEventListener('click', async () => {
-  // Report the state we're moving TO — status.paused only flips on the next poll.
-  const willPause = !(lastStatus && lastStatus.paused);
-  try { await invoke('toggle_pause'); toast(willPause ? 'Monitoring paused' : 'Monitoring resumed', 'ok'); }
-  catch (e) { console.error('toggle_pause failed', e); toast('Could not change pause state', 'err'); }
+  try {
+    const result = await invoke('toggle_pause');
+    toast(commandMessage(result, 'Pause state changed'), 'ok');
+  }
+  catch (e) { console.error('toggle_pause failed', e); toast('Could not change pause state: ' + e, 'err'); }
   refresh();
 });
 
@@ -1674,8 +1837,11 @@ document.getElementById('game-btn').addEventListener('click', async () => {
   // Manual toggle (a latch, distinct from the auto-detector's lease). If auto-detect has
   // it on, turning it off here is re-enabled by the next detector heartbeat (by design).
   const on = !(lastStatus && lastStatus.gaming);
-  try { await invoke('set_gaming', { on, manual: true }); toast(on ? 'Game Mode on' : 'Game Mode off', 'ok'); }
-  catch (e) { console.error('set_gaming failed', e); toast('Could not change Game Mode', 'err'); }
+  try {
+    const result = await invoke('set_gaming', { on, manual: true });
+    toast(commandMessage(result, on ? 'Game Mode on' : 'Game Mode off'), 'ok');
+  }
+  catch (e) { console.error('set_gaming failed', e); toast('Could not change Game Mode: ' + e, 'err'); }
   refresh();
 });
 

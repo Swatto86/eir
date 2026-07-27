@@ -4,7 +4,7 @@
 //! (session 0) can't see the desktop's fullscreen state.
 
 use crate::pipe_client::SharedStatus;
-use eir_proto::UiMsg;
+use eir_proto::{UiMsg, UiRequest};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,9 +30,15 @@ fn is_fullscreen_app() -> bool {
     }
 }
 
+fn try_set_gaming(cmd_tx: &Sender<UiRequest>, on: bool) -> bool {
+    cmd_tx
+        .try_send(UiMsg::SetGaming { on, manual: false }.into())
+        .is_ok()
+}
+
 /// The auto-detect loop. Only acts while the pipe is connected and the `game_mode_auto`
 /// setting is on; sends `SetGaming { manual: false }` (the heartbeat lease) on transitions.
-pub async fn run(status: SharedStatus, cmd_tx: Sender<UiMsg>, connected: Arc<AtomicBool>) {
+pub async fn run(status: SharedStatus, cmd_tx: Sender<UiRequest>, connected: Arc<AtomicBool>) {
     let mut gaming = false; // our last auto-reported state
     let mut non_fs_since: Option<Instant> = None;
     let mut last_heartbeat = Instant::now();
@@ -45,11 +51,7 @@ pub async fn run(status: SharedStatus, cmd_tx: Sender<UiMsg>, connected: Arc<Ato
         }
         // On first connect, clear any stale auto-lease/power a prior tray instance may have
         // left (covers a tray relaunch after a crash). Harmless if nothing was set.
-        if !cleared_stale {
-            let _ = cmd_tx.try_send(UiMsg::SetGaming {
-                on: false,
-                manual: false,
-            });
+        if !cleared_stale && try_set_gaming(&cmd_tx, false) {
             cleared_stale = true;
             gaming = false;
         }
@@ -63,11 +65,7 @@ pub async fn run(status: SharedStatus, cmd_tx: Sender<UiMsg>, connected: Arc<Ato
             .unwrap_or(false);
         if !auto {
             // Auto disabled: withdraw any auto lease we set (the manual toggle is separate).
-            if gaming {
-                let _ = cmd_tx.try_send(UiMsg::SetGaming {
-                    on: false,
-                    manual: false,
-                });
+            if gaming && try_set_gaming(&cmd_tx, false) {
                 gaming = false;
                 non_fs_since = None;
             }
@@ -75,24 +73,28 @@ pub async fn run(status: SharedStatus, cmd_tx: Sender<UiMsg>, connected: Arc<Ato
         }
         if is_fullscreen_app() {
             non_fs_since = None;
-            if !gaming || last_heartbeat.elapsed() >= HEARTBEAT {
-                let _ = cmd_tx.try_send(UiMsg::SetGaming {
-                    on: true,
-                    manual: false,
-                });
+            if (!gaming || last_heartbeat.elapsed() >= HEARTBEAT) && try_set_gaming(&cmd_tx, true) {
                 last_heartbeat = Instant::now();
                 gaming = true;
             }
         } else if gaming {
             let since = *non_fs_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= EXIT_DEBOUNCE {
-                let _ = cmd_tx.try_send(UiMsg::SetGaming {
-                    on: false,
-                    manual: false,
-                });
+            if since.elapsed() >= EXIT_DEBOUNCE && try_set_gaming(&cmd_tx, false) {
                 gaming = false;
                 non_fs_since = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_queue_reports_unsent_transition() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        assert!(try_set_gaming(&tx, true));
+        assert!(!try_set_gaming(&tx, false));
     }
 }

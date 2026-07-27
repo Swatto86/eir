@@ -65,6 +65,20 @@ pub async fn run_capped(program: &str, args: &[String], dur: Duration) -> (i32, 
     run_capped_cmd(c, dur).await
 }
 
+/// Reject a failed read-only command instead of letting its empty/partial output
+/// masquerade as a successful inventory with no updates.
+pub fn checked_output<'a>(action: &str, code: i32, output: &'a str) -> Result<&'a str, String> {
+    if code == 0 {
+        return Ok(output);
+    }
+    let detail: String = output.trim().chars().take(300).collect();
+    Err(if detail.is_empty() {
+        format!("{action} failed (exit {code})")
+    } else {
+        format!("{action} failed (exit {code}): {detail}")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +113,12 @@ mod tests {
         .await;
         assert_eq!(code, TIMED_OUT);
         assert!(out.contains("timed out"), "got: {out:?}");
+    }
+
+    #[test]
+    fn failed_listing_is_not_an_empty_success() {
+        let err = checked_output("winget update listing", 1, "").expect_err("must fail");
+        assert!(err.contains("winget update listing"));
+        assert!(err.contains("exit 1"));
     }
 }

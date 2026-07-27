@@ -14,8 +14,8 @@ use crate::updater::winget_parse::{parse_upgrades, AppUpdate};
 
 /// List apps with an available update (`winget upgrade`). Runs unprivileged-style
 /// (listing needs no special rights) and parses the fixed-width table.
-pub async fn list_updates() -> Vec<AppUpdate> {
-    let (_code, out) = run_winget(
+pub async fn list_updates() -> Result<Vec<AppUpdate>, String> {
+    let (code, out) = run_winget(
         vec![
             "upgrade".to_string(),
             "--include-unknown".to_string(),
@@ -25,22 +25,19 @@ pub async fn list_updates() -> Vec<AppUpdate> {
         LIST,
     )
     .await;
-    let ups = parse_upgrades(&out);
-    // Make the non-English-locale blind spot visible instead of silently reporting zero
-    // updates forever: our column parser locates fields by the English header labels
-    // ("Id"/"Version"), so a localized winget header yields no columns and every row is
-    // dropped. Key on "a table is present (dashed separator, locale-independent) but the
-    // header was NOT locatable" — this precisely targets the localized-header case and
-    // won't fire on the benign English path where the header parses but rows are filtered
-    // out (e.g. --include-unknown rows with an empty Available column). Fails safe: no
-    // wrong action, just no detection — hence a log line, not a hard error.
-    if out.contains("---") && !crate::updater::winget_parse::header_present(&out) {
-        tracing::warn!(
-            "winget returned a table but its header wasn't parseable — likely a non-English \
-             display language (column headers are localized)"
-        );
+    proc::checked_output("winget update listing", code, &out)?;
+    parse_update_listing("winget update listing", &out)
+}
+
+pub(crate) fn parse_update_listing(action: &str, output: &str) -> Result<Vec<AppUpdate>, String> {
+    // The table separator is locale-independent, but the parser's column labels are
+    // English. A table without those labels is incomplete coverage, not "up to date".
+    if output.contains("---") && !crate::updater::winget_parse::header_present(output) {
+        return Err(format!(
+            "{action} returned a table whose header could not be parsed (possibly localized)"
+        ));
     }
-    ups
+    Ok(parse_upgrades(output))
 }
 
 /// The full `winget upgrade` argument list for one id, optionally forcing past the
@@ -331,5 +328,15 @@ mod tests {
             clean_winget_output(raw),
             "Installer failed with exit code: 1603"
         );
+    }
+
+    #[test]
+    fn localized_table_is_not_an_empty_success() {
+        let output = "Nom        Identifiant  Version  Disponible  Source\n\
+                      ---------- ----------- -------- ----------- ------\n\
+                      Example    Vendor.App  1.0      2.0         winget\n";
+        let error = parse_update_listing("winget update listing", output)
+            .expect_err("an unparseable table must be reported");
+        assert!(error.contains("header"));
     }
 }

@@ -55,12 +55,17 @@ async fn run(choco: PathBuf, args: Vec<String>, dur: Duration) -> (i32, String) 
     proc::run_capped_cmd(cmd, dur).await
 }
 
+/// With Chocolatey's enhanced exit codes, `outdated` returns 2 when it found updates.
+fn outdated_ok(code: i32) -> bool {
+    code == 0 || code == 2
+}
+
 /// List outdated Chocolatey packages.
-pub async fn list_outdated() -> Vec<ChocoUpdate> {
+pub async fn list_outdated() -> Result<Vec<ChocoUpdate>, String> {
     let Some(choco) = detect::choco_path() else {
-        return Vec::new();
+        return Err("Chocolatey is not installed".to_string());
     };
-    let (_code, out) = run(
+    let (code, out) = run(
         choco,
         vec![
             "outdated".to_string(),
@@ -70,7 +75,12 @@ pub async fn list_outdated() -> Vec<ChocoUpdate> {
         LIST,
     )
     .await;
-    parse_outdated(&out)
+    let output = if outdated_ok(code) {
+        &out
+    } else {
+        proc::checked_output("Chocolatey update listing", code, &out)?
+    };
+    Ok(parse_outdated(output))
 }
 
 /// choco upgrade exit codes that mean success (0) or success-pending-reboot.
@@ -213,5 +223,13 @@ mod tests {
         assert!(choco_ok(1641));
         assert!(!choco_ok(1));
         assert!(!choco_ok(-1));
+    }
+
+    #[test]
+    fn outdated_accepts_updates_found_exit_code() {
+        assert!(outdated_ok(0));
+        assert!(outdated_ok(2));
+        assert!(!outdated_ok(1));
+        assert!(!outdated_ok(-1));
     }
 }

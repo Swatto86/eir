@@ -67,60 +67,64 @@ fn ps_capped(command: &str, timeout: std::time::Duration) -> Option<String> {
         }
     }
     let out = child.wait_with_output().ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// CPU usage via a WMI PowerShell query, bounded so a slow WMI host can't stall the
 /// snapshot loop.
-fn get_cpu_usage() -> f32 {
+fn get_cpu_usage() -> Option<f32> {
     ps_capped(
         "(Get-WmiObject Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average",
         std::time::Duration::from_secs(15),
     )
     .and_then(|s| s.trim().parse::<f32>().ok())
-    .unwrap_or(0.0)
 }
 
-fn get_memory() -> (f32, f32) {
+fn get_memory() -> Option<(f32, f32)> {
     let mut mem = MEMORYSTATUSEX {
         dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
     };
-    unsafe {
-        let _ = GlobalMemoryStatusEx(&mut mem);
+    if unsafe { GlobalMemoryStatusEx(&mut mem) }.is_err() {
+        return None;
     }
     let usage = mem.dwMemoryLoad as f32;
     let available_gb = mem.ullAvailPhys as f32 / (1024.0 * 1024.0 * 1024.0);
-    (usage, available_gb)
+    Some((usage, available_gb))
 }
 
-fn get_disk() -> (f32, f32) {
+fn get_disk() -> Option<(f32, f32)> {
     let mut free_bytes: u64 = 0;
     let mut total_bytes: u64 = 0;
     let path = wide("C:\\");
-    unsafe {
-        let _ = GetDiskFreeSpaceExW(
+    if unsafe {
+        GetDiskFreeSpaceExW(
             PCWSTR(path.as_ptr()),
             None,
             Some(&mut total_bytes),
             Some(&mut free_bytes),
-        );
+        )
     }
-    if total_bytes == 0 {
-        return (0.0, 0.0);
+    .is_err()
+        || total_bytes == 0
+    {
+        return None;
     }
     let used = total_bytes.saturating_sub(free_bytes);
     let usage = (used as f32 / total_bytes as f32) * 100.0;
     let free_gb = free_bytes as f32 / (1024.0 * 1024.0 * 1024.0);
-    (usage, free_gb)
+    Some((usage, free_gb))
 }
 
 /// Aggregate SMART health across the machine's physical disks: the worst
 /// `HealthStatus` reported by `Get-PhysicalDisk` ("Healthy" | "Warning" |
-/// "Unhealthy"), or "unknown" if the query fails or returns nothing. A disk
+/// "Unhealthy"), or "unknown" if the query returns nothing. A failed probe is
+/// reported and retains the last good value. A disk
 /// predicting failure is exactly the early warning a guardian should surface, so this
 /// feeds the actionable fingerprint via `SystemState::fault_parts`.
-fn get_disk_health() -> String {
+fn get_disk_health() -> Option<String> {
     let out = ps_capped(
         "$h = Get-PhysicalDisk -ErrorAction SilentlyContinue | \
            Select-Object -ExpandProperty HealthStatus; \
@@ -130,23 +134,20 @@ fn get_disk_health() -> String {
          else { 'Healthy' }",
         std::time::Duration::from_secs(15),
     );
-    match out {
-        Some(s) => {
-            let t = s.trim();
-            if t.is_empty() {
-                "unknown".to_string()
-            } else {
-                t.to_string()
-            }
+    out.map(|s| {
+        let t = s.trim();
+        if t.is_empty() {
+            "unknown".to_string()
+        } else {
+            t.to_string()
         }
-        None => "unknown".to_string(),
-    }
+    })
 }
 
 /// Total NIC packet errors (received + outbound) across adapters, via the standard
-/// CIM statistics class. Defensive: any missing property or a failed query yields 0
-/// (same as the old hardcoded value), so a wrong environment can't inject noise.
-fn get_network_errors() -> u32 {
+/// CIM statistics class. A missing property or failed query is reported so it cannot
+/// masquerade as a healthy zero.
+fn get_network_errors() -> Option<u32> {
     let out = ps_capped(
         "try { \
            $s = Get-CimInstance -Namespace root/StandardCimv2 \
@@ -155,12 +156,11 @@ fn get_network_errors() -> u32 {
            foreach ($a in $s) { \
              $e += [int64]$a.ReceivedPacketErrors + [int64]$a.OutboundPacketErrors } \
            $e \
-         } catch { 0 }",
+         } catch { exit 1 }",
         std::time::Duration::from_secs(15),
     );
     out.and_then(|s| s.trim().parse::<i64>().ok())
-        .map(|n| n.clamp(0, u32::MAX as i64) as u32)
-        .unwrap_or(0)
+        .and_then(|n| u32::try_from(n.clamp(0, i64::from(u32::MAX))).ok())
 }
 
 /// Enumerate services and return (running_count, failed_names).
@@ -172,19 +172,20 @@ fn get_network_errors() -> u32 {
 /// stop) and 1077 (`ERROR_SERVICE_NEVER_STARTED`, the normal state of Manual/Disabled
 /// services) are excluded so `failed_services` isn't flooded with services that are
 /// stopped by design.
-fn get_services() -> (usize, Vec<String>) {
+fn get_services() -> Option<(usize, Vec<String>)> {
     const ERROR_SERVICE_NEVER_STARTED: u32 = 1077;
     let manager = match unsafe {
         OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ENUMERATE_SERVICE)
     } {
         Ok(h) => h,
-        Err(_) => return (0, vec![]),
+        Err(_) => return None,
     };
 
     let mut running = 0usize;
     let mut failed: Vec<String> = Vec::new();
     let mut resume_handle: u32 = 0;
     let mut buf = vec![0u8; 256 * 1024];
+    let mut complete = false;
 
     // Bounded loop over resume batches (guards against a pathological non-advancing
     // resume handle); SERVICE_STATE_ALL can span hundreds of services.
@@ -211,6 +212,7 @@ fn get_services() -> (usize, Vec<String>) {
                 buf.resize(bytes_needed as usize, 0);
                 continue;
             }
+            complete = result.is_ok();
             break;
         }
 
@@ -247,7 +249,10 @@ fn get_services() -> (usize, Vec<String>) {
         // Ok => all remaining services fit in this batch; ERROR_MORE_DATA => another
         // batch remains (resume_handle advanced); any other error => stop.
         match result {
-            Ok(()) => break,
+            Ok(()) => {
+                complete = true;
+                break;
+            }
             Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => continue,
             Err(_) => break,
         }
@@ -256,7 +261,7 @@ fn get_services() -> (usize, Vec<String>) {
     unsafe {
         let _ = CloseServiceHandle(manager);
     }
-    (running, failed)
+    complete.then_some((running, failed))
 }
 
 fn i8_array_to_string(arr: &[i8]) -> String {
@@ -265,7 +270,7 @@ fn i8_array_to_string(arr: &[i8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).to_string()
 }
 
-fn get_network_interfaces() -> Vec<NetworkInterface> {
+fn get_network_interfaces() -> Option<Vec<NetworkInterface>> {
     let mut interfaces = Vec::new();
     let mut buf_size: u32 = 16384;
     let mut buf = vec![0u8; buf_size as usize];
@@ -291,7 +296,7 @@ fn get_network_interfaces() -> Vec<NetworkInterface> {
     }
 
     if result != 0 {
-        return interfaces;
+        return None;
     }
 
     let mut adapter_ptr = buf.as_ptr() as *const IP_ADAPTER_INFO;
@@ -312,10 +317,10 @@ fn get_network_interfaces() -> Vec<NetworkInterface> {
         adapter_ptr = adapter.Next;
     }
 
-    interfaces
+    Some(interfaces)
 }
 
-fn get_windows_update_status() -> String {
+fn get_windows_update_status() -> Option<String> {
     let key_path = wide(
         "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\Results\\Install",
     );
@@ -332,7 +337,7 @@ fn get_windows_update_status() -> String {
         )
         .is_err()
         {
-            return "unknown".to_string();
+            return None;
         }
 
         let mut data = vec![0u8; 128];
@@ -351,14 +356,14 @@ fn get_windows_update_status() -> String {
         let _ = RegCloseKey(hkey);
 
         if !ok || data_len < 2 {
-            return "unknown".to_string();
+            return None;
         }
 
         let chars: &[u16] = std::slice::from_raw_parts(
             data.as_ptr() as *const u16,
             (data_len as usize / 2).saturating_sub(1),
         );
-        format!("last_install: {}", String::from_utf16_lossy(chars))
+        Some(format!("last_install: {}", String::from_utf16_lossy(chars)))
     }
 }
 
@@ -458,32 +463,107 @@ fn parse_defender_status(line: &str) -> DefenderStatus {
 /// Query Windows Defender via PowerShell, bounded by ps_capped. Absent Defender, a
 /// failed query, or a timeout leaves every field None (handled by
 /// parse_defender_status on empty output).
-fn get_defender() -> DefenderStatus {
-    ps_capped(
+fn get_defender() -> Option<DefenderStatus> {
+    let status = ps_capped(
         "$s = Get-MpComputerStatus -ErrorAction SilentlyContinue; \
-         if ($s) { '{0}|{1}|{2}' -f $s.RealTimeProtectionEnabled, $s.AntivirusEnabled, $s.AntivirusSignatureAge }",
+         if ($s) { '{0}|{1}|{2}' -f $s.RealTimeProtectionEnabled, $s.AntivirusEnabled, $s.AntivirusSignatureAge } \
+         else { exit 1 }",
         std::time::Duration::from_secs(15),
     )
-    .map(|s| parse_defender_status(&s))
-    .unwrap_or_default()
+    .map(|s| parse_defender_status(&s))?;
+    (status.realtime_enabled.is_some()
+        || status.antivirus_enabled.is_some()
+        || status.signature_age_days.is_some())
+    .then_some(status)
 }
 
-fn snapshot_state() -> SystemState {
+fn retain_or_report<T: Clone>(
+    value: Option<T>,
+    previous: &T,
+    source: &'static str,
+    errors: &mut Vec<String>,
+) -> T {
+    value.unwrap_or_else(|| {
+        errors.push(source.to_string());
+        previous.clone()
+    })
+}
+
+fn snapshot_state(previous: SystemState) -> SystemState {
+    let mut collector_errors = Vec::new();
     let uptime_secs = get_uptime_secs();
-    let cpu_usage_percent = get_cpu_usage();
-    let (memory_usage_percent, memory_available_gb) = get_memory();
-    let (disk_usage_percent, disk_free_gb) = get_disk();
-    let (running_services_count, failed_services) = get_services();
-    let network_interfaces = get_network_interfaces();
-    let network_errors = get_network_errors();
-    let disk_health = get_disk_health();
-    let windows_update_status = get_windows_update_status();
-    let security = SecurityPosture {
-        firewall: get_firewall(),
-        defender: get_defender(),
-    };
+    let cpu_usage_percent = retain_or_report(
+        get_cpu_usage(),
+        &previous.cpu_usage_percent,
+        "cpu",
+        &mut collector_errors,
+    );
+    let (memory_usage_percent, memory_available_gb) = retain_or_report(
+        get_memory(),
+        &(previous.memory_usage_percent, previous.memory_available_gb),
+        "memory",
+        &mut collector_errors,
+    );
+    let (disk_usage_percent, disk_free_gb) = retain_or_report(
+        get_disk(),
+        &(previous.disk_usage_percent, previous.disk_free_gb),
+        "disk",
+        &mut collector_errors,
+    );
+    let (running_services_count, failed_services) = retain_or_report(
+        get_services(),
+        &(
+            previous.running_services_count,
+            previous.failed_services.clone(),
+        ),
+        "services",
+        &mut collector_errors,
+    );
+    let network_interfaces = retain_or_report(
+        get_network_interfaces(),
+        &previous.network_interfaces,
+        "network_interfaces",
+        &mut collector_errors,
+    );
+    let network_errors = retain_or_report(
+        get_network_errors(),
+        &previous.network_errors,
+        "network_errors",
+        &mut collector_errors,
+    );
+    let disk_health = retain_or_report(
+        get_disk_health(),
+        &previous.disk_health,
+        "disk_health",
+        &mut collector_errors,
+    );
+    let windows_update_status = retain_or_report(
+        get_windows_update_status(),
+        &previous.windows_update_status,
+        "windows_update",
+        &mut collector_errors,
+    );
+    let firewall_probe = get_firewall();
+    let firewall_known = firewall_probe.domain.is_some()
+        || firewall_probe.private.is_some()
+        || firewall_probe.public.is_some();
+    let firewall = retain_or_report(
+        firewall_known.then_some(firewall_probe),
+        &previous.security.firewall,
+        "firewall",
+        &mut collector_errors,
+    );
+    let defender = retain_or_report(
+        get_defender(),
+        &previous.security.defender,
+        "defender",
+        &mut collector_errors,
+    );
+    let security = SecurityPosture { firewall, defender };
 
     SystemState {
+        collected_at: chrono::Utc::now().timestamp(),
+        collector_errors,
         uptime_secs,
         cpu_usage_percent,
         memory_usage_percent,
@@ -530,18 +610,32 @@ fn fault_changed(prev: &str, cur: &str) -> bool {
 /// the background poller only re-scans every few minutes — and overwrite `st.failed_services`
 /// back to the stale value, silently re-showing the service the user just cleared.
 pub async fn rescan_failed_services(shared: &SharedState) -> Vec<String> {
-    let failed = tokio::task::spawn_blocking(|| get_services().1)
+    let result = tokio::task::spawn_blocking(get_services)
         .await
-        .unwrap_or_default();
-    if let Ok(mut guard) = shared.lock() {
-        // Only correct the services field; leave cpu/mem/disk to the next full poll. When
-        // the cache is still None (first poll hasn't run), `current` returns an empty
-        // snapshot, so there's no stale value to reconcile — nothing to do.
-        if let Some(s) = guard.as_mut() {
-            s.failed_services = failed.clone();
+        .ok()
+        .flatten();
+    if let Some((running, failed)) = result {
+        if let Ok(mut guard) = shared.lock() {
+            // Only correct the services field; leave cpu/mem/disk to the next full poll.
+            if let Some(s) = guard.as_mut() {
+                s.running_services_count = running;
+                s.failed_services = failed.clone();
+                s.collector_errors.retain(|source| source != "services");
+            }
         }
+        failed
+    } else {
+        warn!("manual service rescan failed; retaining the last good service state");
+        if let Ok(mut guard) = shared.lock() {
+            if let Some(s) = guard.as_mut() {
+                if !s.collector_errors.iter().any(|source| source == "services") {
+                    s.collector_errors.push("services".to_string());
+                }
+                return s.failed_services.clone();
+            }
+        }
+        Vec::new()
     }
-    failed
 }
 
 pub fn spawn(
@@ -558,7 +652,8 @@ pub fn spawn(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    match tokio::task::spawn_blocking(snapshot_state).await {
+                    let previous = current(&shared_clone);
+                    match tokio::task::spawn_blocking(move || snapshot_state(previous)).await {
                         Ok(s) => {
                             info!(
                                 cpu = s.cpu_usage_percent,
@@ -566,6 +661,7 @@ pub fn spawn(
                                 disk_free_gb = s.disk_free_gb,
                                 failed_services = s.failed_services.len(),
                                 update = %s.windows_update_status,
+                                collector_errors = ?s.collector_errors,
                                 "WMI snapshot"
                             );
                             // Wake the decision loop when a NEW fault appears
@@ -604,6 +700,8 @@ pub fn current(shared: &SharedState) -> SystemState {
         .ok()
         .and_then(|g| g.clone())
         .unwrap_or_else(|| SystemState {
+            collected_at: 0,
+            collector_errors: vec!["not_collected".to_string()],
             uptime_secs: 0,
             cpu_usage_percent: 0.0,
             memory_usage_percent: 0.0,
@@ -622,7 +720,14 @@ pub fn current(shared: &SharedState) -> SystemState {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_firewall, fault_changed, parse_defender_status};
+    use super::{effective_firewall, fault_changed, parse_defender_status, retain_or_report};
+
+    #[test]
+    fn failed_probe_keeps_last_good_value_and_reports_the_source() {
+        let mut errors = Vec::new();
+        assert_eq!(retain_or_report(None, &42_u32, "network", &mut errors), 42);
+        assert_eq!(errors, ["network"]);
+    }
 
     #[tokio::test]
     async fn rescan_overwrites_the_cached_failed_services() {

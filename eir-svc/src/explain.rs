@@ -86,15 +86,13 @@ pub fn explain(action: &FixAction) -> ActionExplanation {
         } => ActionExplanation {
             summary: format!(
                 "Sets the registry value '{value_name}' under '{key_path}' to '{value_data}', \
-                 overwriting whatever is there now. The previous value is snapshotted first \
-                 so this can usually be undone — if that snapshot can't be read, no undo is \
-                 offered."
+                 overwriting whatever is there now. Its exact prior type and value are captured \
+                 first; if that snapshot cannot be read, the reset is refused. Undo will not \
+                 overwrite a value changed again after Eir's reset."
             ),
             target: format!("{key_path}\\{value_name}"),
-            // The prior value is snapshotted before the write (see registry::reset_value);
-            // when that read succeeds this is auto-undoable from the activity feed. The
-            // undo button only appears post-execution if a snapshot was actually captured,
-            // so the summary is honest about the best-effort case.
+            // The exact prior value is required before the write and its undo is committed
+            // with the execution, so a reported success is auto-undoable from the feed.
             reversible: true,
         },
         FixAction::NetworkDiagnostic { command } => explain_network(command),
@@ -283,8 +281,30 @@ fn file_facts(path: &str) -> String {
                 would be rejected — nothing is previewed or deleted."
             .to_string();
     }
-    let p = std::path::Path::new(path);
-    let meta = match std::fs::metadata(p) {
+    crate::executor::logs::with_active_user(|| Ok(file_facts_as_active_user(path))).unwrap_or_else(
+        |_| {
+            "Eir cannot inspect this file without the active desktop user's access token. \
+             Nothing is previewed or deleted."
+                .to_string()
+        },
+    )
+}
+
+fn file_facts_as_active_user(path: &str) -> String {
+    let p = match crate::executor::logs::checked_local_path(std::path::Path::new(path)) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            return "This file does not currently exist (it may already be gone, or the path is \
+                    wrong). Nothing would be deleted."
+                .to_string();
+        }
+        Err(_) => {
+            return "This path is not a plain local file path. Eir refuses reparse, relative, and \
+                    network paths, so nothing is previewed or deleted."
+                .to_string();
+        }
+    };
+    let meta = match std::fs::metadata(&p) {
         Ok(m) => m,
         Err(_) => {
             return "This file does not currently exist (it may already be gone, or the path is \
@@ -422,7 +442,7 @@ mod tests {
 
     #[test]
     fn missing_file_says_nothing_to_delete() {
-        let details = file_facts("C:\\definitely\\not\\here\\nope.bin");
+        let details = file_facts_as_active_user("C:\\definitely\\not\\here\\nope.bin");
         assert!(details.contains("does not currently exist"));
     }
 

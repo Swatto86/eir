@@ -1,17 +1,12 @@
-//! The Scoop update method. Scoop is user-scoped, so the service runs it in the
-//! logged-in user's profile context (USERPROFILE/HOME pointed at their home, like it
-//! borrows their Claude session) — best-effort: scoop also relies on the user's PATH
-//! (git etc.), which a SYSTEM service can't fully reproduce. We never bootstrap scoop
-//! as SYSTEM. Verification is by exit code (scoop apps don't register in ARP).
+//! Scoop is user-scoped and its `.cmd` shim is user-writable. EirSvc runs as SYSTEM,
+//! so this backend is fail-closed until it has a real active-user process launcher.
 
-use crate::updater::domain::{
-    classify_error, AttemptOutcome, ErrorCategory, Method, UpdateCandidate, Verification,
-};
-use crate::updater::methods::detect;
-use crate::updater::proc::{self, INSTALL, LIST};
+use crate::updater::domain::{AttemptOutcome, ErrorCategory, Method, UpdateCandidate};
+#[cfg(test)]
 use crate::updater::version::is_newer;
-use std::path::PathBuf;
-use std::time::Duration;
+
+const DISABLED_REASON: &str =
+    "Scoop is disabled in the SYSTEM service because its user-owned shim cannot be run safely";
 
 /// One outdated Scoop app.
 pub struct ScoopUpdate {
@@ -20,33 +15,13 @@ pub struct ScoopUpdate {
     pub available: String,
 }
 
-/// Run a scoop command via its .cmd shim in the user's profile context. Bounded by
-/// `dur`: scoop shells out to git/network, so a stall must not wedge the cycle. (The
-/// timeout kills the `cmd` shim; a grandchild git/scoop process may briefly linger.)
-async fn run_scoop(
-    profile: String,
-    shim: PathBuf,
-    args: Vec<String>,
-    dur: Duration,
-) -> (i32, String) {
-    let homepath = profile.strip_prefix("C:").unwrap_or(&profile).to_string();
-    let mut cmd = std::process::Command::new("cmd");
-    cmd.arg("/c")
-        .arg(&shim)
-        .args(&args)
-        .env("USERPROFILE", &profile)
-        .env("HOME", &profile)
-        .env("HOMEDRIVE", "C:")
-        .env("HOMEPATH", homepath);
-    proc::run_capped_cmd(cmd, dur).await
-}
-
 /// A Scoop app identifier is a slug: `app` or `bucket/app`, using only alphanumerics
 /// and `.`, `-`, `_`, `/`. Anything else is rejected before it reaches `cmd.exe`. A
 /// leading `-` is refused too: a real scoop slug never starts with a dash, but a name
 /// like `--all` would be re-read by scoop's OWN argv parser as a flag (`scoop update
 /// --all` = update everything), bypassing the per-app/budget scoping — a different
 /// vector from the shell-metacharacter defense the char set already covers.
+#[cfg(test)]
 fn is_safe_scoop_name(app: &str) -> bool {
     !app.is_empty()
         && !app.starts_with('-')
@@ -59,6 +34,7 @@ fn is_safe_scoop_name(app: &str) -> bool {
 /// Name, Installed Version, Latest Version. Only rows where a strictly newer Latest
 /// exists are kept. Scoop app names are slugs (no spaces), so splitting on whitespace
 /// is safe.
+#[cfg(test)]
 fn parse_status(text: &str) -> Vec<ScoopUpdate> {
     let mut out = Vec::new();
     let mut in_table = false;
@@ -89,74 +65,14 @@ fn parse_status(text: &str) -> Vec<ScoopUpdate> {
     out
 }
 
-/// List outdated Scoop apps (runs in the user's context).
-pub async fn list_outdated() -> Vec<ScoopUpdate> {
-    let Some((profile, shim)) = detect::scoop_install() else {
-        return Vec::new();
-    };
-    let (_code, out) = run_scoop(profile, shim, vec!["status".to_string()], LIST).await;
-    parse_status(&out)
+/// Listing is disabled rather than executing a user-owned shim as SYSTEM.
+pub async fn list_outdated() -> Result<Vec<ScoopUpdate>, String> {
+    Err(DISABLED_REASON.to_string())
 }
 
-/// Update one app via Scoop. Success is exit-code based (scoop apps aren't in ARP, so
-/// there's no independent version to verify against).
-pub async fn attempt(candidate: &UpdateCandidate) -> AttemptOutcome {
-    let Some((profile, shim)) = detect::scoop_install() else {
-        return AttemptOutcome::failed(
-            Method::Scoop,
-            ErrorCategory::NotFound,
-            "Scoop is not installed for any user",
-        );
-    };
-    let app = candidate
-        .package_id
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| candidate.name.clone());
-
-    // Defense-in-depth: the shim runs via `cmd /c <shim> update <app>`, and because the
-    // program is `cmd` (not the .cmd shim itself) Rust's batch-argument escaping does not
-    // engage — so `&`, `|`, `^`, `"`, etc. in `app` would reach cmd.exe's re-parser.
-    // Real scoop names are slugs (`app` or `bucket/app`), so anything else is refused.
-    if !is_safe_scoop_name(&app) {
-        return AttemptOutcome::failed(
-            Method::Scoop,
-            ErrorCategory::NotFound,
-            format!("refusing scoop app name with unexpected characters: {app}"),
-        );
-    }
-
-    let (code, output) = run_scoop(
-        profile,
-        shim,
-        vec!["update".to_string(), app.clone()],
-        INSTALL,
-    )
-    .await;
-    let mut out = AttemptOutcome::failed(Method::Scoop, ErrorCategory::Unknown, String::new());
-    out.exit_code = Some(code);
-    if code == 0 {
-        out.success = true;
-        out.verification = Verification::Unverified;
-        out.detail = format!("scoop updated {app}");
-    } else {
-        out.category = Some(classify_error(Method::Scoop, Some(code), &output));
-        out.detail = {
-            let tail: Vec<&str> = output
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .collect();
-            tail.iter()
-                .rev()
-                .take(3)
-                .rev()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" · ")
-        };
-    }
-    out
+/// Updating is disabled for the same privilege-boundary reason as listing.
+pub async fn attempt(_candidate: &UpdateCandidate) -> AttemptOutcome {
+    AttemptOutcome::failed(Method::Scoop, ErrorCategory::Blocked, DISABLED_REASON)
 }
 
 #[cfg(test)]
@@ -192,5 +108,26 @@ mod tests {
         // A flag-shaped name would be re-parsed by scoop as a flag, not an app.
         assert!(!is_safe_scoop_name("--all"));
         assert!(!is_safe_scoop_name("-g"));
+    }
+
+    #[tokio::test]
+    async fn system_backend_never_selects_or_executes_a_user_owned_shim() {
+        match list_outdated().await {
+            Err(reason) => assert_eq!(reason, DISABLED_REASON),
+            Ok(_) => panic!("Scoop unexpectedly became available to the SYSTEM service"),
+        }
+        let candidate = UpdateCandidate {
+            id: "attacker-scoop-shim".to_string(),
+            name: r"C:\Users\attacker\scoop\shims\scoop.cmd".to_string(),
+            current: "1".to_string(),
+            available: "2".to_string(),
+            package_id: Some(r"C:\Users\attacker\scoop\shims\scoop.cmd".to_string()),
+            methods: vec![Method::Scoop],
+        };
+        let outcome = attempt(&candidate).await;
+        assert!(!outcome.success);
+        assert_eq!(outcome.category, Some(ErrorCategory::Blocked));
+        assert_eq!(outcome.exit_code, None);
+        assert_eq!(outcome.detail, DISABLED_REASON);
     }
 }

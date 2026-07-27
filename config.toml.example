@@ -102,7 +102,7 @@ audit_db = "./eir.db"
 # ── Autonomous app updater ────────────────────────────────────────────────────
 # Eir can keep your installed apps up to date by itself: it checks for updates,
 # applies them with the best method, and — if one fails — reads the actual error
-# and tries another way (winget -> Chocolatey -> Scoop -> Microsoft Store -> an
+# and tries another way (winget -> Chocolatey -> Microsoft Store -> an
 # AI-found official installer). Because the service runs as LocalSystem, this needs
 # NO UAC prompt. Everything here is editable in the app's Settings panel.
 #
@@ -116,7 +116,7 @@ enabled = false
 schedule_interval_secs = 86400
 
 # Package-manager methods to use, in preference order. Unknown names are ignored.
-methods = ["winget", "choco", "scoop", "msstore"]
+methods = ["winget", "choco", "msstore"]
 
 # Whether AI-found official native installers may be downloaded and run for apps no
 # package manager can update.
@@ -134,7 +134,7 @@ max_attempts_per_app = 3      # methods tried per app before giving up
 max_apps_per_run = 20         # apps acted on per cycle
 max_installer_mb = 256        # largest native installer to download
 
-# Auto-install a missing package manager (Chocolatey/Scoop) when a method needs it.
+# Auto-install Chocolatey when that method needs it.
 bootstrap_managers = true
 
 # Apps to skip entirely (by stable, version-stripped display name). Matching ignores

@@ -2,9 +2,9 @@ use crate::updater::config::UpdaterConfig;
 use anyhow::{Context, Result};
 use eir_proto::{SettingsUpdate, UiSettings};
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::{collections::HashSet, fs, path::Component};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     pub api: ApiConfig,
     pub monitoring: MonitoringConfig,
@@ -118,7 +118,7 @@ impl ApiProvider {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ApiConfig {
     #[serde(default)]
     pub provider: ApiProvider,
@@ -164,7 +164,7 @@ pub struct ApiConfig {
     pub kilo_cli_user_profile: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MonitoringConfig {
     #[serde(default)]
     pub event_log_channels: Vec<String>,
@@ -224,9 +224,67 @@ fn normalize_effort(value: &str) -> String {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PersistenceConfig {
     pub audit_db: String,
+}
+
+const MAX_LOG_DIRECTORIES: usize = 16;
+const MAX_LOG_DIRECTORY_CHARS: usize = 1024;
+
+fn normalize_log_directories(directories: Vec<String>) -> Result<Vec<String>> {
+    if directories.len() > MAX_LOG_DIRECTORIES {
+        anyhow::bail!("at most {MAX_LOG_DIRECTORIES} log directories are allowed");
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for raw in directories {
+        let path = raw.trim();
+        if path.is_empty() {
+            continue;
+        }
+        if path.chars().count() > MAX_LOG_DIRECTORY_CHARS {
+            anyhow::bail!("log directory is too long");
+        }
+        let parsed = std::path::Path::new(path);
+        let mut components = parsed.components();
+        let local_drive = matches!(components.next(), Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::Disk(_)))
+            && matches!(components.next(), Some(Component::RootDir));
+        if !local_drive {
+            anyhow::bail!("log directory must be an absolute local drive path: {path}");
+        }
+        let key = path.replace('/', "\\").to_ascii_lowercase();
+        if seen.insert(key) {
+            out.push(path.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn sanitize_loaded_log_directories(directories: Vec<String>) -> Vec<String> {
+    let mut safe = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in directories {
+        if safe.len() >= MAX_LOG_DIRECTORIES {
+            tracing::warn!(
+                "Ignoring configured log directories past the {MAX_LOG_DIRECTORIES}-root limit"
+            );
+            break;
+        }
+        match normalize_log_directories(vec![raw]) {
+            Ok(paths) => {
+                for path in paths {
+                    let key = path.replace('/', "\\").to_ascii_lowercase();
+                    if seen.insert(key) {
+                        safe.push(path);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("Ignoring unsafe legacy log directory: {e}"),
+        }
+    }
+    safe
 }
 
 impl Config {
@@ -272,7 +330,8 @@ impl Config {
     }
 
     /// Apply an update from the UI. Empty/None secret fields keep the stored value.
-    pub fn apply_update(&mut self, u: SettingsUpdate) {
+    pub fn apply_update(&mut self, u: SettingsUpdate) -> Result<()> {
+        let log_directories = normalize_log_directories(u.log_directories)?;
         let provider = ApiProvider::parse(&u.provider);
         if provider != self.api.provider {
             // An escalation model belongs to the old provider and may be invalid
@@ -305,12 +364,13 @@ impl Config {
         self.monitoring.event_log_poll_interval_secs = u.event_log_poll_interval_secs.max(5);
         self.monitoring.wmi_poll_interval_secs = u.wmi_poll_interval_secs.max(30);
         self.monitoring.event_log_channels = u.event_log_channels;
-        self.monitoring.log_directories = u.log_directories;
+        self.monitoring.log_directories = log_directories;
         // Clamp to a sane range: never 0 (would auto-run everything) nor ≥1.0
         // (would never run anything).
         self.monitoring.confidence_threshold = u.confidence_threshold.clamp(0.50, 0.95);
         self.monitoring.game_mode_auto = u.game_mode_auto;
         self.monitoring.game_mode_power_boost = u.game_mode_power_boost;
+        Ok(())
     }
 }
 
@@ -360,7 +420,11 @@ pub fn load(path: &str) -> Result<Config> {
     let contents = fs::read_to_string(&resolved)
         .with_context(|| format!("Failed to read config file: {}", resolved.display()))?;
     match toml::from_str::<Config>(&contents) {
-        Ok(cfg) => Ok(cfg),
+        Ok(mut cfg) => {
+            cfg.monitoring.log_directories =
+                sanitize_loaded_log_directories(cfg.monitoring.log_directories);
+            Ok(cfg)
+        }
         Err(primary) => {
             // The live config didn't parse (e.g. truncated by a crash mid-write).
             // Recover from the last-known-good backup rather than going fatal — a
@@ -370,7 +434,9 @@ pub fn load(path: &str) -> Result<Config> {
                 .ok()
                 .and_then(|c| toml::from_str::<Config>(&c).ok());
             match recovered {
-                Some(cfg) => {
+                Some(mut cfg) => {
+                    cfg.monitoring.log_directories =
+                        sanitize_loaded_log_directories(cfg.monitoring.log_directories);
                     tracing::warn!(
                         "config.toml failed to parse ({primary}); recovered from {}",
                         bak.display()
@@ -421,7 +487,8 @@ audit_db = "./eir.db"
             confidence_threshold: 0.9,
             game_mode_auto: true,
             game_mode_power_boost: false,
-        });
+        })
+        .unwrap();
         // Must serialize to TOML the loader can read back (else a settings save bricks the service).
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
@@ -477,6 +544,56 @@ audit_db = "./eir.db"
         changed = no_restart.clone();
         changed.wmi_poll_interval_secs = 600;
         assert!(cfg.settings_update_needs_restart(&changed));
+    }
+
+    #[test]
+    fn configured_log_roots_are_local_bounded_and_deduplicated() {
+        let roots = normalize_log_directories(vec![
+            r"C:\Logs".into(),
+            r" c:\logs ".into(),
+            r"D:\Games\App\logs".into(),
+        ])
+        .expect("local roots");
+        assert_eq!(roots, vec![r"C:\Logs", r"D:\Games\App\logs"]);
+
+        for bad in [
+            vec![r"\\server\share".into()],
+            vec!["//server/share".into()],
+            vec![r"relative\logs".into()],
+            vec![r"\\?\C:\Logs".into()],
+        ] {
+            assert!(normalize_log_directories(bad).is_err());
+        }
+
+        let too_many: Vec<String> = (0..=MAX_LOG_DIRECTORIES)
+            .map(|i| format!(r"C:\Logs\{i}"))
+            .collect();
+        assert!(normalize_log_directories(too_many).is_err());
+    }
+
+    #[test]
+    fn unsafe_legacy_log_roots_are_skipped_without_bricking_config() {
+        let roots = sanitize_loaded_log_directories(vec![
+            r"relative\logs".into(),
+            r"\\server\share".into(),
+            r"C:\Logs".into(),
+            r"c:\logs".into(),
+        ]);
+        assert_eq!(roots, [r"C:\Logs"]);
+    }
+
+    #[test]
+    fn rejected_settings_update_does_not_partially_mutate_config() {
+        let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
+        let before = toml::to_string(&cfg).unwrap();
+        let update = SettingsUpdate {
+            provider: "codex_cli".into(),
+            model: "changed".into(),
+            log_directories: vec![r"\\server\share".into()],
+            ..Default::default()
+        };
+        assert!(cfg.apply_update(update).is_err());
+        assert_eq!(toml::to_string(&cfg).unwrap(), before);
     }
 
     #[test]
@@ -601,7 +718,8 @@ audit_db = "./eir.db"
         cfg.apply_update(SettingsUpdate {
             provider: "codex_cli".into(),
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert!(cfg.advisor.escalation_model.is_empty());
     }
 
@@ -614,7 +732,8 @@ audit_db = "./eir.db"
             provider: "kilocode".into(),
             model: "kilo/anthropic/claude-sonnet-5".into(),
             ..Default::default()
-        });
+        })
+        .unwrap();
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.api.provider, ApiProvider::KiloCli);
@@ -629,7 +748,8 @@ audit_db = "./eir.db"
             kilo_cli_user_profile: Some("C:\\Users\\You".into()),
             kilo_cli_path: Some("C:\\Users\\You\\AppData\\Roaming\\npm\\kilo.cmd".into()),
             ..Default::default()
-        });
+        })
+        .unwrap();
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.api.provider, ApiProvider::KiloCli);
@@ -661,7 +781,8 @@ audit_db = "./eir.db"
             kilo_cli_user_profile: Some(String::new()),
             kilo_cli_path: Some(String::new()),
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert_eq!(
             cfg.api.kilo_cli_user_profile.as_deref(),
             Some("C:\\Users\\Old")

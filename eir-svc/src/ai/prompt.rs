@@ -298,6 +298,8 @@ mod tests {
             event_log: vec![],
             file_changes: vec![],
             system_state: SystemState {
+                collected_at: 0,
+                collector_errors: vec![],
                 uptime_secs: 1,
                 cpu_usage_percent: 1.0,
                 memory_usage_percent: 1.0,

@@ -6,6 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
+use windows::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    Security::{ImpersonateLoggedOnUser, RevertToSelf},
+    System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken},
+};
 
 const RING_SIZE: usize = 50;
 const MAX_READ_BYTES: u64 = 65_536;
@@ -45,6 +50,46 @@ fn try_parse_log(path: &Path, size_bytes: u64) -> Option<crate::models::LogEvent
     }
 }
 
+struct ActiveUserImpersonation(HANDLE);
+
+impl ActiveUserImpersonation {
+    fn new() -> Option<Self> {
+        let session = unsafe { WTSGetActiveConsoleSessionId() };
+        if session == u32::MAX {
+            return None;
+        }
+        let mut token = HANDLE::default();
+        unsafe {
+            WTSQueryUserToken(session, &mut token).ok()?;
+            if let Err(e) = ImpersonateLoggedOnUser(token) {
+                let _ = CloseHandle(token);
+                warn!("Cannot impersonate active user for configured log path: {e}");
+                return None;
+            }
+        }
+        Some(Self(token))
+    }
+}
+
+impl Drop for ActiveUserImpersonation {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = RevertToSelf();
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+fn parse_path(path: &Path, as_active_user: bool) -> Option<(u64, crate::models::LogEvent)> {
+    let _user = if as_active_user {
+        Some(ActiveUserImpersonation::new()?)
+    } else {
+        None
+    };
+    let size = std::fs::metadata(path).ok()?.len();
+    try_parse_log(path, size).map(|event| (size, event))
+}
+
 /// Read up to the last `max_bytes` of a file as (lossy) UTF-8. If the file is
 /// larger, seeks to the tail and drops the first — likely partial — line so the
 /// parser never keys off a truncated leading record.
@@ -76,6 +121,10 @@ fn read_tail(path: &Path, max_bytes: u64) -> Option<String> {
 /// Always includes any `extra` paths from `config.toml` that exist on disk,
 /// regardless of age. Designed to run via `tokio::task::spawn_blocking`.
 pub fn discover_watch_dirs(extra: &[String]) -> Vec<PathBuf> {
+    let Some(_user) = ActiveUserImpersonation::new() else {
+        warn!("Log directory discovery deferred: active user token unavailable");
+        return Vec::new();
+    };
     let cutoff = SystemTime::now()
         .checked_sub(Duration::from_secs(DISCOVERY_WINDOW_DAYS * 86400))
         .unwrap_or(UNIX_EPOCH);
@@ -119,17 +168,43 @@ pub fn discover_watch_dirs(extra: &[String]) -> Vec<PathBuf> {
         }
     }
 
-    // Config extras are always included if the path exists on this machine
-    for path in extra {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            result.insert(p);
-        }
+    for path in configured_watch_dirs_current_user(extra) {
+        result.insert(path);
     }
 
     let mut dirs: Vec<PathBuf> = result.into_iter().collect();
     dirs.sort();
     dirs
+}
+
+/// Resolve configured roots while already impersonating the active desktop user.
+fn configured_watch_dirs_current_user(extra: &[String]) -> Vec<PathBuf> {
+    let mut dirs = HashSet::new();
+    for path in extra {
+        let canonical = std::fs::canonicalize(path);
+        match canonical {
+            Ok(path) if path.is_dir() && canonical_is_local_drive(&path) => {
+                dirs.insert(path);
+            }
+            Ok(_) => warn!("Configured log directory did not resolve to a local drive: {path}"),
+            Err(e) => {
+                warn!("Configured log directory is unavailable to the active user ({path}): {e}")
+            }
+        }
+    }
+    let mut dirs: Vec<_> = dirs.into_iter().collect();
+    dirs.sort();
+    dirs
+}
+
+fn canonical_is_local_drive(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    matches!(
+        components.next(),
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+    ) && matches!(components.next(), Some(Component::RootDir))
 }
 
 /// Returns true if `dir` contains at least one recognised text-extension file
@@ -174,11 +249,6 @@ pub fn spawn(
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel::<()>(0);
     let (dir_tx, dir_rx) = std::sync::mpsc::channel::<PathBuf>();
 
-    if directories.is_empty() {
-        warn!("No log directories discovered — file watcher inactive");
-        return (shared, shutdown_tx, dir_tx);
-    }
-
     let (event_tx, event_rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
 
     let mut watcher = match RecommendedWatcher::new(event_tx, Config::default()) {
@@ -191,6 +261,13 @@ pub fn spawn(
 
     let mut watched: HashSet<PathBuf> = HashSet::new();
     for dir in &directories {
+        let Some(_user) = ActiveUserImpersonation::new() else {
+            warn!(
+                "Cannot watch directory without active-user token: {}",
+                dir.display()
+            );
+            continue;
+        };
         match watcher.watch(dir, RecursiveMode::Recursive) {
             Ok(()) => {
                 watched.insert(dir.clone());
@@ -207,6 +284,13 @@ pub fn spawn(
         while let Err(std::sync::mpsc::TryRecvError::Empty) = shutdown_rx.try_recv() {
             // Check for directories added by the main loop's re-discovery
             while let Ok(new_dir) = dir_rx.try_recv() {
+                let Some(_user) = ActiveUserImpersonation::new() else {
+                    warn!(
+                        "Cannot re-watch directory without active-user token: {}",
+                        new_dir.display()
+                    );
+                    continue;
+                };
                 if !new_dir.exists() {
                     continue;
                 }
@@ -237,17 +321,15 @@ pub fn spawn(
                         _ => continue,
                     };
                     for path in event.paths {
-                        let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                        let log_event = try_parse_log(&path, size_bytes);
+                        let Some((size_bytes, log_event)) = parse_path(&path, true) else {
+                            continue;
+                        };
                         // Only KEEP a change that carries a parsed log event. The watch
                         // trees (%TEMP%, %LOCALAPPDATA%, …) churn constantly with
                         // browser-cache/temp writes; pushing those non-log changes into
                         // the small ring evicts genuine error-log events before the
                         // decision loop drains them, so a fired trigger would arrive with
                         // no supporting evidence. Non-log noise is simply dropped.
-                        let Some(log_event) = log_event else {
-                            continue;
-                        };
                         // Error-bearing log writes are actionable — wake the
                         // decision loop (try_send is fine off the runtime).
                         let actionable = log_event.is_actionable();

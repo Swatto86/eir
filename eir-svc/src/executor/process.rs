@@ -12,7 +12,10 @@ pub async fn kill(process_name: &str) -> Result<String> {
     if process_name.contains(['*', '?', '[', ']']) {
         bail!("Process name '{process_name}' contains wildcard characters — refusing");
     }
-    let lower = process_name.to_lowercase();
+    let lower = process_name
+        .strip_suffix(".exe")
+        .unwrap_or(process_name)
+        .to_lowercase();
     if PROTECTED_PROCESSES
         .iter()
         .any(|&p| p.to_lowercase() == lower)
@@ -29,7 +32,9 @@ pub async fn kill(process_name: &str) -> Result<String> {
     let script = format!(
         "$procs = @(Get-Process -Name '{safe_name}' -ErrorAction SilentlyContinue); \
          if ($procs.Count -eq 0) {{ throw 'No running process named: {safe_name}' }}; \
+         $ids = @($procs.Id); \
          $procs | Stop-Process -Force -ErrorAction Stop; \
+         foreach ($id in $ids) {{ Wait-Process -Id $id -Timeout 10 -ErrorAction Stop }}; \
          Write-Output 'Stopped process(es) named: {safe_name}'"
     );
     super::powershell::run_diagnostic(&script).await
@@ -51,7 +56,9 @@ mod tests {
 
     #[tokio::test]
     async fn protected_processes_are_refused() {
-        let err = kill("lsass").await.unwrap_err();
-        assert!(err.to_string().contains("protected"), "{err}");
+        for name in ["lsass", "lsass.exe"] {
+            let err = kill(name).await.unwrap_err();
+            assert!(err.to_string().contains("protected"), "{err}");
+        }
     }
 }

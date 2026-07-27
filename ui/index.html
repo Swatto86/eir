@@ -183,7 +183,7 @@
     .ask-chip .rm { cursor: pointer; opacity: .55; padding: 0 4px; }
     .ask-chip .rm:hover { opacity: 1; }
     .ask-att-tag { font-size: 11px; color: var(--muted); margin-top: 2px; }
-    .ask-when { padding: 0 15px 11px; font-size: 11px; color: var(--muted); }
+    .ask-when { padding: 0 15px 11px; font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 8px; }
     .ask-spinner { padding: 13px 15px; color: var(--muted); font-size: 13px; }
 
     /* ── Disk / Startup rows ── */
@@ -265,6 +265,7 @@
     .upd-status { margin-left: 6px; font-size: 11px; color: var(--muted); white-space: nowrap; }
     .upd-badge { font-size: 11px; padding: 1px 8px; border-radius: 20px; font-weight: 600; margin-left: 6px; white-space: nowrap; }
     .upd-result { flex-basis: 100%; padding: 2px 0 0; font-size: 11px; color: var(--muted); white-space: normal; user-select: text; }
+    details.upd-result summary { cursor: pointer; width: max-content; }
     .upd-note { padding: 6px 15px; font-size: 11px; color: var(--muted); user-select: text; }
     .upd-note-editor { flex-basis: 100%; display: flex; gap: 7px; align-items: flex-end; }
     .upd-note-input { flex: 1; min-height: 54px; resize: vertical; padding: 7px 9px; background: var(--bg); border: 1px solid var(--border); border-radius: 7px; color: var(--text); font: inherit; font-size: 12px; line-height: 1.4; }
@@ -425,6 +426,7 @@
           <div class="bar-track"><div class="bar-fill" id="disk-bar" style="width:0;background:var(--blue)"></div></div>
         </div>
       </div>
+      <div id="signal-health" class="set-note" style="display:none;padding:8px 2px 0" role="status"></div>
 
       <div class="card" id="history-card" style="display:none">
         <div class="card-header">Last 24 hours</div>
@@ -643,6 +645,7 @@
         <div class="set-note">Eir reacts to errors the moment they land (debounced ~10&nbsp;s); the decision interval is just the background sweep. Game Mode pauses the updater &amp; housekeeping while a fullscreen game runs.</div>
         <div class="set-actions">
           <button class="btn primary" id="set-save">Save settings</button>
+          <button class="btn" id="test-provider" title="Update the Eir service to enable provider testing" disabled>Test provider</button>
           <span class="set-status" id="set-status"></span>
         </div>
       </div>
@@ -686,7 +689,7 @@
           <div class="methods-row" id="set-methods">
             <label><input type="checkbox" id="m-winget"> winget</label>
             <label><input type="checkbox" id="m-choco"> Chocolatey</label>
-            <label><input type="checkbox" id="m-scoop"> Scoop</label>
+            <label title="Unavailable while Eir runs as a Windows service"><input type="checkbox" id="m-scoop" disabled> Scoop (unavailable under service)</label>
             <label><input type="checkbox" id="m-msstore"> Store</label>
           </div>
           <label for="set-native-enabled">AI-found installers</label>

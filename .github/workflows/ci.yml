@@ -56,6 +56,10 @@ jobs:
         with:
           projectPath: eir-ui
 
+      - name: Smoke installed LocalSystem service
+        shell: pwsh
+        run: ./scripts/service-smoke.ps1 -ServiceBinary target/release/eir-svc.exe
+
       - name: Smoke standalone executable
         shell: pwsh
         run: |

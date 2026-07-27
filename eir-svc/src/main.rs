@@ -199,6 +199,8 @@ struct SvcState {
     memory: f32,
     disk: f32,
     failed_services: Vec<String>,
+    signals_at: i64,
+    signal_errors: Vec<String>,
     last_analysis: String,
     /// Unix seconds the last completed AI analysis finished (0 = none yet this run).
     last_analysis_unix: i64,
@@ -257,6 +259,8 @@ struct SvcState {
     disk_targets: std::collections::HashMap<String, FixAction>,
     /// On-demand startup-scan results broadcast to the UI (None until first scan).
     startup: Option<eir_proto::StartupView>,
+    /// Active interactive-user SID that owns `startup` and `startup_targets`.
+    startup_owner_sid: Option<String>,
     /// True while a startup scan is in flight (prevents overlap).
     startup_scan_running: bool,
     /// Server-side map of the last startup scan's entry ids → toggle info, so an
@@ -282,6 +286,8 @@ impl Default for SvcState {
             memory: 0.0,
             disk: 0.0,
             failed_services: vec![],
+            signals_at: 0,
+            signal_errors: vec![],
             last_analysis: String::new(),
             last_analysis_unix: 0,
             recent_problems: VecDeque::new(),
@@ -311,6 +317,7 @@ impl Default for SvcState {
             disk_scan_running: false,
             disk_targets: std::collections::HashMap::new(),
             startup: None,
+            startup_owner_sid: None,
             startup_scan_running: false,
             startup_targets: std::collections::HashMap::new(),
             gaming_until: 0,
@@ -359,14 +366,12 @@ fn updater_due(enabled: bool, interval_secs: i64, last_run: i64, st: &SvcState, 
         && (last_run == 0 || now - last_run >= interval_secs)
 }
 
-/// Restart the service to apply new settings: a detached helper stops then
-/// starts EirSvc (LocalSystem — no UAC). It survives this process exiting.
+/// Restart the service to apply new settings: a detached helper waits for this
+/// process to stop cleanly, then starts EirSvc (LocalSystem — no UAC).
 ///
 /// The helper *waits* for the service to actually reach STOPPED (up to 60s) before
-/// starting it, then retries the start until it reports Running. The old fixed ~3s
-/// `ping` delay with unconditional `&` chaining could fire `sc start` while the
-/// service was still STOP_PENDING (in-flight execution / updater cycle), which fails
-/// and leaves the service stopped with nothing to retry.
+/// starting it, then retries the start until it reports Running. It does not issue
+/// `sc stop`: the caller first flushes its result to the UI, then returns cleanly.
 /// Returns false if the helper could not be spawned — the caller must then
 /// stay alive (a stop with no helper running means nothing ever starts us
 /// again; that failure mode is exactly a "service lost" incident).
@@ -385,7 +390,6 @@ fn restart_self() -> bool {
     let log = config::resolve("eir-restart.log");
     let script = format!(
         "& {{ Get-Date -Format o; \
-         sc.exe stop EirSvc; \
          $d=(Get-Date).AddSeconds(60); \
          while((Get-Date) -lt $d){{ \
              $s=(Get-Service EirSvc -ErrorAction SilentlyContinue).Status; \
@@ -416,8 +420,34 @@ fn restart_self() -> bool {
     }
 }
 
+fn startup_owner_matches(owner_sid: Option<&str>, active_sid: Option<&str>) -> bool {
+    matches!((owner_sid, active_sid), (Some(owner), Some(active)) if owner.eq_ignore_ascii_case(active))
+}
+
+fn clear_stale_startup_cache(st: &mut SvcState, active_sid: Option<&str>) -> bool {
+    if st.startup_owner_sid.is_none()
+        || startup_owner_matches(st.startup_owner_sid.as_deref(), active_sid)
+    {
+        return false;
+    }
+    st.startup = None;
+    st.startup_owner_sid = None;
+    st.startup_scan_running = false;
+    st.startup_targets.clear();
+    true
+}
+
 fn build_status(st: &SvcState) -> StatusPayload {
+    let active_sid = executor::startup::active_user_sid().ok();
+    let startup = startup_owner_matches(st.startup_owner_sid.as_deref(), active_sid.as_deref())
+        .then(|| st.startup.clone())
+        .flatten();
     StatusPayload {
+        protocol_version: eir_proto::PROTOCOL_VERSION,
+        capabilities: vec![
+            eir_proto::CAP_COMMAND_RESULTS.to_string(),
+            eir_proto::CAP_PROVIDER_TEST.to_string(),
+        ],
         status: st.status.clone(),
         paused: st.paused,
         cpu: st.cpu,
@@ -439,9 +469,11 @@ fn build_status(st: &SvcState) -> StatusPayload {
         history: st.history.clone(),
         ask: st.ask.clone(),
         disk_insights: st.disk_insights.clone(),
-        startup: st.startup.clone(),
+        startup,
         gaming: is_gaming(st),
         svc_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        signals_at: st.signals_at,
+        signal_errors: st.signal_errors.clone(),
     }
 }
 
@@ -534,6 +566,8 @@ fn spawn_update_cycle(
                 results: Vec::new(),
                 notes: vec!["update cycle aborted unexpectedly".to_string()],
                 cost_usd: 0.0,
+                completed_at: chrono::Utc::now().timestamp(),
+                clean_at: 0,
             },
             Err(_elapsed) => {
                 inner.abort();
@@ -544,6 +578,8 @@ fn spawn_update_cycle(
                         CYCLE_MAX.as_secs() / 60
                     )],
                     cost_usd: 0.0,
+                    completed_at: chrono::Utc::now().timestamp(),
+                    clean_at: 0,
                 }
             }
         };
@@ -575,16 +611,21 @@ struct ExecJob {
     action: FixAction,
     decision_id: i64,
     baseline: SystemState,
-    /// `format!("{action:?}")` — the dedupe key and the label shown in the activity feed.
+    /// Semantic identity used for in-flight deduplication.
+    key: String,
+    /// `format!("{action:?}")` — the label shown in the activity feed.
     label: String,
     diagnosis: String,
     confidence: f32,
     /// Why it ran (e.g. "approved by user"); None for an autonomous fix.
     reason: Option<String>,
+    /// Persisted approved row retained until the execution is durably logged.
+    approval_id: Option<u64>,
 }
 
 /// The result of one executor job, folded back into `SvcState` on the decision loop.
 struct ExecOutcome {
+    key: String,
     label: String,
     /// `result.action` (the executed action's Debug form) for the execution log entry.
     exec_action: String,
@@ -599,6 +640,8 @@ struct ExecOutcome {
     /// Set to an undo-record id when a user-triggered undo SUCCEEDED, so the loop can
     /// clear that id from the original activity row (its "Undo" button disappears).
     cleared_undo_id: Option<i64>,
+    /// Reload the durable approval queue after an execution failure requeued its row.
+    refresh_pending: bool,
 }
 
 /// Slow AI work for one decision-loop pass, run off-loop (mirrors ExecJob/ExecOutcome
@@ -629,9 +672,10 @@ fn exec_timeout(action: &FixAction) -> Duration {
 }
 
 /// Spawn the single executor worker. It serialises fix-action execution off the
-/// decision loop: each job runs `executor::execute` (panic-isolated) and writes the
-/// audit/feedback records, then reports an [`ExecOutcome`] back over `done_tx` for the
-/// loop to fold into `SvcState`. Because execution no longer blocks the loop, UI
+/// decision loop: each job runs `executor::execute` (panic-isolated), then durably
+/// commits its audit/approval transition and writes feedback before reporting an
+/// [`ExecOutcome`] back over `done_tx` for the loop to fold into `SvcState`. Because
+/// execution no longer blocks the loop, UI
 /// commands and status updates stay responsive however long an action takes.
 fn spawn_executor(
     db: &SqlitePool,
@@ -645,88 +689,159 @@ fn spawn_executor(
                 action,
                 decision_id,
                 baseline,
+                key,
                 label,
                 diagnosis,
                 confidence,
                 reason,
+                approval_id,
             } = job;
             // Per-job backstop timeout. Most actions carry their own timeout (powershell
             // DEFAULT_TIMEOUT, driver/security calls, etc.); this bounds the queue so one
             // wedged action can't latch every later action on "Executing". SFC/DISM are
             // legitimately long, so they get a longer cap than the default.
             let exec_max = exec_timeout(&action);
-            // Run the whole job body (execute + audit + feedback) inside an isolated,
-            // timeout-bounded task: a panic anywhere is contained to this job (the
-            // worker survives to run the next), and a hang can't wedge the queue.
-            let db2 = db.clone();
-            let label2 = label.clone();
-            let mut handle = tokio::spawn(async move {
-                let result = executor::execute(&action).await;
-                let mut undo_id = None;
-                match audit::log_execution(&db2, decision_id, &result).await {
-                    Ok(exec_id) => {
-                        if let Err(e) = audit::mark_decision_executed(&db2, decision_id).await {
-                            error!("Failed to mark decision executed: {e}");
-                        }
-                        if let Err(e) = feedback::record(
-                            &db2,
-                            exec_id,
-                            &result.action,
-                            result.success,
-                            &feedback::action_target(&action),
-                            &baseline,
-                        )
-                        .await
-                        {
-                            error!("Failed to record feedback: {e}");
-                        }
-                        // Persist the registry-undo snapshot for a successful reset so
-                        // the UI can offer a one-click revert.
-                        if result.success {
-                            if let Some(undo) = &result.undo {
-                                match audit::save_registry_undo(&db2, exec_id, undo).await {
-                                    Ok(id) => undo_id = Some(id),
-                                    Err(e) => error!("Failed to persist registry undo: {e}"),
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => error!("Failed to log execution: {e}"),
-                }
-                (result, undo_id)
-            });
-            let (result, undo_id) = match tokio::time::timeout(exec_max, &mut handle).await {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(_join)) => (
-                    ExecutionResult {
-                        action: label2.clone(),
-                        success: false,
-                        output: "execution task panicked".to_string(),
-                        undo: None,
-                    },
-                    None,
-                ),
-                Err(_elapsed) => {
-                    handle.abort();
-                    (
+            // Isolate only the executor itself. Persistence happens afterwards in this
+            // worker so panic/timeout outcomes go through the same durable transition.
+            let action_to_execute = action.clone();
+            let mut handle =
+                tokio::spawn(async move { executor::execute(&action_to_execute).await });
+            let (mut result, synthetic_failure) =
+                match tokio::time::timeout(exec_max, &mut handle).await {
+                    Ok(Ok(result)) => (result, false),
+                    Ok(Err(_join)) => (
                         ExecutionResult {
-                            action: label2.clone(),
+                            action: label.clone(),
                             success: false,
-                            output: format!(
-                                "execution exceeded {}m and was abandoned",
-                                exec_max.as_secs() / 60
-                            ),
+                            output: "execution task panicked".to_string(),
                             undo: None,
                         },
-                        None,
-                    )
+                        true,
+                    ),
+                    Err(_elapsed) => {
+                        handle.abort();
+                        let _ = handle.await;
+                        (
+                            ExecutionResult {
+                                action: label.clone(),
+                                success: false,
+                                output: format!(
+                                    "execution exceeded {}m and was abandoned",
+                                    exec_max.as_secs() / 60
+                                ),
+                                undo: None,
+                            },
+                            true,
+                        )
+                    }
+                };
+
+            let requeue_approval = synthetic_failure && approval_id.is_some();
+            let mut undo_id = None;
+            let mut refresh_pending = false;
+            let mut persisted = None;
+            match audit::persist_execution(
+                &db,
+                decision_id,
+                &action,
+                &result,
+                approval_id,
+                requeue_approval,
+            )
+            .await
+            {
+                Ok(commit) => {
+                    refresh_pending = requeue_approval;
+                    persisted = Some(commit);
                 }
-            };
+                Err(commit_error)
+                    if result.success && matches!(action, FixAction::RegistryReset { .. }) =>
+                {
+                    // The reset is only safe while its exact undo is durable. If that
+                    // atomic commit fails, restore the live value immediately. A
+                    // successful rollback is then logged as a failure and an approved
+                    // action is returned to the queue.
+                    error!("Failed to persist registry reset and undo: {commit_error}");
+                    if let Some(undo) = result.undo.clone() {
+                        match executor::registry::restore_value(&undo).await {
+                            Ok(rollback_output) => {
+                                result = ExecutionResult {
+                                    action: result.action,
+                                    success: false,
+                                    output: format!(
+                                        "Registry reset was rolled back because its undo could not be stored ({commit_error}): {rollback_output}"
+                                    ),
+                                    undo: None,
+                                };
+                                let fallback_requeue = approval_id.is_some();
+                                match audit::persist_execution(
+                                    &db,
+                                    decision_id,
+                                    &action,
+                                    &result,
+                                    approval_id,
+                                    fallback_requeue,
+                                )
+                                .await
+                                {
+                                    Ok(commit) => {
+                                        refresh_pending = fallback_requeue;
+                                        persisted = Some(commit);
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to log rolled-back registry reset: {e}");
+                                        result.output.push_str(&format!(
+                                            "; the rollback audit could not be stored: {e}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(rollback_error) => {
+                                result.success = false;
+                                result.undo = None;
+                                result.output = format!(
+                                    "Registry reset ran, but its undo could not be stored ({commit_error}) and automatic rollback failed ({rollback_error}); the approved action was retained for recovery"
+                                );
+                                error!("{}", result.output);
+                            }
+                        }
+                    } else {
+                        result.success = false;
+                        result.output = format!(
+                            "Registry reset ran, but no exact undo was available ({commit_error}); the approved action was retained for recovery"
+                        );
+                        error!("{}", result.output);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to durably record execution: {e}");
+                    result.output.push_str(&format!(
+                        "; execution audit and approval transition failed: {e}"
+                    ));
+                }
+            }
+
+            if let Some(commit) = persisted {
+                undo_id = commit.undo_id;
+                if let Err(e) = feedback::record(
+                    &db,
+                    commit.execution_id,
+                    &result.action,
+                    result.success,
+                    &feedback::action_target(&action),
+                    &baseline,
+                )
+                .await
+                {
+                    error!("Failed to record feedback: {e}");
+                }
+            }
 
             // Always report back — even on timeout/panic — so the loop clears the
             // in_flight label and never latches the tray on "Executing". If the loop
             // has gone away the whole service is shutting down, so ignore the error.
             let _ = done_tx.send(ExecOutcome {
+                key,
                 label,
                 exec_action: result.action,
                 success: result.success,
@@ -736,6 +851,7 @@ fn spawn_executor(
                 reason,
                 undo_id,
                 cleared_undo_id: None,
+                refresh_pending,
             });
         }
     })
@@ -750,8 +866,7 @@ fn spawn_executor(
 ///
 /// `force_approval` downgrades a whitelist AutoApprove to RequireApproval — used for
 /// startup toggles so that a task enable/disable (whitelisted for the AI path) gets the
-/// same human confirmation as a `StartupSet`, since the pipe is writable by any local
-/// user.
+/// same human confirmation as a `StartupSet`.
 #[allow(clippy::too_many_arguments)]
 async fn route_user_action(
     st: &mut SvcState,
@@ -762,20 +877,20 @@ async fn route_user_action(
     diagnosis: &str,
     reason_label: &str,
     force_approval: bool,
-) {
+) -> Result<String, String> {
     let label = format!("{action:?}");
     // Dedup on the semantic key, not the label: parameters can differ while the
     // targeted issue is the same (see FixAction::dedup_key).
     let dedup = action.dedup_key();
-    if st.in_flight.contains(&label) || st.pending.iter().any(|p| p.action.dedup_key() == dedup) {
+    if st.in_flight.contains(&dedup) || st.pending.iter().any(|p| p.action.dedup_key() == dedup) {
         info!(action = %label, "User action already queued or executing — skipping duplicate");
-        return;
+        return Err("Action is already queued or executing".to_string());
     }
     let decision_id = match audit::log_manual_decision(db, diagnosis).await {
         Ok(id) => id,
         Err(e) => {
             error!("Failed to log manual decision: {e}");
-            return;
+            return Err(format!("Action could not be recorded: {e}"));
         }
     };
     // A zeroed baseline: a user-requested action isn't scored for effectiveness the way
@@ -787,10 +902,19 @@ async fn route_user_action(
         }
         v => v,
     };
-    match verdict {
+    let result = match verdict {
         policy::Verdict::Block(reason) => {
             info!(reason = %reason, action = %label, "User action blocked by policy");
-            push_problem(st, diagnosis, 1.0, &label, true, false, Some(reason));
+            push_problem(
+                st,
+                diagnosis,
+                1.0,
+                &label,
+                true,
+                false,
+                Some(reason.clone()),
+            );
+            Err(reason)
         }
         policy::Verdict::AutoApprove => {
             match safety::rate_limited(db, &action, pol.execution.rate_limit_mins).await {
@@ -808,26 +932,31 @@ async fn route_user_action(
                         false,
                         Some("Skipped — already done recently (rate-limited).".into()),
                     );
-                    return;
+                    return Err("Action was already completed recently".to_string());
                 }
                 Err(e) => {
                     warn!("Rate limit check failed — skipping user action to fail safe: {e}");
-                    return;
+                    return Err(format!("Safety check failed: {e}"));
                 }
                 Ok(false) => {}
             }
-            st.in_flight.insert(label.clone());
+            st.in_flight.insert(dedup.clone());
             if let Err(e) = exec_tx.send(ExecJob {
                 action,
                 decision_id,
                 baseline,
+                key: dedup.clone(),
                 label: label.clone(),
                 diagnosis: diagnosis.to_string(),
                 confidence: 1.0,
                 reason: Some(reason_label.to_string()),
+                approval_id: None,
             }) {
                 warn!("Executor worker unavailable: {e}");
-                st.in_flight.remove(&label);
+                st.in_flight.remove(&dedup);
+                Err("Executor is unavailable".to_string())
+            } else {
+                Ok("Action queued".to_string())
             }
         }
         policy::Verdict::RequireApproval(reason) => {
@@ -850,13 +979,14 @@ async fn route_user_action(
             match audit::insert_pending_approval(db, decision_id, &action, &info, &baseline).await {
                 Ok(row_id) => {
                     let mut info = info;
-                    info.id = row_id as u64;
+                    info.id = row_id;
                     st.pending.push(PendingApproval {
                         info,
                         action,
                         decision_id,
                         baseline,
                     });
+                    Ok("Action queued for approval".to_string())
                 }
                 Err(e) => {
                     error!("Failed to queue user action for approval: {e}");
@@ -869,11 +999,13 @@ async fn route_user_action(
                         false,
                         Some(format!("could not queue for approval: {e}")),
                     );
+                    Err(format!("Action could not be queued for approval: {e}"))
                 }
             }
         }
-    }
+    };
     st.status = resting_status(st);
+    result
 }
 
 /// Fingerprint of the *actionable* signals in a snapshot — error-level log
@@ -931,6 +1063,8 @@ fn apply_live_metrics(st: &mut SvcState, sys: &SystemState) {
     st.memory = sys.memory_usage_percent;
     st.disk = sys.disk_usage_percent;
     st.failed_services = sys.failed_services.clone();
+    st.signals_at = sys.collected_at;
+    st.signal_errors = sys.collector_errors.clone();
 }
 
 fn push_problem(
@@ -1052,12 +1186,53 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         app_notes: cfg.updater.note_views(),
         ..Default::default()
     };
+    let persisted_last_run = updater::history::last_run(&db).await.unwrap_or(0);
+    let last_clean_run = updater::history::last_clean_run(&db).await.unwrap_or(0);
     if let Ok(recent) = updater::history::recent(&db, 50).await {
         // Seed last_run from history so a restart doesn't force an immediate update
         // cycle regardless of the configured schedule (the due-check treats
         // last_run == 0 as "never run").
-        st.updater.last_run = recent.iter().map(|r| r.at).max().unwrap_or(0);
+        st.updater.last_run = recent
+            .iter()
+            .map(|r| r.at)
+            .max()
+            .unwrap_or(0)
+            .max(last_clean_run);
         st.updater.recent = recent;
+    }
+    st.updater.last_run = st
+        .updater
+        .last_run
+        .max(last_clean_run)
+        .max(persisted_last_run);
+    st.updater.last_clean_run = last_clean_run;
+    let restored_cycle = match updater::history::last_cycle_status(&db).await {
+        Ok(Some((at, notes, mut apps))) if at == st.updater.last_run => {
+            for app in &mut apps {
+                app.ignored = cfg
+                    .updater
+                    .ignored
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case(&app.id));
+                app.note = cfg.updater.notes.get(&app.id).cloned().unwrap_or_default();
+            }
+            st.updater.notes = notes;
+            st.updater.apps = apps;
+            true
+        }
+        Ok(_) => false,
+        Err(e) => {
+            warn!("Failed to restore update-cycle evidence: {e}");
+            false
+        }
+    };
+    if !restored_cycle
+        && st.updater.last_run > 0
+        && st.updater.last_clean_run != st.updater.last_run
+    {
+        let detail = "The last update check was incomplete; run it again for fresh evidence.";
+        st.updater.notes = vec![detail.to_string()];
+        st.updater.apps = vec![updater::orchestrator::warning_row(detail)];
     }
     st.advisor = Some(AdvisorStatus {
         enabled: cfg.advisor.enabled,
@@ -1150,6 +1325,13 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         }
         Err(e) => warn!("Failed to load pending approvals: {e}"),
     }
+    let claimed_approvals = match audit::load_claimed_approvals(&db).await {
+        Ok(approvals) => approvals,
+        Err(e) => {
+            warn!("Failed to load claimed approvals: {e}");
+            Vec::new()
+        }
+    };
     if ai.is_some() {
         st.status = resting_status(&st);
     }
@@ -1177,6 +1359,51 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     // blocking ui_rx on the restore's PowerShell call.
     let undo_done_tx = exec_done_tx.clone();
     let exec_handle = spawn_executor(&db, exec_rx, exec_done_tx);
+    for approval in claimed_approvals {
+        let id = approval.info.id;
+        let key = approval.action.dedup_key();
+        match approved_action_ready(&pol, &db, &approval).await {
+            Ok(()) if st.in_flight.insert(key.clone()) => {
+                let label = approval.info.action.clone();
+                if let Err(e) = exec_tx.send(ExecJob {
+                    action: approval.action,
+                    decision_id: approval.decision_id,
+                    baseline: approval.baseline,
+                    key: key.clone(),
+                    label,
+                    diagnosis: approval.info.diagnosis,
+                    confidence: approval.info.confidence,
+                    reason: Some("approved before service restart".into()),
+                    approval_id: Some(id),
+                }) {
+                    st.in_flight.remove(&key);
+                    warn!("Could not restore approved action {id}: {e}");
+                }
+            }
+            Ok(()) => {
+                info!(id, "Dropping duplicate claimed approval");
+                let _ = audit::delete_pending_approval(&db, id).await;
+            }
+            Err(ApprovalPreflightError::Resolved(reason)) => {
+                warn!(id, %reason, "Claimed approval no longer passes safety preflight");
+                let _ = audit::delete_pending_approval(&db, id).await;
+            }
+            Err(ApprovalPreflightError::Retry(reason)) => {
+                warn!(id, %reason, "Claimed approval safety preflight could not complete");
+                st.status = "Error".to_string();
+                st.error = Some(format!(
+                    "Approved action {id} is saved but could not pass safety checks: {reason}"
+                ));
+                pipe.broadcast_status(build_status(&st));
+            }
+        }
+    }
+    if !st.in_flight.is_empty() {
+        if st.status != "Error" {
+            st.status = resting_status(&st);
+        }
+        pipe.broadcast_status(build_status(&st));
+    }
     // AI analysis (and its optional advisor escalation) runs off the loop too — see
     // the analysis_done_rx arm below — so a multi-minute call never delays ui_rx.
     let (analysis_done_tx, mut analysis_done_rx) =
@@ -1199,8 +1426,10 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         tokio::sync::mpsc::unbounded_channel::<Result<disk_scan::DiskScanResult, String>>();
     // On-demand startup scan (registry/folder enumeration + optional AI classify) runs
     // off the loop and reports back here.
-    let (startup_done_tx, mut startup_done_rx) =
-        tokio::sync::mpsc::unbounded_channel::<Result<startup_scan::StartupScanResult, String>>();
+    let (startup_done_tx, mut startup_done_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        String,
+        Result<startup_scan::StartupScanResult, String>,
+    )>();
     /// Regenerate the digest weekly.
     const DIGEST_INTERVAL_SECS: i64 = 7 * 24 * 3600;
     let mut analysis_running = false;
@@ -1218,6 +1447,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     // (fire-and-forget). This flag stops it stacking; the stored explanation is
     // surfaced by the next facts_for_view refresh.
     let labelling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider_test_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut cycle_count = 0u64;
     // Reactive-trigger pacing: a trigger *schedules* a reaction (react_at)
     // rather than running one inline — the debounce lets an error burst
@@ -1277,15 +1507,37 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         info!("Reacting to fresh actionable signals");
                         // fall through to the decision body below
                     }
-                    Some(summary) = update_done_rx.recv() => {
+                    Some(mut summary) = update_done_rx.recv() => {
                         // An update cycle finished — fold its result into the status.
                         st.updater_running = false;
                         st.updater.running = false;
-                        st.updater.last_run = chrono::Utc::now().timestamp();
-                        st.updater.last_cost_usd = summary.cost_usd;
-                        st.updater.notes = summary.notes.clone();
-                        st.updater.apps =
+                        st.updater.last_run = summary.completed_at;
+                        let mut apps =
                             updater::orchestrator::app_rows(&summary, &cfg.updater);
+                        if let Err(e) = updater::history::record_cycle_status(
+                            &db,
+                            summary.completed_at,
+                            &summary.notes,
+                            &apps,
+                        )
+                        .await
+                        {
+                            warn!("Failed to persist update cycle completion: {e}");
+                            summary
+                                .notes
+                                .push(format!("failed to persist update cycle completion: {e}"));
+                            if apps.is_empty() {
+                                apps.push(updater::orchestrator::warning_row(
+                                    "The update check finished, but its evidence could not be saved.",
+                                ));
+                            }
+                        }
+                        st.updater.last_cost_usd = summary.cost_usd;
+                        if summary.clean_at > 0 {
+                            st.updater.last_clean_run = summary.clean_at;
+                        }
+                        st.updater.notes = summary.notes.clone();
+                        st.updater.apps = apps;
                         st.updater.phase = "idle".to_string();
                         if let Ok(recent) = updater::history::recent(&db, 50).await {
                             st.updater.recent = recent;
@@ -1317,8 +1569,36 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         }
                         continue;
                     }
-                    Some(result) = startup_done_rx.recv() => {
-                        // A startup scan finished. Fold in the entries + the id→toggle map.
+                    Some((scan_sid, result)) = startup_done_rx.recv() => {
+                        // A switched user's result must never replace or reveal the
+                        // current user's cache. A newer scan may already own the slot.
+                        let active_sid = executor::startup::active_user_sid().ok();
+                        if !startup_owner_matches(
+                            st.startup_owner_sid.as_deref(),
+                            Some(&scan_sid),
+                        ) || !startup_owner_matches(Some(&scan_sid), active_sid.as_deref())
+                        {
+                            if startup_owner_matches(
+                                st.startup_owner_sid.as_deref(),
+                                Some(&scan_sid),
+                            ) {
+                                clear_stale_startup_cache(&mut st, active_sid.as_deref());
+                            }
+                            warn!("Discarded startup scan result for a non-active user");
+                            pipe.broadcast_status(build_status(&st));
+                            continue;
+                        }
+                        if let Ok(res) = &result {
+                            if !res.owner_sid.eq_ignore_ascii_case(&scan_sid) {
+                                clear_stale_startup_cache(&mut st, None);
+                                warn!("Discarded startup scan result with mismatched owner SID");
+                                pipe.broadcast_status(build_status(&st));
+                                continue;
+                            }
+                        }
+
+                        // This active user's startup scan finished. Fold in the entries
+                        // and opaque id→toggle map.
                         st.startup_scan_running = false;
                         let now = chrono::Utc::now().timestamp();
                         match result {
@@ -1437,7 +1717,15 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                     }
                     Some(outcome) = exec_done_rx.recv() => {
                         // A fix action finished on the worker — fold its result in.
-                        st.in_flight.remove(&outcome.label);
+                        st.in_flight.remove(&outcome.key);
+                        if outcome.refresh_pending {
+                            match audit::load_pending_approvals(&db).await {
+                                Ok(pending) => st.pending = pending,
+                                Err(e) => {
+                                    warn!("Failed to reload requeued approvals: {e}");
+                                }
+                            }
+                        }
                         // If this was a successful undo, retire the original row's Undo
                         // button so it can't be clicked again (it would no-op).
                         if let Some(cid) = outcome.cleared_undo_id {
@@ -1674,7 +1962,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                     // label — AI-regenerated parameters must not defeat
                                     // the check (see FixAction::dedup_key).
                                     let dedup = action.dedup_key();
-                                    if st.in_flight.contains(&label)
+                                    if st.in_flight.contains(&dedup)
                                         || st.pending.iter().any(|p| p.action.dedup_key() == dedup)
                                     {
                                         info!(action = %label, "Already executing or awaiting approval — skipping duplicate");
@@ -1683,24 +1971,31 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                     info!(action = ?action, "AUTO-EXECUTING (queued)");
                                     // Hand off to the executor worker and move on; the outcome
                                     // is folded in when it finishes (see exec_done_rx arm).
-                                    st.in_flight.insert(label.clone());
+                                    st.in_flight.insert(dedup.clone());
                                     if let Err(e) = exec_tx.send(ExecJob {
                                         action: action.clone(),
                                         decision_id,
                                         baseline: snapshot.system_state.clone(),
+                                        key: dedup.clone(),
                                         label: label.clone(),
                                         diagnosis: problem.diagnosis.clone(),
                                         confidence: problem.confidence,
                                         reason: None,
+                                        approval_id: None,
                                     }) {
                                         // The worker is gone; no ExecOutcome will arrive, so
                                         // drop the label instead of leaking it in in_flight
                                         // (which would skip this action forever and pin the
                                         // UI to "Executing").
                                         warn!("Executor worker unavailable: {e}");
-                                        st.in_flight.remove(&label);
+                                        st.in_flight.remove(&dedup);
+                                        st.error = Some(
+                                            "Executor is unavailable; the fix was not started"
+                                                .to_string(),
+                                        );
+                                    } else {
+                                        st.status = "Executing".to_string();
                                     }
-                                    st.status = "Executing".to_string();
                                     pipe.broadcast_status(build_status(&st));
                                 }
 
@@ -1719,7 +2014,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                     // label match would let those pile up as duplicate cards.
                                     let dedup = action.dedup_key();
                                     if st.pending.iter().any(|p| p.action.dedup_key() == dedup)
-                                        || st.in_flight.contains(&action_label)
+                                        || st.in_flight.contains(&dedup)
                                     {
                                         info!(action = %action_label, "Already awaiting approval or executing — skipping duplicate");
                                         continue;
@@ -1754,7 +2049,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                     {
                                         Ok(row_id) => {
                                             let mut info = info;
-                                            info.id = row_id as u64;
+                                            info.id = row_id;
                                             st.pending.push(PendingApproval {
                                                 info,
                                                 action: action.clone(),
@@ -1801,19 +2096,28 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         pipe.broadcast_status(build_status(&st));
                         continue;
                     }
-                    Some(cmd) = ui_rx.recv() => {
-                        match cmd {
+                    Some(request) = ui_rx.recv() => {
+                        let mut request_id = request.request_id;
+                        let mut command_result = Ok("Command applied".to_string());
+                        match request.command {
                         UiMsg::TogglePause => {
                             st.paused = !st.paused;
                             st.status = resting_status(&st);
+                            command_result = Ok(if st.paused {
+                                "Monitoring paused".to_string()
+                            } else {
+                                "Monitoring resumed".to_string()
+                            });
                             pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::ClearProblems => {
                             st.recent_problems.clear();
+                            command_result = Ok("Problems cleared".to_string());
                             pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::ClearExecutions => {
                             st.recent_executions.clear();
+                            command_result = Ok("Activity cleared".to_string());
                             pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::RefreshStatus => {
@@ -1833,6 +2137,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             if st.status != "Error" {
                                 st.status = resting_status(&st);
                             }
+                            command_result = Ok("Status refreshed".to_string());
                             pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::SetGaming { on, manual } => {
@@ -1873,52 +2178,99 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 }
                             }
                             st.status = resting_status(&st);
+                            command_result = Ok(if is_now {
+                                "Game Mode enabled".to_string()
+                            } else {
+                                "Game Mode disabled".to_string()
+                            });
                             pipe.broadcast_status(build_status(&st));
                         }
-                        UiMsg::UpdateSettings(update) => {
-                            // Decide whether a restart is required BEFORE mutating cfg.
-                            let needs_restart = cfg.settings_update_needs_restart(&update);
-                            cfg.apply_update(*update);
-                            // Validate before committing — never apply a broken provider
-                            // (e.g. openrouter with no key).
+                        UiMsg::TestProvider => {
+                            if provider_test_running
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    std::sync::atomic::Ordering::AcqRel,
+                                    std::sync::atomic::Ordering::Acquire,
+                                )
+                                .is_err()
+                            {
+                                command_result =
+                                    Err("A provider test is already running".to_string());
+                            } else {
                             match ai::client::AiClient::new(&cfg.api) {
+                                Err(e) => {
+                                    provider_test_running
+                                        .store(false, std::sync::atomic::Ordering::Release);
+                                    command_result =
+                                        Err(format!("Provider configuration is invalid: {e}"));
+                                }
+                                Ok(client) => {
+                                    let provider = cfg.api.provider.as_str().to_string();
+                                    let model = if cfg.api.model.trim().is_empty() {
+                                        "provider default".to_string()
+                                    } else {
+                                        cfg.api.model.clone()
+                                    };
+                                    let pipe_test = pipe.clone();
+                                    let running = provider_test_running.clone();
+                                    let test_request_id = request_id.take();
+                                    tokio::spawn(async move {
+                                        let tested = tokio::time::timeout(
+                                            Duration::from_secs(120),
+                                            client.complete_text(
+                                                "Reply with exactly EIR_OK.",
+                                                "",
+                                            ),
+                                        )
+                                        .await;
+                                        let result = match tested {
+                                            Ok(Ok((text, _))) if !text.trim().is_empty() => Ok(
+                                                format!("{provider} / {model} responded successfully"),
+                                            ),
+                                            Ok(Ok(_)) => {
+                                                Err(format!("{provider} / {model} returned no text"))
+                                            }
+                                            Ok(Err(e)) => {
+                                                Err(format!("{provider} / {model} failed: {e}"))
+                                            }
+                                            Err(_) => Err(format!(
+                                                "{provider} / {model} timed out after 120 seconds"
+                                            )),
+                                        };
+                                        running.store(
+                                            false,
+                                            std::sync::atomic::Ordering::Release,
+                                        );
+                                        pipe_test.command_result(test_request_id, result);
+                                    });
+                                }
+                            }
+                            }
+                        }
+                        UiMsg::UpdateSettings(update) => {
+                            let needs_restart = cfg.settings_update_needs_restart(&update);
+                            let mut next = cfg.clone();
+                            match next
+                                .apply_update(*update)
+                                .and_then(|()| ai::client::AiClient::new(&next.api))
+                            {
                                 Err(e) => {
                                     warn!("Rejected settings: {e}");
                                     st.error = Some(format!("Settings not applied — {e}"));
-                                    if let Ok(reloaded) = config::load("config.toml") {
-                                        cfg = reloaded; // discard the invalid change
-                                    }
-                                    st.settings = Some(cfg.to_ui_settings());
+                                    command_result = Err(format!("Settings not applied: {e}"));
                                     pipe.broadcast_status(build_status(&st));
                                 }
                                 Ok(new_ai) => {
-                                    st.settings = Some(cfg.to_ui_settings());
-                                    if let Err(e) = config::save(&cfg, "config.toml") {
+                                    if let Err(e) = config::save(&next, "config.toml") {
                                         error!("Failed to save settings: {e}");
                                         st.error = Some(format!("Save settings: {e}"));
-                                        pipe.broadcast_status(build_status(&st));
-                                    } else if needs_restart {
-                                        info!("Settings saved — restarting service to apply collector changes");
-                                        st.status = "Restarting".to_string();
-                                        st.error = None;
-                                        pipe.broadcast_status(build_status(&st));
-                                        if restart_self() {
-                                            return; // SCM stop will follow; exit cleanly now
-                                        }
-                                        // No helper running means nothing would ever
-                                        // start us again — stay alive on the old
-                                        // settings instead of stopping into the void.
-                                        st.status = resting_status(&st);
-                                        st.error = Some(
-                                            "Settings saved, but the restart helper failed to launch — restart the EirSvc service manually to apply them.".to_string(),
-                                        );
+                                        command_result =
+                                            Err(format!("Settings could not be saved: {e}"));
                                         pipe.broadcast_status(build_status(&st));
                                     } else {
-                                        info!("Settings applied live");
-                                        // Swap in the newly-validated client and update the
-                                        // live policy threshold + decision ticker so the
-                                        // common settings (provider/model/key/effort/interval)
-                                        // take effect immediately without a service restart.
+                                        cfg = next;
+                                        st.settings = Some(cfg.to_ui_settings());
                                         ai = Some(std::sync::Arc::new(new_ai));
                                         pol.execution.confidence_threshold =
                                             cfg.monitoring.confidence_threshold;
@@ -1935,46 +2287,101 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                             st.error = None;
                                         }
                                         st.status = resting_status(&st);
+                                        command_result = Ok(if needs_restart {
+                                            "Settings saved; restarting service".to_string()
+                                        } else {
+                                            "Settings saved and applied".to_string()
+                                        });
                                         pipe.broadcast_status(build_status(&st));
+                                        if needs_restart {
+                                            info!("Settings saved — restarting service to apply collector changes");
+                                            st.status = "Restarting".to_string();
+                                            pipe.broadcast_status(build_status(&st));
+                                            if restart_self() {
+                                                if !pipe
+                                                    .command_result_flushed(
+                                                        request_id.take(),
+                                                        command_result.clone(),
+                                                    )
+                                                    .await
+                                                {
+                                                    warn!("Settings were saved, but the UI disconnected before the restart result was delivered");
+                                                }
+                                                return;
+                                            }
+                                            st.status = resting_status(&st);
+                                            st.error = Some(
+                                                "Settings saved, but the restart helper failed to launch — restart EirSvc manually.".to_string(),
+                                            );
+                                            command_result = Err(
+                                                "Settings saved, but EirSvc could not restart automatically".to_string(),
+                                            );
+                                            pipe.broadcast_status(build_status(&st));
+                                        }
                                     }
                                 }
                             }
                         }
                         UiMsg::Approve { id, approved } => {
-                            // Resolve a queued approval. Find it, remove it from
-                            // both memory and the DB, then act on the decision.
-                            if let Some(pos) =
-                                st.pending.iter().position(|p| p.info.id == id)
-                            {
-                                let pa = st.pending.remove(pos);
-                                if let Err(e) = audit::delete_pending_approval(&db, id).await {
-                                    warn!("Failed to delete pending approval {id}: {e}");
-                                }
+                            // Claim first: the durable row owns the decision until a
+                            // completed execution is logged, so a crash cannot lose it.
+                            match audit::claim_pending_approval(&db, id, approved).await {
+                            Ok(Some(pa)) => {
+                                st.pending.retain(|p| p.info.id != id);
                                 if approved {
                                     let label = pa.info.action.clone();
-                                    if st.in_flight.contains(&label) {
-                                        // Same action already running off-loop — resolve
-                                        // this card without enqueueing a second run.
-                                        info!(action = %label, "Approved action already executing — not re-running");
-                                    } else {
+                                    let key = pa.action.dedup_key();
+                                    match approved_action_ready(&pol, &db, &pa).await {
+                                    Ok(()) if st.in_flight.insert(key.clone()) => {
                                         info!(action = ?pa.action, "UI-approved — queueing for execution");
-                                        // Hand off to the executor worker; the outcome
-                                        // (execution log + problem entry) is folded in
-                                        // when it finishes, so the loop stays responsive.
-                                        st.in_flight.insert(label.clone());
                                         if let Err(e) = exec_tx.send(ExecJob {
                                             action: pa.action,
                                             decision_id: pa.decision_id,
                                             baseline: pa.baseline,
+                                            key: key.clone(),
                                             label: label.clone(),
                                             diagnosis: pa.info.diagnosis.clone(),
                                             confidence: pa.info.confidence,
                                             reason: Some("approved by user".into()),
+                                            approval_id: Some(id),
                                         }) {
-                                            // Worker gone — don't leak the label in in_flight.
                                             warn!("Executor worker unavailable: {e}");
-                                            st.in_flight.remove(&label);
+                                            st.in_flight.remove(&key);
+                                            command_result =
+                                                Err("Executor is unavailable; approval was saved for retry".to_string());
+                                        } else {
+                                            command_result =
+                                                Ok("Approval saved; action queued".to_string());
                                         }
+                                    }
+                                    Ok(()) => {
+                                        info!(action = %label, "Approved action already executing — not re-running");
+                                        let _ = audit::delete_pending_approval(&db, id).await;
+                                        command_result =
+                                            Ok("Action is already executing".to_string());
+                                    }
+                                    Err(ApprovalPreflightError::Resolved(reason)) => {
+                                        warn!(id, %reason, "Approved action no longer passes safety preflight");
+                                        let _ = audit::delete_pending_approval(&db, id).await;
+                                        push_problem(
+                                            &mut st,
+                                            &pa.info.diagnosis,
+                                            pa.info.confidence,
+                                            &label,
+                                            true,
+                                            false,
+                                            Some(reason),
+                                        );
+                                        command_result =
+                                            Err("Action is no longer allowed by current safety policy".to_string());
+                                    }
+                                    Err(ApprovalPreflightError::Retry(reason)) => {
+                                        warn!(id, %reason, "Approved action safety preflight could not complete");
+                                        st.error = Some(reason);
+                                        command_result = Err(
+                                            "Approval was saved, but safety checks could not complete; it will retry after restart".to_string(),
+                                        );
+                                    }
                                     }
                                 } else {
                                     info!(id, diagnosis = %pa.info.diagnosis, "UI-rejected");
@@ -1994,13 +2401,29 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                         false,
                                         Some("rejected by user".into()),
                                     );
+                                    if let Err(e) = audit::delete_pending_approval(&db, id).await {
+                                        warn!("Failed to retire rejected approval {id}: {e}");
+                                    }
+                                    command_result = Ok("Action rejected".to_string());
                                 }
                                 // Match every other error-clear site: don't wipe a live
                                 // AI/config error the user may have paused because of. An
                                 // Approve/Reject is unrelated to that error.
-                                if !st.paused {
+                                if !st.paused && command_result.is_ok() {
                                     st.error = None;
                                 }
+                            }
+                            Ok(None) => {
+                                info!(id, "Approval was stale or already claimed");
+                                command_result =
+                                    Err("Approval is stale or already resolved".to_string());
+                            }
+                            Err(e) => {
+                                warn!("Failed to claim approval {id}: {e}");
+                                st.error = Some(format!("Could not save approval decision: {e}"));
+                                command_result =
+                                    Err(format!("Approval decision could not be saved: {e}"));
+                            }
                             }
                             // Whether resolved or stale, settle the status and
                             // refresh the UI (the card disappears from the queue).
@@ -2008,127 +2431,148 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::RunUpdatesNow => {
-                            // Gate the manual trigger on the SAME controls as the
-                            // scheduled run: the master switch and pause. The command
-                            // pipe is writable by any authenticated user (so the
-                            // Medium-integrity UI can send it), so a manual run must
-                            // not be able to override the admin's enabled/pause state.
-                            if cfg.updater.enabled && !st.paused && !st.updater_running {
+                            if st.paused {
+                                command_result =
+                                    Err("Resume monitoring before running updates".to_string());
+                            } else if st.updater_running {
+                                command_result =
+                                    Err("An update check is already running".to_string());
+                            } else {
                                 st.updater_running = true;
                                 st.updater.running = true;
-                                st.updater.enabled = true;
                                 st.updater.phase = "checking…".to_string();
+                                command_result = Ok("Update check started".to_string());
                                 pipe.broadcast_status(build_status(&st));
                                 spawn_update_cycle(&cfg, &db, &update_done_tx, &update_progress_tx);
                             }
                         }
                         UiMsg::ClearUpdateHistory => {
-                            // Wipe the persisted attempt log and the last cycle's
-                            // in-memory results so the card resets to a clean state.
-                            if let Err(e) = updater::history::clear(&db).await {
-                                warn!("Failed to clear update history: {e}");
+                            if st.updater_running {
+                                command_result =
+                                    Err("Wait for the current update check to finish".to_string());
+                            } else {
+                                match updater::history::clear(&db).await {
+                                    Err(e) => {
+                                        warn!("Failed to clear update history: {e}");
+                                        command_result =
+                                            Err(format!("Update history could not be cleared: {e}"));
+                                    }
+                                    Ok(_) => {
+                                        st.updater.recent.clear();
+                                        if let Err(e) = learn::clear_detector_facts(&db).await {
+                                            warn!("Failed to clear learned facts: {e}");
+                                            command_result = Err(format!(
+                                                "History cleared, but learned update facts remain: {e}"
+                                            ));
+                                        } else {
+                                            command_result =
+                                                Ok("Update history cleared".to_string());
+                                        }
+                                        st.learned_facts =
+                                            learn::facts_for_view(&db).await.unwrap_or_default();
+                                        pipe.broadcast_status(build_status(&st));
+                                    }
+                                }
                             }
-                            // Also reset detector-learned facts: they are derived purely
-                            // from the attempt log just cleared, so leaving them would keep
-                            // skipping apps with no remaining evidence. User pinned/disabled
-                            // facts are preserved by clear_detector_facts.
-                            if let Err(e) = learn::clear_detector_facts(&db).await {
-                                warn!("Failed to clear learned facts: {e}");
-                            }
-                            st.updater.recent.clear();
-                            st.updater.apps.clear();
-                            st.updater.notes.clear();
-                            st.learned_facts = learn::facts_for_view(&db).await.unwrap_or_default();
-                            pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::SetLearnedFact { id, op } => {
                             if let Err(e) = learn::set_learned_fact(&db, id, &op).await {
                                 warn!("Failed to set learned fact {id} ({op}): {e}");
+                                command_result =
+                                    Err(format!("Learned fact could not be changed: {e}"));
+                            } else {
+                                command_result = Ok("Learned fact updated".to_string());
+                                st.learned_facts =
+                                    learn::facts_for_view(&db).await.unwrap_or_default();
+                                pipe.broadcast_status(build_status(&st));
                             }
-                            st.learned_facts = learn::facts_for_view(&db).await.unwrap_or_default();
-                            pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::UpdateUpdaterSettings(update) => {
-                            // Applied live — no service restart (unlike provider settings).
-                            cfg.updater.apply_view(*update);
-                            st.updater.enabled = cfg.updater.enabled;
-                            st.updater.settings = cfg.updater.to_view();
-                            st.updater.next_run = if !cfg.updater.enabled {
-                                0
-                            } else if st.updater.last_run > 0 {
-                                st.updater.last_run + cfg.updater.schedule_interval_secs as i64
-                            } else {
-                                chrono::Utc::now().timestamp()
-                                    + cfg.updater.schedule_interval_secs as i64
-                            };
-                            if let Err(e) = config::save(&cfg, "config.toml") {
+                            let mut next = cfg.clone();
+                            next.updater.apply_view(*update);
+                            if let Err(e) = config::save(&next, "config.toml") {
                                 warn!("Failed to save updater settings: {e}");
+                                command_result =
+                                    Err(format!("Updater settings could not be saved: {e}"));
+                            } else {
+                                cfg = next;
+                                st.updater.enabled = cfg.updater.enabled;
+                                st.updater.settings = cfg.updater.to_view();
+                                st.updater.next_run = if !cfg.updater.enabled {
+                                    0
+                                } else if st.updater.last_run > 0 {
+                                    st.updater.last_run
+                                        + cfg.updater.schedule_interval_secs as i64
+                                } else {
+                                    chrono::Utc::now().timestamp()
+                                        + cfg.updater.schedule_interval_secs as i64
+                                };
+                                command_result = Ok("Updater settings saved".to_string());
+                                pipe.broadcast_status(build_status(&st));
                             }
-                            pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::SetAppIgnore { id, ignore, note } => {
-                            // The pipe is writable by any authenticated local user, so cap
-                            // the ignore list (far above any real installed-app count) and
-                            // only persist on an ACTUAL change — otherwise a flood of
-                            // distinct ids could grow config.toml without bound and hammer
-                            // the LocalSystem config with a synchronous write per message.
-                            const MAX_IGNORED: usize = 500;
-                            let key = id.to_lowercase();
-                            let mut changed = false;
-                            if ignore {
-                                let present = cfg
-                                    .updater
-                                    .ignored
-                                    .iter()
-                                    .any(|x| x.eq_ignore_ascii_case(&key));
-                                if !present {
-                                    if cfg.updater.ignored.len() >= MAX_IGNORED {
-                                        warn!(
-                                            "Ignore list at cap ({MAX_IGNORED}) — refusing to add '{key}'"
-                                        );
-                                    } else {
-                                        cfg.updater.ignored.push(key.clone());
-                                        changed = true;
-                                    }
-                                }
-                            } else if cfg.updater.ignored.iter().any(|x| x.eq_ignore_ascii_case(&key))
-                            {
-                                cfg.updater.ignored.retain(|x| !x.eq_ignore_ascii_case(&key));
-                                changed = true;
-                            }
-                            // A blank note means "unchanged" here because ignore toggles
-                            // carry one; SetAppNote owns explicit create/update/delete.
-                            let n = note.trim();
+                            let key = id.trim().to_lowercase();
                             let known = st
                                 .updater
                                 .apps
                                 .iter()
-                                .any(|a| a.id.eq_ignore_ascii_case(&key));
+                                .any(|a| a.id.eq_ignore_ascii_case(&key))
+                                || cfg
+                                    .updater
+                                    .ignored
+                                    .iter()
+                                    .any(|a| a.eq_ignore_ascii_case(&key));
+                            if key.is_empty() || !known {
+                                command_result = Err("Unknown app".to_string());
+                            } else {
+                            let mut next = cfg.clone();
+                            let mut changed = match next.updater.set_app_ignored(&key, ignore) {
+                                Ok(changed) => changed,
+                                Err(e) => {
+                                    command_result = Err(e.to_string());
+                                    false
+                                }
+                            };
+                            // A blank note means "unchanged" here because ignore toggles
+                            // carry one; SetAppNote owns explicit create/update/delete.
+                            let n = note.trim();
                             if !n.is_empty() && known {
-                                match cfg.updater.set_app_note(&key, n) {
+                                match next.updater.set_app_note(&key, n) {
                                     Ok(note_changed) => changed |= note_changed,
-                                    Err(e) => warn!("Refusing app note for '{key}': {e}"),
+                                    Err(e) => {
+                                        warn!("Refusing app note for '{key}': {e}");
+                                        command_result = Err(e.to_string());
+                                    }
                                 }
                             }
-                            if changed {
-                                if let Err(e) = config::save(&cfg, "config.toml") {
-                                    warn!("Failed to save app note: {e}");
+                            if command_result.is_ok() && changed {
+                                if let Err(e) = config::save(&next, "config.toml") {
+                                    warn!("Failed to save app setting: {e}");
+                                    command_result =
+                                        Err(format!("App setting could not be saved: {e}"));
+                                } else {
+                                    cfg = next;
                                 }
                             }
                             // Reflect the toggle on the live row so the UI shows it
                             // immediately — the broadcast below carries the unchanged
                             // apps list from the last cycle, so without this the
                             // optimistic dim would revert on the next poll.
-                            for a in st.updater.apps.iter_mut() {
-                                if a.id.eq_ignore_ascii_case(&key) {
-                                    a.ignored = ignore;
-                                    if !n.is_empty() {
-                                        a.note = n.to_string();
+                            if command_result.is_ok() {
+                                for a in st.updater.apps.iter_mut() {
+                                    if a.id.eq_ignore_ascii_case(&key) {
+                                        a.ignored = ignore;
+                                        if !n.is_empty() {
+                                            a.note = n.to_string();
+                                        }
                                     }
                                 }
+                                st.updater.app_notes = cfg.updater.note_views();
+                                command_result = Ok("App setting saved".to_string());
+                                pipe.broadcast_status(build_status(&st));
                             }
-                            st.updater.app_notes = cfg.updater.note_views();
-                            pipe.broadcast_status(build_status(&st));
+                            }
                         }
                         UiMsg::SetAppNote { id, note } => {
                             let key = id.trim().to_lowercase();
@@ -2140,60 +2584,74 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 || cfg.updater.notes.contains_key(&key);
                             if !known {
                                 warn!("Refusing app note for unknown id '{key}'");
-                                continue;
-                            }
-                            match cfg.updater.set_app_note(&key, &note) {
+                                command_result = Err("Unknown app".to_string());
+                            } else {
+                            let mut next = cfg.clone();
+                            match next.updater.set_app_note(&key, &note) {
                                 Ok(true) => {
-                                    if let Err(e) = config::save(&cfg, "config.toml") {
+                                    if let Err(e) = config::save(&next, "config.toml") {
                                         warn!("Failed to save app note: {e}");
-                                    }
-                                    let saved =
-                                        cfg.updater.notes.get(&key).cloned().unwrap_or_default();
-                                    for app in st.updater.apps.iter_mut() {
-                                        if app.id.eq_ignore_ascii_case(&key) {
-                                            app.note = saved.clone();
+                                        command_result =
+                                            Err(format!("App note could not be saved: {e}"));
+                                    } else {
+                                        cfg = next;
+                                        let saved = cfg
+                                            .updater
+                                            .notes
+                                            .get(&key)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        for app in st.updater.apps.iter_mut() {
+                                            if app.id.eq_ignore_ascii_case(&key) {
+                                                app.note = saved.clone();
+                                            }
                                         }
+                                        st.updater.app_notes = cfg.updater.note_views();
+                                        command_result = Ok("App note saved".to_string());
+                                        pipe.broadcast_status(build_status(&st));
                                     }
-                                    st.updater.app_notes = cfg.updater.note_views();
-                                    pipe.broadcast_status(build_status(&st));
                                 }
-                                Ok(false) => {}
-                                Err(e) => warn!("Refusing app note for '{key}': {e}"),
+                                Ok(false) => command_result = Ok("App note unchanged".to_string()),
+                                Err(e) => {
+                                    warn!("Refusing app note for '{key}': {e}");
+                                    command_result = Err(e.to_string());
+                                }
+                            }
                             }
                         }
                         UiMsg::SetAdvisorSettings(update) => {
-                            // Applied live — no service restart.
-                            cfg.advisor.apply_view(*update);
-                            let view = cfg.advisor.to_view();
-                            match st.advisor.as_mut() {
-                                Some(a) => {
-                                    a.enabled = cfg.advisor.enabled;
-                                    a.settings = view;
-                                }
-                                None => {
-                                    st.advisor = Some(AdvisorStatus {
-                                        enabled: cfg.advisor.enabled,
-                                        settings: view,
-                                        ..Default::default()
-                                    });
-                                }
-                            }
-                            if let Err(e) = config::save(&cfg, "config.toml") {
+                            let mut next = cfg.clone();
+                            next.advisor.apply_view(*update);
+                            if let Err(e) = config::save(&next, "config.toml") {
                                 warn!("Failed to save advisor settings: {e}");
+                                command_result =
+                                    Err(format!("Advisor settings could not be saved: {e}"));
+                            } else {
+                                cfg = next;
+                                let view = cfg.advisor.to_view();
+                                match st.advisor.as_mut() {
+                                    Some(a) => {
+                                        a.enabled = cfg.advisor.enabled;
+                                        a.settings = view;
+                                    }
+                                    None => {
+                                        st.advisor = Some(AdvisorStatus {
+                                            enabled: cfg.advisor.enabled,
+                                            settings: view,
+                                            ..Default::default()
+                                        });
+                                    }
+                                }
+                                command_result = Ok("Advisor settings saved".to_string());
+                                pipe.broadcast_status(build_status(&st));
                             }
-                            pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::UndoRegistry { id } => {
-                            // Restore a prior registry value off the loop, reporting the
-                            // outcome through the exec_done arm so it appears in the
-                            // activity feed and never blocks ui_rx on the PowerShell call.
-                            let db_u = db.clone();
-                            let done = undo_done_tx.clone();
-                            tokio::spawn(async move {
-                                // CLAIM atomically so two concurrent undo clicks can't both
-                                // run (the second sees the record already claimed).
-                                match audit::claim_registry_undo(&db_u, id).await {
-                                    Ok(Some(undo)) => {
+                            match audit::claim_registry_undo(&db, id).await {
+                                Ok(Some(undo)) => {
+                                    let db_u = db.clone();
+                                    let done = undo_done_tx.clone();
+                                    tokio::spawn(async move {
                                         let label = format!(
                                             "Undo registry {}\\{}",
                                             undo.key_path, undo.value_name
@@ -2213,6 +2671,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                             }
                                         }
                                         let _ = done.send(ExecOutcome {
+                                            key: String::new(),
                                             label: label.clone(),
                                             exec_action: label,
                                             success,
@@ -2225,14 +2684,21 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                             // On success, clear this undo_id from the original
                                             // activity row so its "Undo" button disappears.
                                             cleared_undo_id: success.then_some(id),
+                                            refresh_pending: false,
                                         });
-                                    }
-                                    Ok(None) => {
-                                        warn!("Registry undo {id} not found or already undone");
-                                    }
-                                    Err(e) => error!("Failed to load registry undo {id}: {e}"),
+                                    });
+                                    command_result = Ok("Registry undo started".to_string());
                                 }
-                            });
+                                Ok(None) => {
+                                    warn!("Registry undo {id} not found or already undone");
+                                    command_result =
+                                        Err("Undo is missing or already claimed".to_string());
+                                }
+                                Err(e) => {
+                                    error!("Failed to load registry undo {id}: {e}");
+                                    command_result = Err(format!("Undo could not start: {e}"));
+                                }
+                            }
                         }
                         UiMsg::AskEir {
                             question,
@@ -2247,9 +2713,11 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 now,
                             ) {
                                 refresh_ask(&mut st, Some(reason.to_string()));
+                                command_result = Err(reason.to_string());
                                 pipe.broadcast_status(build_status(&st));
                             } else if let Some(ai_ref) = ai.as_ref() {
                                 st.ask_running = true;
+                                command_result = Ok("Question accepted".to_string());
                                 refresh_ask(&mut st, None);
                                 pipe.broadcast_status(build_status(&st));
                                 // Route attachments: text files fold into the prompt, images
@@ -2379,14 +2847,22 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             st.ask_entries.clear();
                             st.last_ask_at = 0;
                             refresh_ask(&mut st, None);
+                            command_result = Ok("Ask history cleared".to_string());
                             pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::ScanDisk => {
                             // Gate on the scan-in-flight flag and pause (a paused guardian
                             // shouldn't be walking the disk). Keep prior results visible
                             // while the new scan runs.
-                            if !st.disk_scan_running && !st.paused {
+                            if st.paused {
+                                command_result =
+                                    Err("Resume monitoring before scanning".to_string());
+                            } else if st.disk_scan_running {
+                                command_result =
+                                    Err("A disk scan is already running".to_string());
+                            } else {
                                 st.disk_scan_running = true;
+                                command_result = Ok("Disk scan started".to_string());
                                 let scanned_at =
                                     st.disk_insights.as_ref().map(|d| d.scanned_at).unwrap_or(0);
                                 let entries = st
@@ -2433,7 +2909,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             // the normal policy gate. The wire never carries an action.
                             match st.disk_targets.get(&id).cloned() {
                                 Some(action) => {
-                                    route_user_action(
+                                    command_result = route_user_action(
                                         &mut st,
                                         &pol,
                                         &db,
@@ -2448,12 +2924,30 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 }
                                 None => {
                                     info!(%id, "Clean requested for unknown/stale disk entry — ignoring");
+                                    command_result =
+                                        Err("Disk entry is stale; scan again".to_string());
                                 }
                             }
                         }
                         UiMsg::ScanStartup => {
-                            if !st.startup_scan_running && !st.paused {
+                            let active_sid = executor::startup::active_user_sid().ok();
+                            if clear_stale_startup_cache(&mut st, active_sid.as_deref()) {
+                                pipe.broadcast_status(build_status(&st));
+                            }
+                            if st.paused {
+                                command_result =
+                                    Err("Resume monitoring before scanning".to_string());
+                            } else if active_sid.is_none() {
+                                command_result =
+                                    Err("Startup scan requires an active interactive user".to_string());
+                            } else if st.startup_scan_running {
+                                command_result =
+                                    Err("A startup scan is already running".to_string());
+                            } else {
+                                let scan_sid = active_sid.unwrap_or_default();
+                                st.startup_owner_sid = Some(scan_sid.clone());
                                 st.startup_scan_running = true;
+                                command_result = Ok("Startup scan started".to_string());
                                 let scanned_at =
                                     st.startup.as_ref().map(|s| s.scanned_at).unwrap_or(0);
                                 let entries = st
@@ -2471,10 +2965,15 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 let done = startup_done_tx.clone();
                                 let ai_s = ai.clone();
                                 let model_s = cfg.api.update_check_model.clone();
+                                let worker_sid = scan_sid.clone();
                                 tokio::spawn(async move {
                                     const STARTUP_MAX: Duration = Duration::from_secs(4 * 60);
                                     let mut inner = tokio::spawn(async move {
-                                        startup_scan::scan(ai_s.as_deref(), &model_s)
+                                        startup_scan::scan(
+                                            ai_s.as_deref(),
+                                            &model_s,
+                                            &worker_sid,
+                                        )
                                             .await
                                             .map_err(|e| e.to_string())
                                     });
@@ -2489,51 +2988,56 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                                 Err("startup scan timed out".to_string())
                                             }
                                         };
-                                    let _ = done.send(result);
+                                    let _ = done.send((scan_sid, result));
                                 });
                             }
                         }
                         UiMsg::SetStartupEntry { id, enable } => {
                             // Reconstruct the toggle from THIS service's own last scan
                             // (unknown/stale id → ignore), then route it through the normal
-                            // policy gate with approval FORCED — StartupSet is approval-gated
-                            // by policy anyway, and a task enable/disable (whitelisted for
-                            // the AI path) must get the same human confirmation here, since
-                            // the pipe is writable by any local user.
-                            let target = st.startup_targets.get(&id).map(|t| {
-                                (
-                                    t.name.clone(),
-                                    t.location.clone(),
-                                    t.hive.clone(),
-                                    t.task_path.clone(),
-                                )
-                            });
+                            // policy gate with approval forced. The cache is SID-owned:
+                            // after fast-user-switching, old opaque ids are invalid.
+                            let active_sid = executor::startup::active_user_sid().ok();
+                            let owner_current = startup_owner_matches(
+                                st.startup_owner_sid.as_deref(),
+                                active_sid.as_deref(),
+                            );
+                            let cache_cleared = if owner_current {
+                                false
+                            } else {
+                                clear_stale_startup_cache(&mut st, active_sid.as_deref())
+                            };
+                            let target = owner_current
+                                .then(|| {
+                                    st.startup_targets.get(&id).map(|t| {
+                                        (
+                                            t.name.clone(),
+                                            t.location.clone(),
+                                            t.hive.clone(),
+                                            t.task_path.clone(),
+                                        )
+                                    })
+                                })
+                                .flatten();
                             match target {
                                 Some((name, location, hive, task_path)) => {
-                                    let action = if location == "scheduled_task" {
-                                        if enable {
-                                            FixAction::TaskEnable {
-                                                task_name: task_path,
-                                            }
-                                        } else {
-                                            FixAction::TaskDisable {
-                                                task_name: task_path,
-                                            }
-                                        }
+                                    let name = if location == "scheduled_task" {
+                                        task_path
                                     } else {
-                                        FixAction::StartupSet {
-                                            name,
-                                            location,
-                                            hive,
-                                            enable,
-                                        }
+                                        name
+                                    };
+                                    let action = FixAction::StartupSet {
+                                        name,
+                                        location,
+                                        hive,
+                                        enable,
                                     };
                                     let diag = if enable {
                                         "User re-enabled a startup entry"
                                     } else {
                                         "User disabled a startup entry"
                                     };
-                                    route_user_action(
+                                    command_result = route_user_action(
                                         &mut st,
                                         &pol,
                                         &db,
@@ -2548,10 +3052,16 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 }
                                 None => {
                                     info!(%id, "Startup toggle for unknown/stale entry — ignoring");
+                                    command_result =
+                                        Err("Startup entry is stale; scan again".to_string());
+                                    if cache_cleared {
+                                        pipe.broadcast_status(build_status(&st));
+                                    }
                                 }
                             }
                         }
                         }
+                        pipe.command_result(request_id, command_result);
                         continue;
                     }
                 }
@@ -3005,6 +3515,39 @@ mod status_tests {
         assert_eq!(resting_status(&st), "Paused");
     }
 
+    #[test]
+    fn startup_cache_is_cleared_when_the_active_sid_changes() {
+        let owner = "S-1-5-21-1-2-3-1001";
+        let mut st = SvcState {
+            startup: Some(eir_proto::StartupView::default()),
+            startup_owner_sid: Some(owner.to_string()),
+            startup_scan_running: true,
+            ..Default::default()
+        };
+        st.startup_targets.insert(
+            "task".to_string(),
+            startup_scan::StartupToggle {
+                name: "Updater".to_string(),
+                location: "scheduled_task".to_string(),
+                hive: owner.to_string(),
+                task_path: r"\Vendor\Updater".to_string(),
+            },
+        );
+
+        assert!(!clear_stale_startup_cache(&mut st, Some(owner)));
+        assert!(st.startup.is_some());
+        assert_eq!(st.startup_targets.len(), 1);
+
+        assert!(clear_stale_startup_cache(
+            &mut st,
+            Some("S-1-5-21-9-8-7-1002")
+        ));
+        assert!(st.startup.is_none());
+        assert!(st.startup_owner_sid.is_none());
+        assert!(!st.startup_scan_running);
+        assert!(st.startup_targets.is_empty());
+    }
+
     /// Game Mode is a lease: active only while `gaming_until > now`, so a crashed/closed
     /// tray auto-expires it.
     #[test]
@@ -3113,6 +3656,8 @@ mod status_tests {
     #[test]
     fn tick_applies_the_cache_verbatim() {
         let sys = SystemState {
+            collected_at: 123,
+            collector_errors: vec!["disk".into()],
             cpu_usage_percent: 12.5,
             failed_services: vec!["W32Time".into()],
             ..Default::default()
@@ -3121,6 +3666,8 @@ mod status_tests {
         apply_live_metrics(&mut st, &sys);
         assert_eq!(st.cpu, 12.5);
         assert_eq!(st.failed_services, vec!["W32Time".to_string()]);
+        assert_eq!(st.signals_at, 123);
+        assert_eq!(st.signal_errors, vec!["disk".to_string()]);
     }
 
     /// build_status must project the live metrics + failed services into the broadcast
@@ -3132,6 +3679,8 @@ mod status_tests {
             memory: 71.0,
             disk: 55.0,
             failed_services: vec!["Spooler".into(), "W32Time".into()],
+            signals_at: 123,
+            signal_errors: vec!["memory".into()],
             ..Default::default()
         };
         let payload = build_status(&st);
@@ -3142,10 +3691,39 @@ mod status_tests {
             payload.failed_services,
             vec!["Spooler".to_string(), "W32Time".to_string()]
         );
+        assert_eq!(payload.signals_at, 123);
+        assert_eq!(payload.signal_errors, vec!["memory".to_string()]);
         assert_eq!(
             payload.svc_version.as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
+    }
+}
+
+enum ApprovalPreflightError {
+    Resolved(String),
+    Retry(String),
+}
+
+async fn approved_action_ready(
+    pol: &policy::ExecutionPolicy,
+    db: &SqlitePool,
+    approval: &PendingApproval,
+) -> Result<(), ApprovalPreflightError> {
+    if let policy::Verdict::Block(reason) = pol.evaluate(&approval.action, approval.info.confidence)
+    {
+        return Err(ApprovalPreflightError::Resolved(format!(
+            "Blocked by current policy: {reason}"
+        )));
+    }
+    match safety::rate_limited(db, &approval.action, pol.execution.rate_limit_mins).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(ApprovalPreflightError::Resolved(
+            "Already completed or repeatedly failed recently".to_string(),
+        )),
+        Err(e) => Err(ApprovalPreflightError::Retry(format!(
+            "Safety preflight failed: {e}"
+        ))),
     }
 }
 
@@ -3227,6 +3805,8 @@ mod analysis_outcome_tests {
             event_log: vec![],
             file_changes: vec![],
             system_state: SystemState {
+                collected_at: 0,
+                collector_errors: vec![],
                 uptime_secs: 0,
                 cpu_usage_percent: 0.0,
                 memory_usage_percent: 0.0,

@@ -9,6 +9,12 @@ use std::collections::BTreeMap;
 pub const MAX_APP_NOTES: usize = 500;
 pub const MAX_APP_NOTE_CHARS: usize = 2_000;
 pub const MAX_APP_ID_CHARS: usize = 200;
+pub const MAX_IGNORED_APPS: usize = 500;
+
+pub fn valid_app_id(id: &str) -> bool {
+    let id = id.trim();
+    !id.is_empty() && id.chars().count() <= MAX_APP_ID_CHARS && !id.chars().any(char::is_control)
+}
 
 /// How strictly a downloaded AI-found native installer must be signed before it
 /// is allowed to run. Decided in Rust *before* the installer is staged, never by
@@ -71,8 +77,8 @@ pub struct UpdaterConfig {
     pub max_apps_per_run: u32,
     /// Largest native installer to download, in MiB.
     pub max_installer_mb: u64,
-    /// Auto-install a missing package manager (Chocolatey/Scoop) when a method
-    /// needs it.
+    /// Auto-install Chocolatey when that method needs it. Scoop is never bootstrapped
+    /// or run by the SYSTEM service.
     pub bootstrap_managers: bool,
     /// App identities to skip entirely. Keyed by the stable, version-stripped,
     /// lowercased display name (the same key used for notes).
@@ -109,7 +115,7 @@ impl UpdaterConfig {
     /// Save, replace, or clear one app's AI guidance. Returns whether config changed.
     pub fn set_app_note(&mut self, id: &str, note: &str) -> Result<bool, &'static str> {
         let key = id.trim().to_lowercase();
-        if key.is_empty() || key.chars().count() > MAX_APP_ID_CHARS {
+        if !valid_app_id(&key) {
             return Err("invalid app id");
         }
         let note = note.trim();
@@ -129,9 +135,37 @@ impl UpdaterConfig {
         Ok(true)
     }
 
+    /// Add or remove one stable app identity from the ignore list.
+    pub fn set_app_ignored(&mut self, id: &str, ignored: bool) -> Result<bool, &'static str> {
+        let key = id.trim().to_lowercase();
+        if !valid_app_id(&key) {
+            return Err("invalid app id");
+        }
+        if ignored {
+            if self
+                .ignored
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&key))
+            {
+                return Ok(false);
+            }
+            if self.ignored.len() >= MAX_IGNORED_APPS {
+                return Err("ignore list limit reached");
+            }
+            self.ignored.push(key);
+            Ok(true)
+        } else {
+            let old_len = self.ignored.len();
+            self.ignored
+                .retain(|existing| !existing.eq_ignore_ascii_case(&key));
+            Ok(self.ignored.len() != old_len)
+        }
+    }
+
     pub fn note_views(&self) -> Vec<eir_proto::UpdaterAppNote> {
         self.notes
             .iter()
+            .filter(|(id, _)| valid_app_id(id))
             .map(|(id, note)| eir_proto::UpdaterAppNote {
                 id: id.clone(),
                 note: note.clone(),
@@ -148,7 +182,6 @@ impl Default for UpdaterConfig {
             methods: vec![
                 "winget".to_string(),
                 "choco".to_string(),
-                "scoop".to_string(),
                 "msstore".to_string(),
             ],
             native_enabled: true,
@@ -196,6 +229,7 @@ mod tests {
         let back: UpdaterConfig = toml::from_str(&toml).expect("reparse");
         assert_eq!(back.enabled, cfg.enabled);
         assert_eq!(back.methods, cfg.methods);
+        assert!(!cfg.methods.iter().any(|method| method == "scoop"));
         assert_eq!(back.native_signature_policy, cfg.native_signature_policy);
         assert_eq!(back.max_apps_per_run, cfg.max_apps_per_run);
     }
@@ -221,5 +255,38 @@ mod tests {
         assert!(cfg
             .set_app_note("example app", &"x".repeat(MAX_APP_NOTE_CHARS + 1))
             .is_err());
+    }
+
+    #[test]
+    fn app_ignore_rejects_empty_and_oversized_ids() {
+        let mut cfg = UpdaterConfig::default();
+        assert!(cfg.set_app_ignored("", true).is_err());
+        assert!(cfg
+            .set_app_ignored(&"x".repeat(MAX_APP_ID_CHARS + 1), true)
+            .is_err());
+        assert!(cfg.set_app_ignored("bad\nid", true).is_err());
+        assert!(cfg.ignored.is_empty());
+    }
+
+    #[test]
+    fn app_ignore_normalises_dedupes_and_removes_ids() {
+        let mut cfg = UpdaterConfig::default();
+        assert!(cfg.set_app_ignored(" Example App ", true).expect("add"));
+        assert_eq!(cfg.ignored, ["example app"]);
+        assert!(!cfg.set_app_ignored("EXAMPLE APP", true).expect("dedupe"));
+        assert!(cfg.set_app_ignored(" example app ", false).expect("remove"));
+        assert!(cfg.ignored.is_empty());
+    }
+
+    #[test]
+    fn app_ignore_enforces_the_config_owned_cap() {
+        let mut cfg = UpdaterConfig {
+            ignored: (0..MAX_IGNORED_APPS)
+                .map(|index| format!("app {index}"))
+                .collect(),
+            ..UpdaterConfig::default()
+        };
+        assert!(cfg.set_app_ignored("one too many", true).is_err());
+        assert!(!cfg.set_app_ignored("APP 0", true).expect("existing"));
     }
 }

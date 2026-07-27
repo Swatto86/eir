@@ -3,11 +3,10 @@
 //!
 //! Context notes that matter for the unattended SYSTEM service:
 //!   - winget and Chocolatey run fine as SYSTEM/admin.
-//!   - Scoop is user-scoped; the service borrows the logged-in user's install
-//!     (like it borrows their Claude session) and runs scoop in that profile's
-//!     context — best-effort.
-//!   - Only Chocolatey is auto-bootstrapped; installing Scoop as SYSTEM would create
-//!     a SYSTEM-profile scoop nobody uses, so we never do that.
+//!   - Scoop is user-scoped and its shim is user-writable. The SYSTEM service must
+//!     neither discover nor execute it; Scoop stays unavailable until it has a real
+//!     active-user process launcher.
+//!   - Only Chocolatey is auto-bootstrapped.
 
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -33,21 +32,10 @@ pub fn choco_available() -> bool {
     choco_path().is_some()
 }
 
-/// Find a logged-in user's Scoop install. Returns (user_profile_root, scoop.cmd).
-pub fn scoop_install() -> Option<(String, PathBuf)> {
-    let users = std::fs::read_dir("C:\\Users").ok()?;
-    for entry in users.flatten() {
-        let dir = entry.path();
-        let shim = dir.join("scoop").join("shims").join("scoop.cmd");
-        if shim.is_file() {
-            return Some((dir.to_string_lossy().into_owned(), shim));
-        }
-    }
-    None
-}
-
+/// Scoop shims live under user-writable profiles. Selecting one from the SYSTEM
+/// service would turn a normal user-owned `.cmd` into arbitrary SYSTEM code.
 pub fn scoop_available() -> bool {
-    scoop_install().is_some()
+    false
 }
 
 #[derive(Clone)]
@@ -288,6 +276,11 @@ mod tests {
             extract_winget_dir_version("Microsoft.WindowsStore_123_x64__8wekyb3d8bbwe").is_none()
         );
         assert!(extract_winget_dir_version("not_a_package").is_none());
+    }
+
+    #[test]
+    fn scoop_is_never_selected_from_a_user_profile_by_the_system_service() {
+        assert!(!scoop_available());
     }
 
     #[test]

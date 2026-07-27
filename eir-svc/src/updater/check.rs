@@ -5,7 +5,7 @@
 //! filtered against the user's ignore list and notes.
 
 use crate::ai::client::{extract_json, AiClient};
-use crate::updater::config::UpdaterConfig;
+use crate::updater::config::{valid_app_id, UpdaterConfig};
 use crate::updater::domain::{Method, UpdateCandidate};
 use crate::updater::methods::{choco, detect, msstore, scoop, winget};
 use crate::updater::names::{app_id, match_installed_entry};
@@ -25,6 +25,9 @@ pub struct CheckResult {
     pub cost_usd: f64,
     /// Human-readable notes (truncation, AI-check failures) for the UI.
     pub notes: Vec<String>,
+    /// A source/check operation failed, so an empty candidate set is not proof that
+    /// the machine is current.
+    pub had_errors: bool,
 }
 
 /// Apps that update themselves and reliably fight or hang package managers, so the
@@ -53,6 +56,9 @@ pub(crate) fn base_id(id: &str) -> &str {
 /// the machine has *learned* (`learned`, keyed by base id), or the user's ignore list
 /// (the exact id or its base, so ignoring "discord" also covers "discord.install").
 fn should_skip(cfg: &UpdaterConfig, learned: &HashSet<String>, id: &str) -> bool {
+    if !valid_app_id(id) {
+        return true;
+    }
     let base = base_id(id);
     SELF_UPDATING.contains(&base)
         || learned.contains(base)
@@ -110,76 +116,109 @@ pub async fn collect(
     let mut candidates: Vec<UpdateCandidate> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut notes: Vec<String> = Vec::new();
+    let mut had_errors = false;
     let mut cost = 0.0;
     // Names any manager already covers, so the AI check skips them.
     let mut managed: HashSet<String> = HashSet::new();
 
     if available.contains(&Method::Winget) {
-        for u in winget::list_updates().await {
-            managed.insert(app_id(&u.name));
-            push_candidate(
-                &mut candidates,
-                &mut seen,
-                cfg,
-                learned_skips,
-                native_avail,
-                &u.name,
-                &u.current,
-                &u.available,
-                Some(u.id.clone()),
-                Method::Winget,
-            );
+        match winget::list_updates().await {
+            Ok(updates) => {
+                for u in updates {
+                    managed.insert(app_id(&u.name));
+                    push_candidate(
+                        &mut candidates,
+                        &mut seen,
+                        cfg,
+                        learned_skips,
+                        native_avail,
+                        &u.name,
+                        &u.current,
+                        &u.available,
+                        Some(u.id.clone()),
+                        Method::Winget,
+                    );
+                }
+            }
+            Err(e) => {
+                had_errors = true;
+                notes.push(e);
+            }
         }
     }
     if available.contains(&Method::Choco) {
-        for u in choco::list_outdated().await {
-            managed.insert(app_id(&u.name));
-            push_candidate(
-                &mut candidates,
-                &mut seen,
-                cfg,
-                learned_skips,
-                native_avail,
-                &u.name,
-                &u.current,
-                &u.available,
-                Some(u.name.clone()),
-                Method::Choco,
-            );
+        match choco::list_outdated().await {
+            Ok(updates) => {
+                for u in updates {
+                    managed.insert(app_id(&u.name));
+                    push_candidate(
+                        &mut candidates,
+                        &mut seen,
+                        cfg,
+                        learned_skips,
+                        native_avail,
+                        &u.name,
+                        &u.current,
+                        &u.available,
+                        Some(u.name.clone()),
+                        Method::Choco,
+                    );
+                }
+            }
+            Err(e) => {
+                had_errors = true;
+                notes.push(e);
+            }
         }
     }
     if available.contains(&Method::Scoop) {
-        for u in scoop::list_outdated().await {
-            managed.insert(app_id(&u.name));
-            push_candidate(
-                &mut candidates,
-                &mut seen,
-                cfg,
-                learned_skips,
-                native_avail,
-                &u.name,
-                &u.current,
-                &u.available,
-                Some(u.name.clone()),
-                Method::Scoop,
-            );
+        match scoop::list_outdated().await {
+            Ok(updates) => {
+                for u in updates {
+                    managed.insert(app_id(&u.name));
+                    push_candidate(
+                        &mut candidates,
+                        &mut seen,
+                        cfg,
+                        learned_skips,
+                        native_avail,
+                        &u.name,
+                        &u.current,
+                        &u.available,
+                        Some(u.name.clone()),
+                        Method::Scoop,
+                    );
+                }
+            }
+            Err(e) => {
+                had_errors = true;
+                notes.push(e);
+            }
         }
     }
     if available.contains(&Method::MsStore) {
-        for u in msstore::list_updates().await {
-            managed.insert(app_id(&u.name));
-            push_candidate(
-                &mut candidates,
-                &mut seen,
-                cfg,
-                learned_skips,
-                native_avail,
-                &u.name,
-                &u.current,
-                &u.available,
-                Some(u.id.clone()),
-                Method::MsStore,
-            );
+        match msstore::list_updates().await {
+            Ok(updates) => {
+                for u in updates {
+                    managed.insert(app_id(&u.name));
+                    push_candidate(
+                        &mut candidates,
+                        &mut seen,
+                        cfg,
+                        learned_skips,
+                        native_avail,
+                        &u.name,
+                        &u.current,
+                        &u.available,
+                        Some(u.id.clone()),
+                        Method::MsStore,
+                    );
+                }
+            }
+            Err(e) => {
+                had_errors = true;
+                notes.push(e);
+            }
         }
     }
 
@@ -188,7 +227,7 @@ pub async fn collect(
         if let Some(ai) = ai {
             let winget_list_available =
                 available.contains(&Method::Winget) && detect::winget_available();
-            match check_unmanaged(
+            let (native_cands, c, check_notes, check_had_errors) = check_unmanaged(
                 pool,
                 ai,
                 cfg,
@@ -197,26 +236,26 @@ pub async fn collect(
                 learned_skips,
                 winget_list_available,
             )
-            .await
-            {
-                Ok((native_cands, c, note)) => {
-                    cost += c;
-                    if let Some(n) = note {
-                        notes.push(n);
-                    }
-                    for cand in native_cands {
-                        if seen.insert(cand.id.clone()) {
-                            candidates.push(cand);
-                        }
-                    }
+            .await;
+            cost += c;
+            notes.extend(check_notes);
+            had_errors |= check_had_errors;
+            for cand in native_cands {
+                if seen.insert(cand.id.clone()) {
+                    candidates.push(cand);
                 }
-                Err(e) => notes.push(format!("couldn't check non-manager apps: {e}")),
             }
         } else {
+            had_errors = true;
             notes.push(
                 "AI provider not configured — only package-manager apps are checked.".to_string(),
             );
         }
+    } else if cfg.native_enabled && ai.is_none() {
+        had_errors = true;
+        notes.push(
+            "AI provider not configured — only package-manager apps are checked.".to_string(),
+        );
     } else {
         notes.push(
             "AI-found installers disabled — only package-manager apps are checked.".to_string(),
@@ -227,6 +266,7 @@ pub async fn collect(
         candidates,
         cost_usd: cost,
         notes,
+        had_errors,
     }
 }
 
@@ -248,9 +288,44 @@ pub fn select_unmanaged_batch(
     apps: &mut Vec<(String, String)>,
     last_check: &HashMap<String, i64>,
     cap: usize,
-) -> Vec<(String, String)> {
+) -> (Vec<(String, String)>, bool) {
+    let total = apps.len();
     apps.sort_by_key(|(n, _)| last_check.get(&app_id(n)).copied().unwrap_or(0));
-    apps.drain(..cap.min(apps.len())).collect()
+    let checked = apps.drain(..cap.min(apps.len())).collect::<Vec<_>>();
+    let incomplete = checked.len() < total;
+    (checked, incomplete)
+}
+
+fn merge_registry_app(
+    apps: &mut Vec<(String, String)>,
+    seen: &mut HashSet<String>,
+    name: String,
+    version: String,
+) {
+    let key = app_id(&name);
+    // ponytail: inventories are hundreds of rows; add an id→index map if they reach thousands.
+    if let Some((_, installed_version)) = apps
+        .iter_mut()
+        .find(|(existing, _)| app_id(existing) == key)
+    {
+        *installed_version = version;
+    } else if seen.insert(key) {
+        apps.push((name, version));
+    }
+}
+
+async fn parse_and_record_checks(
+    pool: &SqlitePool,
+    checked: &[(String, String)],
+    content: &str,
+) -> Result<AiResp, String> {
+    let response: AiResp = serde_json::from_str(extract_json(content))
+        .map_err(|e| format!("could not parse update list: {e}"))?;
+    let ids: Vec<String> = checked.iter().map(|(name, _)| app_id(name)).collect();
+    crate::updater::history::record_checks(pool, &ids)
+        .await
+        .map_err(|e| format!("could not record non-manager checks: {e}"))?;
+    Ok(response)
 }
 
 /// Ask the AI which unmanaged apps have a newer version, and turn the verified ones
@@ -267,13 +342,15 @@ async fn check_unmanaged(
     managed: &HashSet<String>,
     learned_skips: &HashSet<String>,
     winget_list_available: bool,
-) -> Result<(Vec<UpdateCandidate>, f64, Option<String>), String> {
+) -> (Vec<UpdateCandidate>, f64, Vec<String>, bool) {
     // Build the installed-app inventory from winget (when available) and the registry.
     let mut apps: Vec<(String, String)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    let mut notes = Vec::new();
+    let mut had_errors = false;
 
-    let note = if winget_list_available {
-        let (_code, list_text) = winget::run_winget(
+    if winget_list_available {
+        let (code, list_text) = winget::run_winget(
             vec![
                 "list".to_string(),
                 "--accept-source-agreements".to_string(),
@@ -282,52 +359,71 @@ async fn check_unmanaged(
             LIST,
         )
         .await;
-        let winget_apps = parse_unmanaged(&list_text, managed);
-        for (n, v) in winget_apps {
-            if seen.insert(app_id(&n)) {
-                apps.push((n, v));
+        match crate::updater::proc::checked_output("winget app inventory", code, &list_text) {
+            Ok(list_text) => {
+                for (n, v) in parse_unmanaged(list_text, managed) {
+                    let key = app_id(&n);
+                    if !should_skip(cfg, learned_skips, &key) && seen.insert(key) {
+                        apps.push((n, v));
+                    }
+                }
+            }
+            Err(e) => {
+                had_errors = true;
+                notes.push(e);
             }
         }
-        None
     } else {
-        Some(detect::winget_unavailability_reason().unwrap_or_else(|| {
+        notes.push(detect::winget_unavailability_reason().unwrap_or_else(|| {
             "winget not available — using registry inventory only for non-manager apps.".to_string()
-        }))
-    };
+        }));
+    }
 
     // Merge in registry inventory as a fallback/supplement. Registry version is
     // authoritative for installed version, so it takes precedence when a name exists
-    // in both sources (we skip the winget duplicate here).
-    for (n, v) in crate::updater::inventory::list_installed().await {
-        let key = app_id(&n);
-        if managed.contains(&key) || should_skip(cfg, learned_skips, &key) || !seen.insert(key) {
-            continue;
+    // in both sources.
+    match crate::updater::inventory::list_installed().await {
+        Ok(inventory) => {
+            if !inventory.warnings.is_empty() {
+                had_errors = true;
+                notes.extend(inventory.warnings);
+            }
+            for (n, v) in inventory.apps {
+                let key = app_id(&n);
+                if managed.contains(&key) || should_skip(cfg, learned_skips, &key) {
+                    continue;
+                }
+                merge_registry_app(&mut apps, &mut seen, n, v);
+            }
         }
-        apps.push((n, v));
+        Err(e) => {
+            had_errors = true;
+            notes.push(e);
+        }
     }
 
     // Fair rotation: stalest check time first, never-checked first, so the tail isn't
     // permanently starved. The cap is applied here, not at collection, because the
     // AI call is the expensive step and we want it to sweep across the whole set.
-    let last_check = crate::updater::history::last_check_times(pool)
-        .await
-        .unwrap_or_default();
-    let total = apps.len();
-    let checked = select_unmanaged_batch(&mut apps, &last_check, AI_CHECK_CAP);
-    let note = if total > AI_CHECK_CAP {
-        let cap_note = format!(
-            "Checking {} of {total} non-manager apps — stalest first.",
-            checked.len()
-        );
-        Some(match note {
-            Some(n) => format!("{n} {cap_note}"),
-            None => cap_note,
-        })
-    } else {
-        note
+    let last_check = match crate::updater::history::last_check_times(pool).await {
+        Ok(times) => times,
+        Err(e) => {
+            had_errors = true;
+            notes.push(format!("couldn't read non-manager check history: {e}"));
+            HashMap::new()
+        }
     };
+    let total = apps.len();
+    let (checked, incomplete) = select_unmanaged_batch(&mut apps, &last_check, AI_CHECK_CAP);
+    if incomplete {
+        had_errors = true;
+        notes.push(format!(
+            "This cycle checks {} of {total} non-manager apps — the remainder is deferred.",
+            checked.len()
+        ));
+    }
     if checked.is_empty() {
-        return Ok((vec![], 0.0, note));
+        return (vec![], 0.0, notes, had_errors);
     }
 
     let app_lines = checked
@@ -351,27 +447,29 @@ async fn check_unmanaged(
  INSTALLED APPS:\n{app_lines}"
     );
 
-    let (content, usage) = ai
-        .complete(&prompt, model_override)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (content, usage) = match ai.complete(&prompt, model_override).await {
+        Ok(response) => response,
+        Err(e) => {
+            notes.push(format!("couldn't check non-manager apps: {e}"));
+            return (vec![], 0.0, notes, true);
+        }
+    };
     let cost = usage.map(|u| u.cost_usd).unwrap_or(0.0);
-
-    // Record the check time for every app we sent, so the next cycle rotates past them
-    // even if the AI reports no update.
-    for (n, _) in &checked {
-        let _ = crate::updater::history::record_check(pool, &app_id(n)).await;
-    }
 
     let installed: HashMap<String, String> = checked
         .iter()
         .map(|(n, v)| (app_id(n), v.clone()))
         .collect();
-    let resp: AiResp = serde_json::from_str(extract_json(&content))
-        .map_err(|e| format!("could not parse update list: {e}"))?;
+    let resp = match parse_and_record_checks(pool, &checked, &content).await {
+        Ok(response) => response,
+        Err(e) => {
+            notes.push(format!("couldn't check non-manager apps: {e}"));
+            return (vec![], cost, notes, true);
+        }
+    };
 
     let candidates = native_candidates_from(&resp.updates, &installed, cfg, learned_skips);
-    Ok((candidates, cost, note))
+    (candidates, cost, notes, had_errors)
 }
 
 /// Pure: turn the AI's reported updates into native candidates, keeping only those
@@ -515,12 +613,76 @@ mod tests {
             [("a".into(), 300), ("b".into(), 200), ("d".into(), 100)]
                 .into_iter()
                 .collect();
-        let picked = select_unmanaged_batch(&mut apps, &last_check, 2);
+        let (picked, incomplete) = select_unmanaged_batch(&mut apps, &last_check, 2);
         // Never-checked (C) and oldest-checked (D) come first.
         assert_eq!(picked.len(), 2);
         assert_eq!(picked[0].0, "C");
         assert_eq!(picked[1].0, "D");
+        assert!(incomplete);
         // The remaining apps are drained from the input vector.
         assert_eq!(apps.len(), 2);
+    }
+
+    #[test]
+    fn registry_version_overrides_same_app_from_winget() {
+        let mut apps = vec![("Example App".to_string(), "1.0".to_string())];
+        let mut seen = HashSet::from(["example app".to_string()]);
+        merge_registry_app(
+            &mut apps,
+            &mut seen,
+            "Example App".to_string(),
+            "2.0".to_string(),
+        );
+        assert_eq!(apps, [("Example App".to_string(), "2.0".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn invalid_ai_json_does_not_advance_check_times() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open db");
+        sqlx::query(
+            "CREATE TABLE update_checks (app_id TEXT PRIMARY KEY, checked_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create table");
+        let checked = vec![("Example App".to_string(), "1.0".to_string())];
+        assert!(parse_and_record_checks(&pool, &checked, "not json")
+            .await
+            .is_err());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM update_checks")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 0);
+
+        parse_and_record_checks(&pool, &checked, r#"{"updates":[]}"#)
+            .await
+            .expect("valid response");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM update_checks")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_ai_marks_native_coverage_incomplete() {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("open db");
+        let cfg = UpdaterConfig::default();
+        let result = collect(&pool, None, &cfg, "", &[Method::Native], &HashSet::new()).await;
+        assert!(result.had_errors);
+
+        let disabled = UpdaterConfig {
+            native_enabled: false,
+            ..UpdaterConfig::default()
+        };
+        let result = collect(&pool, None, &disabled, "", &[], &HashSet::new()).await;
+        assert!(!result.had_errors);
     }
 }

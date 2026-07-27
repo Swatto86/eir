@@ -7,14 +7,14 @@
 use crate::updater::domain::{
     classify_error, AttemptOutcome, ErrorCategory, Method, UpdateCandidate, Verification,
 };
-use crate::updater::methods::winget::{clean_winget_output, run_winget};
+use crate::updater::methods::winget::{clean_winget_output, parse_update_listing, run_winget};
 use crate::updater::proc::{INSTALL, LIST};
 use crate::updater::verify::{verify_app, VerifyTarget};
-use crate::updater::winget_parse::{parse_upgrades, AppUpdate};
+use crate::updater::winget_parse::AppUpdate;
 
 /// List Store apps with an available update.
-pub async fn list_updates() -> Vec<AppUpdate> {
-    let (_code, out) = run_winget(
+pub async fn list_updates() -> Result<Vec<AppUpdate>, String> {
+    let (code, out) = run_winget(
         vec![
             "upgrade".to_string(),
             "--source".to_string(),
@@ -25,7 +25,10 @@ pub async fn list_updates() -> Vec<AppUpdate> {
         LIST,
     )
     .await;
-    parse_upgrades(&out)
+    parse_update_listing(
+        "Microsoft Store update listing",
+        crate::updater::proc::checked_output("Microsoft Store update listing", code, &out)?,
+    )
 }
 
 /// Update one Store app via winget's msstore source, then verify by id.

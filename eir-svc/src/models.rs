@@ -65,6 +65,12 @@ impl LogEvent {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SystemState {
+    /// Unix seconds when this snapshot finished collecting.
+    #[serde(default)]
+    pub collected_at: i64,
+    /// Collector tokens whose values could not be refreshed.
+    #[serde(default)]
+    pub collector_errors: Vec<String>,
     pub uptime_secs: u64,
     pub cpu_usage_percent: f32,
     pub memory_usage_percent: f32,
@@ -370,9 +376,38 @@ pub struct ExecutionResult {
     pub undo: Option<RegistryUndo>,
 }
 
+/// Registry scalar types that can be snapshotted and restored without losing data.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryScalarKind {
+    String,
+    ExpandString,
+    DWord,
+    QWord,
+}
+
+impl RegistryScalarKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::String => "String",
+            Self::ExpandString => "ExpandString",
+            Self::DWord => "DWord",
+            Self::QWord => "QWord",
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Option<Self> {
+        match value {
+            "String" => Some(Self::String),
+            "ExpandString" => Some(Self::ExpandString),
+            "DWord" => Some(Self::DWord),
+            "QWord" => Some(Self::QWord),
+            _ => None,
+        }
+    }
+}
+
 /// The prior state of a registry value captured before a `RegistryReset`, enough to
-/// restore it: put `prior_data` back if it existed, or delete the value we created if
-/// it did not.
+/// restore its exact scalar type and data, or delete the value if it did not exist.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RegistryUndo {
     pub key_path: String,
@@ -380,7 +415,15 @@ pub struct RegistryUndo {
     /// True if the value existed before we wrote it (restore = set back to prior_data);
     /// false if we created it (restore = delete the value).
     pub prior_existed: bool,
+    #[serde(default)]
+    pub prior_kind: Option<RegistryScalarKind>,
     pub prior_data: Option<String>,
+    /// Exact value Eir wrote. Undo is allowed only while the live value still matches
+    /// this type and data, so a later user/application change is never overwritten.
+    #[serde(default)]
+    pub applied_kind: Option<RegistryScalarKind>,
+    #[serde(default)]
+    pub applied_data: Option<String>,
 }
 
 /// A fix awaiting the user's decision. Carries everything needed to execute it
@@ -428,6 +471,8 @@ mod tests {
 
     fn state_with_disk_health(dh: &str) -> SystemState {
         SystemState {
+            collected_at: 0,
+            collector_errors: vec![],
             uptime_secs: 0,
             cpu_usage_percent: 0.0,
             memory_usage_percent: 0.0,

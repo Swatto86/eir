@@ -49,7 +49,10 @@ fn header_offsets(text: &str) -> Vec<(&'static str, usize)> {
 /// is present — used to distinguish the locale blind spot from the benign "header found,
 /// rows all filtered out" case (e.g. `--include-unknown` rows with an empty Available).
 pub fn header_present(text: &str) -> bool {
-    !header_offsets(text).is_empty()
+    let offsets = header_offsets(text);
+    ["Name", "Id", "Version", "Available"]
+        .iter()
+        .all(|required| offsets.iter().any(|(label, _)| label == required))
 }
 
 /// Read one column's trimmed value from a row. A column spans from its own start

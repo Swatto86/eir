@@ -1,17 +1,21 @@
 use anyhow::Result;
-use eir_proto::{ServiceMsg, StatusPayload, UiMsg, PIPE_NAME};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+use eir_proto::{CommandResult, ServiceMsg, StatusPayload, UiRequest, PIPE_NAME};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::windows::named_pipe::ClientOptions,
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
 use tracing::{info, warn};
 
 pub type SharedStatus = Arc<Mutex<StatusPayload>>;
+pub type CommandWaiters = Arc<Mutex<HashMap<u64, oneshot::Sender<CommandResult>>>>;
 
 /// Lock the shared status, recovering from a poisoned mutex instead of panicking. The
 /// guarded data is a plain snapshot the poll/tray/pipe loops clone or overwrite, so a
@@ -20,25 +24,45 @@ pub fn lock_status(status: &SharedStatus) -> std::sync::MutexGuard<'_, StatusPay
     status.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+pub fn lock_waiters(
+    waiters: &CommandWaiters,
+) -> std::sync::MutexGuard<'_, HashMap<u64, oneshot::Sender<CommandResult>>> {
+    waiters.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Runs the pipe client loop forever, reconnecting on disconnect.
 /// Updates `status` whenever a StatusPayload arrives from the service, and holds
 /// `connected` true only while a live connection exists so command handlers can
 /// refuse work that would otherwise be queued and silently dropped.
-pub async fn run(status: SharedStatus, cmd_rx: mpsc::Receiver<UiMsg>, connected: Arc<AtomicBool>) {
-    run_on(status, cmd_rx, PIPE_NAME, connected).await
+pub async fn run(
+    status: SharedStatus,
+    cmd_rx: mpsc::Receiver<UiRequest>,
+    connected: Arc<AtomicBool>,
+    waiters: CommandWaiters,
+) {
+    run_on(status, cmd_rx, PIPE_NAME, connected, waiters).await
 }
 
 async fn run_on(
     status: SharedStatus,
-    mut cmd_rx: mpsc::Receiver<UiMsg>,
+    mut cmd_rx: mpsc::Receiver<UiRequest>,
     pipe_name: &str,
     connected: Arc<AtomicBool>,
+    waiters: CommandWaiters,
 ) {
     loop {
-        let result = connect_and_run(&status, &mut cmd_rx, pipe_name, &connected).await;
+        let result = connect_and_run(&status, &mut cmd_rx, pipe_name, &connected, &waiters).await;
         // Whatever ended the connection, we are no longer connected — refuse
         // commands until the next connect succeeds.
         connected.store(false, Ordering::Relaxed);
+        // Capabilities describe one peer connection. Clear them before reconnecting
+        // so a newly connected older service cannot inherit command-result support
+        // from the service that just disconnected.
+        {
+            let mut s = lock_status(&status);
+            s.protocol_version = 0;
+            s.capabilities.clear();
+        }
         match result {
             Ok(()) => {
                 // A clean EOF means the service closed the pipe (typically a
@@ -65,15 +89,19 @@ async fn run_on(
         // a stale command (e.g. a TogglePause clicked before the drop) on the next
         // connection would act against the user's current intent.
         while cmd_rx.try_recv().is_ok() {}
+        // Dropping reply senders wakes any Tauri commands waiting on the dead
+        // connection; they fail now rather than sitting on the timeout.
+        lock_waiters(&waiters).clear();
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }
 
 async fn connect_and_run(
     status: &SharedStatus,
-    cmd_rx: &mut mpsc::Receiver<UiMsg>,
+    cmd_rx: &mut mpsc::Receiver<UiRequest>,
     pipe_name: &str,
     connected: &AtomicBool,
+    waiters: &CommandWaiters,
 ) -> Result<()> {
     // Keep trying until the pipe is available (service may still be starting).
     let client = loop {
@@ -114,7 +142,12 @@ async fn connect_and_run(
                     if !trimmed.is_empty() {
                         match serde_json::from_str::<ServiceMsg>(trimmed) {
                             Ok(ServiceMsg::Status(payload)) => {
-                                *lock_status(status) = payload;
+                                *lock_status(status) = *payload;
+                            }
+                            Ok(ServiceMsg::CommandResult(result)) => {
+                                if let Some(tx) = lock_waiters(waiters).remove(&result.request_id) {
+                                    let _ = tx.send(result);
+                                }
                             }
                             Err(e) => warn!("Bad service message: {e}"),
                         }
@@ -137,7 +170,6 @@ async fn connect_and_run(
                 break;
             }
             let _ = writer.flush().await;
-            info!("Sent command to service: {}", json.trim());
         }
     };
 
@@ -151,7 +183,7 @@ async fn connect_and_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
 
     /// A command sent on the cmd channel must be written to the pipe as a JSON
@@ -166,20 +198,28 @@ mod tests {
             .expect("create server");
 
         let status: SharedStatus = Arc::new(Mutex::new(StatusPayload::default()));
-        let (tx, rx) = mpsc::channel::<UiMsg>(8);
+        let (tx, rx) = mpsc::channel::<UiRequest>(8);
         let connected = Arc::new(AtomicBool::new(false));
+        let waiters: CommandWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let waiters_for_client = waiters.clone();
 
         let status_c = status.clone();
         let connected_c = connected.clone();
         let name_owned = name.to_string();
-        tokio::spawn(async move { run_on(status_c, rx, &name_owned, connected_c).await });
+        tokio::spawn(async move { run_on(status_c, rx, &name_owned, connected_c, waiters).await });
 
         server.connect().await.expect("server accept client");
 
-        // Send an Approve exactly as the Approve button does.
-        tx.send(UiMsg::Approve {
-            id: 7,
-            approved: true,
+        // Send an Approve exactly as the Approve button does, with a waiter for
+        // the service's applied/rejected result.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        lock_waiters(&waiters_for_client).insert(9, reply_tx);
+        tx.send(UiRequest {
+            request_id: Some(9),
+            command: eir_proto::UiMsg::Approve {
+                id: 7,
+                approved: true,
+            },
         })
         .await
         .expect("send cmd");
@@ -192,15 +232,52 @@ mod tests {
             .expect("read");
         let got = String::from_utf8_lossy(&buf[..n]);
         assert!(
-            got.contains("\"type\":\"approve\"") && got.contains("\"id\":7"),
+            got.contains("\"type\":\"approve\"")
+                && got.contains("\"id\":7")
+                && got.contains("\"request_id\":9"),
             "unexpected payload: {got}"
         );
+
+        let result = CommandResult {
+            request_id: 9,
+            ok: true,
+            message: "Approval applied".to_string(),
+        };
+        let mut json = serde_json::to_string(&ServiceMsg::CommandResult(result))
+            .expect("serialize command result");
+        json.push('\n');
+        server
+            .write_all(json.as_bytes())
+            .await
+            .expect("write command result");
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx)
+            .await
+            .expect("client should dispatch command result")
+            .expect("waiter remains live");
+        assert!(reply.ok);
+        assert_eq!(reply.message, "Approval applied");
 
         // By the time a command has round-tripped, the client is connected: the
         // gate flag must be true so command handlers accept work.
         assert!(
             connected.load(Ordering::Relaxed),
             "connected flag should be true while the pipe is live"
+        );
+
+        lock_status(&status)
+            .capabilities
+            .push(eir_proto::CAP_COMMAND_RESULTS.to_string());
+        drop(server);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while connected.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("client should notice the closed pipe");
+        assert!(
+            lock_status(&status).capabilities.is_empty(),
+            "capabilities from the disconnected service must not leak into a new connection"
         );
     }
 

@@ -200,9 +200,9 @@ pub async fn heal(
 }
 
 /// Methods usable right now: enabled in config AND present on this machine. Missing
-/// Chocolatey is bootstrapped when `bootstrap_managers` is set; Scoop is only used if
-/// a user already has it (never installed as SYSTEM); native is offered when an AI
-/// provider is configured.
+/// Chocolatey is bootstrapped when `bootstrap_managers` is set; Scoop remains
+/// unavailable because its user-owned shim cannot run safely as SYSTEM; native is
+/// offered when an AI provider is configured.
 pub async fn available_methods(cfg: &UpdaterConfig, ai: Option<&AiClient>) -> Vec<Method> {
     let enabled: Vec<Method> = cfg
         .methods
@@ -240,12 +240,31 @@ pub struct CycleSummary {
     pub results: Vec<(UpdateCandidate, Vec<AttemptOutcome>)>,
     pub notes: Vec<String>,
     pub cost_usd: f64,
+    /// Completion time for every cycle, including failed/empty runs.
+    pub completed_at: i64,
+    /// Persisted completion time for a cycle with no check/app failures (0 otherwise).
+    pub clean_at: i64,
+}
+
+fn app_completed_cleanly(outcomes: &[AttemptOutcome]) -> bool {
+    outcomes.iter().any(|outcome| outcome.success)
+        || outcomes
+            .last()
+            .is_some_and(|outcome| outcome.category == Some(ErrorCategory::AlreadyCurrent))
+}
+
+fn cycle_completed_cleanly<'a>(
+    had_errors: bool,
+    deferred: usize,
+    mut outcomes: impl Iterator<Item = &'a [AttemptOutcome]>,
+) -> bool {
+    !had_errors && deferred == 0 && outcomes.all(app_completed_cleanly)
 }
 
 /// Flatten a cycle's per-candidate attempts into one UI row each: the winning attempt
 /// (the verified/installed one if any, else the last tried) decides the row's state.
 pub fn app_rows(summary: &CycleSummary, config: &UpdaterConfig) -> Vec<eir_proto::UpdaterAppRow> {
-    summary
+    let mut rows: Vec<_> = summary
         .results
         .iter()
         .map(|(cand, outcomes)| {
@@ -262,7 +281,10 @@ pub fn app_rows(summary: &CycleSummary, config: &UpdaterConfig) -> Vec<eir_proto
                     String::new(),
                 ),
                 Some(o) => {
-                    let state = if o.success {
+                    let already_current = o.category == Some(ErrorCategory::AlreadyCurrent);
+                    let state = if already_current {
+                        "current"
+                    } else if o.success {
                         if o.verification == Verification::Verified {
                             "verified"
                         } else {
@@ -276,9 +298,13 @@ pub fn app_rows(summary: &CycleSummary, config: &UpdaterConfig) -> Vec<eir_proto
                         state.to_string(),
                         o.detail.clone(),
                         o.signature.clone().unwrap_or_default(),
-                        o.installed_version
-                            .clone()
-                            .unwrap_or_else(|| cand.available.clone()),
+                        if already_current {
+                            cand.current.clone()
+                        } else {
+                            o.installed_version
+                                .clone()
+                                .unwrap_or_else(|| cand.available.clone())
+                        },
                     )
                 }
             };
@@ -295,7 +321,23 @@ pub fn app_rows(summary: &CycleSummary, config: &UpdaterConfig) -> Vec<eir_proto
                 note: config.notes.get(&cand.id).cloned().unwrap_or_default(),
             }
         })
-        .collect()
+        .collect();
+    if rows.is_empty() && summary.clean_at == 0 {
+        rows.push(warning_row(
+            "Check finished with warnings; review the notes below.",
+        ));
+    }
+    rows
+}
+
+pub fn warning_row(detail: &str) -> eir_proto::UpdaterAppRow {
+    eir_proto::UpdaterAppRow {
+        id: "update-check".to_string(),
+        name: "Update check".to_string(),
+        state: "failed".to_string(),
+        detail: detail.to_string(),
+        ..Default::default()
+    }
 }
 
 /// Run one full cycle: check for candidates, heal each (bounded by the per-run app
@@ -326,6 +368,11 @@ pub async fn run_cycle(
     .await;
     let mut spent = check.cost_usd;
     let mut notes = check.notes;
+    let mut had_errors = check.had_errors;
+    if available.is_empty() {
+        had_errors = true;
+        notes.push("No usable update source is available.".to_string());
+    }
     let mut results = Vec::new();
 
     // Fair rotation: order candidates by how recently each was last attempted (never-tried
@@ -351,6 +398,11 @@ pub async fn run_cycle(
         spent += outcomes.iter().map(|o| o.cost_usd).sum::<f64>();
         if let Err(e) = history::record_attempts(pool, cycle_id, &cand, &outcomes).await {
             warn!("failed to record update history for {}: {e}", cand.name);
+            notes.push(format!(
+                "failed to record update history for {}: {e}",
+                cand.name
+            ));
+            had_errors = true;
         }
         results.push((cand, outcomes));
     }
@@ -360,10 +412,25 @@ pub async fn run_cycle(
     // works is deprioritised. Best-effort, on already-collected data — no AI, no extra I/O.
     crate::learn::analyse_updates(pool).await;
 
+    let completed_at = chrono::Utc::now().timestamp();
+    let mut clean_at = 0;
+    if cycle_completed_cleanly(
+        had_errors,
+        deferred,
+        results.iter().map(|(_, outcomes)| outcomes.as_slice()),
+    ) {
+        match history::record_clean_run(pool, completed_at).await {
+            Ok(()) => clean_at = completed_at,
+            Err(e) => notes.push(format!("failed to persist clean update cycle: {e}")),
+        }
+    }
+
     CycleSummary {
         results,
         notes,
         cost_usd: spent,
+        completed_at,
+        clean_at,
     }
 }
 
@@ -424,5 +491,85 @@ mod tests {
             next_method(&order, &[Method::Winget, Method::Native], &last2),
             None
         );
+    }
+
+    #[test]
+    fn clean_completion_accepts_success_or_already_current_only() {
+        assert!(app_completed_cleanly(&[outcome(
+            Method::Winget,
+            true,
+            None
+        )]));
+        assert!(app_completed_cleanly(&[outcome(
+            Method::Winget,
+            false,
+            Some(ErrorCategory::AlreadyCurrent)
+        )]));
+        assert!(!app_completed_cleanly(&[]));
+        assert!(!app_completed_cleanly(&[outcome(
+            Method::Winget,
+            false,
+            Some(ErrorCategory::InstallerFailed)
+        )]));
+    }
+
+    #[test]
+    fn deferred_apps_prevent_a_clean_cycle() {
+        let successful = vec![outcome(Method::Winget, true, None)];
+        assert!(cycle_completed_cleanly(
+            false,
+            0,
+            std::iter::once(successful.as_slice())
+        ));
+        assert!(!cycle_completed_cleanly(
+            false,
+            1,
+            std::iter::once(successful.as_slice())
+        ));
+    }
+
+    #[test]
+    fn already_current_rows_are_not_reported_as_failures() {
+        let candidate = UpdateCandidate {
+            id: "tool".into(),
+            name: "Tool".into(),
+            current: "2.0".into(),
+            available: "2.0".into(),
+            package_id: None,
+            methods: vec![Method::Winget],
+        };
+        let summary = CycleSummary {
+            results: vec![(
+                candidate,
+                vec![outcome(
+                    Method::Winget,
+                    false,
+                    Some(ErrorCategory::AlreadyCurrent),
+                )],
+            )],
+            notes: vec![],
+            cost_usd: 0.0,
+            completed_at: 1,
+            clean_at: 1,
+        };
+        assert_eq!(
+            app_rows(&summary, &UpdaterConfig::default())[0].state,
+            "current"
+        );
+    }
+
+    #[test]
+    fn incomplete_empty_cycle_has_visible_warning_row() {
+        let summary = CycleSummary {
+            results: vec![],
+            notes: vec!["inventory failed".into()],
+            cost_usd: 0.0,
+            completed_at: 1,
+            clean_at: 0,
+        };
+        let rows = app_rows(&summary, &UpdaterConfig::default());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "failed");
+        assert_eq!(rows[0].name, "Update check");
     }
 }

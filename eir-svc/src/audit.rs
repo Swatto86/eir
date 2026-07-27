@@ -1,8 +1,8 @@
 use crate::models::{
     CallUsage, ClaudeDecision, ExecutionResult, FixAction, PastDecision, PendingApproval,
-    RegistryUndo, SignalSnapshot, SystemState,
+    RegistryScalarKind, RegistryUndo, SignalSnapshot, SystemState,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use eir_proto::{ApprovalInfo, UsageSummary};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
@@ -131,14 +131,6 @@ pub async fn log_manual_decision(pool: &SqlitePool, summary: &str) -> Result<i64
     .await?
     .last_insert_rowid();
     Ok(id)
-}
-
-pub async fn mark_decision_executed(pool: &SqlitePool, decision_id: i64) -> Result<()> {
-    sqlx::query("UPDATE decisions SET executed = 1 WHERE id = ?")
-        .bind(decision_id)
-        .execute(pool)
-        .await?;
-    Ok(())
 }
 
 pub async fn get_recent_decisions(pool: &SqlitePool, limit: i64) -> Result<Vec<PastDecision>> {
@@ -437,30 +429,6 @@ pub async fn latest_digest(pool: &SqlitePool) -> Result<Option<(String, i64)>> {
     }
 }
 
-/// Persist a registry-undo snapshot linked to its execution; returns the row id the
-/// UI uses to trigger a one-click revert.
-pub async fn save_registry_undo(
-    pool: &SqlitePool,
-    execution_id: i64,
-    undo: &RegistryUndo,
-) -> Result<i64> {
-    let id = sqlx::query(
-        "INSERT INTO registry_undo
-           (execution_id, key_path, value_name, prior_existed, prior_data, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(execution_id)
-    .bind(&undo.key_path)
-    .bind(&undo.value_name)
-    .bind(undo.prior_existed as i64)
-    .bind(&undo.prior_data)
-    .bind(Utc::now().to_rfc3339())
-    .execute(pool)
-    .await?
-    .last_insert_rowid();
-    Ok(id)
-}
-
 /// Atomically CLAIM a not-yet-undone registry-undo record for reverting: flip
 /// `undone` 0→1 and, only if this call is the one that flipped it, return the
 /// snapshot. Two concurrent undo requests for the same id can't both win (SQLite
@@ -468,29 +436,54 @@ pub async fn save_registry_undo(
 /// `None` if the record doesn't exist or was already claimed/reverted. On a restore
 /// failure the caller should [`unclaim_registry_undo`] so the user can retry.
 pub async fn claim_registry_undo(pool: &SqlitePool, id: i64) -> Result<Option<RegistryUndo>> {
+    let mut tx = pool.begin().await?;
     let flipped = sqlx::query("UPDATE registry_undo SET undone = 1 WHERE id = ? AND undone = 0")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
     if flipped == 0 {
+        tx.commit().await?;
         return Ok(None);
     }
     let row = sqlx::query(
-        "SELECT key_path, value_name, prior_existed, prior_data FROM registry_undo WHERE id = ?",
+        "SELECT key_path, value_name, prior_existed, prior_data, prior_kind,
+                applied_kind, applied_data
+         FROM registry_undo WHERE id = ?",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    match row {
-        Some(r) => Ok(Some(RegistryUndo {
-            key_path: r.try_get(0)?,
-            value_name: r.try_get(1)?,
-            prior_existed: r.try_get::<i64, _>(2)? != 0,
-            prior_data: r.try_get(3)?,
-        })),
-        None => Ok(None),
-    }
+    let undo = match row {
+        Some(r) => {
+            let prior_kind = r
+                .try_get::<Option<String>, _>(4)?
+                .map(|kind| {
+                    RegistryScalarKind::from_storage(&kind)
+                        .with_context(|| format!("Unknown stored registry value type '{kind}'"))
+                })
+                .transpose()?;
+            let applied_kind = r
+                .try_get::<Option<String>, _>(5)?
+                .map(|kind| {
+                    RegistryScalarKind::from_storage(&kind)
+                        .with_context(|| format!("Unknown stored registry value type '{kind}'"))
+                })
+                .transpose()?;
+            RegistryUndo {
+                key_path: r.try_get(0)?,
+                value_name: r.try_get(1)?,
+                prior_existed: r.try_get::<i64, _>(2)? != 0,
+                prior_kind,
+                prior_data: r.try_get(3)?,
+                applied_kind,
+                applied_data: r.try_get(6)?,
+            }
+        }
+        None => anyhow::bail!("claimed registry undo disappeared"),
+    };
+    tx.commit().await?;
+    Ok(Some(undo))
 }
 
 /// Release a claim made by [`claim_registry_undo`] (restore failed) so a later attempt
@@ -566,25 +559,88 @@ pub async fn insert_pending_approval(
     action: &FixAction,
     info: &ApprovalInfo,
     baseline: &SystemState,
-) -> Result<i64> {
+) -> Result<u64> {
     let created_at = Utc::now().to_rfc3339();
     let action_json = serde_json::to_string(action)?;
     let info_json = serde_json::to_string(info)?;
     let baseline_json = serde_json::to_string(baseline)?;
     let id = sqlx::query(
         "INSERT INTO pending_approvals
-         (created_at, decision_id, action_json, info_json, baseline_json)
-         VALUES (?, ?, ?, ?, ?)",
+         (created_at, decision_id, action_json, info_json, baseline_json, action_key)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&created_at)
     .bind(decision_id)
     .bind(&action_json)
     .bind(&info_json)
     .bind(&baseline_json)
+    .bind(action.dedup_key())
     .execute(pool)
     .await?
     .last_insert_rowid();
-    Ok(id)
+    u64::try_from(id).map_err(|_| anyhow::anyhow!("pending approval row id was negative"))
+}
+
+/// Upgrade legacy active approvals whose additive `action_key` column is NULL and
+/// enforce one durable row per semantic action across pending + approved states.
+/// Approved rows win over pending duplicates; otherwise the newest row wins.
+async fn normalize_active_approval_keys(pool: &SqlitePool) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let rows = sqlx::query(
+        "SELECT id, action_json
+         FROM pending_approvals
+         WHERE status IN ('pending', 'approved')
+         ORDER BY CASE status WHEN 'approved' THEN 0 ELSE 1 END, id DESC",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut keep = Vec::new();
+    let mut remove = Vec::new();
+    for row in rows {
+        let id: i64 = row.try_get("id")?;
+        let action_json: String = row.try_get("action_json")?;
+        match serde_json::from_str::<FixAction>(&action_json) {
+            Ok(action) => {
+                let key = action.dedup_key();
+                if seen.insert(key.clone()) {
+                    keep.push((id, key));
+                } else {
+                    remove.push(id);
+                }
+            }
+            Err(e) => {
+                warn!(id, "Dropping unreadable active approval: {e}");
+                remove.push(id);
+            }
+        }
+    }
+
+    // Delete duplicates before backfilling winners so the partial unique index can
+    // never reject an upgrade where a keyed row and a legacy NULL-key row collide.
+    for id in remove {
+        sqlx::query("DELETE FROM pending_approvals WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(
+        "UPDATE pending_approvals
+         SET action_key = NULL
+         WHERE status IN ('pending', 'approved')",
+    )
+    .execute(&mut *tx)
+    .await?;
+    for (id, key) in keep {
+        sqlx::query("UPDATE pending_approvals SET action_key = ? WHERE id = ?")
+            .bind(key)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Load all outstanding approvals (oldest first), reconstructing the action and
@@ -592,9 +648,15 @@ pub async fn insert_pending_approval(
 /// action shape removed in an upgrade — are dropped (and deleted) rather than
 /// failing the whole load.
 pub async fn load_pending_approvals(pool: &SqlitePool) -> Result<Vec<PendingApproval>> {
+    // A crash after durably recording Reject but before the best-effort delete must
+    // never resurrect the card. Retire those tombstones on the next startup.
+    sqlx::query("DELETE FROM pending_approvals WHERE status = 'rejected'")
+        .execute(pool)
+        .await?;
+    normalize_active_approval_keys(pool).await?;
     let rows = sqlx::query(
         "SELECT id, decision_id, action_json, info_json, baseline_json
-         FROM pending_approvals ORDER BY id ASC",
+         FROM pending_approvals WHERE status = 'pending' ORDER BY id ASC",
     )
     .fetch_all(pool)
     .await?;
@@ -611,7 +673,7 @@ pub async fn load_pending_approvals(pool: &SqlitePool) -> Result<Vec<PendingAppr
             let action: FixAction = serde_json::from_str(&action_json)?;
             let mut info: ApprovalInfo = serde_json::from_str(&info_json)?;
             // The row id is the source of truth for the approval id.
-            info.id = id as u64;
+            info.id = u64::try_from(id)?;
             let baseline: SystemState = serde_json::from_str(&baseline_json)?;
             Ok(PendingApproval {
                 info,
@@ -625,7 +687,10 @@ pub async fn load_pending_approvals(pool: &SqlitePool) -> Result<Vec<PendingAppr
             Ok(pa) => out.push(pa),
             Err(e) => {
                 warn!(id, "Dropping unreadable pending approval: {e}");
-                let _ = delete_pending_approval(pool, id as u64).await;
+                let _ = sqlx::query("DELETE FROM pending_approvals WHERE id = ?")
+                    .bind(id)
+                    .execute(pool)
+                    .await;
             }
         }
     }
@@ -651,34 +716,204 @@ pub async fn load_pending_approvals(pool: &SqlitePool) -> Result<Vec<PendingAppr
     Ok(keep)
 }
 
+pub async fn load_claimed_approvals(pool: &SqlitePool) -> Result<Vec<PendingApproval>> {
+    normalize_active_approval_keys(pool).await?;
+    let rows = sqlx::query(
+        "SELECT id, decision_id, action_json, info_json, baseline_json
+         FROM pending_approvals WHERE status = 'approved' ORDER BY id ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::new();
+    for row in rows {
+        let id: i64 = row.try_get("id")?;
+        match parse_pending_approval(&row) {
+            Ok(approval) => out.push(approval),
+            Err(e) => {
+                warn!(id, "Dropping unreadable approved action: {e}");
+                let _ = sqlx::query("DELETE FROM pending_approvals WHERE id = ?")
+                    .bind(id)
+                    .execute(pool)
+                    .await;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Atomically records the user's decision. Only a still-pending row can be claimed,
+/// so repeated clicks/connections cannot enqueue the same privileged action twice.
+pub async fn claim_pending_approval(
+    pool: &SqlitePool,
+    id: u64,
+    approved: bool,
+) -> Result<Option<PendingApproval>> {
+    let id = i64::try_from(id)?;
+    let status = if approved { "approved" } else { "rejected" };
+    let row = sqlx::query(
+        "UPDATE pending_approvals
+         SET status = ?, claimed_at = ?
+         WHERE id = ? AND status = 'pending'
+         RETURNING id, decision_id, action_json, info_json, baseline_json",
+    )
+    .bind(status)
+    .bind(Utc::now().to_rfc3339())
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref().map(parse_pending_approval).transpose()
+}
+
+fn parse_pending_approval(row: &sqlx::sqlite::SqliteRow) -> Result<PendingApproval> {
+    let id: i64 = row.try_get("id")?;
+    let decision_id: i64 = row.try_get("decision_id")?;
+    let action: FixAction = serde_json::from_str(&row.try_get::<String, _>("action_json")?)?;
+    let mut info: ApprovalInfo = serde_json::from_str(&row.try_get::<String, _>("info_json")?)?;
+    info.id = u64::try_from(id)?;
+    let baseline: SystemState = serde_json::from_str(&row.try_get::<String, _>("baseline_json")?)?;
+    Ok(PendingApproval {
+        info,
+        action,
+        decision_id,
+        baseline,
+    })
+}
+
 /// Remove a resolved approval (approved or rejected) from the queue.
 pub async fn delete_pending_approval(pool: &SqlitePool, id: u64) -> Result<()> {
+    let id = i64::try_from(id)?;
     sqlx::query("DELETE FROM pending_approvals WHERE id = ?")
-        .bind(id as i64)
+        .bind(id)
         .execute(pool)
         .await?;
     Ok(())
 }
 
-pub async fn log_execution(
+pub struct PersistedExecution {
+    pub execution_id: i64,
+    pub undo_id: Option<i64>,
+}
+
+/// Durably record an execution and transition its approved row in one transaction.
+/// Successful registry resets cannot commit without their exact undo snapshot.
+pub async fn persist_execution(
     pool: &SqlitePool,
     decision_id: i64,
+    action: &FixAction,
     result: &ExecutionResult,
-) -> anyhow::Result<i64> {
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let id = sqlx::query(
-        "INSERT INTO execution_log (decision_id, action, success, output, executed_at)
-         VALUES (?, ?, ?, ?, ?)",
+    approval_id: Option<u64>,
+    requeue_approval: bool,
+) -> Result<PersistedExecution> {
+    anyhow::ensure!(
+        !requeue_approval || approval_id.is_some(),
+        "cannot requeue an execution without an approval"
+    );
+    let registry_reset = matches!(action, FixAction::RegistryReset { .. });
+    if result.success && registry_reset {
+        let undo = result
+            .undo
+            .as_ref()
+            .context("successful registry reset omitted its undo snapshot")?;
+        anyhow::ensure!(
+            undo.applied_kind.is_some() && undo.applied_data.is_some(),
+            "registry undo omitted Eir's applied value"
+        );
+        if undo.prior_existed {
+            anyhow::ensure!(
+                undo.prior_kind.is_some() && undo.prior_data.is_some(),
+                "registry undo omitted the prior value"
+            );
+        } else {
+            anyhow::ensure!(
+                undo.prior_kind.is_none() && undo.prior_data.is_none(),
+                "absent registry undo contained a prior value"
+            );
+        }
+    } else {
+        anyhow::ensure!(
+            result.undo.is_none(),
+            "non-successful or non-registry execution carried an undo snapshot"
+        );
+    }
+
+    let mut tx = pool.begin().await?;
+    let timestamp = Utc::now().to_rfc3339();
+    let execution_id = sqlx::query(
+        "INSERT INTO execution_log
+         (decision_id, action, action_key, success, output, executed_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(decision_id)
     .bind(&result.action)
-    .bind(if result.success { 1i64 } else { 0i64 })
+    .bind(action.dedup_key())
+    .bind(i64::from(result.success))
     .bind(&result.output)
     .bind(&timestamp)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .last_insert_rowid();
-    Ok(id)
+
+    sqlx::query("UPDATE decisions SET executed = 1 WHERE id = ?")
+        .bind(decision_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let undo_id = if result.success && registry_reset {
+        let undo = result
+            .undo
+            .as_ref()
+            .context("successful registry reset omitted its undo snapshot")?;
+        Some(
+            sqlx::query(
+                "INSERT INTO registry_undo
+                   (execution_id, key_path, value_name, prior_existed, prior_kind, prior_data,
+                    applied_kind, applied_data, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(execution_id)
+            .bind(&undo.key_path)
+            .bind(&undo.value_name)
+            .bind(i64::from(undo.prior_existed))
+            .bind(undo.prior_kind.map(RegistryScalarKind::as_str))
+            .bind(&undo.prior_data)
+            .bind(undo.applied_kind.map(RegistryScalarKind::as_str))
+            .bind(&undo.applied_data)
+            .bind(&timestamp)
+            .execute(&mut *tx)
+            .await?
+            .last_insert_rowid(),
+        )
+    } else {
+        None
+    };
+
+    if let Some(id) = approval_id {
+        let id = i64::try_from(id)?;
+        let changed = if requeue_approval {
+            sqlx::query(
+                "UPDATE pending_approvals
+                 SET status = 'pending', claimed_at = NULL
+                 WHERE id = ? AND status = 'approved'",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+        } else {
+            sqlx::query("DELETE FROM pending_approvals WHERE id = ? AND status = 'approved'")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+        };
+        anyhow::ensure!(changed == 1, "approved action changed before completion");
+    }
+
+    tx.commit().await?;
+    Ok(PersistedExecution {
+        execution_id,
+        undo_id,
+    })
 }
 
 /// Delete rows older than `days` from the three high-frequency audit tables that
@@ -701,8 +936,8 @@ pub async fn prune_old(pool: &SqlitePool, days: i64) -> anyhow::Result<u64> {
     }
     // Prune `decisions` too, but never a decision that still has an outstanding
     // approval: pending_approvals has no time-based retention, so pruning its parent
-    // would orphan the queue's decision_id and make a later mark_decision_executed a
-    // silent no-op. An unresolved approval keeps its decision row until it's resolved.
+    // would orphan the queue's decision_id and prevent its eventual execution from
+    // being linked. An unresolved approval keeps its decision row until it's resolved.
     let res = sqlx::query(
         "DELETE FROM decisions WHERE timestamp < ? \
          AND id NOT IN (SELECT decision_id FROM pending_approvals)",
@@ -731,6 +966,368 @@ mod tests {
             memory: 2.0,
             disk: 3.0,
         }
+    }
+
+    #[tokio::test]
+    async fn registry_undo_round_trips_exact_scalar_type() {
+        let path =
+            std::env::temp_dir().join(format!("eir-registry-undo-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let pool = init_db(&path.to_string_lossy()).await.expect("db");
+        let decision_id = log_manual_decision(&pool, "test").await.expect("decision");
+        let undo = RegistryUndo {
+            key_path: r"HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters".into(),
+            value_name: "Setting".into(),
+            prior_existed: true,
+            prior_kind: Some(RegistryScalarKind::ExpandString),
+            prior_data: Some(r"%SystemRoot%\Temp".into()),
+            applied_kind: Some(RegistryScalarKind::ExpandString),
+            applied_data: Some(r"%SystemRoot%\NewTemp".into()),
+        };
+        let action = FixAction::RegistryReset {
+            key_path: undo.key_path.clone(),
+            value_name: undo.value_name.clone(),
+            value_data: r"%SystemRoot%\NewTemp".into(),
+        };
+        let result = ExecutionResult {
+            action: "Reset registry value".into(),
+            success: true,
+            output: "Set registry value Setting".into(),
+            undo: Some(undo),
+        };
+
+        let id = persist_execution(&pool, decision_id, &action, &result, None, false)
+            .await
+            .expect("persist execution and undo")
+            .undo_id
+            .expect("undo id");
+        let claimed = claim_registry_undo(&pool, id)
+            .await
+            .expect("claim")
+            .expect("stored undo");
+        assert_eq!(claimed.prior_kind, Some(RegistryScalarKind::ExpandString));
+        assert_eq!(claimed.prior_data.as_deref(), Some(r"%SystemRoot%\Temp"));
+        assert_eq!(claimed.applied_kind, Some(RegistryScalarKind::ExpandString));
+        assert_eq!(
+            claimed.applied_data.as_deref(),
+            Some(r"%SystemRoot%\NewTemp")
+        );
+        assert!(claim_registry_undo(&pool, id)
+            .await
+            .expect("second claim")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_execution_is_logged_and_approved_action_is_requeued_atomically() {
+        let path =
+            std::env::temp_dir().join(format!("eir-requeue-execution-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let pool = init_db(&path.to_string_lossy()).await.expect("db");
+        let decision_id = log_manual_decision(&pool, "test").await.expect("decision");
+        let action = FixAction::ServiceRestart {
+            service_name: "Spooler".into(),
+        };
+        let info = ApprovalInfo {
+            id: 0,
+            diagnosis: "test".into(),
+            confidence: 0.9,
+            action: "restart".into(),
+            reason: "test".into(),
+            reversible: true,
+            root_cause: String::new(),
+            side_effects: String::new(),
+            undo_instructions: String::new(),
+            action_summary: String::new(),
+            target: String::new(),
+            target_details: String::new(),
+            created_at: 0,
+        };
+        let id =
+            insert_pending_approval(&pool, decision_id, &action, &info, &SystemState::default())
+                .await
+                .expect("insert");
+        claim_pending_approval(&pool, id, true)
+            .await
+            .expect("claim")
+            .expect("approved row");
+        let result = ExecutionResult {
+            action: "Restart service Spooler".into(),
+            success: false,
+            output: "executor timed out".into(),
+            undo: None,
+        };
+
+        let persisted = persist_execution(&pool, decision_id, &action, &result, Some(id), true)
+            .await
+            .expect("persist failure and requeue");
+
+        assert!(persisted.execution_id > 0);
+        assert!(persisted.undo_id.is_none());
+        let log_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution_log WHERE id = ? AND success = 0 AND output = ?",
+        )
+        .bind(persisted.execution_id)
+        .bind(&result.output)
+        .fetch_one(&pool)
+        .await
+        .expect("execution log");
+        assert_eq!(log_count, 1);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM pending_approvals WHERE id = ?")
+                .bind(i64::try_from(id).expect("id"))
+                .fetch_one(&pool)
+                .await
+                .expect("approval status");
+        assert_eq!(status, "pending");
+        assert_eq!(
+            load_pending_approvals(&pool).await.expect("pending").len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_reset_does_not_commit_or_finalize_without_undo_persistence() {
+        let path =
+            std::env::temp_dir().join(format!("eir-registry-atomic-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let pool = init_db(&path.to_string_lossy()).await.expect("db");
+        let decision_id = log_manual_decision(&pool, "test").await.expect("decision");
+        let action = FixAction::RegistryReset {
+            key_path: r"HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters".into(),
+            value_name: "Setting".into(),
+            value_data: "7".into(),
+        };
+        let info = ApprovalInfo {
+            id: 0,
+            diagnosis: "test".into(),
+            confidence: 0.9,
+            action: "reset".into(),
+            reason: "test".into(),
+            reversible: true,
+            root_cause: String::new(),
+            side_effects: String::new(),
+            undo_instructions: String::new(),
+            action_summary: String::new(),
+            target: String::new(),
+            target_details: String::new(),
+            created_at: 0,
+        };
+        let id =
+            insert_pending_approval(&pool, decision_id, &action, &info, &SystemState::default())
+                .await
+                .expect("insert");
+        claim_pending_approval(&pool, id, true)
+            .await
+            .expect("claim")
+            .expect("approved row");
+        let result = ExecutionResult {
+            action: "Reset registry value".into(),
+            success: true,
+            output: "Set registry value Setting".into(),
+            undo: Some(RegistryUndo {
+                key_path: r"HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters".into(),
+                value_name: "Setting".into(),
+                prior_existed: true,
+                prior_kind: Some(RegistryScalarKind::DWord),
+                prior_data: Some("42".into()),
+                applied_kind: Some(RegistryScalarKind::DWord),
+                applied_data: Some("7".into()),
+            }),
+        };
+        sqlx::query("DROP TABLE registry_undo")
+            .execute(&pool)
+            .await
+            .expect("break undo persistence");
+
+        assert!(
+            persist_execution(&pool, decision_id, &action, &result, Some(id), false)
+                .await
+                .is_err()
+        );
+
+        let execution_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_log")
+            .fetch_one(&pool)
+            .await
+            .expect("execution count");
+        assert_eq!(execution_count, 0);
+        let executed: i64 = sqlx::query_scalar("SELECT executed FROM decisions WHERE id = ?")
+            .bind(decision_id)
+            .fetch_one(&pool)
+            .await
+            .expect("decision state");
+        assert_eq!(executed, 0);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM pending_approvals WHERE id = ?")
+                .bind(i64::try_from(id).expect("id"))
+                .fetch_one(&pool)
+                .await
+                .expect("approval status");
+        assert_eq!(status, "approved");
+    }
+
+    #[tokio::test]
+    async fn approval_claim_is_atomic_and_survives_until_completion() {
+        let path = std::env::temp_dir().join(format!("eir-approval-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let pool = init_db(&path.to_string_lossy()).await.expect("db");
+        let decision_id = log_manual_decision(&pool, "test").await.expect("decision");
+        let action = FixAction::ServiceRestart {
+            service_name: "Spooler".into(),
+        };
+        let info = ApprovalInfo {
+            id: 0,
+            diagnosis: "test".into(),
+            confidence: 0.9,
+            action: "restart".into(),
+            reason: "test".into(),
+            reversible: true,
+            root_cause: String::new(),
+            side_effects: String::new(),
+            undo_instructions: String::new(),
+            action_summary: String::new(),
+            target: String::new(),
+            target_details: String::new(),
+            created_at: 0,
+        };
+        let id =
+            insert_pending_approval(&pool, decision_id, &action, &info, &SystemState::default())
+                .await
+                .expect("insert");
+
+        assert!(claim_pending_approval(&pool, id, true)
+            .await
+            .expect("claim")
+            .is_some());
+        assert!(claim_pending_approval(&pool, id, true)
+            .await
+            .expect("second claim")
+            .is_none());
+        assert!(load_pending_approvals(&pool)
+            .await
+            .expect("pending")
+            .is_empty());
+        assert_eq!(
+            load_claimed_approvals(&pool).await.expect("claimed").len(),
+            1
+        );
+        delete_pending_approval(&pool, id).await.expect("complete");
+        assert!(load_claimed_approvals(&pool)
+            .await
+            .expect("completed")
+            .is_empty());
+
+        let rejected_id =
+            insert_pending_approval(&pool, decision_id, &action, &info, &SystemState::default())
+                .await
+                .expect("insert rejection");
+        assert!(claim_pending_approval(&pool, rejected_id, false)
+            .await
+            .expect("reject")
+            .is_some());
+        assert!(load_pending_approvals(&pool)
+            .await
+            .expect("rejected stays hidden")
+            .is_empty());
+        assert!(load_claimed_approvals(&pool)
+            .await
+            .expect("rejected is not executable")
+            .is_empty());
+
+        // One corrupt legacy row must not prevent another durably-approved action
+        // from being restored after a restart.
+        let valid_id =
+            insert_pending_approval(&pool, decision_id, &action, &info, &SystemState::default())
+                .await
+                .expect("insert valid claim");
+        claim_pending_approval(&pool, valid_id, true)
+            .await
+            .expect("claim valid");
+        let corrupt_id = sqlx::query(
+            "INSERT INTO pending_approvals
+             (created_at, decision_id, action_json, info_json, baseline_json, action_key, status)
+             VALUES (?, ?, ?, ?, ?, ?, 'approved')",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(decision_id)
+        .bind("{")
+        .bind("{}")
+        .bind("{}")
+        .bind("corrupt:legacy")
+        .execute(&pool)
+        .await
+        .expect("insert corrupt claim")
+        .last_insert_rowid();
+
+        let claimed = load_claimed_approvals(&pool)
+            .await
+            .expect("valid claim still loads");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].info.id, valid_id);
+        let corrupt_remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pending_approvals WHERE id = ?")
+                .bind(corrupt_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count corrupt claim");
+        assert_eq!(corrupt_remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_active_approval_keys_are_backfilled_after_deduplication() {
+        let path =
+            std::env::temp_dir().join(format!("eir-legacy-approval-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let pool = init_db(&path.to_string_lossy()).await.expect("db");
+        let decision_id = log_manual_decision(&pool, "legacy")
+            .await
+            .expect("decision");
+        let action = FixAction::ServiceRestart {
+            service_name: "Spooler".into(),
+        };
+        let info = ApprovalInfo {
+            id: 0,
+            diagnosis: "legacy".into(),
+            confidence: 0.9,
+            action: "restart".into(),
+            reason: "test".into(),
+            reversible: true,
+            root_cause: String::new(),
+            side_effects: String::new(),
+            undo_instructions: String::new(),
+            action_summary: String::new(),
+            target: String::new(),
+            target_details: String::new(),
+            created_at: 0,
+        };
+        let action_json = serde_json::to_string(&action).expect("action");
+        let info_json = serde_json::to_string(&info).expect("info");
+        let baseline_json = serde_json::to_string(&SystemState::default()).expect("baseline");
+        for _ in 0..2 {
+            sqlx::query(
+                "INSERT INTO pending_approvals
+                 (created_at, decision_id, action_json, info_json, baseline_json)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(decision_id)
+            .bind(&action_json)
+            .bind(&info_json)
+            .bind(&baseline_json)
+            .execute(&pool)
+            .await
+            .expect("legacy row");
+        }
+
+        let pending = load_pending_approvals(&pool).await.expect("load");
+        assert_eq!(pending.len(), 1);
+        let stored_key: Option<String> =
+            sqlx::query_scalar("SELECT action_key FROM pending_approvals WHERE id = ?")
+                .bind(i64::try_from(pending[0].info.id).expect("id"))
+                .fetch_one(&pool)
+                .await
+                .expect("stored key");
+        assert_eq!(stored_key.as_deref(), Some(action.dedup_key().as_str()));
     }
 
     #[test]

@@ -1,10 +1,51 @@
 use crate::policy::{is_network_path, is_within, normalize_path_lexical};
-use anyhow::{bail, Result};
-use std::path::Path;
+use anyhow::{bail, Context, Result};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::time::{Duration, Instant, SystemTime};
-use tracing::info;
+use tracing::{info, warn};
+use windows::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    Security::{ImpersonateLoggedOnUser, RevertToSelf},
+    System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken},
+};
 
 const CLEANABLE_EXTENSIONS: &[&str] = &["log", "tmp", "dmp", "etl", "blf", "regtrans-ms"];
+
+struct ActiveUserImpersonation(HANDLE);
+
+impl ActiveUserImpersonation {
+    fn new() -> Result<Self> {
+        let session = unsafe { WTSGetActiveConsoleSessionId() };
+        if session == u32::MAX {
+            bail!("No active desktop user is available for this file action");
+        }
+        let mut token = HANDLE::default();
+        unsafe {
+            WTSQueryUserToken(session, &mut token).context("Get active desktop user token")?;
+            if let Err(error) = ImpersonateLoggedOnUser(token) {
+                let _ = CloseHandle(token);
+                return Err(error).context("Impersonate active desktop user");
+            }
+        }
+        Ok(Self(token))
+    }
+}
+
+impl Drop for ActiveUserImpersonation {
+    fn drop(&mut self) {
+        unsafe {
+            if let Err(error) = RevertToSelf() {
+                warn!(%error, "Failed to end file-action user impersonation");
+            }
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+pub(crate) fn with_active_user<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _user = ActiveUserImpersonation::new()?;
+    f()
+}
 
 /// Directories whose files must never be deleted by a log cleanup, even when they
 /// match a cleanable extension — Windows keeps live ETW traces and registry
@@ -43,6 +84,86 @@ pub(crate) fn is_protected_file(path: &str) -> bool {
     PROTECTED_DIRS.iter().any(|d| is_within(path, d))
 }
 
+pub(crate) fn checked_local_path(path: &Path) -> Result<Option<PathBuf>> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    if !path.is_absolute() {
+        bail!(
+            "Refusing '{}' — path is not an absolute local drive path",
+            path.display()
+        );
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) if matches!(prefix.kind(), Prefix::Disk(_)) => {
+                current.push(component.as_os_str());
+            }
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::Normal(_) => {
+                current.push(component.as_os_str());
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata)
+                        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 =>
+                    {
+                        bail!(
+                            "Refusing '{}' — path contains a reparse point",
+                            path.display()
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!("Cannot inspect file-action path '{}'", current.display())
+                        });
+                    }
+                }
+            }
+            Component::CurDir => {}
+            _ => bail!(
+                "Refusing '{}' — path is not a plain local drive path",
+                path.display()
+            ),
+        }
+    }
+
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("Cannot resolve log cleanup path '{}'", path.display()))?;
+    let mut components = canonical.components();
+    let local_drive = matches!(
+        components.next(),
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+    ) && matches!(components.next(), Some(Component::RootDir));
+    if !local_drive {
+        bail!(
+            "Refusing '{}' — resolved target is not a local drive",
+            path.display()
+        );
+    }
+    Ok(Some(canonical))
+}
+
+fn validate_cleanup_result(
+    deleted: u32,
+    attempted: u32,
+    walk_errors: u32,
+    timed_out: bool,
+) -> Result<()> {
+    if deleted == 0 && walk_errors > 0 {
+        bail!("Log cleanup could not enumerate the target ({walk_errors} read error(s))");
+    }
+    if deleted == 0 && attempted > 0 {
+        bail!("Log cleanup could not remove any of {attempted} eligible file(s)");
+    }
+    if deleted == 0 && timed_out {
+        bail!("Log cleanup reached its time limit before removing any file");
+    }
+    Ok(())
+}
+
 pub fn cleanup(path: &str, days_old: u32) -> Result<String> {
     // days_old == 0 makes the cutoff "now", matching every existing file — a mass
     // delete disguised as a log cleanup. Require a real age window.
@@ -59,30 +180,16 @@ pub fn cleanup(path: &str, days_old: u32) -> Result<String> {
         bail!("Refusing log cleanup on '{path}' — root is a drive root or contains protected system directories");
     }
 
+    // The service is LocalSystem, but these paths are user-controlled. Keep the
+    // complete check/walk/delete sequence at the active user's privilege level.
+    let _user = ActiveUserImpersonation::new()?;
     let dir = Path::new(path);
-    if !dir.exists() {
+    let Some(walk_root) = checked_local_path(dir)? else {
         return Ok(format!("Directory '{path}' does not exist, skipping"));
-    }
-    // Canonicalise once, and use the resolved path as BOTH the protected-dir re-check
-    // and the walk root. The lexical `root_too_broad` guard above can be evaded by an 8.3
-    // short name or a junction whose text differs from a protected dir but resolves to it
-    // on disk; `canonicalize` resolves 8.3 / junctions / symlinks to the real target.
-    // Walking the canonical path (not the original `dir`) also closes a check->act gap:
-    // WalkDir always follows a reparse point at the ROOT (`follow_links(false)` only
-    // affects descent), so walking the original path could enter a junction swapped in
-    // after the check. If it can't be canonicalised, the lexical guard already applied;
-    // walk the original path.
-    let walk_root = match std::fs::canonicalize(dir) {
-        Ok(canon) => {
-            if root_too_broad(&canon.to_string_lossy()) {
-                bail!(
-                    "Refusing log cleanup on '{path}' — it resolves to a protected system location"
-                );
-            }
-            canon
-        }
-        Err(_) => dir.to_path_buf(),
     };
+    if root_too_broad(&walk_root.to_string_lossy()) {
+        bail!("Refusing log cleanup on '{path}' — it resolves to a protected system location");
+    }
 
     // Self-terminate before the executor's 10-min backstop aborts us: an abort can't reach
     // this blocking walk, so without an internal deadline it would keep deleting after the
@@ -97,12 +204,20 @@ pub fn cleanup(path: &str, days_old: u32) -> Result<String> {
     let mut skipped = 0u32;
     let mut bytes_freed: u64 = 0;
     let mut timed_out = false;
+    let mut walk_errors = 0u32;
+    let mut attempted = 0u32;
 
-    for entry in walkdir::WalkDir::new(&walk_root)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
+    for entry in walkdir::WalkDir::new(&walk_root) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                walk_errors += 1;
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
         if Instant::now() >= deadline {
             timed_out = true;
             break;
@@ -122,15 +237,25 @@ pub fn cleanup(path: &str, days_old: u32) -> Result<String> {
 
         let meta = match entry.metadata() {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(_) => {
+                walk_errors += 1;
+                continue;
+            }
         };
 
-        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let modified = match meta.modified() {
+            Ok(modified) => modified,
+            Err(_) => {
+                walk_errors += 1;
+                continue;
+            }
+        };
         if modified >= cutoff {
             continue;
         }
 
         let size = meta.len();
+        attempted += 1;
         match std::fs::remove_file(p) {
             Ok(()) => {
                 deleted += 1;
@@ -147,10 +272,46 @@ pub fn cleanup(path: &str, days_old: u32) -> Result<String> {
     } else {
         ""
     };
+    validate_cleanup_result(deleted, attempted, walk_errors, timed_out)?;
+    skipped = skipped.saturating_add(walk_errors);
     Ok(format!(
         "Cleaned {deleted} files ({mb_freed:.1} MB freed), {skipped} locked/protected/skipped \
          (>{days_old} days old in '{path}'){note}"
     ))
+}
+
+pub fn delete_file(path: &str) -> Result<String> {
+    if is_network_path(path) {
+        bail!("Refusing to delete '{path}' — network/UNC paths are not allowed");
+    }
+    let _user = ActiveUserImpersonation::new()?;
+    delete_file_as_active_user(path)
+}
+
+fn delete_file_as_active_user(path: &str) -> Result<String> {
+    let Some(canonical) = checked_local_path(Path::new(path))? else {
+        return Ok(format!("Not found (already gone?): {path}"));
+    };
+    if is_protected_file(&canonical.to_string_lossy()) {
+        bail!(
+            "Refusing to delete '{path}': resolves into a protected system directory ({})",
+            canonical.display()
+        );
+    }
+    let metadata = std::fs::metadata(&canonical)
+        .with_context(|| format!("Cannot inspect file '{}'", canonical.display()))?;
+    if metadata.is_dir() {
+        bail!("Refusing to delete directory: {path}");
+    }
+    std::fs::remove_file(&canonical)
+        .with_context(|| format!("Delete file '{}'", canonical.display()))?;
+    if canonical
+        .try_exists()
+        .with_context(|| format!("Verify deletion of '{}'", canonical.display()))?
+    {
+        bail!("File still exists after deletion: {path}");
+    }
+    Ok(format!("Deleted: {path}"))
 }
 
 #[cfg(test)]
@@ -192,5 +353,34 @@ mod tests {
         ));
         assert!(is_protected_file("c:/windows/winsxs/x.log"));
         assert!(!is_protected_file("C:\\ProgramData\\App\\logs\\app.log"));
+    }
+
+    #[test]
+    fn cleanup_requires_an_effect_when_work_was_attempted() {
+        assert!(validate_cleanup_result(0, 1, 0, false).is_err());
+        assert!(validate_cleanup_result(0, 0, 1, false).is_err());
+        assert!(validate_cleanup_result(0, 0, 0, true).is_err());
+        assert!(validate_cleanup_result(1, 2, 1, true).is_ok());
+        assert!(validate_cleanup_result(0, 0, 0, false).is_ok());
+    }
+
+    #[test]
+    fn native_file_delete_verifies_the_effect() {
+        let root = std::env::temp_dir().join(format!(
+            "eir-delete-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).expect("create test directory");
+        let path = root.join("old.log");
+        std::fs::write(&path, b"old").expect("create test file");
+        let message =
+            delete_file_as_active_user(&path.to_string_lossy()).expect("delete test file");
+        assert!(message.starts_with("Deleted:"));
+        assert!(!path.exists());
+        std::fs::remove_dir(&root).expect("remove test directory");
     }
 }

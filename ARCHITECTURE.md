@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-26 · **Release:** v0.31.0
+**Last updated:** 2026-07-27 · **Release:** v0.33.0
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -78,7 +78,7 @@ Eir is a single Cargo workspace (`resolver = "2"`) with three crates, plus a sta
 | `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service: signal collection, AI client, policy, execution, autonomous updater, SQLite audit DB. Heavy `windows` 0.58 feature set. |
 | `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), `windows-service` 0.7 (SCM queries + install from About), tracing. `build-dependencies`: `tauri-build` 2. |
 
-All three crates are versioned in lockstep — currently `0.31.0` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
+All three crates are versioned in lockstep — currently `0.33.0` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
 
 The dependency graph is acyclic and points inward: `eir-proto` depends on nothing internal; `eir-svc` and `eir-ui` each depend only on `eir-proto`. The UI and service never link against each other — they are separate processes coupled solely through the `eir-proto` wire contract over `\\.\pipe\EirSvc`.
 
@@ -116,16 +116,16 @@ This means `eir-svc.exe` ends up at the install root (renamed from `bin/`), alon
 ### CI gate (`.github/workflows/ci.yml`)
 
 Triggers: `push` to `master`, and all `pull_request`. `permissions: contents: read`. Single job `verify` on `windows-latest`:
-1. `actions/checkout@v6`
-2. `dtolnay/rust-toolchain@1.95.0` with `rustfmt, clippy`
-3. `swatinem/rust-cache@v2`
-4. **Format**: `cargo fmt --all --check`
-5. **Stage service binary**: runs `build-svc.ps1` — required because `eir-ui`'s `tauri_build` validates bundle resources (incl. the gitignored `bin/eir-svc.exe`) during a bare `cargo clippy`/`cargo test`; without staging, clippy/test would fail on the missing resource.
-6. **Clippy**: `cargo clippy --all-targets -- -D warnings` (`--all-targets`, not `--lib`, per the user's rule).
-7. **Test**: `cargo test --workspace`.
-8. **Full Tauri build**: `tauri-apps/tauri-action@v0` with `projectPath: eir-ui`, signing keys from secrets (`TAURI_SIGNING_PRIVATE_KEY`, `..._PASSWORD`), **no `tagName`** so it builds and signs but publishes nothing. This re-runs `beforeBuildCommand` and produces/signs the real bundle so a broken bundle can't pass green.
+1. `actions/checkout@v6`, then `scripts/check-versions.ps1`.
+2. `dtolnay/rust-toolchain@1.95.0` with `rustfmt, clippy`, then `swatinem/rust-cache@v2`.
+3. **Format**: `cargo fmt --all --check`.
+4. **Stage service binary**: runs `build-svc.ps1` — required because `eir-ui`'s `tauri_build` validates bundle resources during clippy/tests.
+5. **Clippy/test**: `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace --all-targets`.
+6. **Full Tauri build**: `tauri-apps/tauri-action@v0` builds and signs the real bundle without publishing.
+7. **Installed-service smoke**: installs the staged binary as `EirSvc`, verifies it is running as LocalSystem, negotiates protocol capabilities, and requires a successful correlated pause command over the real pipe.
+8. **Standalone smoke**: launches `target/release/eir.exe` and requires it to remain running.
 
-Note: step 5 stages the binary, then step 8's full build stages it again via `beforeBuildCommand` — redundant but intentional (steps 6–7 need it before the bundle build runs).
+The early staging and the bundle build's `beforeBuildCommand` both build the service; this is intentional because clippy/tests need the resource before the bundle step.
 
 The green CI gate is the only pre-release bar (matches the user's "no manual/live-test gate" policy).
 
@@ -135,9 +135,10 @@ Triggers: `push` of tags matching `v*`. `permissions: contents: write`. Single j
 1. `actions/checkout@v6`
 2. `dtolnay/rust-toolchain@1.95.0` (no components — release doesn't lint)
 3. `swatinem/rust-cache@v2`
-4. `tauri-apps/tauri-action@v0` with `projectPath: eir-ui`, `tagName: ${{ github.ref_name }}`, `releaseName: Eir ${{ github.ref_name }}`, a templated `releaseBody`, `releaseDraft: false`, `prerelease: false`. Env: `GITHUB_TOKEN` + the two `TAURI_SIGNING_*` secrets.
+4. `tauri-apps/tauri-action@v0` with `projectPath: eir-ui`, `tagName: ${{ github.ref_name }}`, `releaseName: Eir ${{ github.ref_name }}`, a templated `releaseBody`, `releaseDraft: true`, `prerelease: false`. Env: `GITHUB_TOKEN` + the two `TAURI_SIGNING_*` secrets.
+5. A PowerShell step uploads the portable executable and checksums, verifies the installer, updater metadata/signature, portable binary, and checksum assets, then publishes the draft.
 
-Because `tagName` is set, `tauri-action` builds, signs, and **publishes** a GitHub release with the NSIS installer (`Eir_<version>_x64-setup.exe`), `latest.json`, and the `.sig`. The signing keypair is minisign; the public key is embedded in `tauri.conf.json` `plugins.updater.pubkey` (base64 minisign public key).
+Because `tagName` is set, `tauri-action` builds, signs, and creates a **draft** GitHub release with the NSIS installer (`Eir_<version>_x64-setup.exe`), `latest.json`, and the `.sig`. The release is not public until every required asset has been verified. The signing keypair is minisign; the public key is embedded in `tauri.conf.json` `plugins.updater.pubkey` (base64 minisign public key).
 
 ### Self-update wiring (single rolling release)
 
@@ -145,7 +146,7 @@ Because `tagName` is set, `tauri-action` builds, signs, and **publishes** a GitH
 `https://github.com/Swatto86/eir/releases/latest/download/latest.json`. It points at the **`/latest/`** redirect, so the installed app always fetches whichever release is newest — the single-rolling-release model. `createUpdaterArtifacts: true` ensures `latest.json` + `.sig` ship beside the installer. The unauthenticated `/latest/download/` fetch requires the release repo to be public.
 
 The NSIS install hooks (`eir-ui/installer-hooks.nsh`, wired via `bundle.windows.nsis.installerHooks`, `installMode: perMachine`) make self-update actually work over a running service:
-- **PREINSTALL**: `sc stop EirSvc` + `Sleep 5000` — must stop the service before files are written, because Windows can't replace `eir-svc.exe` while it runs (the comment notes this is "what broke auto-updates").
+- **PREINSTALL**: `sc stop EirSvc`, then poll for STOPPED for up to ~40 s before deleting the old registration — Windows cannot replace `eir-svc.exe` while it runs.
 - **POSTINSTALL**: stop + `eir-svc.exe uninstall` (tear down prior registration), seed `config.toml` from `config.toml.example` on first install then delete the template, then `eir-svc.exe install` + `sc start EirSvc`.
 - **PREUNINSTALL**: `sc stop EirSvc` + `eir-svc.exe uninstall`.
 - **POSTUNINSTALL**: empty.
@@ -163,11 +164,11 @@ There is **no `package.json`**, so the WattMail blueprint's "bump `package.json`
 
 ### Build/release control flow (summary)
 
-Developer bumps the 3 `Cargo.toml` versions + `tauri.conf.json` + `Cargo.lock`, commits with `[release]`, pushes to `master` (CI gate runs), then pushes tag `vX.Y.Z` → `release.yml` builds the signed bundle and publishes the rolling GitHub release → installed clients poll `releases/latest/download/latest.json`, verify the minisign `.sig` against the embedded pubkey, and self-update (NSIS hooks stop/replace/restart `EirSvc`).
+Developer bumps the 3 `Cargo.toml` versions + `tauri.conf.json` + `Cargo.lock`, commits with `[release]`, pushes to `master`, waits for CI on that exact SHA, then pushes tag `vX.Y.Z` → `release.yml` builds the signed bundle as a draft, verifies every asset, and publishes the rolling GitHub release → installed clients poll `releases/latest/download/latest.json`, verify the minisign `.sig` against the embedded pubkey, and self-update (NSIS hooks stop/replace/restart `EirSvc`).
 
 ## Pipe protocol & tray UI
 
-The UI subsystem is a thin Tauri tray app (`eir-ui`) that talks to the LocalSystem service (`eir-svc`) over a single Windows named pipe, `\\.\pipe\EirSvc`. All wire types live in the shared `eir-proto` crate so both ends serialize/deserialize the same shapes. The service owns all state; the UI is a stateless renderer that polls a locally-cached snapshot and sends fire-and-forget commands.
+The UI subsystem is a thin Tauri tray app (`eir-ui`) that talks to the LocalSystem service (`eir-svc`) over a single Windows named pipe, `\\.\pipe\EirSvc`. All wire types live in the shared `eir-proto` crate so both ends serialize/deserialize the same shapes. The service owns all state; the UI renders a locally-cached snapshot and correlates mutating commands with service outcomes when protocol v2 is available.
 
 ### Transport & framing
 
@@ -177,23 +178,24 @@ The UI subsystem is a thin Tauri tray app (`eir-ui`) that talks to the LocalSyst
 
 ### Wire types (`eir-proto/src/lib.rs`)
 
-Two tagged enums carry everything (`#[serde(tag = "type", rename_all = "snake_case")]`):
+Two tagged enums carry service output, while a flattened request wrapper preserves the original command shape:
 
-- **`ServiceMsg`** (service → UI), one variant: `Status(StatusPayload)` (`lib.rs:287-292`).
-- **`UiMsg`** (UI → service) (`lib.rs`): includes approval, pause, settings, refresh, updater, learned-fact, Ask, disk, startup, and Game Mode commands. Updater mutations include `RunUpdatesNow`, `ClearUpdateHistory`, `UpdateUpdaterSettings`, `SetAppIgnore`, and `SetAppNote`; the latter persists bounded per-app AI guidance. (`Box` keeps the settings variants small.) `RefreshStatus` forces an immediate services-only rescan (`wmi::rescan_failed_services`) + status re-settle, so the manual "Refresh" button clears a recovered service without waiting for the poll.
+- **`ServiceMsg`** (service → UI) carries either `Status(StatusPayload)` or a correlated `CommandResult { request_id, ok, message }`.
+- **`UiRequest`** flattens an optional `request_id` beside the existing tagged **`UiMsg`**, so old services can still deserialize new commands and new services can acknowledge whether a command was actually applied. The tray falls back to neutral queued feedback when connected to protocol v1.
+- **`UiMsg`** includes approval, pause, settings, refresh, updater, learned-fact, Ask, disk, startup, Game Mode, and `TestProvider`. `TestProvider` exercises the saved provider/model from the LocalSystem service context without exposing credentials. `RefreshStatus` forces an immediate services-only rescan and status re-settle.
 
-**`StatusPayload`** (`lib.rs:5-38`) is the single snapshot the UI renders, carrying: `status` (string state machine value), `paused`, `cpu`/`memory`/`disk` (`f32` percentages), `failed_services`, `last_analysis`, `last_analysis_at` (unix secs of the last completed analysis, 0 = none this run; v0.24.3, `#[serde(default)]`), `recent_problems: Vec<ProblemSummary>`, `recent_executions: Vec<ExecutionSummary>`, `pending_approvals: Vec<ApprovalInfo>`, `error: Option<String>`, `usage: Option<UsageSummary>`, `settings: Option<UiSettings>`, `updater: Option<UpdaterStatus>`, `advisor: Option<AdvisorStatus>`, and `learned_facts: Vec<LearnedFactView>`. Derives `Default` so the channel can be seeded empty.
+**`StatusPayload`** is the single snapshot the UI renders. In addition to health, activity, settings, updater/advisor, on-demand-tool, and learned-fact state, protocol v2 adds `protocol_version`, `capabilities`, `svc_version`, `signals_at`, and `signal_errors`. All new fields default so an old peer remains decodable; unavailable metrics render as unknown rather than healthy zeroes.
 
 Supporting types:
 - **`ApprovalInfo`** (`lib.rs:226-259`): `id: u64`, `diagnosis`, `root_cause`, `confidence: f32`, `action` (debug render of the fix), `reason` (policy verdict), `side_effects`, `undo_instructions`, plus the trust-critical deterministic fields `action_summary`, `target`, `target_details`, `reversible: bool`, `created_at: i64`. The doc comment notes `action_summary` is "derived from the action type, not the AI, so it can be trusted."
 - **`ProblemSummary`** (`lib.rs:261-275`): `diagnosis`, `confidence`, `action`, `blocked`, `auto_executed`, `reason: Option<String>`, `at: i64`.
 - **`ExecutionSummary`** (`lib.rs:277-285`): `action`, `success`, `preview`, `at: i64`.
-- **`UpdaterStatus`** (`lib.rs:92-114`): `enabled`, `running`, `phase`, `last_run`/`next_run` (unix secs), `last_cost_usd`, `notes: Vec<String>`, `apps: Vec<UpdaterAppRow>`, `recent: Vec<UpdateAttemptRow>`, `settings: UpdaterSettingsView`. `UpdaterAppRow` carries per-app `state` ("verified"|"installed"|"failed"|"skipped"), `method`, `signature`; `UpdateAttemptRow` is history.
+- **`UpdaterStatus`**: `enabled`, `running`, `phase`, durable `last_run`/`last_clean_run`, `next_run`, cost/notes, saved app guidance, per-app results, rich recent attempts, and settings. A current app is distinct from an installed/verified update, and incomplete source coverage prevents a clean-cycle claim.
 - **`LearnedFactView`** (`lib.rs:42-60`): `id`, `summary`, `detail`, `status`, `source` for the UI's "What Eir has learned" card.
 - **`AdvisorStatus`** (`lib.rs:64-77`): `enabled`, `escalated`, `escalation_model`, `reason`, `spent_today_usd`, `settings: AdvisorSettingsView`.
 - **`UiSettings`** / **`UsageSummary`** plus the `*Update` mirrors (`SettingsUpdate`, `UpdaterSettingsUpdate`, `AdvisorSettingsUpdate`) that flow back as `UiMsg` payloads. The provider settings carry `openrouter`/`anthropic` key flags and secrets, plus `kilo_cli_user_profile`/`kilo_cli_path` hint fields; the removed OpenAI-compatible provider's `base_url`/`api_key_set` remain on `UiSettings` as always-empty **deprecated wire fields** so a not-yet-updated v0.16 tray app (which requires them) can still decode the payload during an update's skew window. The API-key-based `kilocode` gateway provider (and its `kilocode_api_key`/`kilocode_key_set` wire fields) was removed in v0.19 in favour of the subscription-based `kilo_cli` path — an old config's `provider = "kilocode"` now aliases to `kilo_cli` on load rather than failing to parse.
 
-**Backward-compat invariant**: every field added after the original protocol is annotated `#[serde(default)]` (e.g. `pending_approvals`, `updater`, `advisor`, `learned_facts`, `effort`, the deterministic `ApprovalInfo` fields, all `at` timestamps, and the v0.24.0 on-demand-tools fields `history`/`ask`/`disk_insights`/`startup` plus their `UiMsg` variants `AskEir`/`ScanDisk`/`CleanDiskEntry`/`ScanStartup`/`SetStartupEntry`, the v0.25.0 `StartupEntryView` fields `signer`/`report_only`/`microsoft`, and the v0.29.0 `ClearAsk` variant). This lets an older service or UI decode a newer payload without error — a deliberate forward/backward-compatibility design across version skew.
+**Backward-compat invariant**: additive status fields use `#[serde(default)]`, and `UiRequest.request_id` is optional + flattened. This keeps the original top-level command JSON valid across the installer’s UI/service skew window; capabilities tell the tray when it may rely on command results or provider testing.
 
 **Secret-handling invariant**: `UiSettings` never carries secret values, only booleans (`openrouter_key_set`, `anthropic_key_set`) so the UI shows "configured" without exposing keys. **OpenRouter is now the only provider that takes a pasted API key** (the default `anthropic` provider also needs one but is otherwise out of scope here); `claude_cli`, `codex_cli`, and `kilo_cli` borrow a locally logged-in subscription session instead. Inbound `SettingsUpdate` uses `Option<String>` for secrets where `None` = "unchanged" and a non-empty value replaces the stored secret; the JS sends `null` to preserve.
 
@@ -202,10 +204,10 @@ Supporting types:
 A pipe created by a LocalSystem service defaults to granting only SYSTEM + Administrators, so a non-elevated, medium-integrity UI would get "Access is denied." `build_pipe_security_descriptor()` builds an explicit descriptor from the SDDL string:
 
 ```
-D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)S:(ML;;NW;;;ME)
+D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;NW;;;ME)
 ```
 
-- **DACL**: SYSTEM (`SY`) and Administrators (`BA`) get full control (`GA`); Authenticated Users (`AU`) get read **and** write (`GRGW`) — write is required so the UI can send commands/approvals, not just read status.
+- **DACL**: SYSTEM (`SY`) and Administrators (`BA`) get full control; Interactive Users (`IU`) get read/write. Every accepted connection is also resolved to a client process/session and rejected unless it belongs to the current active interactive session; the session is rechecked during reads and writes, so a user switch invalidates the old client.
 - **SACL mandatory label**: `S:(ML;;NW;;;ME)` sets a **Medium** integrity label with the no-write-up (`NW`) policy. Without this the pipe inherits the creator's System integrity and Windows' no-write-up rule would silently let the medium-integrity UI *read* but block its *writes* (Approve/Reject/Pause). Labelling the pipe Medium permits the UI's writes while still blocking Low-integrity (sandboxed) processes.
 
 Implementation details: the descriptor is **intentionally leaked** and returned as a `usize` (not a raw pointer) so it can cross the listener's `.await` points (a raw pointer is not `Send`); `pipe_server.rs:32,47`. The `SECURITY_ATTRIBUTES` is constructed inside a block that ends before the first `.await`, so the non-`Send` pointer is never held across an await (`pipe_server.rs:83-104`), and the pipe is created via `create_with_security_attributes_raw`. If descriptor construction fails the server falls back to a default-ACL pipe and warns (`pipe_server.rs:77-79, 102`).
@@ -214,9 +216,9 @@ Implementation details: the descriptor is **intentionally leaked** and returned 
 
 - `spawn()` creates a `watch::channel<StatusPayload>` (status fan-out) and an `mpsc::channel<UiMsg>` (size 8, command intake), returns a `PipeServer { status_tx }` plus the `UiMsg` receiver, and spawns `listener_task` (`pipe_server.rs:54-69`).
 - `PipeServer::broadcast_status()` just does `status_tx.send()` — the rest of the service pushes a fresh snapshot here whenever state changes (`pipe_server.rs:187-191`).
-- **Listener loop**: creates a pipe instance (`first_pipe_instance` only on the first iteration), `connect().await`s a client, then splits it. The **writer task** sends the current `watch` value immediately on connect (snapshot-on-connect), then resends on every `status_rx.changed()` (`pipe_server.rs:131-152`). The **reader loop** reads lines, deserializes `UiMsg`, and forwards each on the `mpsc` to the decision loop with `ui_cmd_tx.send(msg).await` (`pipe_server.rs:157-180`). Bad messages are logged and skipped, not fatal.
+- **Listener loop**: connects one client, enforces the active-session identity, then splits it. The writer sends a protocol-v2 starting snapshot immediately and broadcasts status/command results; the bounded reader rejects oversized lines, deserializes `UiRequest`, and forwards commands plus correlation ids to the decision loop. Bad messages are logged and skipped.
 - **Single-consumer design**: the listener handles one connection at a time; on disconnect (`read_line` returns `Ok(0)` EOF) it aborts the writer task and loops back to accept the next client (`pipe_server.rs:182-184`). There is no concurrent multi-client support.
-- **Critical invariant**: Approve/Reject are *not* resolved in the pipe layer — all `UiMsg`, including approvals, are forwarded to the decision loop, "which owns the persistent approval queue" (`pipe_server.rs:166-167`). Approvals persist across cycles and service restarts (per `StatusPayload.pending_approvals` doc, `lib.rs:16-18`), so an approval never expires out from under the user.
+- **Critical invariant**: Approve/Reject are resolved only by the decision loop against the persistent queue. Claiming is atomic in SQLite; approved-but-not-completed rows reload after a service restart, while rejected rows cannot resurrect.
 
 ### UI side: pipe client (`eir-ui/src/pipe_client.rs`)
 
@@ -281,7 +283,7 @@ The frontend was fully rebuilt in v0.17 (still hand-written vanilla HTML/CSS/JS,
 
 - **Approve / Reject**: a delegated click handler on `#approvals` parses the card's `data-id`, **disables both buttons** to prevent double-submit, and calls `decide_approval(id, approved)`; on error it re-enables them (`main.js:271-280, 456-462`). Since v0.24.3, approving an **irreversible** action (`!info.reversible`, marked `data-irreversible` on the button) takes two clicks: the first arms the button (orange, "Click again to confirm — cannot be undone") for 6 s, the second submits; the armed state survives the 2 s poll because the approvals signature guard skips rebuilds, and a list rebuild simply disarms it. The command → `UiMsg::Approve` → pipe → decision loop, which resolves it against the persistent queue. The card disappears on the next poll once the service drops it from `pending_approvals`.
 - **Pause**: header button (and tray menu) → `toggle_pause` → `UiMsg::TogglePause`; the button label flips Pause/Resume based on `status.paused` (`main.js:228-229, 266-269`).
-- **Clear (Activity)**: one button fires both `clear_problems` and `clear_executions` then `refresh()`s (`main.js:601-604`). **Clear (Updates)** → `clear_update_history` (clears last cycle + persisted attempts).
+- **Clear (Activity)**: one button fires both `clear_problems` and `clear_executions` then `refresh()`s (`main.js:601-604`). **Clear (Updates)** → `clear_update_history` (clears displayed attempts and learned update facts, but preserves scheduler timestamps so it cannot trigger an update).
 - **Ignore / AI guidance (per app)**: Ignore sends `set_app_ignore { id, ignore, note:"" }`; blank remains **"unchanged"** so a toggle cannot wipe guidance. “Guide AI” sends `set_app_note`, and the saved-guidance list provides full create/read/update/delete access even after an ignored app leaves the latest results.
 - **Learned fact override**: delegated click on `#learned-list` sends `set_learned_fact { id, op }`; the service updates the persisted fact and refreshes the broadcast list (`main.js:511-519`, `main.rs:930-934`).
 - **Update now**: `#upd-now` → `run_updates_now` → `UiMsg::RunUpdatesNow`. The button is disabled when the updater is `running` or `!enabled`, because "the service ignores a manual run unless the updater is enabled" — the UI mirrors that gate rather than enforcing it (`main.js:369-375, 412-415`).
@@ -320,7 +322,7 @@ Not shared/locked — it lives on the loop task and is mutated inline; the UI se
 5. Inits SQLite (`audit::init_db`), cleans stale updater staging, seeds `updater`/`advisor` status from config + history, sets `advisor_spend_date` to today.
 6. **AI client init is non-fatal** (646-656): a bad AI config sets `status="Error"` + an actionable error and leaves `ai = None`, but the service keeps running so Settings stays usable. The post-warmup settle (and its `resting_status` re-settle) is gated on `ai.is_some()` (v0.24.4) — it previously cleared this error before the first broadcast, leaving a mis-configured provider looking healthy forever.
 7. Spawns signal collectors: `event_log`, `file_watch` (after `discover_watch_dirs`), `wmi`. Sleeps 5 s to let them warm up.
-8. Restores `usage_summary` and `load_pending_approvals` from the DB, then settles `status = resting_status(&st)` and broadcasts.
+8. Restores `usage_summary` plus pending approvals from the DB. Durably claimed (`approved`) rows are replayed into the executor after its channel starts, so a service crash cannot lose an accepted action. Legacy active rows have their semantic action keys backfilled and duplicates removed before either queue is loaded.
 9. Sets up the decision `ticker` (`cfg.monitoring.decision_interval_secs`), channels, and the executor worker (below).
 
 ### The `tokio::select!` decision loop (lines 729-1378)
@@ -332,7 +334,7 @@ The outer `tokio::select!` races the main loop future against the `shutdown` fut
 3. `sleep_until(react_at)` (enabled only while a reaction is scheduled) — drains any coalesced pings and falls through to the decision body, exactly like a tick. The body clears `react_at` (a scheduled tick that fires first also cancels the pending reaction so the same signals aren't analysed twice).
 4. `update_done_rx` — an update cycle finished: clears `updater_running`/`updater.running`, records `last_run`/`last_cost_usd`/`notes`/`apps`, sets `phase="idle"`, refreshes history, recomputes `next_run`.
 5. `update_progress_rx` — coarse live phase label; **guarded on `updater_running`** so a straggling message can't overwrite the `idle` a just-finished cycle set.
-6. `exec_done_rx` — a fix finished on the worker: removes label from `in_flight`, pushes an execution + a `auto_executed=true` problem entry, settles `resting_status`. Explicitly **does not touch `st.error`** so an execution outcome can't wipe an unrelated AI/connection error.
+6. `exec_done_rx` — a fix finished on the worker: removes its semantic key from `in_flight`, reloads the durable pending queue when a panic/timeout or rolled-back registry reset was requeued, pushes an execution + an `auto_executed=true` problem entry, and settles `resting_status`. It explicitly **does not touch `st.error`** so an execution outcome cannot wipe an unrelated AI/connection error.
 7. `analysis_done_rx` — the off-loop AI analysis (and optional advisor escalation) finished: on `Err`, sets `status="Error"`/`error` and continues; on `Ok`, destructures the returned `AnalysisSuccess`, logs usage, updates `last_fingerprint`/`last_analysis_at`/`st.advisor*`, reloads `learned_facts` fresh (they may have changed during the multi-minute call), then runs `audit::log_decision` and the **same per-problem routing + tray-status logic previously inline in the per-cycle body** (see below).
 8. `ui_rx` — UI commands (see below).
 
@@ -354,16 +356,16 @@ The outer `tokio::select!` races the main loop future against the `shutdown` fut
 - `ClearProblems` / `ClearExecutions` / `ClearAsk` → clear the respective deque / Ask history.
 - `RefreshStatus` → force a fast services-only rescan (`wmi::rescan_failed_services`, no PowerShell), overwrite `failed_services`, re-settle `resting_status`, and broadcast — clears a recovered service on demand. Deliberately does **not** touch `st.error` (that is a live AI/config error, not stale status).
 - `UpdateSettings` → `apply_update`, compute `settings_update_needs_restart` **before** mutating config, **validate by constructing a fresh `AiClient`**; on failure reject and reload config from disk (never apply a bricked provider); on success save config. If the update changed collector spawn parameters (event-log channels, event-log/WMI poll intervals, log directories), `restart_self()` then `return`; otherwise the new AI client, policy confidence threshold, and decision ticker are swapped live without a restart. If the restart helper fails to spawn, the service stays alive on the old settings and surfaces an error instead of stopping with nothing to start it again.
-- `Approve { id, approved }` → find/remove the pending item and `delete_pending_approval`. If approved and not already `in_flight`, insert label and send an `ExecJob` (reason `"approved by user"`); if approved but already in-flight, log and skip re-run; if rejected, push a `rejected by user` problem. Always resettle status + broadcast.
+- `Approve { id, approved }` atomically claims a still-pending database row. An accepted row remains durable as `approved` until the executor transaction either completes it or requeues it; startup replays claimed rows after a crash. Current policy and target preflight are rechecked before execution. A rejection is recorded for learning and then retired. Always resettle status + broadcast.
 - `RunUpdatesNow` → **gated on the same controls as the scheduled run** (`enabled && !paused && !updater_running`) — the pipe is writable by any authenticated user, so a manual run must not override admin state.
 - `ClearUpdateHistory`, `UpdateUpdaterSettings`, `SetAppIgnore`, `SetAdvisorSettings` → applied **live, no restart** (unlike provider settings), each persisting via `config::save`.
 
 ### Off-loop executor (lines 378-458)
 
 To keep the loop responsive, fix execution is serialised on a dedicated worker:
-- `ExecJob` (378-388): `action`, `decision_id`, `baseline` (`SystemState`), `label` (`format!("{action:?}")`, the dedupe key + feed label), `diagnosis`, `confidence`, `reason: Option<String>` (None = autonomous).
-- `ExecOutcome` (391-400): `label`, `exec_action` (executed action's Debug form), `success`, `output`, `diagnosis`, `confidence`, `reason`.
-- `spawn_executor` (407-458): consumes `ExecJob`s on an unbounded channel; each job runs `executor::execute` inside an inner `tokio::spawn` so a **panic is isolated** (JoinError → a failed `ExecutionResult` "execution task panicked", worker survives). It then `audit::log_execution`, `mark_decision_executed`, and `feedback::record`, and finally sends `ExecOutcome` back on `done_tx` (ignored if the loop is gone = shutting down).
+- `ExecJob`: `action`, `decision_id`, proposal-time `baseline`, semantic dedup `key`, display `label`, diagnosis/confidence/reason, and the optional durable `approval_id`.
+- `ExecOutcome`: the display/audit result, optional registry `undo_id`, optional cleared undo id, and a `refresh_pending` flag.
+- `spawn_executor` consumes `ExecJob`s on an unbounded channel. Only `executor::execute` runs inside the timeout-bounded inner task, so a panic or timeout becomes a synthetic failed `ExecutionResult` while the worker survives. Every result then passes through `audit::persist_execution`, which atomically writes `execution_log`, marks the decision executed, persists any required registry undo, and deletes or requeues the approved row. Synthetic failures are logged and requeued instead of becoming hidden `approved` rows. A successful registry reset whose execution+undo transaction fails is immediately restored from its in-memory snapshot; only a successful rollback is logged/requeued. Feedback is written after that durable commit, then `ExecOutcome` is sent on `done_tx`.
 - The loop sends jobs via `exec_tx` and folds outcomes via the `exec_done_rx` arm. Unbounded channels are used deliberately (job volume bounded by problems-per-cycle + approvals) so a send never blocks the loop.
 
 ### Off-loop analysis task (`AnalysisSuccess`, lines ~413-423, spawn ~1435-1525)
@@ -389,7 +391,7 @@ Identical fingerprints across cycles mean nothing changed → skipped until the 
 
 - `resting_status` (363-374): the non-cycle status with precedence **Paused > PendingApproval > Executing > Active**. Asserted by `status_tests::resting_status_precedence`.
 - `should_escalate` (271-302): pure. Returns `Some(reason)` only when advisor `enabled`, a deeper tier is configured (`escalation_model` or `escalation_effort` non-empty), `escalations_today < MAX_ESCALATIONS_PER_DAY` (=24, the provider-agnostic backstop), USD budget not spent, AND either `needs_deeper_analysis` ("the agent flagged the signals as ambiguous") or non-empty problems whose max confidence < `low_confidence_threshold` ("confidence was low"). Covered by `advisor_tests`.
-- `restart_self`: spawns a detached PowerShell helper (LocalSystem, no UAC, survives this process exiting) that stops EirSvc, waits for STOPPED (≤60s; a missing service also exits the wait), then retries `sc start` every 5s over a 60s window checking for Running each second; all helper streams redirect to `eir-restart.log` next to the exe (the only evidence when a restart fails to come back). Returns `bool`: a helper that fails to spawn means nothing would ever start the service again, so the `UpdateSettings` caller stays alive on the old settings instead of stopping into the void (v0.27.5 — hardened after a live incident where the service stopped and never returned).
+- `restart_self`: spawns a detached PowerShell helper (LocalSystem, no UAC, survives this process exiting) that waits for EirSvc to stop cleanly, then retries `sc start` every 5s over a 60s window checking for Running each second; all helper streams redirect to `eir-restart.log`. The caller flushes the correlated settings result to the UI before returning and reporting STOPPED. A helper spawn failure keeps the service alive instead of stopping into the void.
 - `spawn_update_cycle` (307-359): runs a cycle on a detached task with a nested inner `tokio::spawn` + `CYCLE_MAX = 60 min` timeout watchdog, so a panic (JoinError) or hang still produces a `CycleSummary` and releases `updater_running` — the updater can never latch "running" forever.
 
 ## Signal sources
@@ -410,12 +412,12 @@ Eir's signal layer is three independent background collectors that each maintain
 - **Cursor logic:** per-channel `HashMap<String,u32>` of the highest `RecordNumber` delivered (lines 149, 160–164). First poll primes from 0; subsequent polls return only records with `RecordNumber > last` (lines 90–94). Newest-first read stops at the first already-seen record.
 - **Bounding & delivery:** `MAX_PER_POLL = 100` caps entries **per channel** — but the cursor still advances to the true newest, so the freshest events are always kept and nothing below the cursor is re-read. Each poll **appends** into a shared rolling buffer capped at `BUFFER_CAP = 100`, pushed oldest-first so `pop_front` eviction drops the **oldest** (keeping the freshest errors); the decision loop **drains** it (`event_log::drain`) — one-shot delivery, like the file-watch buffer. (The former `RING_SIZE = 20` per-poll-across-all-channels cap silently and *permanently* dropped every record past the 20th in a burst and starved later channels — both fixed.)
 - **Reactive trigger:** a poll containing a fresh **Error**-level entry pings the decision-loop trigger channel. Warnings deliberately don't trigger (Windows emits them near-continuously; the scheduled sweep still analyses them) — reacting to each would burn AI calls on noise.
-- **Message extraction is intentionally shallow:** `message` is just `format!("EventID {}", id & 0xFFFF)` (line 120); full text would require loading provider DLLs ("sufficient for Phase 1"). `event_id` is masked to the low 16 bits (line 121). The blocking Win32 work runs in `spawn_blocking` (line 157).
+- **Message extraction:** insertion strings embedded in each event record are decoded, sanitised, and bounded into the message beside the low-16-bit Event ID. This recovers the actionable detail Windows stores without loading arbitrary provider DLLs. Blocking Win32 work stays in `spawn_blocking`.
 
 ### Source 2 — File / log watcher (`signals/file_watch.rs` + `signals/log_parser.rs`)
 
-- **Discovery (`discover_watch_dirs`, lines 51–106):** scans fixed roots (`C:\Windows\Logs`, `C:\Windows\Temp`, `C:\Temp`, `C:\Logs`) plus env-var roots (`LOCALAPPDATA`, `APPDATA`, `PROGRAMDATA`, `TEMP`, `TMP`). A root/subdir (one level deep, `max_depth` 1–2) is watched only if it contains a recognised text file modified within `DISCOVERY_WINDOW_DAYS = 30` (lines 12, 110–131). Config `log_directories` extras are always included if they exist on disk, regardless of age. Runs in `spawn_blocking`; re-discovered every 20 decision cycles, new dirs pushed to the running watcher over an mpsc channel (`main.rs:977–995`, `file_watch.rs:179–190`).
-- **Watching:** `notify` `RecommendedWatcher`, `RecursiveMode::Recursive`, on a dedicated OS thread (line 173). Reacts to `Create`/`Modify` only (lines 195–199). Shutdown is via dropping a `SyncSender(0)` handle (`TryRecv::Disconnected` → exit, lines 142–144, 177).
+- **Discovery (`discover_watch_dirs`):** scans fixed roots (`C:\Windows\Logs`, `C:\Windows\Temp`, `C:\Temp`, `C:\Logs`) plus active-user roots (`LOCALAPPDATA`, `APPDATA`, `TEMP`, `TMP`) and `PROGRAMDATA`. A root/subdir is watched only if it contains a recognised recent text file; configured extras are always included when present. Discovery and all subsequent watcher/file reads run while impersonating the active desktop user, so LocalSystem never traverses user-controlled reparse points with SYSTEM authority. Re-discovery feeds new dirs to the live watcher.
+- **Watching:** `notify` `RecommendedWatcher`, `RecursiveMode::Recursive`, on a dedicated OS thread. It reacts to `Create`/`Modify` only, re-arms known directories after recreation, and stays alive when startup discovery is empty so a later login can add roots.
 - **Per-event parse:** for each changed path it reads `size_bytes` and calls `try_parse_log` (lines 200–209). `try_parse_log` (27–42) skips empty files, requires one of `TEXT_EXTENSIONS` (log/txt/csv/json/xml/ini/cfg/conf/err/out/trace/debug/warn/error/info, lines 14–17), reads at most the **last** `MAX_READ_BYTES = 65_536` of the file (`read_tail`, dropping the partial first line) so a rolling log that has grown past 64 KB still has its newest lines parsed, and runs `log_parser::parse`. A result that is INFO with no error snippets is dropped to `None` (line 37) — only "interesting" log events attach to the `FileChange`.
 - **`log_parser::parse`** (`log_parser.rs:38–48): infers `program` from path shape (Program Files / ProgramData / Windows\Logs\<Subsystem> / AppData\(Local|Roaming|LocalLow), lines 64–125, falling back to parent dir name); `extract_errors` (129–171) walks lines, classifies against `ERROR_KEYWORDS`/`WARN_KEYWORDS` (lines 4–30), raises a severity ceiling (FATAL > ERROR > WARN > INFO), and collects up to 5 non-overlapping snippets (1 line before + 2 after, lines 161–167); `excerpt` caps raw content at `MAX_EXCERPT_CHARS = 2500` with a truncation marker (lines 35, 52–60).
 - **Bounding:** `RING_SIZE = 50`, a true rolling ring buffer (`pop_front` when full). File changes are **drained**, so each `FileChange` is delivered to the AI at most once.
@@ -423,7 +425,7 @@ Eir's signal layer is three independent background collectors that each maintain
 
 ### Source 3 — System state / WMI (`signals/wmi.rs`)
 
-- **Cadence:** `wmi_poll_interval_secs`, default 300 (`config.rs:281`), 30 s floor on update (`config.rs:211`). `snapshot_state` runs in `spawn_blocking`; the result **replaces** the single shared `Option<SystemState>` (lines 437, 447–449). `current()` clones it, or returns an all-zero placeholder if nothing has been collected yet (462–482).
+- **Cadence/freshness:** `wmi_poll_interval_secs`, default 300, with a 30 s floor. `snapshot_state` runs in `spawn_blocking`; the cache records its collection timestamp and per-probe error tokens. A failed probe keeps the last known good value but marks that collector degraded; before the first collection, metrics are explicitly `not_collected` and the UI renders `—`, never a healthy zero. A failed manual service rescan preserves the prior service state.
 - **What it collects** (mostly direct Win32, not WMI, despite the name):
   - Uptime: `GetTickCount64` (lines 31–33).
   - Memory: `GlobalMemoryStatusEx` → load % + available GB (83–94).
@@ -432,7 +434,7 @@ Eir's signal layer is three independent background collectors that each maintain
   - Network interfaces: `GetAdaptersInfo`, marking each up/down by whether it has a non-`0.0.0.0` IPv4 (207–242).
   - Windows Update: registry read of `…\WindowsUpdate\Auto Update\Results\Install\LastSuccessTime` → `"last_install: <time>"` or `"unknown"` (244–289).
   - CPU: the **only real WMI call** — `Get-WmiObject Win32_Processor … LoadPercentage` via PowerShell (74–81).
-- **`ps_capped` (the bounded probe, lines 41–70):** spawns `powershell.exe -NonInteractive -NoProfile -Command`, polls `try_wait` every 100 ms, and on deadline `kill()`s the child and returns `None`. Rationale documented inline (35–40): the snapshot loop awaits each `snapshot_state` before the next tick, so a wedged `Get-MpComputerStatus` on a degraded box would otherwise stall **every** signal; the cap bounds it. Two probes use it — CPU and Defender — both with a **15 s** timeout. Outputs are tiny (one line), so reading after exit can't deadlock the pipe.
+- **`ps_capped` (the bounded probe):** spawns PowerShell non-interactively, captures stdout/stderr, rejects non-zero exit codes, and kills on deadline. CPU and Defender each have a 15 s cap so one wedged provider cannot stall the whole snapshot; failure is surfaced through `signal_errors` while the last good measurement remains visible.
 - **GPO-aware firewall (`get_firewall` + `effective_firewall`, lines 330–362):** reads `EnableFirewall` REG_DWORD from both the local store (`…SharedAccess\Parameters\FirewallPolicy\{DomainProfile|StandardProfile|PublicProfile}`) and the GPO store (`…Policies\Microsoft\WindowsFirewall\{DomainProfile|PrivateProfile|PublicProfile}`). Note the naming mismatch: local calls private "StandardProfile", GPO calls it "PrivateProfile" (handled at lines 358–360). `effective_firewall` (330–336): policy ON → `Some(true)`; **policy OFF → `None`** (a GPO is deliberately holding it off and `netsh` can't override, so Eir treats it as "not ours to fix," preventing a futile `firewall_enable` loop on managed machines); no policy → the local value. Unreadable stays `None` so the AI never reads "couldn't read it" as "firewall off." `read_reg_dword` (294–321) checks the value **type** is `REG_DWORD` and length is 4, rejecting a 4-byte string/binary value rather than misreading it.
 - **Defender parse (`get_defender` + `parse_defender_status`, lines 364–395):** one `ps_capped` call runs `Get-MpComputerStatus -ErrorAction SilentlyContinue` and formats `'{0}|{1}|{2}'` from `RealTimeProtectionEnabled|AntivirusEnabled|AntivirusSignatureAge`. `parse_defender_status` splits on `|`; each field parses independently to `Some`/`None` (bools tolerant of casing/whitespace, age as `u32`), so any garbage/empty field degrades to `None` instead of failing the snapshot. Absent Defender / timeout → empty output → all `None`.
 - Unit tests in-file cover the firewall GPO matrix and Defender parsing (lines 484–529).
@@ -532,13 +534,13 @@ Per diagnosed problem (`main.rs:1208`):
    - **`Block(reason)`** — recorded as a problem with the reason; nothing runs (`main.rs:1231`).
    - **`AutoApprove`** — guarded by `safety::rate_limited` (`main.rs:1246`) and an in-process `st.in_flight` dedupe set (`main.rs:1262`); then handed to the executor worker via `exec_tx.send(ExecJob{…})` and the loop moves on (`main.rs:1270`).
    - **`RequireApproval(reason)`** — builds an `ApprovalInfo` from `explain::explain` + `explain::target_details`, persists a pending-approval row, and pushes a `PendingApproval` card to UI state (`main.rs:1283–1336`). Non-blocking; dedup-guarded against both pending cards and in-flight actions.
-4. The executor worker (`spawn_executor`, `main.rs:407`) is a single serialised task draining an unbounded mpsc queue. Each job runs `executor::execute(&action)` inside an inner `tokio::spawn` so a panicking action is isolated (join error ⇒ synthetic failed `ExecutionResult`, `main.rs:417`). It then writes the execution log, marks the decision executed, records feedback, and reports an `ExecOutcome` back to the loop. **Design decision (task #6):** execution was moved off the decision loop so UI/status stays responsive regardless of action duration.
+4. The executor worker is a single serialised task draining an unbounded mpsc queue. It isolates and times out `executor::execute`, then atomically commits the execution/decision/approval transition (including exact registry undo when required), records feedback, and reports an `ExecOutcome` back to the loop. Panic/timeout results take the same audited path and requeue an approved row. **Design decision:** execution stays off the decision loop so UI/status remains responsive regardless of action duration.
 
 `executor::execute` (`executor/mod.rs:15`) is a single big `match` over `FixAction`. Two execution styles:
 - **`blocking(...)`** (`mod.rs:130`) wraps synchronous Win32/`std::process` work in `tokio::task::spawn_blocking`, mapping a join panic to an `Err`. Used by `services`, `logs`, `tasks`, `registry`.
 - Direct `.await` of an async adapter (`driver`, `software`, `boot`, `process`, `security`, and the inline PowerShell variants) via `make_result(...)` (`mod.rs:140`).
 
-`make_result` normalises `anyhow::Result<String>` into `ExecutionResult { action: format!("{action:?}"), success, output }`. **Invariant:** the Debug format of the action (`format!("{action:?}")`) is the canonical key — it is what gets written to `execution_log.action` and what `safety::rate_limited` and the `in_flight` set match on. Any change to the enum's Debug shape silently invalidates rate-limiting and dedup.
+`make_result` normalises `anyhow::Result<String>` into `ExecutionResult { action: format!("{action:?}"), success, output }`. The Debug form remains the human-readable audit label and legacy rate-limit fallback. Durable deduplication and new execution-rate matching use `FixAction::dedup_key`, which deliberately ignores regenerable parameters while retaining the action type and semantic target.
 
 ### FixAction implementations
 
@@ -548,24 +550,24 @@ AI-proposed):
 
 | Action | Adapter | Mechanism | Built-in guard |
 |---|---|---|---|
-| `ServiceRestart/Stop/Start` | `services.rs` | Win32 SCM API (`OpenSCManagerW`/`ControlService`/`StartServiceW`), restart waits up to 30s for STOPPED then RUNNING | **`CRITICAL_SERVICES` blocklist** in `stop` (RpcSs/DcomLaunch/EventLog/Winmgmt/… — an adapter backstop so a policy.toml edit can't expose them; `restart` routes through `stop`) + policy blocklist |
-| `LogCleanup{path,days_old}` | `logs.rs` | `walkdir`, deletes files with ext in `log/tmp/dmp/etl/blf/regtrans-ms` older than cutoff | ext allowlist; missing dir ⇒ no-op; **UNC/network-path refusal** (a `\\host\share` root would make LocalSystem authenticate over SMB); `days_old ≥ 1`; canonical-walk under protected-dir re-check |
+| `ServiceRestart/Stop/Start` | `services.rs` | Win32 SCM API; stop/start wait up to 30s for the requested state | critical-service blocklist; empty/control/NUL/slash service names rejected before UTF-16/SCM conversion; observed final state required |
+| `LogCleanup{path,days_old}` | `logs.rs` | active-user-impersonated `walkdir` delete of bounded extensions older than cutoff | local absolute non-reparse path; `days_old ≥ 1`; protected-dir checks; no-effect/read-error/time-limit runs fail instead of rate-limiting a false success |
 | `DiskCleanup{target}` | inline PS (`mod.rs:35`) | only `temp`/`tmp`/`prefetch` mapped; an unknown target returns a real **failure** (not a success-shaped no-op that would poison the rate limiter) | hardcoded target switch |
 | `PowerShellDiagnostic{script}` | `powershell::run_diagnostic` | arbitrary script as SYSTEM | **none** — full machine access; kept off whitelist |
-| `TaskDisable/Enable{task_name}` | `tasks.rs` | `Disable/Enable-ScheduledTask` via the timed `powershell::run_diagnostic` helper | single-quote escaping; glob-metachar refusal; a bare (unqualified) name is resolved first and refused if it matches >1 folder; **policy `[blocklist] tasks` denies `\Microsoft\...` (Defender/BitLocker/backup/restore) so auto-execute can't disable a security/maintenance task** |
-| `RegistryReset{key,name,data}` | `registry.rs` | `Set-ItemProperty` via the timed `powershell::run_diagnostic` helper | **`ALLOWED_KEY_PREFIXES` allowlist** (Tcpip, Multimedia, HKCU\SOFTWARE\Microsoft); `DENIED_KEY_PREFIXES` denies persistence subkeys (Run/RunOnce/Winlogon/IFEO/**Explorer\StartupApproved**); normalises `HKEY_*` forms |
+| `TaskDisable/Enable{task_name}` | `tasks.rs` | `Disable/Enable-ScheduledTask` + state readback | fully-qualified path required; glob refusal; policy denies all `\Microsoft\Windows\…` tasks |
+| `RegistryReset{key,name,data}` | `registry.rs` | exact typed snapshot → write/readback; failure rolls back immediately; execution and durable undo commit together | machine-only Tcpip/Multimedia allowlist; only String/ExpandString/DWord/QWord; unsupported/read failures abort before writing; undo first verifies the live type/data still equals Eir's applied value and refuses to overwrite a newer change |
 | `NetworkDiagnostic{command}` | inline PS (`mod.rs:68`) | only `flush_dns/release_renew/reset_tcp/reset_winsock`; else early-return failure | hardcoded command switch |
-| `DriverDisable{name}` | `driver.rs` | `sc.exe config … start= disabled` | **`CRITICAL_DRIVERS` blocklist** (storage/bus/net/fs/usb/wdf) |
-| `DriverEnable{name}` | `driver.rs` | `sc.exe config … start= demand` | none (auto-whitelisted) |
+| `DriverDisable{name}` | `driver.rs` | `sc.exe config … start= disabled`, then registry start-mode readback | critical-driver blocklist + bounded service-name charset |
+| `DriverEnable{name}` | `driver.rs` | `sc.exe config … start= demand`, then readback | bounded service-name charset (auto-whitelisted) |
 | `SoftwareUninstall{pkg}` | `software.rs` | Get-Package → registry uninstall string / msiexec | **also hard-blocked in policy** — never runs |
 | `BcdEdit{element,value}` | `boot.rs` | `bcdedit /set {current}` | **`SAFE_ELEMENTS` allowlist** + shell-metachar rejection on value |
-| `ProcessKill{name}` | `process.rs` | `Get-Process` (must exist) → `Stop-Process -Force -ErrorAction Stop` (success reflects reality, not a fabricated "signal sent") | **`PROTECTED_PROCESSES` blocklist** (lsass/winlogon/csrss/…); **glob-metachar refusal** (`Stop-Process -Name` globs `*?[]`, so `lsass*` would evade the exact-match blocklist without it) |
-| `FileDelete{path}` | inline PS (`mod.rs:116`) | refuses directories, requires file to exist, `Remove-Item -Force` (no Recycle Bin) | **UNC/network-path refusal** (policy + executor + the `file_facts` approval preview, so the preview never SMB-auths); dir/exists guard in script; canonicalize→protected-dir re-check; policy path blocklist |
-| `FirewallEnable{profile}` | `security.rs` | `netsh advfirewall set <profile> state on` | profile mapped via allowlist |
-| `DefenderSignatureUpdate` | `security.rs` | `Update-MpSignature` | safe by nature (refresh only) |
+| `ProcessKill{name}` | `process.rs` | exact process lookup → forced stop → bounded wait for exit | protected-process blocklist (including `.exe` spelling) + glob refusal |
+| `FileDelete{path}` | `logs.rs` | active-user-impersonated native single-file deletion with existence postcheck | approval-gated; local absolute non-reparse path; directory/protected/UNC refusal; preview uses the same user token, so a mutable user path never becomes a privileged SYSTEM deletion |
+| `FirewallEnable{profile}` | `security.rs` | `netsh advfirewall set … on`, then profile-state query | profile allowlist + observed postcondition |
+| `DefenderSignatureUpdate` | `security.rs` | `Update-MpSignature`, then signature-age query | observed postcondition |
 | `DefenderRealtimeEnable` | `security.rs` | `Set-MpPreference -DisableRealtimeMonitoring $false` | approval-gated (could conflict with 3rd-party AV) |
 | `SfcScan` / `DismRestoreHealth` | `repair.rs` | `sfc /scannow` / `DISM …/RestoreHealth` (long timeout) | approval-gated, never whitelisted |
-| `StartupSet{name,location,hive,enable}` | `startup.rs` | writes the `StartupApproved` REG_BINARY flag (`0x02`/`0x03`) via `Registry::`-qualified `Set-ItemProperty` | **closed-set `location` → hard-coded key**, `valid_sid` on `hive`, glob-reject on name; approval-gated, not AI-proposed, reversible |
+| `StartupSet{name,location,hive,enable}` | `startup.rs` | writes and reads back the `StartupApproved` REG_BINARY flag | closed locations; active interactive SID must match per-user entries; underlying Run value/shortcut must still exist; leaf/glob guards; approval-gated |
 
 Adapter-level guards are **defence in depth**: they enforce regardless of policy.toml, mostly via const allow/block lists plus single-quote escaping (`'` → `''`) before string interpolation into PowerShell.
 
@@ -588,8 +590,8 @@ All PowerShell-based adapters — including `registry.rs` and `tasks.rs` — rou
 Ordering is the key invariant: blocklist beats whitelist (a tested property — `blocklisted_action_is_always_blocked`, `mod.rs:154`), and confidence is checked before the whitelist so a low-confidence whitelisted action is blocked rather than auto-run. `confidence_threshold` is the only live `ExecutionConfig` field; it is overwritten at startup from `config.toml`/Settings (`main.rs:613`, `pol.execution.confidence_threshold = cfg.monitoring.confidence_threshold`). `policy.toml`'s value is a fallback.
 
 **Auto vs approval vs blocked (current policy.toml):**
-- **Auto** (whitelisted, reversible/low-risk): `service_restart/stop/start`, `log_cleanup`, `disk_cleanup`, `task_disable/enable`, `registry_reset`, `network_diagnostic`, `driver_enable`, `firewall_enable`, `defender_signature_update`.
-- **Approval** (off whitelist on purpose): `powershell_diagnostic`, `driver_disable`, `bcd_edit`, `process_kill`, `file_delete`, `defender_realtime_enable`.
+- **Auto** (whitelisted, reversible/low-risk): `service_restart/stop/start`, `log_cleanup`, `disk_cleanup`, `task_disable/enable`, `network_diagnostic`, `driver_enable`, `firewall_enable`, `defender_signature_update`.
+- **Approval** (off whitelist on purpose): `registry_reset`, `powershell_diagnostic`, `driver_disable`, `bcd_edit`, `process_kill`, `file_delete`, `defender_realtime_enable`, and user-initiated startup changes.
 - **Blocked outright**: `software_uninstall` (one-way door — no reinstall path). Plus any target hitting the service/path blocklists (e.g. NTDS, WinDefend, `C:\Windows\System32`).
 
 ### Safety: rate-limiting & success rate
@@ -612,8 +614,8 @@ Both behaviours are covered by unit tests against the real migrations. The match
 ### Current gaps / dead code
 
 - `max_retries_per_issue` and `auto_approve_on_success_rate` (`ExecutionConfig`, `mod.rs:17/19`) are **dead** — deserialized and referenced only inside `policy/mod.rs` tests; no production code reads them (confirmed by crate-wide grep). The `#[allow(dead_code)]` comment claims "used in Phase 4" but they are not. There is consequently **no success-rate-driven auto-approval promotion** (the retry problem itself is now bounded by the failure breaker in `safety.rs`).
-- `registry.rs` / `tasks.rs` bypass the per-action timeout helper, but the executor worker now wraps **every** job in a `tokio::time::timeout(EXEC_MAX = 10 min)` + panic isolation and always reports an outcome back, so a wedged action can't stall the serial queue or latch the tray on "Executing".
-- `RegistryReset.reversible` and `BcdEdit.reversible` are both `false` because the prior value is never snapshotted (`explain.rs`); there is no generic undo mechanism for any action.
+- The executor worker adds a 10-minute backstop around every normal job (with the longer repair timeout for SFC/DISM) in addition to adapter-specific timeouts. Panic/timeout results are durably audited and approved jobs are returned to the approval queue.
+- `RegistryReset` has the one specialised durable undo path described above. There is no generic undo mechanism for the other actions; `BcdEdit` remains non-reversible because its prior value is not snapshotted.
 
 ## Autonomous app updater
 
@@ -627,8 +629,8 @@ The updater is an AI-driven, self-healing, fully-unattended app updater that liv
 
 One full cycle is `run_cycle` (`orchestrator.rs:303`), driven from `main.rs:307` (`spawn_update_cycle`) on a detached task with a 60-minute backstop watchdog and a `cycle_id` = `Utc::now().timestamp()` that groups the run's rows in the audit DB. The cycle:
 
-1. **Determine available methods** — `available_methods` (`orchestrator.rs:207`): a method is usable only if enabled in config AND present on the machine. winget via `detect::winget_path` (`detect.rs`), which checks the PATH alias first, then resolves the real MSIX exe under `C:\Program Files\WindowsApps`, and finally falls back to `Get-AppxPackage -AllUsers` (PowerShell) when the folder itself is not listable as SYSTEM; choco via its ProgramData path (bootstrapped through the official install.ps1 if `bootstrap_managers` and missing — `detect.rs:61`); scoop only if a logged-in user already has it (never installed as SYSTEM); msstore reuses winget; `Native` is offered only when `native_enabled` and an AI client exists.
-2. **Collect candidates** — `check::collect` (`check.rs:97`). Each enabled manager lists its updates (`winget upgrade`, `choco outdated -r`, `scoop status`, `winget upgrade --source msstore`). Results are de-duplicated by app identity via `push_candidate` (`check.rs:66`): earlier (more-preferred) managers win, the id is `clean_app_name(name).to_lowercase()`, and `should_skip` / the seen-set drop ignored/duplicate apps. When a primary manager handles the app, the native installer is appended as a self-healing fallback method (unless the primary already is native). Then an **AI web-search pass** over apps no manager covers (`check_unmanaged`, `check.rs:244`) produces native-only candidates. The unmanaged inventory is now independent of winget: `inventory::list_installed` (`inventory.rs`) enumerates the HKLM + Wow6432Node + per-user Uninstall registry keys, and the result is merged with `winget list` when winget is present. If winget is missing or the AI/native path is disabled, a UI note explains the degraded coverage instead of staying silent.
+1. **Determine available methods** — `available_methods` (`orchestrator.rs:207`): a method is usable only if enabled in config AND safe in the SYSTEM service. winget resolves through PATH, `C:\Program Files\WindowsApps`, then `Get-AppxPackage -AllUsers`; choco uses its ProgramData path and can be bootstrapped through the official install script; msstore reuses winget; `Native` requires `native_enabled` and an AI client. Scoop is fail-closed: its user-owned `.cmd` shim is never discovered or executed by EirSvc, and `detect::scoop_available` always returns false until a real active-user process launcher exists.
+2. **Collect candidates** — `check::collect` (`check.rs:97`). Each available manager lists its updates (`winget upgrade`, `choco outdated -r`, `winget upgrade --source msstore`). Results are de-duplicated by app identity via `push_candidate` (`check.rs:66`): earlier (more-preferred) managers win, the id is `clean_app_name(name).to_lowercase()`, and `should_skip` / the seen-set drop ignored/duplicate apps. When a primary manager handles the app, the native installer is appended as a self-healing fallback method (unless the primary already is native). Then an **AI web-search pass** over apps no manager covers (`check_unmanaged`, `check.rs:244`) produces native-only candidates. The unmanaged inventory is now independent of winget: `inventory::list_installed` (`inventory.rs`) enumerates the HKLM + Wow6432Node + per-user Uninstall registry keys, and the result is merged with `winget list` when winget is present. If winget is missing or the AI/native path is disabled, a UI note explains the degraded coverage instead of staying silent.
 3. **Heal each candidate** (bounded by `max_apps_per_run` and `max_attempts_per_app`) — `heal` (`orchestrator.rs:134`).
 4. **Record** every attempt to the `update_attempts` table under `cycle_id` (`history::record_attempts`).
 
@@ -647,11 +649,11 @@ One full cycle is `run_cycle` (`orchestrator.rs:303`), driven from `main.rs:307`
 
 ### Method order and adapters
 
-Default preference order is `winget, choco, scoop, msstore` (`config.rs:114`); `native` is gated separately by `native_enabled` and appended as a per-candidate fallback. Each adapter returns a structured `AttemptOutcome`:
+The persisted/default method token order remains `winget, choco, scoop, msstore` for config and wire compatibility, but the UI disables Scoop and `available_methods` removes it unconditionally. `native` is gated separately by `native_enabled` and appended as a per-candidate fallback. Each adapter returns a structured `AttemptOutcome`:
 
 - **winget** (`winget.rs`): resolves `winget.exe` through `detect::winget_path` (PATH alias, WindowsApps MSIX, or `Get-AppxPackage -AllUsers`), runs directly as SYSTEM, captures and cleans winget's output (`clean_winget_output`, ported verbatim with tests for spinner/OEM-mojibake/byte-counter stripping), auto-retries once with `--force` for the portable-modified case, verifies by id.
 - **choco** (`choco.rs`): `choco outdated -r` (pipe-delimited, pinned packages skipped), `choco upgrade <id> -y`, success codes 0/3010/1641, cross-checks the new version via winget's ARP read.
-- **scoop** (`scoop.rs`): user-scoped — runs the user's `scoop.cmd` shim with `USERPROFILE`/`HOME` pointed at their profile; best-effort, exit-code-only verification (scoop apps don't register in ARP).
+- **scoop** (`scoop.rs`): disabled in the SYSTEM service. Listing returns an explicit unavailable error and update attempts return `Blocked`; no `C:\Users\*\scoop\shims\scoop.cmd` path is selected or launched.
 - **msstore** (`msstore.rs`): `winget ... --source msstore`; per-user, may need the user's Store entitlement.
 - **native** (`native.rs`): the AI-found installer path (below).
 
@@ -681,11 +683,11 @@ Per-app AI guidance reuses the updater's existing `[updater.notes]` config map. 
 
 ### update_attempts history
 
-`history::record_attempts` (`history.rs:17`) inserts one row per attempt into the `update_attempts` table (migration 0007) under the run's `cycle_id`: app id/name, from/to version, method, success, category (stable snake_case token, NULL on success), exit code, signature, sha256, detail, AI cost, timestamp. `recent` feeds the UI history view (newest first); `clear` backs the UI's "Clear" on the App Updates card. This is the audit trail for unattended installs.
+`history::record_attempts` inserts one row per attempt into `update_attempts`: app identity, from/to versions, method, outcome/category, exit code, signature/hash evidence, detail, cost, and timestamp. `recent` exposes that evidence to the UI. Separate durable state records the last completed run and last fully clean run; clearing history removes both so the scheduler/UI cannot resurrect stale timestamps. `AlreadyCurrent` is a successful `current` state, distinct from an update Eir installed.
 
 ### update_checks rotation (unmanaged AI sweep)
 
-The unmanaged AI check is capped at `AI_CHECK_CAP` (20) apps per cycle to bound cost, but without rotation the same front of the list would be re-checked forever and the tail never reached. A new `update_checks` table (migration 0016) records the last AI-check time per app. `check_unmanaged` sorts the merged inventory stalest-first (`history::last_check_times`), takes the cap, records a check for each one (`history::record_check`), and only then asks the AI. This guarantees every app in the unmanaged inventory gets reached across cycles even when the list is far larger than the per-cycle cap.
+The unmanaged AI check is capped at `AI_CHECK_CAP` (20) apps per cycle. The inventory merges bounded HKLM, 32-bit, and real per-user uninstall hives with `winget list`; service-account hives and malformed/oversized rows are excluded, while partial-source failures remain visible as warnings. `update_checks` (migration 0016) stores the last successfully parsed AI check per app. `check_unmanaged` sorts stalest/never-checked first and records a batch only after a valid response, so the tail rotates without presenting a failed parse as completed coverage. Any failed/enabled source, deferred candidate, or incomplete native coverage prevents the run from being labelled clean.
 
 ## User-facing on-demand tools (Ask / Timeline / Disk / Startup)
 
@@ -752,7 +754,8 @@ machine adds no noise), **logon-triggered scheduled tasks** outside `\Microsoft\
 **auto-start services** whose binary lives outside `<drive>:\Windows\` (regex anchored at the
 drive root, optionally quoted, so `C:\Users\Public\Windows\evil.exe` can't masquerade its way
 out of the listing). Because LocalSystem's `HKCU` is the SYSTEM hive, per-user data is read
-from each loaded interactive-user hive under `HKEY_USERS\S-1-5-21-…` (via `ProfileList`).
+only from the SID attached to the active WTS session under `HKEY_USERS`, never from every
+loaded user's hive.
 
 Each entry carries a **deterministic identity**: the launched binary is resolved from its
 command line (quoted path / `.exe`-prefix / first token; **UNC targets are skipped** — probing
@@ -782,7 +785,9 @@ so a same-named task in another folder can't be hit, and `run_task_cmd` **refuse
 metacharacters** (`Get-ScheduledTask` globs `*?[]`; single-quoting stops injection, not
 globbing — this guard also covers the AI path's bare names). `executor::startup`: `location`
 is a **closed set** mapped to hard-coded keys (`approved_key`, `Registry::`-qualified); SIDs
-validated (`valid_sid`) before interpolation; value names reject glob metacharacters.
+are validated and re-resolved immediately before a per-user write; value names reject glob
+metacharacters. The underlying Run value or startup shortcut must still exist before the
+`StartupApproved` flag is written, and the resulting byte is read back.
 `StartupSet` is **not in the AI prompt catalogue** and **not whitelisted**, so it lands on
 `RequireApproval`; task toggles are whitelisted for the AI path, so `route_user_action` takes
 `force_approval: true` from `SetStartupEntry` to downgrade their AutoApprove to
@@ -797,7 +802,7 @@ This is the durable substrate Eir learns from. The original feedback loop still 
 
 ### Database bootstrap
 
-`audit::init_db(path)` (`eir-svc/src/audit.rs:12`) builds `SqliteConnectOptions` from `sqlite:{path}?mode=rwc` with `create_if_missing(true)`, connects a pool, and runs all migrations. The DB path comes from `config.persistence.audit_db` (a plain string field, `eir-svc/src/config.rs:163`); the sample default is `./eir.db` (`config.rs:264`). Migrations are versioned `0001`–`0010` and applied in order on every start (idempotent/additive table and column creation).
+`audit::init_db(path)` builds `SqliteConnectOptions` with `create_if_missing(true)`, connects a pool, and runs the embedded migrations. The DB path comes from `config.persistence.audit_db`. Migrations are currently versioned `0001`–`0018` and apply in order on every start.
 
 ### Full schema (every table)
 
@@ -810,7 +815,7 @@ This is the durable substrate Eir learns from. The original feedback loop still 
 - `executed INTEGER DEFAULT 0` — flipped to 1 once any action from this decision runs
 - `execution_output TEXT` — **declared but never written or read** (executions go to `execution_log` instead; dead column)
 
-Written by `audit::log_decision` (`audit.rs:21`); `executed` flipped by `audit::mark_decision_executed` (`audit.rs:68`); read by `audit::get_recent_decisions` (`audit.rs:76`).
+Written by `audit::log_decision`; `executed` is flipped inside the same `persist_execution` transaction that writes the execution record; read by `audit::get_recent_decisions`.
 
 **`system_state_history`** (`0001_initial.sql:11`) — a metrics time-series row written alongside every decision.
 - `id`, `timestamp TEXT`, `cpu_usage REAL`, `memory_usage REAL`, `disk_usage REAL`, `failed_services_count INTEGER`, `snapshot TEXT` (full `SystemState` JSON).
@@ -818,7 +823,7 @@ Written by `audit::log_decision` (`audit.rs:21`); `executed` flipped by `audit::
 
 **`execution_log`** (`migrations/0002_execution_log.sql`) — one row per fix-action execution.
 - `id`, `decision_id INTEGER NOT NULL → decisions(id)`, `action TEXT` (the executed action string), `success INTEGER`, `output TEXT` (stdout/stderr or error text), `executed_at TEXT`.
-- Written by `audit::log_execution` (`audit.rs:261`), called from the executor worker (`main.rs:426`). Read by `safety::success_rate` (aggregate) and joined in `feedback::recent_summary` for failure-reason text.
+- Written by `audit::persist_execution` in the executor worker. Read by `safety::success_rate` (aggregate), semantic rate limiting, and `feedback::recent_summary` for failure-reason text.
 
 **`execution_feedback`** (`migrations/0003_feedback.sql`) — the before/after outcome record; the heart of the feedback loop.
 - `id`, `execution_log_id INTEGER → execution_log(id)`, `action TEXT`, `succeeded INTEGER`
@@ -826,18 +831,20 @@ Written by `audit::log_decision` (`audit.rs:21`); `executed` flipped by `audit::
 - `cpu_after REAL`, `memory_after REAL`, `failed_services_after INTEGER` — filled on the **next** decision cycle (NULL until then)
 - `improvement_score REAL` — computed when after-state is filled
 - `recorded_at TEXT`
-- Written by `feedback::record` (`feedback/mod.rs:7`, right after `log_execution` at `main.rs:431`); after-states + score filled by `feedback::update_after_states` (`feedback/mod.rs:35`); read by `feedback::recent_summary` (`feedback/mod.rs:112`).
+- Written by `feedback::record` after the execution transaction commits; after-states + score are filled by `feedback::update_after_states`; read by `feedback::recent_summary`.
 
 **`usage_log`** (`migrations/0005_usage.sql`) — per-call AI token/cost accounting (populated for every provider as of v0.17: OpenRouter and the Kilo CLI report cost, Anthropic's is estimated, both subscription CLIs' cost is an equivalent-cost figure with no actual charge).
 - `id`, `timestamp TEXT`, `input_tokens`, `output_tokens`, `cache_creation`, `cache_read` (all INTEGER), `cost_usd REAL`.
 - Written by `audit::log_usage` (`audit.rs:123`); aggregated by `audit::usage_summary` (`audit.rs:142`) over 24h / 7d windows into `UsageSummary { calls, tokens, cost }` shown in the UI.
 
-**`pending_approvals`** (`migrations/0006_pending_approvals.sql`) — actions awaiting the user's decision, persisted so an approval survives idle cycles and service restarts (replaces an old blocking timeout flow). The **row id is the approval id surfaced to the UI**.
+**`pending_approvals`** (`0006`, extended by `0017_durable_approvals.sql`) — actions awaiting or durably claimed by the user. The **row id is the approval id surfaced to the UI**.
 - `id`, `created_at TEXT`, `decision_id INTEGER → decisions(id)`
 - `action_json TEXT` — serialized `FixAction`, executed verbatim on approval
 - `info_json TEXT` — serialized `ApprovalInfo` for the UI (its `id` field overwritten from the row id on load)
 - `baseline_json TEXT` — `SystemState` at proposal time, the "before" baseline for feedback once executed
-- Written by `audit::insert_pending_approval` (`audit.rs:180`, from `main.rs:1317`); loaded at startup by `audit::load_pending_approvals` (`audit.rs:211`); removed by `audit::delete_pending_approval` (`audit.rs:253`, on approve/reject at `main.rs:840`).
+- `action_key`, `status` (`pending|approved|rejected`), and `claimed_at` make a click an atomic database transition. A unique active-action index prevents duplicate cards. On load, legacy NULL keys are derived from `action_json` after semantic duplicates are removed. Approved rows reload and retry after a crash until the execution transaction removes them; synthetic failures atomically return them to pending. Rejected tombstones are never re-presented.
+
+**`registry_undo`** (`0002`, extended by `0018_registry_undo_type.sql` and `0019_registry_undo_applied_value.sql`) stores both the exact prior scalar kind/data and the exact kind/data Eir applied. Legacy or incomplete rows fail closed. Undo runs its applied-value comparison and restore in one PowerShell invocation, refusing if the live value no longer matches Eir's write.
 
 **`update_attempts`** (`migrations/0007_update_history.sql`) — append-only log of every autonomous-updater attempt, grouped by `cycle_id`.
 - `id`, `cycle_id INTEGER` (groups one run), `app_id TEXT` (version-stripped identity), `name TEXT`, `from_version TEXT`, `to_version TEXT`, `method TEXT` (winget|choco|scoop|msstore|native), `success INTEGER`, `category TEXT` (failure `ErrorCategory` token, NULL on success), `exit_code INTEGER`, `signature TEXT` (Authenticode result, native), `sha256 TEXT` (installer hash, native), `detail TEXT` (cleaned reason), `cost_usd REAL` (AI spend attributable to the attempt), `created_at TEXT`.
@@ -849,7 +856,7 @@ Written by `audit::log_decision` (`audit.rs:21`); `executed` flipped by `audit::
 
 1. **Decision logged.** Each cycle, after the AI returns, `audit::log_decision` writes the `decisions` row (returning `decision_id`) plus a `system_state_history` row (`main.rs:1181`).
 2. **Approval or execution routed per problem.** For each problem, the proposed fix is policy-gated (`main.rs:1205`+). `RequireApproval` → `insert_pending_approval` persists it (`main.rs:1317`); auto-approve → handed to the executor worker.
-3. **Execution + baseline capture.** The executor worker (`spawn_executor`, `main.rs:407`) runs the action panic-isolated, then writes `execution_log` (`log_execution`), marks the decision executed (`mark_decision_executed`), and writes the `execution_feedback` "before" row via `feedback::record` using the baseline `SystemState` captured at proposal/execution time (`main.rs:426`–`441`).
+3. **Execution + baseline capture.** The executor worker runs the action panic-isolated and timeout-bounded. `persist_execution` atomically writes `execution_log`, marks the decision executed, stores any required registry undo, and transitions its approved row. Only after that commit does `feedback::record` write the "before" row using the `SystemState` captured when the action was proposed.
 4. **After-state measurement.** On the *next* cycle, once fresh signals are collected, `feedback::update_after_states` (`main.rs:1060`) finds up to 50 rows with `cpu_after IS NULL`, fills `cpu_after`/`memory_after`/`failed_services_after`, and computes `improvement_score`.
 5. **Scoring.** `improvement_score` (`feedback/mod.rs:75`) = `cpu_delta*0.3 + mem_delta*0.3 + fs_delta*10.0`, where each delta is `before - after` (a drop in CPU/memory/failed-service count is positive). Fixed weights; heavily favours reducing failed services. Positive = improved, negative = degraded.
 6. **Feedback into the AI.** `feedback::recent_summary(db, 10)` (`main.rs:1064`) builds a human-readable bullet list of the last 10 outcomes — `"- {ts}: {action} -> SUCCESS, improved (+N)"` or `FAILURE ... [reason: …]`. For failures it `LEFT JOIN`s `execution_log.output` and condenses it to one whitespace-normalised line capped at 200 chars (`condense_reason`, `feedback/mod.rs:94`) so the model can avoid re-proposing a fix that already failed. This string is passed to `ai.analyze(snapshot, history, Some(&feedback_summary))` (`main.rs:1092`).
@@ -862,8 +869,8 @@ So the entire closed loop is: execute → record before → next-cycle record af
 
 `config.rs` defines `Config { api, monitoring, persistence, updater (#[serde(default)]), advisor (#[serde(default)]) }`. The two `#[serde(default)]` sections let an older `config.toml` (written before those features) still parse — covered by round-trip tests (`config.rs:267`–331).
 
-- **`load(path)`** (`config.rs:242`) resolves the path relative to the **executable directory** (`resolve`, `config.rs:231` — absolute paths pass through, since LocalSystem's cwd is unreliable), reads the file, and `toml::from_str`s it with context errors.
-- **`save(config, path)`** (`config.rs:221`) serialises with `toml::to_string_pretty` and writes to the resolved path.
+- **`load(path)`** resolves relative to the executable directory, parses TOML, sanitises legacy unsafe log roots, and recovers from the last parseable `.bak` if the live file is corrupt.
+- **`save(config, path)`** serialises the fully validated candidate, preserves only a parseable live file as `.bak`, writes a sibling temp, then atomically renames it over the live config. Callers clone/apply/validate/save before swapping in-memory state, so a rejected change cannot partially mutate the running service.
 - **`to_ui_settings`** projects `Config` into `eir_proto::UiSettings` for the tray app. Crucially it **never sends secrets** — API keys are reduced to `*_key_set: bool` flags via the local `set` closure (true iff present and non-empty). It surfaces provider, model, update-check model, effort, the three poll/decision intervals, channels/dirs, and `confidence_threshold` (plus the deprecated always-empty `base_url`/`api_key_set` wire-compat fields).
 - **`apply_update(SettingsUpdate)`** applies a UI edit: blank/None secret fields **keep the stored value** (the `keep` closure), so the UI never needs to re-send keys it can't read back. Intervals are floored (`decision ≥10`, event-log `≥5`, wmi `≥30`); `confidence_threshold` is clamped to `0.50–0.95`; `effort` is `normalize_effort`'d to one of low|medium|high|xhigh|max or empty. `ApiProvider::parse` maps `claude_cli`/`openrouter`/`kilo_cli` (plus legacy aliases, including the removed gateway provider's `kilocode`/`kilo` tokens now folding into `kilo_cli`) and defaults anything else to Anthropic; the serde attributes on `ApiProvider` alias the removed `openai_compatible` token to Anthropic so a pre-0.17 config.toml still loads (its now-unknown extra keys are ignored by the toml loader — covered by `removed_provider_aliases_to_anthropic`; the `claude_cli` provider is first-class again as of v0.18, round-trip covered by `claude_cli_provider_round_trips_with_no_key_or_model`; the `kilocode` → `kilo_cli` alias is covered by `kilocode_provider_alias_loads_as_kilo_cli`).
 - **Settings save hot-applies or restarts as needed.** In the loop (`main.rs:802`), an `UpdateSettings` message is validated by constructing an `AiClient` first (rejecting e.g. a keyless provider, reloading the prior config on failure so the service isn't bricked). A pure `settings_update_needs_restart` diff decides whether the changed fields require a process restart (only collector spawn parameters: event-log channels, event-log/WMI poll intervals, log directories). If so, `config::save` + `restart_self()`; if the helper fails to spawn the service stays alive on the old settings. Otherwise the new AI client, policy confidence threshold, and decision ticker are applied live without restart.
@@ -1290,8 +1297,8 @@ regression pass (all 44 prior fixes held). Highlights:
   watchdog was raised to 30 min to cover worst-case retry+escalation (D10); untrusted
   log/file content is framed as data-not-instructions in the prompt (D11); the raw model
   blob in a parse-failure error is truncated before broadcast (D12); the ask-rejection
-  notice survives an in-flight answer completing (D21); a flag-shaped scoop name is refused
-  (D16); `prune_old` no longer orphans a decision with an outstanding approval (D17); the
+  notice survives an in-flight answer completing (D21); Scoop execution is fail-closed in
+  the SYSTEM service (D16); `prune_old` no longer orphans a decision with an outstanding approval (D17); the
   registry-reset approval copy is honest about the best-effort undo (D15); and two frontend
   UX-integrity gaps were closed (Ignore button feedback D19, stuck irreversible-confirm
   button D20). Verification: `cargo fmt`/`clippy --all-targets -D warnings`/`test --workspace`
@@ -1478,11 +1485,10 @@ Current gaps surfaced while mapping each subsystem (the self-improvement plan ab
 **Autonomous app updater**
 
 - RequirePublisherMatch's expected_publisher is AI-sourced, so it is a tripwire (valid signature whose CN equals the claimed publisher), not a true vendor pin; the code itself notes a trusted per-app publisher map would harden it.
-- Scoop and msstore are best-effort under SYSTEM: scoop can't fully reproduce the user's PATH (git etc.) and verifies by exit code only (no ARP); msstore apps are per-user and may require the user's Store entitlement, applicable only while that user is signed in.
+- Scoop is disabled under SYSTEM because its user-owned shim is an elevation boundary; msstore remains best-effort because Store apps are per-user and may require the signed-in user's entitlement.
 - clean_app_name folds same-base products that differ only by a dotted major (e.g. Python 3.11 vs 3.12) to one identity key — a documented, accepted limitation tolerated because heavyweight runtimes are filtered as noise upstream.
 - is_newer cannot distinguish a legitimate bare-major bump from a driver cross-product false positive (e.g. 551.86.0.0 -> 552); the marketing-truncation guard deliberately leaves those alone, and the only recourse for the residual case is the per-app Ignore list.
 - SELF_UPDATING is a hard-coded single entry ('discord'); other genuinely self-updating apps would need code changes or a user Ignore entry rather than configuration.
-- The scoop run_scoop timeout kills the cmd shim but a grandchild git/scoop process may briefly linger (noted in scoop.rs).
 - AI web-search check is capped at AI_CHECK_CAP = 20 apps per cycle (check.rs:19); beyond that, only the first 20 unmanaged apps are checked (surfaced as a UI note).
 - The native signature/install path is download/hash/signature compile- and unit-verified (pure gates exhaustively tested), but running an installer as SYSTEM and the live AI plan/web-search path are not exercised in the test suite — verification level is compile/unit, not live-run.
 

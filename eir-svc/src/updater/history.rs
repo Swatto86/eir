@@ -4,7 +4,20 @@
 
 use crate::updater::domain::{AttemptOutcome, ErrorCategory, UpdateCandidate};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+
+const HISTORY_CLEARED_AT_KEY: &str = "updater_history_cleared_at";
+const LAST_CLEAN_RUN_KEY: &str = "updater_last_clean_run";
+const LAST_CYCLE_STATUS_KEY: &str = "updater_last_cycle_status";
+const LAST_RUN_KEY: &str = "updater_last_run";
+
+#[derive(Serialize, Deserialize)]
+struct StoredCycleStatus {
+    at: i64,
+    notes: Vec<String>,
+    apps: Vec<eir_proto::UpdaterAppRow>,
+}
 
 /// The failure category as the stable snake_case token serde gives it (NULL on
 /// success), so the stored value matches what the wire/UI use.
@@ -89,36 +102,142 @@ pub async fn last_check_times(pool: &SqlitePool) -> Result<std::collections::Has
     Ok(map)
 }
 
-/// Record that an app was AI-checked now. Called for every app in the unmanaged batch
-/// (including those with no update), so the next cycle knows it was reached.
-pub async fn record_check(pool: &SqlitePool, app_id: &str) -> Result<()> {
+/// Atomically record that every app in one valid AI response was checked now.
+pub async fn record_checks(pool: &SqlitePool, app_ids: &[String]) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    for app_id in app_ids {
+        anyhow::ensure!(
+            crate::updater::config::valid_app_id(app_id),
+            "invalid app id"
+        );
+        sqlx::query(
+            "INSERT INTO update_checks (app_id, checked_at) VALUES (?, ?) \
+             ON CONFLICT(app_id) DO UPDATE SET checked_at = excluded.checked_at",
+        )
+        .bind(app_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Persist the latest cycle that completed without a check/app failure.
+async fn record_run_state(pool: &SqlitePool, key: &str, at: i64) -> Result<()> {
+    anyhow::ensure!(at > 0, "update-run timestamp must be positive");
     sqlx::query(
-        "INSERT INTO update_checks (app_id, checked_at) VALUES (?, ?) \
-         ON CONFLICT(app_id) DO UPDATE SET checked_at = excluded.checked_at",
+        "INSERT INTO app_state (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     )
-    .bind(app_id)
-    .bind(&now)
+    .bind(key)
+    .bind(at.to_string())
     .execute(pool)
     .await?;
     Ok(())
 }
 
-/// Delete the whole attempt history (the UI's "Clear" on the App Updates card).
-/// Returns the number of rows removed.
-pub async fn clear(pool: &SqlitePool) -> Result<u64> {
-    let res = sqlx::query("DELETE FROM update_attempts")
-        .execute(pool)
+async fn run_state(pool: &SqlitePool, key: &str) -> Result<i64> {
+    let value: Option<String> = sqlx::query_scalar("SELECT value FROM app_state WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
         .await?;
-    Ok(res.rows_affected())
+    match value {
+        Some(value) => Ok(value.parse()?),
+        None => Ok(0),
+    }
+}
+
+#[cfg(test)]
+pub async fn record_run(pool: &SqlitePool, at: i64) -> Result<()> {
+    record_run_state(pool, LAST_RUN_KEY, at).await
+}
+
+pub async fn last_run(pool: &SqlitePool) -> Result<i64> {
+    run_state(pool, LAST_RUN_KEY).await
+}
+
+/// Atomically persist a cycle's scheduler timestamp and its UI evidence.
+pub async fn record_cycle_status(
+    pool: &SqlitePool,
+    at: i64,
+    notes: &[String],
+    apps: &[eir_proto::UpdaterAppRow],
+) -> Result<()> {
+    anyhow::ensure!(at > 0, "update-run timestamp must be positive");
+    let status = serde_json::to_string(&StoredCycleStatus {
+        at,
+        notes: notes.to_vec(),
+        apps: apps.to_vec(),
+    })?;
+    let mut tx = pool.begin().await?;
+    for (key, value) in [
+        (LAST_RUN_KEY, at.to_string()),
+        (LAST_CYCLE_STATUS_KEY, status),
+    ] {
+        sqlx::query(
+            "INSERT INTO app_state (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn last_cycle_status(
+    pool: &SqlitePool,
+) -> Result<Option<(i64, Vec<String>, Vec<eir_proto::UpdaterAppRow>)>> {
+    let value: Option<String> = sqlx::query_scalar("SELECT value FROM app_state WHERE key = ?")
+        .bind(LAST_CYCLE_STATUS_KEY)
+        .fetch_optional(pool)
+        .await?;
+    value
+        .map(|value| {
+            let stored: StoredCycleStatus = serde_json::from_str(&value)?;
+            anyhow::ensure!(stored.at > 0, "stored update-cycle timestamp is invalid");
+            Ok((stored.at, stored.notes, stored.apps))
+        })
+        .transpose()
+}
+
+/// Persist the latest cycle that completed without a check/app failure.
+pub async fn record_clean_run(pool: &SqlitePool, at: i64) -> Result<()> {
+    record_run_state(pool, LAST_CLEAN_RUN_KEY, at).await
+}
+
+/// Read the latest persisted clean-cycle timestamp (0 when none has completed).
+pub async fn last_clean_run(pool: &SqlitePool) -> Result<i64> {
+    run_state(pool, LAST_CLEAN_RUN_KEY).await
+}
+
+/// Hide displayed attempt history while preserving the rows used for fair scheduling.
+pub async fn clear(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO app_state (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(HISTORY_CLEARED_AT_KEY)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// The most recent attempts, newest first, for the UI's history view.
 pub async fn recent(pool: &SqlitePool, limit: i64) -> Result<Vec<eir_proto::UpdateAttemptRow>> {
     let rows = sqlx::query(
-        "SELECT name, method, success, detail, created_at FROM update_attempts \
+        "SELECT name, method, success, detail, from_version, to_version, category, \
+                 exit_code, created_at FROM update_attempts \
+         WHERE julianday(created_at) > COALESCE( \
+             (SELECT julianday(value) FROM app_state WHERE key = ?), 0) \
          ORDER BY id DESC LIMIT ?",
     )
+    .bind(HISTORY_CLEARED_AT_KEY)
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -133,6 +252,10 @@ pub async fn recent(pool: &SqlitePool, limit: i64) -> Result<Vec<eir_proto::Upda
             method: r.try_get("method")?,
             success: r.try_get::<i64, _>("success")? != 0,
             detail: r.try_get("detail").unwrap_or_default(),
+            from_version: r.try_get("from_version").unwrap_or_default(),
+            to_version: r.try_get("to_version").unwrap_or_default(),
+            category: r.try_get("category").unwrap_or_default(),
+            exit_code: r.try_get("exit_code").unwrap_or_default(),
             at,
         });
     }
@@ -207,6 +330,49 @@ mod tests {
         let cat1: String = rows[1].try_get("category").unwrap();
         assert_eq!(m1, "native");
         assert_eq!(cat1, "signature_rejected");
+
+        let recent_rows = recent(&pool, 10).await.expect("recent");
+        assert_eq!(recent_rows[0].from_version, "1.0");
+        assert_eq!(recent_rows[0].category, "signature_rejected");
+        assert_eq!(recent_rows[1].to_version, "2.0");
+        assert_eq!(recent_rows[1].exit_code, Some(0));
+
+        assert_eq!(last_clean_run(&pool).await.expect("no clean run"), 0);
+        assert_eq!(last_run(&pool).await.expect("no run"), 0);
+        record_run(&pool, 1200).await.expect("record run");
+        record_clean_run(&pool, 1234)
+            .await
+            .expect("record clean run");
+        assert_eq!(last_run(&pool).await.expect("read run"), 1200);
+        assert_eq!(last_clean_run(&pool).await.expect("read clean run"), 1234);
+        let status_apps = vec![eir_proto::UpdaterAppRow {
+            id: "update-check".into(),
+            name: "Update check".into(),
+            state: "failed".into(),
+            ..Default::default()
+        }];
+        record_cycle_status(&pool, 1300, &["partial inventory".into()], &status_apps)
+            .await
+            .expect("record cycle status");
+        let (at, notes, apps) = last_cycle_status(&pool)
+            .await
+            .expect("read cycle status")
+            .expect("stored cycle status");
+        assert_eq!(at, 1300);
+        assert_eq!(notes, ["partial inventory"]);
+        assert_eq!(apps[0].state, "failed");
+
+        clear(&pool).await.expect("clear");
+        assert!(recent(&pool, 10).await.expect("cleared recent").is_empty());
+        assert!(last_attempt_times(&pool)
+            .await
+            .expect("preserved attempt ordering")
+            .contains_key("tool"));
+        assert_eq!(last_run(&pool).await.expect("preserved run"), 1300);
+        assert_eq!(
+            last_clean_run(&pool).await.expect("preserved clean run"),
+            1234
+        );
 
         drop(pool);
         let _ = std::fs::remove_file(&path);

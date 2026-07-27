@@ -62,8 +62,8 @@ services = [
 # otherwise disable a security/maintenance task with no human review. Matched on
 # normalised path components (case- and separator-insensitive), so a fully-qualified
 # `\Microsoft\Windows\Windows Defender\…` task is blocked. The AI is told to name
-# tasks by full `\Folder\Name` path (see the prompt) and the executor refuses an
-# ambiguous bare name, so a leaf-only name can't slip past this by omitting the path.
+# tasks by full `\Folder\Name` path (see the prompt) and the executor refuses every
+# bare name, so a leaf-only name can't slip past this by omitting the path.
 tasks = [
     "\\Microsoft\\Windows\\Windows Defender",
     "\\Microsoft\\Windows\\BitLocker",

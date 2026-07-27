@@ -14,6 +14,60 @@ pub mod tasks;
 use crate::models::{ExecutionResult, FixAction};
 use tracing::{error, info};
 
+fn build_disk_cleanup_script(target: &str) -> Option<String> {
+    let (root, label) = match target.to_ascii_lowercase().as_str() {
+        "temp" | "tmp" => (r"C:\Windows\Temp", "Temp folder"),
+        "prefetch" => (r"C:\Windows\Prefetch", "Prefetch"),
+        _ => return None,
+    };
+    let root = powershell::ps_single_quote(root);
+    Some(format!(
+        "$ErrorActionPreference='Stop'; $root={root}; \
+         if (-not (Test-Path -LiteralPath $root -PathType Container -ErrorAction Stop)) {{ \
+           Write-Output '{label} is already empty'; return \
+         }}; \
+         $items=@(Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop); \
+         $removed=0; $skipped=0; \
+         foreach($item in $items) {{ \
+           try {{ \
+             Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop; \
+             if (Test-Path -LiteralPath $item.FullName -ErrorAction Stop) {{ \
+               throw 'item remained after deletion' \
+             }}; \
+             $removed++ \
+           }} catch {{ $skipped++ }} \
+         }}; \
+         if ($items.Count -gt 0 -and $removed -eq 0) {{ \
+           throw '{label} cleanup could not remove any item' \
+         }}; \
+         Write-Output ('{label} cleaned: {{0}} removed, {{1}} skipped' -f $removed,$skipped)"
+    ))
+}
+
+fn network_diagnostic_script(command: &str) -> Option<&'static str> {
+    match command.to_ascii_lowercase().as_str() {
+        "flush_dns" => Some(
+            "ipconfig /flushdns; \
+             if ($LASTEXITCODE -ne 0) { throw 'ipconfig flushdns failed' }",
+        ),
+        "release_renew" => Some(
+            "ipconfig /release; \
+             if ($LASTEXITCODE -ne 0) { throw 'ipconfig release failed' }; \
+             Start-Sleep -Seconds 2; ipconfig /renew; \
+             if ($LASTEXITCODE -ne 0) { throw 'ipconfig renew failed' }",
+        ),
+        "reset_tcp" => Some(
+            "netsh int ip reset; \
+             if ($LASTEXITCODE -ne 0) { throw 'TCP/IP reset failed' }",
+        ),
+        "reset_winsock" => Some(
+            "netsh winsock reset; \
+             if ($LASTEXITCODE -ne 0) { throw 'Winsock reset failed' }",
+        ),
+        _ => None,
+    }
+}
+
 pub async fn execute(action: &FixAction) -> ExecutionResult {
     info!("Executing: {action:?}");
 
@@ -35,21 +89,14 @@ pub async fn execute(action: &FixAction) -> ExecutionResult {
             blocking(action, move || logs::cleanup(&p, d)).await
         }
         FixAction::DiskCleanup { target } => {
-            let script = match target.to_lowercase().as_str() {
-                "temp" | "tmp" => {
-                    "Remove-Item -Path \"$env:TEMP\\*\" -Recurse -Force -ErrorAction SilentlyContinue; \
-                     Write-Output 'Temp folder cleaned'"
-                }
-                "prefetch" => {
-                    "Remove-Item -Path 'C:\\Windows\\Prefetch\\*' -Force -ErrorAction SilentlyContinue; \
-                     Write-Output 'Prefetch cleaned'"
-                }
-                other => {
+            let script = match build_disk_cleanup_script(target) {
+                Some(script) => script,
+                None => {
                     // Report a real failure, not a success-shaped no-op — disk_cleanup is
                     // auto-executed, so a false "success" here would poison the rate limiter
                     // (safety::rate_limited suppresses a fingerprint that already "succeeded").
                     // Mirrors the NetworkDiagnostic unknown-command branch below.
-                    let msg = format!("Unknown disk cleanup target: '{other}'");
+                    let msg = format!("Unknown disk cleanup target: '{target}'");
                     error!("{msg}");
                     return ExecutionResult {
                         action: format!("{action:?}"),
@@ -59,7 +106,7 @@ pub async fn execute(action: &FixAction) -> ExecutionResult {
                     };
                 }
             };
-            make_result(action, powershell::run_diagnostic(script).await)
+            make_result(action, powershell::run_diagnostic(&script).await)
         }
         FixAction::PowerShellDiagnostic { script } => {
             make_result(action, powershell::run_diagnostic(script).await)
@@ -81,13 +128,10 @@ pub async fn execute(action: &FixAction) -> ExecutionResult {
             Err(e) => make_result(action, Err(e)),
         },
         FixAction::NetworkDiagnostic { command } => {
-            let script = match command.to_lowercase().as_str() {
-                "flush_dns" => "ipconfig /flushdns",
-                "release_renew" => "ipconfig /release; Start-Sleep -Seconds 2; ipconfig /renew",
-                "reset_tcp" => "netsh int ip reset",
-                "reset_winsock" => "netsh winsock reset",
-                other => {
-                    let msg = format!("Unknown network diagnostic command: '{other}'");
+            let script = match network_diagnostic_script(command) {
+                Some(script) => script,
+                None => {
+                    let msg = format!("Unknown network diagnostic command: '{command}'");
                     error!("{msg}");
                     return ExecutionResult {
                         action: format!("{action:?}"),
@@ -141,45 +185,8 @@ pub async fn execute(action: &FixAction) -> ExecutionResult {
             startup::set_enabled(name, location, hive, *enable).await,
         ),
         FixAction::FileDelete { path } => {
-            // Defense in depth (policy already blocks this): refuse a UNC/network path
-            // BEFORE canonicalize, which would otherwise authenticate to a remote host.
-            if crate::policy::is_network_path(path) {
-                return make_result(
-                    action,
-                    Err(anyhow::anyhow!(
-                        "Refusing to delete '{path}' — network/UNC paths are not allowed"
-                    )),
-                );
-            }
-            // Canonicalise before deleting. An 8.3 short name or a junction can lexically
-            // dodge the policy blocklist yet resolve into a protected system dir — and the
-            // approval card shows the UN-resolved path, so the human can't see the real
-            // target. Resolve it and refuse anything under a protected dir, mirroring the
-            // per-file guard LogCleanup already applies. (canonicalize fails for a missing
-            // file; that path can't be deleted anyway, so fall through to the script,
-            // which reports "not found".) A narrow check-then-act race remains (a swap
-            // between here and Remove-Item), but the target is a single approval-gated
-            // file and `Remove-Item -Force` on a reparse point removes the link itself.
-            if let Ok(canon) = std::fs::canonicalize(path) {
-                if logs::is_protected_file(&canon.to_string_lossy()) {
-                    return make_result(
-                        action,
-                        Err(anyhow::anyhow!(
-                            "Refusing to delete '{path}': resolves into a protected system directory ({})",
-                            canon.display()
-                        )),
-                    );
-                }
-            }
-            let safe = path.replace('\'', "''");
-            // Guard: refuse if path is a directory, and require the item to exist.
-            let script = format!(
-                r#"$item = Get-Item -LiteralPath '{safe}' -ErrorAction SilentlyContinue
-if (-not $item) {{ Write-Output 'Not found (already gone?): {safe}' }}
-elseif ($item.PSIsContainer) {{ throw 'Refusing to delete directory: {safe}' }}
-else {{ Remove-Item -LiteralPath '{safe}' -Force -ErrorAction Stop; Write-Output 'Deleted: {safe}' }}"#
-            );
-            make_result(action, powershell::run_diagnostic(&script).await)
+            let path = path.clone();
+            blocking(action, move || logs::delete_file(&path)).await
         }
     }
 }
@@ -214,6 +221,25 @@ fn make_result(action: &FixAction, r: anyhow::Result<String>) -> ExecutionResult
                 output: e.to_string(),
                 undo: None,
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_disk_cleanup_script, network_diagnostic_script};
+
+    #[test]
+    fn cleanup_and_network_scripts_fail_when_native_effects_fail() {
+        let cleanup = build_disk_cleanup_script("temp").expect("known target");
+        assert!(cleanup.contains("C:\\Windows\\Temp"));
+        assert!(cleanup.contains("Test-Path"));
+        assert!(cleanup.contains("$removed -eq 0"));
+        assert!(!cleanup.contains("SilentlyContinue"));
+        for command in ["flush_dns", "release_renew", "reset_tcp", "reset_winsock"] {
+            assert!(network_diagnostic_script(command)
+                .expect("known command")
+                .contains("$LASTEXITCODE"));
         }
     }
 }

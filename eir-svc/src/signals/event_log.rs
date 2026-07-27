@@ -19,6 +19,7 @@ const MAX_PER_POLL: usize = 100;
 /// Cap on the accumulate-until-drained buffer (multiple polls can land between
 /// decision cycles); oldest entries are dropped first.
 const BUFFER_CAP: usize = 100;
+const MAX_EVENT_DETAIL_CHARS: usize = 2048;
 
 // READ_EVENT_LOG_READ_FLAGS values
 const SEQUENTIAL_BACKWARDS: READ_EVENT_LOG_READ_FLAGS = READ_EVENT_LOG_READ_FLAGS(0x0008 | 0x0001);
@@ -139,6 +140,10 @@ fn read_channel_since(channel: &str, last_record: u32, prime: bool) -> (Vec<Even
             }
 
             if let Some(level) = level_name(record.EventType) {
+                let rec_end = offset
+                    .saturating_add(record.Length as usize)
+                    .min(bytes_read as usize);
+                let record_bytes = &buf[offset..rec_end];
                 let source_ptr = unsafe {
                     (record as *const EVENTLOGRECORD as *const u8)
                         .add(std::mem::size_of::<EVENTLOGRECORD>())
@@ -149,9 +154,6 @@ fn read_channel_since(channel: &str, last_record: u32, prime: bool) -> (Vec<Even
                     // bytes actually read): a malformed record whose source field is
                     // not NUL-terminated within itself must not walk past the buffer.
                     let header = std::mem::size_of::<EVENTLOGRECORD>();
-                    let rec_end = offset
-                        .saturating_add(record.Length as usize)
-                        .min(bytes_read as usize);
                     let avail_u16 = rec_end.saturating_sub(offset + header) / 2;
                     let mut len = 0usize;
                     while len < avail_u16 && *source_ptr.add(len) != 0 {
@@ -161,13 +163,24 @@ fn read_channel_since(channel: &str, last_record: u32, prime: bool) -> (Vec<Even
                 };
 
                 let timestamp = win32_time_to_datetime(record.TimeGenerated);
+                let event_id = record.EventID & 0xFFFF;
+                let details = insertion_strings(
+                    record_bytes,
+                    record.StringOffset as usize,
+                    record.NumStrings as usize,
+                    MAX_EVENT_DETAIL_CHARS,
+                );
+                let message = if details.is_empty() {
+                    format!("EventID {event_id}")
+                } else {
+                    format!("EventID {event_id}: {}", details.join(" | "))
+                };
                 entries.push(EventLogEntry {
                     timestamp,
                     level: level.to_string(),
                     source,
-                    // Full message extraction requires loading provider DLLs; event ID is sufficient for Phase 1
-                    message: format!("EventID {}", record.EventID & 0xFFFF),
-                    event_id: record.EventID & 0xFFFF,
+                    message,
+                    event_id,
                 });
             }
 
@@ -279,6 +292,53 @@ pub fn spawn(
     (shared, shutdown_tx)
 }
 
+/// Decode the event-specific insertion strings stored inside one legacy
+/// `EVENTLOGRECORD`. Count and total text are bounded because event data is
+/// untrusted and is later included in the AI prompt.
+fn insertion_strings(
+    record: &[u8],
+    string_offset: usize,
+    count: usize,
+    max_chars: usize,
+) -> Vec<String> {
+    if string_offset >= record.len() || max_chars == 0 {
+        return Vec::new();
+    }
+    let mut offset = string_offset;
+    let mut remaining = max_chars;
+    let mut out = Vec::new();
+    for _ in 0..count.min(16) {
+        let mut units = Vec::new();
+        let mut terminated = false;
+        while offset + 1 < record.len() {
+            let unit = u16::from_le_bytes([record[offset], record[offset + 1]]);
+            offset += 2;
+            if unit == 0 {
+                terminated = true;
+                break;
+            }
+            if remaining == 0 {
+                break;
+            }
+            units.push(unit);
+            remaining -= 1;
+        }
+        if !units.is_empty() {
+            let value = String::from_utf16_lossy(&units)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !value.is_empty() {
+                out.push(value);
+            }
+        }
+        if remaining == 0 || !terminated {
+            break;
+        }
+    }
+    out
+}
+
 /// Take (and clear) everything collected since the last drain — each entry is
 /// delivered to the decision loop exactly once, like the file-watch buffer.
 pub fn drain(shared: &SharedEntries) -> Vec<EventLogEntry> {
@@ -286,4 +346,28 @@ pub fn drain(shared: &SharedEntries) -> Vec<EventLogEntry> {
         .lock()
         .map(|mut g| g.drain(..).collect())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::insertion_strings;
+
+    #[test]
+    fn insertion_strings_recover_event_details_with_bounds() {
+        let mut bytes = vec![0u8; 12];
+        for value in ["service failed", "error 1067", "ignored"] {
+            bytes.extend(value.encode_utf16().flat_map(u16::to_le_bytes));
+            bytes.extend(0u16.to_le_bytes());
+        }
+
+        assert_eq!(
+            insertion_strings(&bytes, 12, 2, 64),
+            vec!["service failed", "error 1067"]
+        );
+        assert_eq!(
+            insertion_strings(&bytes, bytes.len() + 1, 2, 64),
+            Vec::<String>::new()
+        );
+        assert_eq!(insertion_strings(&bytes, 12, 2, 7), vec!["service"]);
+    }
 }

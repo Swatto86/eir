@@ -8,7 +8,7 @@
 //! classifies it keep / optional / unnecessary — advisory only; it triggers nothing.
 //!
 //! Running as LocalSystem, `HKCU` is the SYSTEM hive, so per-user entries are read from
-//! each loaded interactive-user hive under `HKEY_USERS\S-1-5-21-…`. Toggling is offered
+//! the active interactive user's hive under `HKEY_USERS\S-1-5-21-…`. Toggling is offered
 //! only where a reversible mechanism exists (StartupApproved flags, task enable/disable);
 //! everything else is listed report-only.
 
@@ -27,13 +27,16 @@ pub struct StartupToggle {
     /// Closed-set selector: machine_run | machine_run32 | user_run | user_startup_folder
     /// | common_startup_folder | scheduled_task.
     pub location: String,
-    /// User SID for the `user_*` locations, empty otherwise.
+    /// Active-user SID for the `user_*` and `scheduled_task` locations, empty otherwise.
     pub hive: String,
     /// Full `\Folder\Name` task path for `scheduled_task`, empty otherwise.
     pub task_path: String,
 }
 
 pub struct StartupScanResult {
+    /// SID whose hive/task scope produced this result. The service binds the cached
+    /// view and opaque toggle ids to this owner across fast-user-switching.
+    pub owner_sid: String,
     pub entries: Vec<StartupEntryView>,
     pub targets: HashMap<String, StartupToggle>,
     /// AI-classify call usage, if a classify call was made.
@@ -128,14 +131,14 @@ fn to_toggle(display: &str, sid: &str, task_path: &str) -> Option<(String, Strin
         }
         "scheduled_task" if !task_path.is_empty() => Some((
             "scheduled_task".into(),
-            String::new(),
+            sid.to_string(),
             task_path.to_string(),
         )),
         _ => None,
     }
 }
 
-/// The enumeration script. Reads fixed machine keys, each loaded interactive-user hive,
+/// The enumeration script. Reads fixed machine keys, the active interactive-user hive,
 /// the task scheduler, and the service list; resolves each entry's launched binary and
 /// its Authenticode signer / CompanyName (cached per path); emits a compact JSON array.
 /// No untrusted interpolation — it reads only fixed key paths and system providers.
@@ -198,9 +201,23 @@ RunLike 'HKEY_LOCAL_MACHINE' '' 'hklm_run' "$cv\Run" 'Run'
 RunLike 'HKEY_LOCAL_MACHINE' '' 'hklm_run32' "SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Run" 'Run32'
 RunLike 'HKEY_LOCAL_MACHINE' '' 'run_once' "$cv\RunOnce" ''
 RunLike 'HKEY_LOCAL_MACHINE' '' 'policies_run' "$cv\Policies\Explorer\Run" ''
-$us=Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-5-21-' -and $_.PSChildName -notmatch '_Classes$' }
-foreach($u in $us){
-  $sid=$u.PSChildName
+$sid='__EIR_ACTIVE_USER_SID__'
+function SidOf($identity){
+  $text=[string]$identity
+  if([string]::IsNullOrWhiteSpace($text)){return ''}
+  try{ $resolved=New-Object System.Security.Principal.SecurityIdentifier($text); return $resolved.Value }catch{}
+  try{ $account=New-Object System.Security.Principal.NTAccount($text); return $account.Translate([System.Security.Principal.SecurityIdentifier]).Value }catch{}
+  return ''
+}
+function ScopeApplies($identity){
+  $text=[string]$identity
+  if([string]::IsNullOrWhiteSpace($text)){return $true}
+  $resolved=SidOf $text
+  if(-not $resolved){return $false}
+  if($resolved -eq $sid){return $true}
+  return -not $resolved.StartsWith('S-1-5-21-',[System.StringComparison]::OrdinalIgnoreCase)
+}
+if(Test-Path -LiteralPath "Registry::HKEY_USERS\$sid"){
   RunLike "HKEY_USERS\$sid" $sid 'hkcu_run' "$cv\Run" 'Run'
   RunLike "HKEY_USERS\$sid" $sid 'run_once' "$cv\RunOnce" ''
   RunLike "HKEY_USERS\$sid" $sid 'policies_run' "$cv\Policies\Explorer\Run" ''
@@ -212,7 +229,7 @@ foreach($u in $us){
       Emit $l.Name $l.FullName 'startup_folder' $sid $ab '' '' $true } }
   }
 }
-$csf='C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp'
+$csf=Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\StartUp'
 if(Test-Path -LiteralPath $csf){ foreach($l in Get-ChildItem -LiteralPath $csf -Filter *.lnk -ErrorAction SilentlyContinue){
   $ab=Approved 'HKEY_LOCAL_MACHINE' 'StartupFolder' $l.Name
   Emit $l.Name $l.FullName 'common_startup_folder' '' $ab '' '' $true } }
@@ -225,18 +242,30 @@ if($wl){
 }
 $ts=Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskPath -notlike '\Microsoft\*' }
 foreach($t in $ts){
-  $lt=$t.Triggers | Where-Object { $_ -and $_.CimClass -and $_.CimClass.CimClassName -match 'LogonTrigger' }
+  $lt=$t.Triggers | Where-Object { $_ -and $_.CimClass -and $_.CimClass.CimClassName -match 'LogonTrigger' -and (ScopeApplies $_.UserId) }
   if(-not $lt){continue}
+  $principalOk=$true
+  foreach($principalId in @($t.Principal.UserId,$t.Principal.GroupId)){
+    if(-not [string]::IsNullOrWhiteSpace([string]$principalId) -and -not (ScopeApplies $principalId)){ $principalOk=$false; break }
+  }
+  if(-not $principalOk){continue}
   $act=$t.Actions | Where-Object { $_.Execute } | Select-Object -First 1
   if(-not $act){continue}
   $cmd=(($act.Execute+' '+$act.Arguments).Trim())
   $state= if($t.State -eq 'Disabled'){'disabled'}else{'enabled'}
-  Emit $t.TaskName $cmd 'scheduled_task' '' -1 $state ($t.TaskPath+$t.TaskName) $false
+  Emit $t.TaskName $cmd 'scheduled_task' $sid -1 $state ($t.TaskPath+$t.TaskName) $false
 }
 $svcs=Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.StartMode -eq 'Auto' -and $_.PathName -and ($_.PathName -notmatch '(?i)^"?[a-z]:\\windows\\') }
 foreach($s in $svcs){ Emit $s.DisplayName $s.PathName 'service' '' -1 'enabled' '' $false }
 ConvertTo-Json -InputObject @($results) -Depth 4 -Compress
 "#;
+
+fn enumeration_script(active_sid: &str) -> Result<String> {
+    if !crate::executor::startup::valid_sid(active_sid) {
+        anyhow::bail!("Active interactive user SID is invalid");
+    }
+    Ok(ENUM_SCRIPT.replace("__EIR_ACTIVE_USER_SID__", active_sid))
+}
 
 /// Parse the enumeration JSON, tolerating the empty and single-object shapes PowerShell's
 /// `ConvertTo-Json` can emit.
@@ -257,8 +286,13 @@ fn parse_entries(json: &str) -> Vec<RawEntry> {
 /// Run the scan. `ai`/`model` drive the optional classify pass; without a provider the
 /// deterministic listing (locations, signers, enabled state) is returned with empty
 /// verdicts.
-pub async fn scan(ai: Option<&AiClient>, model: &str) -> Result<StartupScanResult> {
-    let json = crate::executor::powershell::run_diagnostic(ENUM_SCRIPT)
+pub async fn scan(
+    ai: Option<&AiClient>,
+    model: &str,
+    active_sid: &str,
+) -> Result<StartupScanResult> {
+    let script = enumeration_script(active_sid)?;
+    let json = crate::executor::powershell::run_diagnostic(&script)
         .await
         .context("startup enumeration failed")?;
     let mut raw = parse_entries(&json);
@@ -325,6 +359,7 @@ pub async fn scan(ai: Option<&AiClient>, model: &str) -> Result<StartupScanResul
     };
 
     Ok(StartupScanResult {
+        owner_sid: active_sid.to_string(),
         entries,
         targets,
         usage,
@@ -431,6 +466,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn enumeration_script_scopes_user_entries_to_the_active_sid() {
+        let script = enumeration_script("S-1-5-21-1-2-3-1001").unwrap();
+        assert!(script.contains("$sid='S-1-5-21-1-2-3-1001'"));
+        assert!(!script.contains("Get-ChildItem 'Registry::HKEY_USERS'"));
+        assert!(!script.contains("foreach($u in $us)"));
+        assert!(enumeration_script("S-1-5-21-1'; Get-ChildItem").is_err());
+    }
+
+    #[test]
+    fn enumeration_script_filters_other_users_scheduled_tasks() {
+        let script = enumeration_script("S-1-5-21-1-2-3-1001").unwrap();
+        assert!(script.contains("ScopeApplies $_.UserId"));
+        assert!(script.contains("$t.Principal.UserId"));
+        assert!(script.contains("$t.Principal.GroupId"));
+        assert!(script.contains("$resolved -eq $sid"));
+        assert!(script.contains("$resolved.StartsWith('S-1-5-21-'"));
+    }
+
+    #[test]
     fn decode_enabled_handles_absent_enabled_and_disabled() {
         assert!(decode_enabled(-1)); // absent → Windows default = enabled
         assert!(decode_enabled(2)); // 0x02 enabled
@@ -489,10 +543,10 @@ mod tests {
             Some(("common_startup_folder".into(), String::new(), String::new()))
         );
         assert_eq!(
-            to_toggle("scheduled_task", "", r"\Vendor\Updater"),
+            to_toggle("scheduled_task", "S-1-5-21-1-2-3-1001", r"\Vendor\Updater"),
             Some((
                 "scheduled_task".into(),
-                String::new(),
+                "S-1-5-21-1-2-3-1001".into(),
                 r"\Vendor\Updater".into()
             ))
         );

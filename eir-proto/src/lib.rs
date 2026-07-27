@@ -1,9 +1,18 @@
 use serde::{Deserialize, Serialize};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\EirSvc";
+pub const PROTOCOL_VERSION: u32 = 2;
+pub const CAP_COMMAND_RESULTS: &str = "command_results";
+pub const CAP_PROVIDER_TEST: &str = "provider_test";
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct StatusPayload {
+    /// Wire contract version and optional features supported by the service.
+    /// Both default for a tray temporarily connected to an older service.
+    #[serde(default)]
+    pub protocol_version: u32,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     pub status: String,
     pub paused: bool,
     pub cpu: f32,
@@ -70,6 +79,12 @@ pub struct StatusPayload {
     /// payload decodable.
     #[serde(default)]
     pub svc_version: Option<String>,
+    /// Unix seconds when the system-signal snapshot was collected (0 = unknown).
+    #[serde(default)]
+    pub signals_at: i64,
+    /// Collector tokens whose latest value is unavailable or degraded.
+    #[serde(default)]
+    pub signal_errors: Vec<String>,
 }
 
 /// One point of the dashboard resource timeline. Percentages, unix-seconds `at`.
@@ -255,6 +270,9 @@ pub struct UpdaterStatus {
     pub phase: String,
     /// Unix seconds of the last completed cycle (0 = never).
     pub last_run: i64,
+    /// Unix seconds of the last completed cycle without failures (0 = never).
+    #[serde(default)]
+    pub last_clean_run: i64,
     /// Unix seconds the next scheduled cycle is due (0 = not scheduled).
     pub next_run: i64,
     /// AI cost (USD) of the last cycle.
@@ -313,6 +331,14 @@ pub struct UpdateAttemptRow {
     pub method: String,
     pub success: bool,
     pub detail: String,
+    #[serde(default)]
+    pub from_version: String,
+    #[serde(default)]
+    pub to_version: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
     /// Unix seconds.
     pub at: i64,
 }
@@ -503,11 +529,40 @@ pub struct ExecutionSummary {
     pub undo_id: Option<i64>,
 }
 
+/// Result of a command carrying a request id. `ok` means the service applied
+/// the command, rather than merely accepting bytes from the pipe.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct CommandResult {
+    pub request_id: u64,
+    pub ok: bool,
+    pub message: String,
+}
+
 /// Messages sent FROM the service TO the UI.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServiceMsg {
-    Status(StatusPayload),
+    Status(Box<StatusPayload>),
+    CommandResult(CommandResult),
+}
+
+/// A command plus an optional correlation id. Flattening preserves the original
+/// top-level `UiMsg` wire shape; older services simply ignore `request_id`.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct UiRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u64>,
+    #[serde(flatten)]
+    pub command: UiMsg,
+}
+
+impl From<UiMsg> for UiRequest {
+    fn from(command: UiMsg) -> Self {
+        Self {
+            request_id: None,
+            command,
+        }
+    }
 }
 
 /// Messages sent FROM the UI TO the service.
@@ -593,4 +648,61 @@ pub enum UiMsg {
         id: String,
         enable: bool,
     },
+    /// Verify the saved provider/model from the LocalSystem service context.
+    TestProvider,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_id_is_flat_and_old_ui_msg_still_decodes_it() {
+        let request = UiRequest {
+            request_id: Some(42),
+            command: UiMsg::TogglePause,
+        };
+        let json = serde_json::to_string(&request).expect("serialize request");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).expect("valid json"),
+            serde_json::json!({"type": "toggle_pause", "request_id": 42})
+        );
+        assert!(matches!(
+            serde_json::from_str::<UiMsg>(&json).expect("old service ignores request_id"),
+            UiMsg::TogglePause
+        ));
+    }
+
+    #[test]
+    fn new_status_health_fields_default_for_old_service() {
+        let status: StatusPayload = serde_json::from_str(
+            r#"{"status":"Active","paused":false,"cpu":1.0,"memory":2.0,"disk":3.0,
+                "failed_services":[],"last_analysis":"","recent_problems":[],
+                "recent_executions":[],"error":null,"usage":null,"settings":null}"#,
+        )
+        .expect("old status decodes");
+        assert_eq!(status.protocol_version, 0);
+        assert!(status.capabilities.is_empty());
+        assert_eq!(status.signals_at, 0);
+        assert!(status.signal_errors.is_empty());
+    }
+
+    #[test]
+    fn command_result_has_stable_top_level_wire_shape() {
+        let json = serde_json::to_value(ServiceMsg::CommandResult(CommandResult {
+            request_id: 7,
+            ok: false,
+            message: "not allowed".to_string(),
+        }))
+        .expect("serialize result");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "command_result",
+                "request_id": 7,
+                "ok": false,
+                "message": "not allowed"
+            })
+        );
+    }
 }

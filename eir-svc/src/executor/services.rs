@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use std::time::{Duration, Instant};
 use tracing::info;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::ERROR_SERVICE_NOT_ACTIVE;
+use windows::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_NOT_ACTIVE};
 use windows::Win32::System::Services::{
     CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
     StartServiceW, SC_MANAGER_CONNECT, SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
@@ -36,16 +36,26 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.encode_utf16().count() > 256
+        || name.chars().any(char::is_control)
+        || name.contains(['\\', '/'])
+    {
+        bail!("Invalid Windows service name");
+    }
+    Ok(())
+}
+
 pub fn restart(name: &str) -> Result<String> {
     info!(service = name, "Restarting service");
     stop(name)?;
-    wait_for(name, SERVICE_STOPPED, 30)?;
     start(name)?;
-    wait_for(name, SERVICE_RUNNING, 30)?;
     Ok(format!("Service '{name}' restarted successfully"))
 }
 
 pub fn stop(name: &str) -> Result<String> {
+    validate_name(name)?;
     // Adapter-level backstop: never stop a critical service, even if policy.toml's
     // blocklist was edited to omit it. `restart` routes through here, so this covers both.
     if CRITICAL_SERVICES.contains(&name.to_lowercase().as_str()) {
@@ -87,10 +97,13 @@ pub fn stop(name: &str) -> Result<String> {
     unsafe {
         let _ = CloseServiceHandle(manager);
     }
-    result
+    result?;
+    wait_for(name, SERVICE_STOPPED, 30)?;
+    Ok(format!("Service '{name}' is stopped"))
 }
 
 pub fn start(name: &str) -> Result<String> {
+    validate_name(name)?;
     let name_w = wide(name);
     let manager = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT)? };
 
@@ -98,9 +111,11 @@ pub fn start(name: &str) -> Result<String> {
 
     let result = match svc {
         Ok(h) => {
-            let r = unsafe { StartServiceW(h, None) }
-                .map(|_| format!("Start issued for '{name}'"))
-                .map_err(|e| anyhow::anyhow!("StartServiceW failed: {e}"));
+            let r = match unsafe { StartServiceW(h, None) } {
+                Ok(()) => Ok(()),
+                Err(e) if e.code() == ERROR_SERVICE_ALREADY_RUNNING.to_hresult() => Ok(()),
+                Err(e) => Err(anyhow::anyhow!("StartServiceW failed: {e}")),
+            };
             unsafe {
                 let _ = CloseServiceHandle(h);
             }
@@ -112,7 +127,9 @@ pub fn start(name: &str) -> Result<String> {
     unsafe {
         let _ = CloseServiceHandle(manager);
     }
-    result
+    result?;
+    wait_for(name, SERVICE_RUNNING, 30)?;
+    Ok(format!("Service '{name}' is running"))
 }
 
 fn wait_for(name: &str, target: SERVICE_STATUS_CURRENT_STATE, timeout_secs: u64) -> Result<()> {
@@ -173,7 +190,7 @@ fn wait_for(name: &str, target: SERVICE_STATUS_CURRENT_STATE, timeout_secs: u64)
 
 #[cfg(test)]
 mod tests {
-    use super::stop;
+    use super::{start, stop};
 
     #[test]
     fn critical_services_are_refused_before_any_scm_call() {
@@ -181,6 +198,20 @@ mod tests {
         for name in ["RpcSs", "rpcss", "EventLog", "Winmgmt", "DcomLaunch"] {
             let err = stop(name).unwrap_err().to_string();
             assert!(err.contains("critical"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn invalid_service_names_are_refused_before_any_scm_call() {
+        for name in [
+            "",
+            "RpcSs\0junk",
+            "bad\nname",
+            r"folder\service",
+            "bad/name",
+        ] {
+            assert!(stop(name).unwrap_err().to_string().contains("Invalid"));
+            assert!(start(name).unwrap_err().to_string().contains("Invalid"));
         }
     }
 }
