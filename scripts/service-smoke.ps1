@@ -48,8 +48,8 @@ try {
         [IO.Pipes.PipeOptions]::None
     )
     $pipe.Connect(30000)
-    $reader = [IO.StreamReader]::new($pipe, [Text.UTF8Encoding]::new($false))
-    $writer = [IO.StreamWriter]::new($pipe, [Text.UTF8Encoding]::new($false))
+    $reader = [IO.StreamReader]::new($pipe, [Text.UTF8Encoding]::new($false), $false, 1024, $true)
+    $writer = [IO.StreamWriter]::new($pipe, [Text.UTF8Encoding]::new($false), 1024, $true)
     $writer.AutoFlush = $true
 
     $statusTask = $reader.ReadLineAsync()
