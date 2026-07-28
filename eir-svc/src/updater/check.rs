@@ -93,6 +93,7 @@ fn push_candidate(
         methods.push(Method::Native);
     }
     out.push(UpdateCandidate {
+        guidance: cfg.guidance_for(&id).map(str::to_string),
         id,
         name: name.to_string(),
         current: current.to_string(),
@@ -111,6 +112,7 @@ pub async fn collect(
     model_override: &str,
     available: &[Method],
     learned_skips: &HashSet<String>,
+    target_id: Option<&str>,
 ) -> CheckResult {
     let native_avail = available.contains(&Method::Native);
     let mut candidates: Vec<UpdateCandidate> = Vec::new();
@@ -233,8 +235,8 @@ pub async fn collect(
                 cfg,
                 model_override,
                 &managed,
-                learned_skips,
                 winget_list_available,
+                (learned_skips, target_id),
             )
             .await;
             cost += c;
@@ -260,6 +262,10 @@ pub async fn collect(
         notes.push(
             "AI-found installers disabled — only package-manager apps are checked.".to_string(),
         );
+    }
+
+    if let Some(target) = target_id {
+        candidates.retain(|candidate| candidate.id.eq_ignore_ascii_case(target));
     }
 
     CheckResult {
@@ -340,9 +346,10 @@ async fn check_unmanaged(
     cfg: &UpdaterConfig,
     model_override: &str,
     managed: &HashSet<String>,
-    learned_skips: &HashSet<String>,
     winget_list_available: bool,
+    filter: (&HashSet<String>, Option<&str>),
 ) -> (Vec<UpdateCandidate>, f64, Vec<String>, bool) {
+    let (learned_skips, target_id) = filter;
     // Build the installed-app inventory from winget (when available) and the registry.
     let mut apps: Vec<(String, String)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -402,6 +409,10 @@ async fn check_unmanaged(
         }
     }
 
+    if let Some(target) = target_id {
+        apps.retain(|(name, _)| app_id(name).eq_ignore_ascii_case(target));
+    }
+
     // Fair rotation: stalest check time first, never-checked first, so the tail isn't
     // permanently starved. The cap is applied here, not at collection, because the
     // AI call is the expensive step and we want it to sweep across the whole set.
@@ -428,9 +439,18 @@ async fn check_unmanaged(
 
     let app_lines = checked
         .iter()
-        .map(|(n, v)| match cfg.notes.get(&app_id(n)) {
-            Some(note) if !note.is_empty() => format!("- {n} ({v}) [user note: {note}]"),
-            _ => format!("- {n} ({v})"),
+        .map(|(n, v)| {
+            let id = app_id(n);
+            match cfg.guidance_for(&id) {
+                Some(note) if cfg.learned_notes.contains_key(&id) => {
+                    format!("- {n} ({v}) [proven guidance: {note}]")
+                }
+                Some(note) if cfg.notes.contains_key(&id) => {
+                    format!("- {n} ({v}) [user note: {note}]")
+                }
+                Some(note) => format!("- {n} ({v}) [related proven guidance: {note}]"),
+                None => format!("- {n} ({v})"),
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -440,8 +460,9 @@ async fn check_unmanaged(
  For GitHub-hosted software, open https://github.com/<owner>/<repo>/releases/latest first; GitHub \
  redirects it to the current stable release. \
  Return ONLY the apps that have a NEWER version available.\n\n\
- Respect any [user note]: it may say an app is custom/self-built or give its real release source — \
- follow that guidance and do NOT report an update that contradicts the note. In the response's \
+ Respect any [user note], [proven guidance], or [related proven guidance]: it may say an app is \
+ custom/self-built or give its real release source — follow that guidance and do NOT report an \
+ update that contradicts it. In the response's \
  name field, copy the installed app name exactly even when its note gives another product or vendor name.\n\n\
  Respond ONLY with JSON, no markdown:\n\
  {{\"updates\":[{{\"name\":\"<app>\",\"current\":\"<installed>\",\"latest\":\"<newer version>\",\"url\":\"<official download or releases page URL>\"}}]}}\n\
@@ -507,6 +528,7 @@ fn native_candidates_from(
             continue;
         }
         out.push(UpdateCandidate {
+            guidance: cfg.guidance_for(&id).map(str::to_string),
             id,
             name: u.name.clone(),
             current: cur,
@@ -677,14 +699,23 @@ mod tests {
             .await
             .expect("open db");
         let cfg = UpdaterConfig::default();
-        let result = collect(&pool, None, &cfg, "", &[Method::Native], &HashSet::new()).await;
+        let result = collect(
+            &pool,
+            None,
+            &cfg,
+            "",
+            &[Method::Native],
+            &HashSet::new(),
+            None,
+        )
+        .await;
         assert!(result.had_errors);
 
         let disabled = UpdaterConfig {
             native_enabled: false,
             ..UpdaterConfig::default()
         };
-        let result = collect(&pool, None, &disabled, "", &[], &HashSet::new()).await;
+        let result = collect(&pool, None, &disabled, "", &[], &HashSet::new(), None).await;
         assert!(!result.had_errors);
     }
 }

@@ -774,6 +774,7 @@ impl AiClient {
                         what: "claude CLI",
                         scratch_prefix: "eir-claude",
                         workspace_flag: None,
+                        timeout_ms: 300_000,
                     },
                     &args,
                     &prompt,
@@ -926,6 +927,7 @@ impl AiClient {
                         what: "kilo CLI",
                         scratch_prefix: "eir-kilo",
                         workspace_flag: Some("--dir"),
+                        timeout_ms: 300_000,
                     },
                     &args,
                     &prompt,
@@ -1598,6 +1600,7 @@ async fn run_codex_cli(
                     what: "codex CLI",
                     scratch_prefix: "eir-codex",
                     workspace_flag: None,
+                    timeout_ms: 300_000,
                 },
                 &args,
                 &prompt,
@@ -1675,7 +1678,7 @@ impl Drop for UserImpersonation {
 }
 
 #[cfg(windows)]
-fn running_as_local_system() -> bool {
+pub(crate) fn running_as_local_system() -> bool {
     unsafe {
         let mut token = HANDLE::default();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
@@ -1850,6 +1853,7 @@ struct UserCliSpec<'a> {
     what: &'a str,
     scratch_prefix: &'a str,
     workspace_flag: Option<&'a str>,
+    timeout_ms: u32,
 }
 
 #[cfg(windows)]
@@ -1865,6 +1869,7 @@ fn run_cli_as_active_user(
         what,
         scratch_prefix,
         workspace_flag,
+        timeout_ms,
     } = spec;
     let session = active_user_session_id()
         .ok_or_else(|| anyhow::anyhow!("No single active desktop user is available for {what}"))?;
@@ -1992,14 +1997,14 @@ fn run_cli_as_active_user(
             }
             bail!("Resume {what} process failed");
         }
-        match unsafe { WaitForSingleObject(process.hProcess, 300_000) } {
+        match unsafe { WaitForSingleObject(process.hProcess, timeout_ms) } {
             WAIT_OBJECT_0 => {}
             WAIT_TIMEOUT => {
                 unsafe {
                     let _ = TerminateProcess(process.hProcess, 1);
                     let _ = WaitForSingleObject(process.hProcess, 5_000);
                 }
-                bail!("{what} timed out after 300s");
+                bail!("{what} timed out after {}s", timeout_ms / 1_000);
             }
             _ => bail!("Wait for {what} failed"),
         }
@@ -2023,6 +2028,49 @@ fn run_cli_as_active_user(
     }
     drop(token_guard);
     result
+}
+
+#[cfg(windows)]
+fn configured_binary(configured: Option<&str>, _profile: Option<&str>) -> String {
+    configured.unwrap_or_default().to_string()
+}
+
+/// Run the trusted machine Winget binary with the active desktop user's primary
+/// token so LocalSystem sees the same installed-package catalog as the user.
+#[cfg(windows)]
+pub(crate) async fn run_winget_as_active_user(
+    program: &std::path::Path,
+    args: &[String],
+    timeout: std::time::Duration,
+) -> Result<(i32, String)> {
+    static USER_PROGRAM_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let program = program.to_string_lossy().into_owned();
+    let args = args.to_vec();
+    let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    let seq = USER_PROGRAM_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let output = tokio::task::spawn_blocking(move || {
+        run_cli_as_active_user(
+            UserCliSpec {
+                configured_binary: Some(&program),
+                resolve_binary: configured_binary,
+                what: "winget",
+                scratch_prefix: "eir-winget",
+                workspace_flag: None,
+                timeout_ms,
+            },
+            &args,
+            "",
+            seq,
+        )
+    })
+    .await
+    .context("Join active-user winget task")??;
+    let mut merged = output.stdout;
+    if !output.stderr.trim().is_empty() {
+        merged.push('\n');
+        merged.push_str(output.stderr.trim());
+    }
+    Ok((i32::from_ne_bytes(output.code.to_ne_bytes()), merged))
 }
 
 /// Resolve the Windows user profile whose logged-in Kilo session the service

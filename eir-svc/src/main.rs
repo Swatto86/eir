@@ -366,6 +366,17 @@ fn updater_due(enabled: bool, interval_secs: i64, last_run: i64, st: &SvcState, 
         && (last_run == 0 || now - last_run >= interval_secs)
 }
 
+fn failed_update_for_retry(
+    apps: &[eir_proto::UpdaterAppRow],
+    id: &str,
+) -> Option<eir_proto::UpdaterAppRow> {
+    updater::config::valid_app_id(id).then(|| {
+        apps.iter()
+            .find(|app| app.id.eq_ignore_ascii_case(id) && app.state == "failed")
+            .cloned()
+    })?
+}
+
 /// Restart the service to apply new settings: a detached helper waits for this
 /// process to stop cleanly, then starts EirSvc (LocalSystem — no UAC).
 ///
@@ -447,6 +458,7 @@ fn build_status(st: &SvcState) -> StatusPayload {
         capabilities: vec![
             eir_proto::CAP_COMMAND_RESULTS.to_string(),
             eir_proto::CAP_PROVIDER_TEST.to_string(),
+            eir_proto::CAP_TARGETED_UPDATE_RETRY.to_string(),
         ],
         status: st.status.clone(),
         paused: st.paused,
@@ -534,6 +546,7 @@ fn spawn_update_cycle(
     db: &SqlitePool,
     done_tx: &tokio::sync::mpsc::Sender<updater::orchestrator::CycleSummary>,
     progress_tx: &updater::orchestrator::ProgressTx,
+    retry: Option<eir_proto::UpdaterAppRow>,
 ) {
     let ai = ai::client::AiClient::new(&cfg.api).ok();
     let updater_cfg = cfg.updater.clone();
@@ -548,6 +561,7 @@ fn spawn_update_cycle(
     // unforeseen wedges.
     const CYCLE_MAX: Duration = Duration::from_secs(60 * 60);
     tokio::spawn(async move {
+        let targeted = retry.is_some();
         // Run the cycle in an inner task so a panic surfaces as a JoinError (not a
         // silent abort) AND a watchdog can stop a hang — either way a summary is sent
         // and `updater_running` is released, so the updater can never latch "running"
@@ -558,7 +572,12 @@ fn spawn_update_cycle(
                 config: &updater_cfg,
                 model_override: &model,
             };
-            updater::orchestrator::run_cycle(&pool, &ctx, cycle_id, &progress).await
+            match retry {
+                Some(prior) => {
+                    updater::orchestrator::run_retry(&pool, &ctx, cycle_id, &progress, prior).await
+                }
+                None => updater::orchestrator::run_cycle(&pool, &ctx, cycle_id, &progress).await,
+            }
         });
         let summary = match tokio::time::timeout(CYCLE_MAX, &mut inner).await {
             Ok(Ok(summary)) => summary,
@@ -568,6 +587,8 @@ fn spawn_update_cycle(
                 cost_usd: 0.0,
                 completed_at: chrono::Utc::now().timestamp(),
                 clean_at: 0,
+                targeted,
+                learned_guidance: None,
             },
             Err(_elapsed) => {
                 inner.abort();
@@ -580,6 +601,8 @@ fn spawn_update_cycle(
                     cost_usd: 0.0,
                     completed_at: chrono::Utc::now().timestamp(),
                     clean_at: 0,
+                    targeted,
+                    learned_guidance: None,
                 }
             }
         };
@@ -1188,23 +1211,18 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     };
     let persisted_last_run = updater::history::last_run(&db).await.unwrap_or(0);
     let last_clean_run = updater::history::last_clean_run(&db).await.unwrap_or(0);
+    let mut recent_last_run = 0;
     if let Ok(recent) = updater::history::recent(&db, 50).await {
-        // Seed last_run from history so a restart doesn't force an immediate update
-        // cycle regardless of the configured schedule (the due-check treats
-        // last_run == 0 as "never run").
-        st.updater.last_run = recent
-            .iter()
-            .map(|r| r.at)
-            .max()
-            .unwrap_or(0)
-            .max(last_clean_run);
+        recent_last_run = recent.iter().map(|r| r.at).max().unwrap_or(0);
         st.updater.recent = recent;
     }
-    st.updater.last_run = st
-        .updater
-        .last_run
-        .max(last_clean_run)
-        .max(persisted_last_run);
+    // The persisted full-run time is authoritative. Attempt history also contains
+    // targeted retries, which must not postpone the next whole-machine cycle.
+    st.updater.last_run = if persisted_last_run > 0 {
+        persisted_last_run
+    } else {
+        recent_last_run.max(last_clean_run)
+    };
     st.updater.last_clean_run = last_clean_run;
     let restored_cycle = match updater::history::last_cycle_status(&db).await {
         Ok(Some((at, notes, mut apps))) if at == st.updater.last_run => {
@@ -1510,33 +1528,73 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         // An update cycle finished — fold its result into the status.
                         st.updater_running = false;
                         st.updater.running = false;
-                        st.updater.last_run = summary.completed_at;
+                        if let Some(learning) = summary.learned_guidance.take() {
+                            let mut next = cfg.clone();
+                            match next
+                                .updater
+                                .set_learned_guidance(&learning.id, &learning.note)
+                            {
+                                Ok(_) => {
+                                    if let Err(e) = config::save(&next, "config.toml") {
+                                        warn!("Failed to save learned update guidance: {e}");
+                                        summary.notes.push(format!(
+                                            "The update succeeded, but its guidance could not be learned: {e}"
+                                        ));
+                                    } else {
+                                        cfg = next;
+                                        st.updater.app_notes = cfg.updater.note_views();
+                                    }
+                                }
+                                Err(e) => summary.notes.push(format!(
+                                    "The update succeeded, but its guidance was invalid: {e}"
+                                )),
+                            }
+                        }
                         let mut apps =
                             updater::orchestrator::app_rows(&summary, &cfg.updater);
-                        if let Err(e) = updater::history::record_cycle_status(
-                            &db,
-                            summary.completed_at,
-                            &summary.notes,
-                            &apps,
-                        )
-                        .await
-                        {
-                            warn!("Failed to persist update cycle completion: {e}");
-                            summary
-                                .notes
-                                .push(format!("failed to persist update cycle completion: {e}"));
-                            if apps.is_empty() {
-                                apps.push(updater::orchestrator::warning_row(
-                                    "The update check finished, but its evidence could not be saved.",
-                                ));
+                        if summary.targeted {
+                            for app in apps.drain(..) {
+                                if let Some(existing) = st
+                                    .updater
+                                    .apps
+                                    .iter_mut()
+                                    .find(|existing| existing.id.eq_ignore_ascii_case(&app.id))
+                                {
+                                    *existing = app;
+                                } else {
+                                    st.updater.apps.push(app);
+                                }
+                            }
+                            st.updater.notes = summary.notes.clone();
+                        } else {
+                            st.updater.last_run = summary.completed_at;
+                            if summary.clean_at > 0 {
+                                st.updater.last_clean_run = summary.clean_at;
+                            }
+                            st.updater.notes = summary.notes.clone();
+                            st.updater.apps = apps;
+                        }
+                        let status_at = if summary.targeted {
+                            st.updater.last_run
+                        } else {
+                            summary.completed_at
+                        };
+                        if status_at > 0 {
+                            if let Err(e) = updater::history::record_cycle_status(
+                                &db,
+                                status_at,
+                                &st.updater.notes,
+                                &st.updater.apps,
+                            )
+                            .await
+                            {
+                                warn!("Failed to persist update completion: {e}");
+                                st.updater
+                                    .notes
+                                    .push(format!("failed to persist update completion: {e}"));
                             }
                         }
                         st.updater.last_cost_usd = summary.cost_usd;
-                        if summary.clean_at > 0 {
-                            st.updater.last_clean_run = summary.clean_at;
-                        }
-                        st.updater.notes = summary.notes.clone();
-                        st.updater.apps = apps;
                         st.updater.phase = "idle".to_string();
                         if let Ok(recent) = updater::history::recent(&db, 50).await {
                             st.updater.recent = recent;
@@ -1546,7 +1604,11 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         } else {
                             0
                         };
-                        info!(apps = st.updater.apps.len(), "Update cycle complete");
+                        info!(
+                            apps = st.updater.apps.len(),
+                            targeted = summary.targeted,
+                            "Update cycle complete"
+                        );
                         pipe.broadcast_status(build_status(&st));
                         continue;
                     }
@@ -2442,7 +2504,45 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 st.updater.phase = "checking…".to_string();
                                 command_result = Ok("Update check started".to_string());
                                 pipe.broadcast_status(build_status(&st));
-                                spawn_update_cycle(&cfg, &db, &update_done_tx, &update_progress_tx);
+                                spawn_update_cycle(
+                                    &cfg,
+                                    &db,
+                                    &update_done_tx,
+                                    &update_progress_tx,
+                                    None,
+                                );
+                            }
+                        }
+                        UiMsg::RetryAppUpdate { id } => {
+                            let key = id.trim().to_lowercase();
+                            let failed = failed_update_for_retry(&st.updater.apps, &key);
+                            if st.paused {
+                                command_result =
+                                    Err("Resume monitoring before retrying updates".to_string());
+                            } else if st.updater_running {
+                                command_result =
+                                    Err("An update check is already running".to_string());
+                            } else if failed.is_none() {
+                                command_result =
+                                    Err("Only a currently failed app can be retried".to_string());
+                            } else if let Some(failed) = failed {
+                                let guided = cfg.updater.guidance_for(&failed.id).is_some();
+                                st.updater_running = true;
+                                st.updater.running = true;
+                                st.updater.phase = format!("re-checking {}…", failed.name);
+                                command_result = Ok(if guided {
+                                    format!("Re-checking {} with saved guidance", failed.name)
+                                } else {
+                                    format!("Re-checking {}", failed.name)
+                                });
+                                pipe.broadcast_status(build_status(&st));
+                                spawn_update_cycle(
+                                    &cfg,
+                                    &db,
+                                    &update_done_tx,
+                                    &update_progress_tx,
+                                    Some(failed),
+                                );
                             }
                         }
                         UiMsg::ClearUpdateHistory => {
@@ -3135,7 +3235,13 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         st.updater.enabled = true;
                         st.updater.phase = "checking…".to_string();
                         pipe.broadcast_status(build_status(&st));
-                        spawn_update_cycle(&cfg, &db, &update_done_tx, &update_progress_tx);
+                        spawn_update_cycle(
+                            &cfg,
+                            &db,
+                            &update_done_tx,
+                            &update_progress_tx,
+                            None,
+                        );
                     }
                 }
 
@@ -3610,6 +3716,26 @@ mod status_tests {
         assert!(!updater_due(true, 3600, 0, &st, now));
         st.paused = false;
         assert!(!updater_due(true, 3600, now, &st, now)); // just ran
+    }
+
+    #[test]
+    fn targeted_retry_accepts_only_the_named_failed_row() {
+        let apps = vec![
+            eir_proto::UpdaterAppRow {
+                id: "failed tool".into(),
+                state: "failed".into(),
+                ..Default::default()
+            },
+            eir_proto::UpdaterAppRow {
+                id: "current tool".into(),
+                state: "current".into(),
+                ..Default::default()
+            },
+        ];
+        assert!(failed_update_for_retry(&apps, "FAILED TOOL").is_some());
+        assert!(failed_update_for_retry(&apps, "current tool").is_none());
+        assert!(failed_update_for_retry(&apps, "unknown").is_none());
+        assert!(failed_update_for_retry(&apps, "bad\nid").is_none());
     }
 
     /// F1 regression: a manual RefreshStatus that clears a recovered service must survive

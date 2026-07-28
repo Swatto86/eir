@@ -86,6 +86,9 @@ pub struct UpdaterConfig {
     /// Per-app freeform hints for the AI, keyed by the stable app identity. A
     /// `BTreeMap` so serialization is deterministic (stable diffs/tests).
     pub notes: BTreeMap<String, String>,
+    /// Guidance that has subsequently produced a successful targeted update.
+    /// Kept separately so close product variants can reuse proven instructions.
+    pub learned_notes: BTreeMap<String, String>,
 }
 
 impl UpdaterConfig {
@@ -123,7 +126,9 @@ impl UpdaterConfig {
             return Err("app note is too long");
         }
         if note.is_empty() {
-            return Ok(self.notes.remove(&key).is_some());
+            let changed =
+                self.notes.remove(&key).is_some() | self.learned_notes.remove(&key).is_some();
+            return Ok(changed);
         }
         if !self.notes.contains_key(&key) && self.notes.len() >= MAX_APP_NOTES {
             return Err("app note limit reached");
@@ -131,8 +136,48 @@ impl UpdaterConfig {
         if self.notes.get(&key).map(String::as_str) == Some(note) {
             return Ok(false);
         }
-        self.notes.insert(key, note.to_string());
+        self.notes.insert(key.clone(), note.to_string());
+        self.learned_notes.remove(&key);
         Ok(true)
+    }
+
+    /// Promote guidance only after it has contributed to an observed successful
+    /// targeted update. Future close-name variants may reuse it.
+    pub fn set_learned_guidance(&mut self, id: &str, note: &str) -> Result<bool, &'static str> {
+        let key = id.trim().to_lowercase();
+        if !valid_app_id(&key) {
+            return Err("invalid app id");
+        }
+        let note = note.trim();
+        if note.is_empty() || note.chars().count() > MAX_APP_NOTE_CHARS {
+            return Err("invalid learned guidance");
+        }
+        if !self.notes.contains_key(&key) && self.notes.len() >= MAX_APP_NOTES {
+            return Err("app note limit reached");
+        }
+        let changed = self.notes.get(&key).map(String::as_str) != Some(note)
+            || self.learned_notes.get(&key).map(String::as_str) != Some(note);
+        self.notes.insert(key.clone(), note.to_string());
+        self.learned_notes.insert(key, note.to_string());
+        Ok(changed)
+    }
+
+    /// Exact per-app guidance wins. Otherwise reuse proven guidance only for a close
+    /// name variant (for example `tool` and `tool x64`), never an unrelated app.
+    pub fn guidance_for<'a>(&'a self, id: &str) -> Option<&'a str> {
+        let key = id.trim().to_lowercase();
+        if let Some(note) = self.notes.get(&key) {
+            return Some(note);
+        }
+        let compact = compact_id(&key);
+        self.learned_notes
+            .iter()
+            .filter(|(learned_id, _)| {
+                let learned = compact_id(learned_id);
+                learned.len() >= 4 && (compact.contains(&learned) || learned.contains(&compact))
+            })
+            .max_by_key(|(learned_id, _)| compact_id(learned_id).len())
+            .map(|(_, note)| note.as_str())
     }
 
     /// Add or remove one stable app identity from the ignore list.
@@ -192,8 +237,16 @@ impl Default for UpdaterConfig {
             bootstrap_managers: true,
             ignored: Vec::new(),
             notes: BTreeMap::new(),
+            learned_notes: BTreeMap::new(),
         }
     }
+}
+
+fn compact_id(id: &str) -> String {
+    id.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 #[cfg(test)]
@@ -255,6 +308,29 @@ mod tests {
         assert!(cfg
             .set_app_note("example app", &"x".repeat(MAX_APP_NOTE_CHARS + 1))
             .is_err());
+    }
+
+    #[test]
+    fn successful_guidance_is_reused_for_related_app_ids_until_edited() {
+        let mut cfg = UpdaterConfig::default();
+        cfg.set_learned_guidance(
+            "Example Tool",
+            "Official releases: https://example.com/releases/latest",
+        )
+        .expect("learn");
+
+        assert_eq!(
+            cfg.guidance_for("example tool x64"),
+            Some("Official releases: https://example.com/releases/latest")
+        );
+        assert!(cfg
+            .set_app_note("example tool", "Use winget package Example.Tool")
+            .expect("edit"));
+        assert_eq!(cfg.guidance_for("example tool x64"), None);
+        assert_eq!(
+            cfg.guidance_for("example tool"),
+            Some("Use winget package Example.Tool")
+        );
     }
 
     #[test]

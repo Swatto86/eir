@@ -165,6 +165,8 @@ pub struct UpdateCandidate {
     pub available: String,
     /// Method-specific package id where known (e.g. a winget `--id`).
     pub package_id: Option<String>,
+    /// Exact or proven close-product guidance selected by Rust for this attempt.
+    pub guidance: Option<String>,
     /// Methods to try, in order.
     pub methods: Vec<Method>,
 }

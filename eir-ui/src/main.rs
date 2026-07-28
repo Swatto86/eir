@@ -8,7 +8,7 @@ mod util;
 
 use eir_proto::{
     AdvisorSettingsUpdate, CommandResult, SettingsUpdate, StatusPayload, UiMsg, UiRequest,
-    UpdaterSettingsUpdate, CAP_COMMAND_RESULTS, CAP_PROVIDER_TEST,
+    UpdaterSettingsUpdate, CAP_COMMAND_RESULTS, CAP_PROVIDER_TEST, CAP_TARGETED_UPDATE_RETRY,
 };
 use pipe_client::{CommandWaiters, SharedStatus};
 use serde::{Deserialize, Serialize};
@@ -447,6 +447,20 @@ async fn test_provider(tx: State<'_, UiCmdTx>) -> Result<String, String> {
 #[tauri::command]
 async fn run_updates_now(tx: State<'_, UiCmdTx>) -> Result<String, String> {
     send_command(&tx, UiMsg::RunUpdatesNow).await
+}
+
+#[tauri::command]
+async fn retry_app_update(id: String, tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    if id.trim().is_empty() || id.chars().count() > 200 {
+        return Err("invalid app id".to_string());
+    }
+    if !supports(&tx.status, CAP_TARGETED_UPDATE_RETRY) {
+        return Err(
+            "The running service does not support individual update retries; update it first"
+                .to_string(),
+        );
+    }
+    send_command(&tx, UiMsg::RetryAppUpdate { id }).await
 }
 
 #[tauri::command]
@@ -1098,6 +1112,7 @@ fn main() {
             clear_ask_attachments,
             remove_ask_attachment,
             run_updates_now,
+            retry_app_update,
             clear_update_history,
             set_updater_settings,
             set_app_ignore,

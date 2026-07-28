@@ -77,9 +77,23 @@ fn no_package_found(output: &str) -> bool {
 /// because LocalSystem has no winget alias in PATH.
 pub(crate) async fn run_winget(args: Vec<String>, dur: std::time::Duration) -> (i32, String) {
     match detect::winget_path() {
+        Some(p) if winget_should_use_active_user(crate::ai::client::running_as_local_system()) => {
+            crate::ai::client::run_winget_as_active_user(&p, &args, dur)
+                .await
+                .unwrap_or_else(|error| {
+                    (
+                        -1,
+                        format!("could not run winget as the active desktop user: {error}"),
+                    )
+                })
+        }
         Some(p) => proc::run_capped(&p.to_string_lossy(), &args, dur).await,
         None => proc::run_capped("winget", &args, dur).await,
     }
+}
+
+fn winget_should_use_active_user(running_as_local_system: bool) -> bool {
+    running_as_local_system
 }
 
 /// winget refused because a portable package's files changed after install — its
@@ -338,5 +352,11 @@ mod tests {
         let error = parse_update_listing("winget update listing", output)
             .expect_err("an unparseable table must be reported");
         assert!(error.contains("header"));
+    }
+
+    #[test]
+    fn local_system_uses_the_active_users_winget_catalog() {
+        assert!(winget_should_use_active_user(true));
+        assert!(!winget_should_use_active_user(false));
     }
 }

@@ -4,6 +4,7 @@ pub const PIPE_NAME: &str = r"\\.\pipe\EirSvc";
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const CAP_COMMAND_RESULTS: &str = "command_results";
 pub const CAP_PROVIDER_TEST: &str = "provider_test";
+pub const CAP_TARGETED_UPDATE_RETRY: &str = "targeted_update_retry";
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct StatusPayload {
@@ -592,6 +593,10 @@ pub enum UiMsg {
     },
     /// Run an update cycle now (on demand).
     RunUpdatesNow,
+    /// Re-check and retry one failed app using the latest saved AI guidance.
+    RetryAppUpdate {
+        id: String,
+    },
     /// Clear the app-update output: the last cycle's results and the persisted
     /// attempt history.
     ClearUpdateHistory,
@@ -702,6 +707,21 @@ mod tests {
                 "request_id": 7,
                 "ok": false,
                 "message": "not allowed"
+            })
+        );
+    }
+
+    #[test]
+    fn targeted_update_retry_has_stable_wire_shape() {
+        let json = serde_json::to_value(UiMsg::RetryAppUpdate {
+            id: "example app".to_string(),
+        })
+        .expect("serialize retry");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "retry_app_update",
+                "id": "example app"
             })
         );
     }

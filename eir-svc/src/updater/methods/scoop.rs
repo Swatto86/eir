@@ -122,6 +122,7 @@ mod tests {
             current: "1".to_string(),
             available: "2".to_string(),
             package_id: Some(r"C:\Users\attacker\scoop\shims\scoop.cmd".to_string()),
+            guidance: None,
             methods: vec![Method::Scoop],
         };
         let outcome = attempt(&candidate).await;

@@ -110,6 +110,7 @@ fn diagnose_prompt(
     format!(
         "You are diagnosing a FAILED Windows app update so it can be retried a different way.\n\n\
 APP: {name} (installed {current}, target {available_ver})\n\
+Saved guidance: {guidance}\n\
 The method \"{method}\" just failed.\n\
 Failure category: {category}\n\
 Error output: {detail}\n\
@@ -124,10 +125,12 @@ Rules:\n\
 \"kill_process\" (name MUST appear in the error output) if a file is locked; \"clear_manager_lock\" if \
 a package-manager lock is held; \"retry_after_reboot\" if a reboot is required.\n\
 - \"give_up\": if no available method can plausibly succeed.\n\
-Only choose a method from the available list. Set remedy to null when switching.",
+Follow saved guidance when it applies, but never bypass integrity checks. Only choose a method \
+from the available list. Set remedy to null when switching.",
         name = candidate.name,
         current = candidate.current,
         available_ver = candidate.available,
+        guidance = candidate.guidance.as_deref().unwrap_or("none"),
         method = last.method.as_str(),
         detail = last.detail,
         tried = method_list(tried),
@@ -234,6 +237,7 @@ mod tests {
             current: "1.0".into(),
             available: "2.0".into(),
             package_id: None,
+            guidance: None,
             methods: vec![Method::Winget, Method::Native],
         };
         let last = AttemptOutcome::failed(Method::Winget, ErrorCategory::InstallerFailed, "boom");
@@ -250,5 +254,26 @@ mod tests {
             NextStep::SwitchTo(Method::Native)
         );
         let _ = candidate; // keeps the realistic shape in view
+    }
+
+    #[test]
+    fn retry_diagnosis_includes_saved_guidance() {
+        let candidate = UpdateCandidate {
+            id: "tool".into(),
+            name: "Tool".into(),
+            current: "1.0".into(),
+            available: "2.0".into(),
+            package_id: None,
+            guidance: Some("Use the signed x64 asset".into()),
+            methods: vec![Method::Winget, Method::Native],
+        };
+        let last = AttemptOutcome::failed(Method::Winget, ErrorCategory::InstallerFailed, "exit 1");
+        let prompt = diagnose_prompt(
+            &candidate,
+            &last,
+            &[Method::Winget],
+            &[Method::Winget, Method::Native],
+        );
+        assert!(prompt.contains("Saved guidance: Use the signed x64 asset"));
     }
 }

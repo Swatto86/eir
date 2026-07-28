@@ -11,6 +11,7 @@ use crate::updater::domain::{
     AttemptOutcome, ErrorCategory, Method, NextStep, Remedy, UpdateCandidate, Verification,
 };
 use crate::updater::methods::{choco, detect, msstore, native, scoop, winget};
+use crate::updater::verify::{verify_app, VerifyTarget};
 use crate::updater::{check, diagnose, history, proc};
 use sqlx::SqlitePool;
 use tracing::warn;
@@ -75,13 +76,12 @@ async fn dispatch(
         Method::MsStore => msstore::attempt(candidate).await,
         Method::Native => match ctx.ai {
             Some(ai) => {
-                let note = ctx.config.notes.get(&candidate.id).map(String::as_str);
                 let max_bytes = ctx.config.max_installer_mb.saturating_mul(1024 * 1024);
                 native::update_native(
                     ai,
                     &candidate.name,
                     &candidate.current,
-                    note,
+                    candidate.guidance.as_deref(),
                     ctx.config.native_signature_policy,
                     max_bytes,
                     ctx.model_override,
@@ -244,6 +244,15 @@ pub struct CycleSummary {
     pub completed_at: i64,
     /// Persisted completion time for a cycle with no check/app failures (0 otherwise).
     pub clean_at: i64,
+    /// A targeted retry updates one prior row and must not postpone the full schedule.
+    pub targeted: bool,
+    /// Concise guidance proven by an observed successful targeted install.
+    pub learned_guidance: Option<GuidanceLearning>,
+}
+
+pub struct GuidanceLearning {
+    pub id: String,
+    pub note: String,
 }
 
 fn app_completed_cleanly(outcomes: &[AttemptOutcome]) -> bool {
@@ -272,12 +281,13 @@ pub fn app_rows(summary: &CycleSummary, config: &UpdaterConfig) -> Vec<eir_proto
                 .iter()
                 .find(|o| o.success)
                 .or_else(|| outcomes.last());
-            let (method, state, detail, signature, to) = match winner {
+            let (method, state, detail, signature, from, to) = match winner {
                 None => (
                     String::new(),
                     "skipped".to_string(),
                     "no available method".to_string(),
                     String::new(),
+                    cand.current.clone(),
                     String::new(),
                 ),
                 Some(o) => {
@@ -293,13 +303,22 @@ pub fn app_rows(summary: &CycleSummary, config: &UpdaterConfig) -> Vec<eir_proto
                     } else {
                         "failed"
                     };
+                    let from = if already_current {
+                        o.installed_version
+                            .clone()
+                            .filter(|version| !version.is_empty())
+                            .unwrap_or_else(|| cand.current.clone())
+                    } else {
+                        cand.current.clone()
+                    };
                     (
                         o.method.as_str().to_string(),
                         state.to_string(),
                         o.detail.clone(),
                         o.signature.clone().unwrap_or_default(),
+                        from.clone(),
                         if already_current {
-                            cand.current.clone()
+                            from
                         } else {
                             o.installed_version
                                 .clone()
@@ -311,7 +330,7 @@ pub fn app_rows(summary: &CycleSummary, config: &UpdaterConfig) -> Vec<eir_proto
             eir_proto::UpdaterAppRow {
                 id: cand.id.clone(),
                 name: cand.name.clone(),
-                from: cand.current.clone(),
+                from,
                 to,
                 method,
                 state,
@@ -364,6 +383,7 @@ pub async fn run_cycle(
         ctx.model_override,
         &available,
         &learned_skips,
+        None,
     )
     .await;
     let mut spent = check.cost_usd;
@@ -431,6 +451,227 @@ pub async fn run_cycle(
         cost_usd: spent,
         completed_at,
         clean_at,
+        targeted: false,
+        learned_guidance: None,
+    }
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn guidance_urls(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter(|word| word.starts_with("https://") || word.starts_with("http://"))
+        .map(|word| {
+            word.trim_end_matches(['.', ',', ';', ')', ']', '}'])
+                .to_string()
+        })
+        .collect()
+}
+
+/// Accept a shorter AI rewrite only when it preserves every explicit URL. Otherwise
+/// the whitespace-normalised original remains the proven instruction.
+fn concise_guidance(original: &str, proposed: &str) -> String {
+    let original = one_line(original);
+    let proposed = one_line(proposed.trim().trim_matches(['`', '"']));
+    let original_urls = guidance_urls(&original);
+    let proposed_urls = guidance_urls(&proposed);
+    let keeps_urls = original_urls.iter().all(|url| proposed.contains(url))
+        && proposed_urls.iter().all(|url| original_urls.contains(url));
+    if !proposed.is_empty()
+        && proposed.chars().count() <= crate::updater::config::MAX_APP_NOTE_CHARS
+        && proposed.chars().count() < original.chars().count()
+        && keeps_urls
+    {
+        proposed
+    } else {
+        original
+    }
+}
+
+async fn refine_guidance(
+    ctx: &EngineCtx<'_>,
+    candidate: &UpdateCandidate,
+    outcome: &AttemptOutcome,
+    guidance: &str,
+) -> (String, f64) {
+    let Some(ai) = ctx.ai else {
+        return (one_line(guidance), 0.0);
+    };
+    let prompt = format!(
+        "Rewrite the following guidance as one concise instruction for future Windows software \
+updates. Preserve the exact product identity, every URL, archive member, installer flag, and \
+other fact needed for the successful method. Do not mention this retry or claim anything not \
+shown. Return only the instruction, no quotes or markdown.\n\n\
+Product: {}\nSuccessful method: {}\nResult: {}\nGuidance: {}",
+        candidate.name,
+        outcome.method.as_str(),
+        outcome.detail,
+        guidance
+    );
+    match ai.complete_text(&prompt, ctx.model_override).await {
+        Ok((text, usage)) => (
+            concise_guidance(guidance, &text),
+            usage.map(|value| value.cost_usd).unwrap_or(0.0),
+        ),
+        Err(error) => {
+            warn!("Could not refine successful update guidance: {error}");
+            (one_line(guidance), 0.0)
+        }
+    }
+}
+
+/// Re-check and retry exactly one previously failed app. The targeted check uses the
+/// latest guidance, bypasses detector skips because this is an explicit user action,
+/// and never advances the full-cycle schedule.
+pub async fn run_retry(
+    pool: &SqlitePool,
+    ctx: &EngineCtx<'_>,
+    cycle_id: i64,
+    progress: &ProgressTx,
+    prior: eir_proto::UpdaterAppRow,
+) -> CycleSummary {
+    let _ = progress.send(format!("re-checking {}…", prior.name)).await;
+    let mut retry_config = ctx.config.clone();
+    retry_config
+        .ignored
+        .retain(|id| !id.eq_ignore_ascii_case(&prior.id));
+    let retry_ctx = EngineCtx {
+        ai: ctx.ai,
+        config: &retry_config,
+        model_override: ctx.model_override,
+    };
+    let available = available_methods(retry_ctx.config, retry_ctx.ai).await;
+    let no_learned_skips = std::collections::HashSet::new();
+    let check = check::collect(
+        pool,
+        retry_ctx.ai,
+        retry_ctx.config,
+        retry_ctx.model_override,
+        &available,
+        &no_learned_skips,
+        Some(&prior.id),
+    )
+    .await;
+    let mut cost_usd = check.cost_usd;
+    let notes = check.notes;
+    let check_had_errors = check.had_errors || available.is_empty();
+    let learned = crate::learn::LearnedFacts::load(pool).await;
+    let mut learned_guidance = None;
+
+    let (candidate, outcomes) = if let Some(candidate) = check.candidates.into_iter().next() {
+        let _ = progress.send(format!("retrying {}…", candidate.name)).await;
+        let guidance = candidate.guidance.clone();
+        let mut outcomes = heal(&candidate, &retry_ctx, &available, &learned).await;
+        if let Some(success) = outcomes.iter_mut().find(|outcome| outcome.success) {
+            if guidance.is_some() {
+                success.detail = format!("Updated successfully using guidance. {}", success.detail);
+            }
+            if let Some(guidance) = guidance {
+                let (note, refinement_cost) =
+                    refine_guidance(&retry_ctx, &candidate, success, &guidance).await;
+                cost_usd += refinement_cost;
+                learned_guidance = Some(GuidanceLearning {
+                    id: candidate.id.clone(),
+                    note,
+                });
+            }
+        } else if guidance.is_some() {
+            if let Some(failure) = outcomes.last_mut() {
+                failure.detail = format!(
+                    "Update still failed after applying guidance: {}",
+                    failure.detail
+                );
+            }
+        }
+        (candidate, outcomes)
+    } else {
+        let method = Method::from_token(&prior.method)
+            .or_else(|| available.first().copied())
+            .unwrap_or(Method::Native);
+        let guidance = retry_ctx.config.guidance_for(&prior.id).map(str::to_string);
+        let observed_version = if check_had_errors {
+            String::new()
+        } else {
+            verify_app(
+                &VerifyTarget::ByName {
+                    name: prior.name.clone(),
+                    verify_exe: None,
+                },
+                &prior.to,
+            )
+            .await
+            .1
+        };
+        let candidate = UpdateCandidate {
+            id: prior.id,
+            name: prior.name,
+            current: prior.from,
+            available: prior.to,
+            package_id: None,
+            guidance: guidance.clone(),
+            methods: vec![method],
+        };
+        let mut outcome = if check_had_errors {
+            let reason = notes.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
+            AttemptOutcome::failed(
+                method,
+                ErrorCategory::Unknown,
+                if guidance.is_some() {
+                    format!(
+                        "Re-check could not confirm an update despite guidance: {}",
+                        if reason.is_empty() {
+                            "the update sources returned no usable result"
+                        } else {
+                            &reason
+                        }
+                    )
+                } else {
+                    format!(
+                        "Re-check could not confirm an update: {}",
+                        if reason.is_empty() {
+                            "the update sources returned no usable result"
+                        } else {
+                            &reason
+                        }
+                    )
+                },
+            )
+        } else {
+            AttemptOutcome::failed(
+                method,
+                ErrorCategory::AlreadyCurrent,
+                if guidance.is_some() {
+                    "Re-check completed with the saved guidance; no newer update is currently available."
+                } else {
+                    "Re-check completed; no newer update is currently available."
+                },
+            )
+        };
+        if !observed_version.is_empty() {
+            outcome.installed_version = Some(observed_version);
+        }
+        (candidate, vec![outcome])
+    };
+
+    cost_usd += outcomes.iter().map(|outcome| outcome.cost_usd).sum::<f64>();
+    if let Err(error) = history::record_attempts(pool, cycle_id, &candidate, &outcomes).await {
+        warn!(
+            "failed to record targeted update history for {}: {error}",
+            candidate.name
+        );
+    }
+    crate::learn::analyse_updates(pool).await;
+
+    CycleSummary {
+        results: vec![(candidate, outcomes)],
+        notes,
+        cost_usd,
+        completed_at: chrono::Utc::now().timestamp(),
+        clean_at: 0,
+        targeted: true,
+        learned_guidance,
     }
 }
 
@@ -533,29 +774,27 @@ mod tests {
         let candidate = UpdateCandidate {
             id: "tool".into(),
             name: "Tool".into(),
-            current: "2.0".into(),
+            current: "1.9".into(),
             available: "2.0".into(),
             package_id: None,
+            guidance: None,
             methods: vec![Method::Winget],
         };
+        let mut current = outcome(Method::Winget, false, Some(ErrorCategory::AlreadyCurrent));
+        current.installed_version = Some("2.0".into());
         let summary = CycleSummary {
-            results: vec![(
-                candidate,
-                vec![outcome(
-                    Method::Winget,
-                    false,
-                    Some(ErrorCategory::AlreadyCurrent),
-                )],
-            )],
+            results: vec![(candidate, vec![current])],
             notes: vec![],
             cost_usd: 0.0,
             completed_at: 1,
             clean_at: 1,
+            targeted: false,
+            learned_guidance: None,
         };
-        assert_eq!(
-            app_rows(&summary, &UpdaterConfig::default())[0].state,
-            "current"
-        );
+        let row = &app_rows(&summary, &UpdaterConfig::default())[0];
+        assert_eq!(row.state, "current");
+        assert_eq!(row.from, "2.0");
+        assert_eq!(row.to, "2.0");
     }
 
     #[test]
@@ -566,10 +805,33 @@ mod tests {
             cost_usd: 0.0,
             completed_at: 1,
             clean_at: 0,
+            targeted: false,
+            learned_guidance: None,
         };
         let rows = app_rows(&summary, &UpdaterConfig::default());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, "failed");
         assert_eq!(rows[0].name, "Update check");
+    }
+
+    #[test]
+    fn learned_guidance_is_single_line_and_never_drops_urls() {
+        let original =
+            "Use the x64 archive.\nOfficial releases: https://example.com/releases/latest";
+        assert_eq!(
+            concise_guidance(original, "Use x64 from https://example.com/releases/latest"),
+            "Use x64 from https://example.com/releases/latest"
+        );
+        assert_eq!(
+            concise_guidance(original, "Use the vendor's x64 archive"),
+            "Use the x64 archive. Official releases: https://example.com/releases/latest"
+        );
+        assert_eq!(
+            concise_guidance(
+                original,
+                "Use https://example.com/releases/latest or https://evil.example/update"
+            ),
+            "Use the x64 archive. Official releases: https://example.com/releases/latest"
+        );
     }
 }

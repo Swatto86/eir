@@ -289,6 +289,7 @@ mod tests {
             current: "1.0".into(),
             available: "2.0".into(),
             package_id: Some("Pub.Tool".into()),
+            guidance: None,
             methods: vec![Method::Winget],
         };
         let ok = AttemptOutcome {
