@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.34.1. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.34.2. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.34.1. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-28 | Eir | v0.34.2 deterministic GitHub latest retry | Native planning now receives the already-detected target version and rejects an AI installer plan that would merely reinstall an older or current release. Any GitHub repository/release URL is reduced to its canonical `/owner/repo/releases/latest` page for fallback display and one bounded corrective AI search when the first plan fails, including pinned `/releases/tag/...` results. The correction explicitly forbids the installed tag and requires the target or newer; all existing URL correlation, hash, signature, archive, silent-install, and post-install verification gates remain unchanged. Reproduced with JetBrainsMono Nerd Font 3.3.0 versus upstream Nerd Fonts 3.4.0 before implementation.
 
 2026-07-28 | Eir | v0.34.1 contextual guidance UI and clearer guided outcomes | App Updates no longer permanently renders the saved-guidance library: guidance and its editor appear only on a non-current product update row, while the service continues to retain and reuse proven notes privately. A guided retry that still fails keeps the concrete adapter failure and asks the configured provider for one factual, evidence-bounded English explanation sentence; provider failure cannot hide the mechanical reason. Successful guidance rewrites now explicitly require clear, precise, grammatically correct English. Rust still preserves every original URL and bounds length, but permits a small increase so correcting broken English is not rejected merely for being longer. Failing prompt/rewrite tests preceded the implementation.
 

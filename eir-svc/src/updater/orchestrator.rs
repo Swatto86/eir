@@ -79,9 +79,7 @@ async fn dispatch(
                 let max_bytes = ctx.config.max_installer_mb.saturating_mul(1024 * 1024);
                 native::update_native(
                     ai,
-                    &candidate.name,
-                    &candidate.current,
-                    candidate.guidance.as_deref(),
+                    candidate,
                     ctx.config.native_signature_policy,
                     max_bytes,
                     ctx.model_override,

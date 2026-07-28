@@ -6,7 +6,9 @@
 
 use crate::ai::client::{extract_json, AiClient};
 use crate::updater::config::SignaturePolicy;
-use crate::updater::domain::{classify_error, AttemptOutcome, ErrorCategory, Method, Verification};
+use crate::updater::domain::{
+    classify_error, AttemptOutcome, ErrorCategory, Method, UpdateCandidate, Verification,
+};
 use crate::updater::download::{download_and_check, Staged};
 use crate::updater::plan::{
     plan_runnable, sanitise_args, validate_plan, InstallPlan, InstallPlanRaw, InstallerKind,
@@ -21,7 +23,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// The prompt that asks the model for one app's official direct installer. The
 /// model only proposes; [`validate_plan`] disposes.
-fn install_plan_prompt(name: &str, current: &str, note_line: &str) -> String {
+fn install_plan_prompt(name: &str, current: &str, target: &str, note_line: &str) -> String {
     format!(
         "You resolve the OFFICIAL direct download for ONE Windows app so it can be installed \
 unattended. Use web search. Use ONLY the vendor's official domain or its official GitHub releases. \
@@ -42,10 +44,50 @@ Rules: if winget can manage this app, set installer_url=null. Never return a URL
 redirect, or file-locker. If unsure of a direct release asset, set installer_url=null and give \
 releases_url only. Prefer a direct .msi or setup .exe; if neither exists, use a ZIP, 7z, TAR, or \
 TAR.GZ archive when it contains a Windows .exe/.msi installer. Do not return source-code or \
-portable-only archives. Respect any \
+portable-only archives. The plan must install target version {target} or newer; never return an \
+asset for the already-installed version {current}. Respect any \
 [user note] and never contradict it.\n\n\
-APP: {name} ({current}){note_line}"
+APP: {name} (installed {current}, target {target}){note_line}"
     )
+}
+
+fn canonical_github_latest(value: &str) -> Option<String> {
+    let value = value.trim().trim_matches([
+        '`', '"', '\'', '(', ')', '[', ']', '{', '}', '<', '>', ',', ';',
+    ]);
+    let parsed = url::Url::parse(value).ok()?;
+    if parsed.scheme() != "https"
+        || !parsed
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+    {
+        return None;
+    }
+    let segments = parsed.path_segments()?.take(2).collect::<Vec<_>>();
+    if segments.len() != 2
+        || segments.iter().any(|part| {
+            part.is_empty()
+                || !part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+    {
+        return None;
+    }
+    Some(format!(
+        "https://github.com/{}/{}/releases/latest",
+        segments[0], segments[1]
+    ))
+}
+
+fn github_latest_in(text: &str) -> Option<String> {
+    text.split_whitespace().find_map(canonical_github_latest)
+}
+
+fn plan_reaches_target(plan: &InstallPlan, target: &str) -> bool {
+    target.trim().is_empty()
+        || crate::updater::version::classify_version(&plan.expected_version, target)
+            == Verification::Verified
 }
 
 /// A validated plan plus the bits the caller needs when it is rejected.
@@ -64,7 +106,7 @@ fn plan_from_response(
     current: &str,
 ) -> (Option<InstallPlan>, Option<String>, Option<String>) {
     let json = extract_json(content);
-    let raw: InstallPlanRaw = match serde_json::from_str(json) {
+    let mut raw: InstallPlanRaw = match serde_json::from_str(json) {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -74,6 +116,9 @@ fn plan_from_response(
             )
         }
     };
+    if let Some(latest) = canonical_github_latest(&raw.releases_url) {
+        raw.releases_url = latest;
+    }
     let releases_pre = {
         let r = raw.releases_url.trim();
         if r.starts_with("https://") {
@@ -97,13 +142,14 @@ pub async fn make_plan(
     model_override: &str,
     name: &str,
     current: &str,
+    target: &str,
     note: Option<&str>,
 ) -> PlanOutcome {
     let note_line = match note.map(str::trim).filter(|n| !n.is_empty()) {
         Some(n) => format!(" [user note: {n}]"),
         None => String::new(),
     };
-    let prompt = install_plan_prompt(name, current, &note_line);
+    let prompt = install_plan_prompt(name, current, target, &note_line);
     let (content, usage) = match ai.complete(&prompt, model_override).await {
         Ok(v) => v,
         Err(e) => {
@@ -114,8 +160,55 @@ pub async fn make_plan(
             }
         }
     };
-    let cost_usd = usage.map(|u| u.cost_usd).unwrap_or(0.0);
-    let (plan, releases, reason) = plan_from_response(&content, name, current);
+    let mut cost_usd = usage.map(|u| u.cost_usd).unwrap_or(0.0);
+    let (mut plan, mut releases, mut reason) = plan_from_response(&content, name, current);
+    let github_latest = releases
+        .as_deref()
+        .and_then(canonical_github_latest)
+        .or_else(|| {
+            plan.as_ref()
+                .and_then(|value| canonical_github_latest(&value.installer_url))
+        })
+        .or_else(|| note.and_then(github_latest_in));
+    if plan
+        .as_ref()
+        .is_some_and(|value| !plan_reaches_target(value, target))
+    {
+        plan = None;
+        reason = Some(format!(
+            "AI returned an installer below target version {target}"
+        ));
+    }
+    if plan.is_none() {
+        if let Some(latest) = github_latest {
+            let correction = format!(
+                "{prompt}\n\nThe previous answer was rejected: {}. Open {latest} and inspect that \
+latest stable release again. Return only an asset that installs version {target} or newer; never \
+use the installed {current} release tag. If that release has no supported Windows installer, \
+return installer_url=null and releases_url=\"{latest}\".",
+                reason.as_deref().unwrap_or("no direct installer was found")
+            );
+            match ai.complete(&correction, model_override).await {
+                Ok((retry_content, retry_usage)) => {
+                    cost_usd += retry_usage.map(|u| u.cost_usd).unwrap_or(0.0);
+                    let retried = plan_from_response(&retry_content, name, current);
+                    plan = retried.0;
+                    releases = retried.1.or(Some(latest));
+                    reason = retried.2;
+                    if plan
+                        .as_ref()
+                        .is_some_and(|value| !plan_reaches_target(value, target))
+                    {
+                        plan = None;
+                        reason = Some(format!(
+                            "AI returned an installer below target version {target}"
+                        ));
+                    }
+                }
+                Err(error) => reason = Some(format!("latest GitHub re-check failed: {error}")),
+            }
+        }
+    }
     // If no direct installer was found but the model surfaced a releases page, fold that
     // manual-download link into the rejection reason (which reaches the UI's failed-native
     // row) instead of discarding it — otherwise the value is computed and tested but never
@@ -136,15 +229,21 @@ pub async fn make_plan(
 /// outcome (method = Native) the orchestrator can act on.
 pub async fn update_native(
     ai: &AiClient,
-    name: &str,
-    current: &str,
-    note: Option<&str>,
+    candidate: &UpdateCandidate,
     policy: SignaturePolicy,
     max_installer_bytes: u64,
     model_override: &str,
 ) -> AttemptOutcome {
     let mut out = AttemptOutcome::failed(Method::Native, ErrorCategory::Unknown, String::new());
-    let planned = make_plan(ai, model_override, name, current, note).await;
+    let planned = make_plan(
+        ai,
+        model_override,
+        &candidate.name,
+        &candidate.current,
+        &candidate.available,
+        candidate.guidance.as_deref(),
+    )
+    .await;
     out.cost_usd = planned.cost_usd;
 
     let plan = match planned.plan {
@@ -308,8 +407,8 @@ mod tests {
 
     #[test]
     fn prompt_carries_the_key_constraints() {
-        let p = install_plan_prompt("Krita", "5.2.0", " [user note: official site]");
-        assert!(p.contains("Krita (5.2.0)"));
+        let p = install_plan_prompt("Krita", "5.2.0", "5.3.0", " [user note: official site]");
+        assert!(p.contains("Krita (installed 5.2.0, target 5.3.0)"));
         assert!(p.contains("user note: official site"));
         assert!(p.contains(".exe, .msi, .zip, .7z, .tar, or .tar.gz"));
         assert!(p.contains("web search"));
@@ -336,7 +435,7 @@ mod tests {
         assert_eq!(plan.silent_args, vec!["/S".to_string()]);
         assert_eq!(
             releases.as_deref(),
-            Some("https://github.com/me/Tool/releases")
+            Some("https://github.com/me/Tool/releases/latest")
         );
     }
 
@@ -377,7 +476,7 @@ mod tests {
         // The releases page is still surfaced for a manual download fallback.
         assert_eq!(
             releases.as_deref(),
-            Some("https://github.com/me/Tool/releases")
+            Some("https://github.com/me/Tool/releases/latest")
         );
     }
 
@@ -387,5 +486,21 @@ mod tests {
         let (plan, _releases, reason) = plan_from_response(content, "Tool", "1.0.0");
         assert!(plan.is_none());
         assert!(reason.unwrap().contains("host"));
+    }
+
+    #[test]
+    fn github_retry_uses_latest_and_rejects_the_installed_release() {
+        assert_eq!(
+            canonical_github_latest("https://github.com/ryanoasis/nerd-fonts/releases/tag/v3.3.0")
+                .as_deref(),
+            Some("https://github.com/ryanoasis/nerd-fonts/releases/latest")
+        );
+
+        let stale = plan_from_response(
+            r#"{"installer_url":"https://github.com/DevelopersCommunity/wix-JetBrainsMonoNF/releases/download/v3.3.0/JetBrainsMono.msi","releases_url":"https://github.com/DevelopersCommunity/wix-JetBrainsMonoNF/releases/tag/v3.3.0","expected_version":"3.3.0","installer_kind":"msi","silent_args":["/qn"],"sha256":null,"publisher":null,"verify_exe":null}"#,
+            "JetBrainsMono Nerd Font",
+            "3.3.0",
+        );
+        assert!(!plan_reaches_target(stale.0.as_ref().unwrap(), "3.4.0"));
     }
 }
