@@ -352,6 +352,8 @@ pub struct UpdaterSettingsView {
     pub methods: Vec<String>,
     pub native_enabled: bool,
     pub native_signature_policy: String,
+    #[serde(default)]
+    pub ignored: Vec<String>,
 }
 
 /// An updater-settings change from the UI.
@@ -690,6 +692,16 @@ mod tests {
         assert!(status.capabilities.is_empty());
         assert_eq!(status.signals_at, 0);
         assert!(status.signal_errors.is_empty());
+    }
+
+    #[test]
+    fn ignored_apps_default_for_an_older_updater_settings_payload() {
+        let settings: UpdaterSettingsView = serde_json::from_str(
+            r#"{"enabled":true,"schedule_interval_secs":86400,"methods":["winget"],
+                "native_enabled":true,"native_signature_policy":"require_valid"}"#,
+        )
+        .expect("old updater settings decode");
+        assert!(settings.ignored.is_empty());
     }
 
     #[test]

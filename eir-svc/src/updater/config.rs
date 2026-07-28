@@ -100,6 +100,7 @@ impl UpdaterConfig {
             methods: self.methods.clone(),
             native_enabled: self.native_enabled,
             native_signature_policy: self.native_signature_policy.as_str().to_string(),
+            ignored: self.ignored.clone(),
         }
     }
 
@@ -349,6 +350,7 @@ mod tests {
         let mut cfg = UpdaterConfig::default();
         assert!(cfg.set_app_ignored(" Example App ", true).expect("add"));
         assert_eq!(cfg.ignored, ["example app"]);
+        assert_eq!(cfg.to_view().ignored, ["example app"]);
         assert!(!cfg.set_app_ignored("EXAMPLE APP", true).expect("dedupe"));
         assert!(cfg.set_app_ignored(" example app ", false).expect("remove"));
         assert!(cfg.ignored.is_empty());

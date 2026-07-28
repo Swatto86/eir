@@ -2668,6 +2668,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                     }
                                 }
                                 st.updater.app_notes = cfg.updater.note_views();
+                                st.updater.settings = cfg.updater.to_view();
                                 command_result = Ok("App setting saved".to_string());
                                 pipe.broadcast_status(build_status(&st));
                             }

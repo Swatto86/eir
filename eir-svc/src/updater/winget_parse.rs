@@ -150,6 +150,7 @@ pub fn is_noise(name: &str) -> bool {
         "redistributable",
         "runtime",
         "microsoft visual c++",
+        "windows subsystem for linux",
         "windows sdk",
         "update for",
         "security update",

@@ -85,7 +85,11 @@ fn push_candidate(
     primary: Method,
 ) {
     let id = app_id(name);
-    if id.is_empty() || should_skip(cfg, learned, &id) || !seen.insert(id.clone()) {
+    if id.is_empty()
+        || crate::updater::winget_parse::is_noise(name)
+        || should_skip(cfg, learned, &id)
+        || !seen.insert(id.clone())
+    {
         return;
     }
     let mut methods = vec![primary];
@@ -584,6 +588,24 @@ mod tests {
         assert!(should_skip(&cfg, &none, "winscp"));
         assert!(should_skip(&cfg, &none, "winscp.install"));
         assert!(!should_skip(&cfg, &none, "vscode"));
+    }
+
+    #[test]
+    fn windows_components_never_become_update_candidates() {
+        let mut candidates = Vec::new();
+        push_candidate(
+            &mut candidates,
+            &mut HashSet::new(),
+            &UpdaterConfig::default(),
+            &HashSet::new(),
+            true,
+            "Windows Subsystem for Linux",
+            "2.7.8.0",
+            "2.7.11",
+            Some("Microsoft.WSL".to_string()),
+            Method::Winget,
+        );
+        assert!(candidates.is_empty());
     }
 
     #[test]

@@ -304,6 +304,7 @@
     .set-hint { grid-column: 2; font-size: 11px; color: var(--muted); line-height: 1.45; }
     .methods-row { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; }
     .methods-row label { color: var(--text); display: flex; align-items: center; gap: 5px; }
+    .set-ignored-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 15px; border-top: 1px solid var(--border); font-size: 12px; }
 
     /* ── About ── */
     .about-hero { display: flex; align-items: center; gap: 16px; padding: 20px; }
@@ -695,6 +696,10 @@
             <option value="require_valid">Require a valid signature (default)</option>
             <option value="allow_unsigned">Allow unsigned — least safe</option>
           </select>
+        </div>
+        <div id="set-upd-ignored-wrap" hidden>
+          <div class="set-section-desc">Ignored apps</div>
+          <div id="set-upd-ignored"></div>
         </div>
         <div class="set-note">Strictest → least-safe. This gates only <em>AI-found installers</em>; winget/Chocolatey/Store packages are trusted by their source. “Publisher match” needs a valid signature first, so unsigned installers (e.g. AutoHotkey and some open-source tools) are blocked under both signature options — update those via Chocolatey instead, or choose “Allow unsigned” (not recommended for unattended installs).</div>
         <div class="set-actions">

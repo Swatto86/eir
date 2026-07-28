@@ -1759,7 +1759,30 @@ function fillUpdaterSettings(s) {
   document.getElementById('m-scoop').disabled = true;
   document.getElementById('set-native-enabled').checked = !!s.native_enabled;
   document.getElementById('set-sigpol').value = s.native_signature_policy || 'require_valid';
+  const ignored = (s.ignored || []).slice().sort((a, b) => a.localeCompare(b));
+  const wrap = document.getElementById('set-upd-ignored-wrap');
+  wrap.hidden = ignored.length === 0;
+  document.getElementById('set-upd-ignored').innerHTML = ignored.map((id) =>
+    `<div class="set-ignored-row"><span>${esc(id)}</span><button class="upd-mini upd-ignore set-upd-unignore" data-id="${escAttr(id)}" type="button">Unignore</button></div>`
+  ).join('');
 }
+
+document.getElementById('set-upd-ignored').addEventListener('click', async (e) => {
+  const btn = e.target.closest('.set-upd-unignore');
+  if (!btn) return;
+  btn.disabled = true;
+  try {
+    const result = await invoke('set_app_ignore', { id: btn.dataset.id, ignore: false, note: '' });
+    btn.closest('.set-ignored-row').remove();
+    document.getElementById('set-upd-ignored-wrap').hidden =
+      !document.getElementById('set-upd-ignored').children.length;
+    toast(commandMessage(result, 'App unignored'), 'ok');
+  } catch (err) {
+    console.error('set_app_ignore failed', err);
+    toast('Could not unignore app: ' + err, 'err');
+    btn.disabled = false;
+  }
+});
 
 async function saveUpdaterSettings() {
   const methods = METHOD_BOXES.filter(([id]) => document.getElementById(id).checked).map(([, n]) => n);
