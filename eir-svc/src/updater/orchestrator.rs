@@ -470,24 +470,70 @@ fn guidance_urls(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Accept a shorter AI rewrite only when it preserves every explicit URL. Otherwise
-/// the whitespace-normalised original remains the proven instruction.
+/// Accept a concise AI rewrite only when it preserves every explicit URL. A small
+/// length increase is allowed so broken English can be corrected without losing facts.
 fn concise_guidance(original: &str, proposed: &str) -> String {
     let original = one_line(original);
     let proposed = one_line(proposed.trim().trim_matches(['`', '"']));
+    let original_chars = original.chars().count();
+    let rewrite_limit = original_chars
+        .saturating_add((original_chars / 4).max(40))
+        .min(crate::updater::config::MAX_APP_NOTE_CHARS);
     let original_urls = guidance_urls(&original);
     let proposed_urls = guidance_urls(&proposed);
     let keeps_urls = original_urls.iter().all(|url| proposed.contains(url))
         && proposed_urls.iter().all(|url| original_urls.contains(url));
-    if !proposed.is_empty()
-        && proposed.chars().count() <= crate::updater::config::MAX_APP_NOTE_CHARS
-        && proposed.chars().count() < original.chars().count()
-        && keeps_urls
-    {
+    if !proposed.is_empty() && proposed.chars().count() <= rewrite_limit && keeps_urls {
         proposed
     } else {
         original
     }
+}
+
+fn refinement_prompt(
+    candidate: &UpdateCandidate,
+    outcome: &AttemptOutcome,
+    guidance: &str,
+) -> String {
+    format!(
+        "Rewrite the following guidance as one concise instruction in clear, precise, \
+grammatically correct English for future Windows software updates. Preserve the exact product \
+identity, every URL, archive member, installer flag, and other fact needed for the successful \
+method. Do not mention this retry or claim anything not shown. Return only the instruction, no \
+quotes or markdown.\n\n\
+Product: {}\nSuccessful method: {}\nResult: {}\nGuidance: {}",
+        candidate.name,
+        outcome.method.as_str(),
+        outcome.detail,
+        guidance
+    )
+}
+
+fn failure_explanation_prompt(
+    candidate: &UpdateCandidate,
+    guidance: &str,
+    outcomes: &[AttemptOutcome],
+) -> String {
+    let attempts = outcomes
+        .iter()
+        .map(|outcome| {
+            format!(
+                "- {} / {:?}: {}",
+                outcome.method.as_str(),
+                outcome.category.unwrap_or(ErrorCategory::Unknown),
+                outcome.detail
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Explain in one concise sentence, using clear, precise, grammatically correct English, why \
+this Windows software update still failed after the saved guidance was applied. Use only the \
+recorded facts below. Do not invent a cause, suggest bypassing an integrity check, or repeat the \
+guidance verbatim. Return only the sentence, no quotes or markdown.\n\n\
+Product: {} (installed {}, target {})\nSaved guidance: {}\nRecorded attempts:\n{}",
+        candidate.name, candidate.current, candidate.available, guidance, attempts
+    )
 }
 
 async fn refine_guidance(
@@ -499,17 +545,7 @@ async fn refine_guidance(
     let Some(ai) = ctx.ai else {
         return (one_line(guidance), 0.0);
     };
-    let prompt = format!(
-        "Rewrite the following guidance as one concise instruction for future Windows software \
-updates. Preserve the exact product identity, every URL, archive member, installer flag, and \
-other fact needed for the successful method. Do not mention this retry or claim anything not \
-shown. Return only the instruction, no quotes or markdown.\n\n\
-Product: {}\nSuccessful method: {}\nResult: {}\nGuidance: {}",
-        candidate.name,
-        outcome.method.as_str(),
-        outcome.detail,
-        guidance
-    );
+    let prompt = refinement_prompt(candidate, outcome, guidance);
     match ai.complete_text(&prompt, ctx.model_override).await {
         Ok((text, usage)) => (
             concise_guidance(guidance, &text),
@@ -520,6 +556,44 @@ Product: {}\nSuccessful method: {}\nResult: {}\nGuidance: {}",
             (one_line(guidance), 0.0)
         }
     }
+}
+
+async fn explain_retry_failure(
+    ctx: &EngineCtx<'_>,
+    candidate: &UpdateCandidate,
+    outcomes: &[AttemptOutcome],
+    guidance: &str,
+) -> (Option<String>, f64) {
+    let Some(ai) = ctx.ai else {
+        return (None, 0.0);
+    };
+    let prompt = failure_explanation_prompt(candidate, guidance, outcomes);
+    match ai.complete_text(&prompt, ctx.model_override).await {
+        Ok((text, usage)) => {
+            let explanation: String = one_line(text.trim().trim_matches(['`', '"']))
+                .chars()
+                .take(500)
+                .collect();
+            (
+                (!explanation.is_empty()).then_some(explanation),
+                usage.map(|value| value.cost_usd).unwrap_or(0.0),
+            )
+        }
+        Err(error) => {
+            warn!("Could not explain guided update failure: {error}");
+            (None, 0.0)
+        }
+    }
+}
+
+fn guided_failure_needs_explanation(
+    candidate: &UpdateCandidate,
+    outcomes: &[AttemptOutcome],
+) -> bool {
+    candidate.guidance.is_some()
+        && outcomes.iter().all(|outcome| !outcome.success)
+        && outcomes.last().and_then(|outcome| outcome.category)
+            != Some(ErrorCategory::AlreadyCurrent)
 }
 
 /// Re-check and retry exactly one previously failed app. The targeted check uses the
@@ -560,7 +634,7 @@ pub async fn run_retry(
     let learned = crate::learn::LearnedFacts::load(pool).await;
     let mut learned_guidance = None;
 
-    let (candidate, outcomes) = if let Some(candidate) = check.candidates.into_iter().next() {
+    let (candidate, mut outcomes) = if let Some(candidate) = check.candidates.into_iter().next() {
         let _ = progress.send(format!("retrying {}…", candidate.name)).await;
         let guidance = candidate.guidance.clone();
         let mut outcomes = heal(&candidate, &retry_ctx, &available, &learned).await;
@@ -576,13 +650,6 @@ pub async fn run_retry(
                     id: candidate.id.clone(),
                     note,
                 });
-            }
-        } else if guidance.is_some() {
-            if let Some(failure) = outcomes.last_mut() {
-                failure.detail = format!(
-                    "Update still failed after applying guidance: {}",
-                    failure.detail
-                );
             }
         }
         (candidate, outcomes)
@@ -618,25 +685,14 @@ pub async fn run_retry(
             AttemptOutcome::failed(
                 method,
                 ErrorCategory::Unknown,
-                if guidance.is_some() {
-                    format!(
-                        "Re-check could not confirm an update despite guidance: {}",
-                        if reason.is_empty() {
-                            "the update sources returned no usable result"
-                        } else {
-                            &reason
-                        }
-                    )
-                } else {
-                    format!(
-                        "Re-check could not confirm an update: {}",
-                        if reason.is_empty() {
-                            "the update sources returned no usable result"
-                        } else {
-                            &reason
-                        }
-                    )
-                },
+                format!(
+                    "Re-check could not confirm an update: {}",
+                    if reason.is_empty() {
+                        "the update sources returned no usable result"
+                    } else {
+                        &reason
+                    }
+                ),
             )
         } else {
             AttemptOutcome::failed(
@@ -654,6 +710,26 @@ pub async fn run_retry(
         }
         (candidate, vec![outcome])
     };
+
+    if guided_failure_needs_explanation(&candidate, &outcomes) {
+        let (explanation, explanation_cost) = explain_retry_failure(
+            &retry_ctx,
+            &candidate,
+            &outcomes,
+            candidate.guidance.as_deref().unwrap_or_default(),
+        )
+        .await;
+        cost_usd += explanation_cost;
+        if let Some(failure) = outcomes.last_mut() {
+            failure.detail = format!(
+                "Update still failed after applying guidance: {}{}",
+                failure.detail,
+                explanation
+                    .map(|text| format!(" AI explanation: {text}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
 
     cost_usd += outcomes.iter().map(|outcome| outcome.cost_usd).sum::<f64>();
     if let Err(error) = history::record_attempts(pool, cycle_id, &candidate, &outcomes).await {
@@ -833,5 +909,52 @@ mod tests {
             ),
             "Use the x64 archive. Official releases: https://example.com/releases/latest"
         );
+        assert_eq!(
+            concise_guidance(
+                "Get x64 here: https://example.com/releases/latest",
+                "Download the latest x64 Windows installer from https://example.com/releases/latest"
+            ),
+            "Download the latest x64 Windows installer from https://example.com/releases/latest"
+        );
+    }
+
+    #[test]
+    fn guided_retry_prompts_require_precise_english_and_real_failure_evidence() {
+        let candidate = UpdateCandidate {
+            id: "tool".into(),
+            name: "Tool".into(),
+            current: "1.0".into(),
+            available: "2.0".into(),
+            package_id: None,
+            guidance: Some("Use https://example.com/releases/latest".into()),
+            methods: vec![Method::Native],
+        };
+        let failed = AttemptOutcome::failed(
+            Method::Native,
+            ErrorCategory::InstallerFailed,
+            "installer exited with code 1603",
+        );
+        let explanation = failure_explanation_prompt(
+            &candidate,
+            candidate.guidance.as_deref().unwrap(),
+            std::slice::from_ref(&failed),
+        );
+        assert!(explanation.contains("precise, grammatically correct English"));
+        assert!(explanation.contains("installer exited with code 1603"));
+        assert!(explanation.contains("https://example.com/releases/latest"));
+
+        let refinement =
+            refinement_prompt(&candidate, &failed, candidate.guidance.as_deref().unwrap());
+        assert!(refinement.contains("precise, grammatically correct English"));
+
+        assert!(guided_failure_needs_explanation(&candidate, &[failed]));
+        assert!(!guided_failure_needs_explanation(
+            &candidate,
+            &[AttemptOutcome::failed(
+                Method::Native,
+                ErrorCategory::AlreadyCurrent,
+                "No newer update is available."
+            )]
+        ));
     }
 }

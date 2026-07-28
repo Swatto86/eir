@@ -1186,46 +1186,38 @@ function updaterAppRow(a, retrySupported, running) {
   // Ignore state comes from the service (a.ignored), so the toggle survives the 2s
   // poll instead of relying on a client-side style that the next render clobbers.
   const ign = !!a.ignored;
-  const note = a.note ? `<span class="upd-result">AI guidance: ${esc(a.note)}</span>` : '';
+  const showGuidance = a.state === 'failed' || a.state === 'skipped';
+  const note = showGuidance && a.note ? `<span class="upd-result">AI guidance: ${esc(a.note)}</span>` : '';
   const btn = ign
     ? `<button class="upd-mini upd-ignore" data-id="${escAttr(a.id)}" data-ignore="0" title="Resume checking this app">Unignore</button>`
     : `<button class="upd-mini upd-ignore" data-id="${escAttr(a.id)}" data-ignore="1" title="Don't check this app again">Ignore</button>`;
   const retry = a.state === 'failed' && retrySupported
     ? `<button class="upd-mini upd-retry" data-id="${escAttr(a.id)}"${running ? ' disabled' : ''} title="Re-check only this app using the latest saved guidance">Retry</button>`
     : '';
+  const guidanceButton = showGuidance
+    ? `<button class="upd-mini upd-guide">${a.note ? 'Edit guidance' : 'Guide AI'}</button>`
+    : '';
+  const guidanceEditor = showGuidance ? updaterNoteEditor(a.id, a.note) : '';
   return `<div class="upd-row${ign ? ' upd-ignored' : ''}" data-id="${escAttr(a.id)}"${ign ? ' style="opacity:.5"' : ''}>
     <span class="upd-name" title="${escAttr(a.name)}">${esc(a.name)}</span>
     <span class="upd-ver">${ver}</span>${meth}${badge}
-    <button class="upd-mini upd-guide">${a.note ? 'Edit guidance' : 'Guide AI'}</button>
+    ${guidanceButton}
     ${retry}
     ${btn}
     ${detail}${note}
-    ${updaterNoteEditor(a.id, a.note)}
-  </div>`;
-}
-
-function updaterGuidanceRow(n) {
-  return `<div class="upd-row" data-id="${escAttr(n.id)}">
-    <span class="upd-name">${esc(n.id)}</span>
-    <button class="upd-mini upd-guide">Edit</button>
-    <button class="upd-mini upd-note-delete" data-id="${escAttr(n.id)}">Delete</button>
-    <span class="upd-result">${esc(n.note)}</span>
-    ${updaterNoteEditor(n.id, n.note)}
+    ${guidanceEditor}
   </div>`;
 }
 
 let lastAppsSig = null;
 let lastNotesSig = null;
 let lastHistSig = null;
-let lastGuidanceSig = null;
 
 function renderUpdater(u, paused, protocolVersion, capabilities) {
   const stateEl = document.getElementById('updater-state');
   const metaEl = document.getElementById('updater-meta');
   const appsEl = document.getElementById('updater-apps');
   const notesEl = document.getElementById('updater-notes');
-  const guidanceWrap = document.getElementById('updater-guidance-wrap');
-  const guidanceEl = document.getElementById('updater-guidance');
   const histWrap = document.getElementById('updater-history-wrap');
   const histEl = document.getElementById('updater-history');
   const nowBtn = document.getElementById('upd-now');
@@ -1236,14 +1228,11 @@ function renderUpdater(u, paused, protocolVersion, capabilities) {
     metaEl.style.display = 'none';
     appsEl.innerHTML = '';
     notesEl.innerHTML = '';
-    guidanceEl.innerHTML = '';
-    guidanceWrap.style.display = 'none';
     histEl.innerHTML = '';
     histWrap.style.display = 'none';
     lastAppsSig = null;
     lastNotesSig = null;
     lastHistSig = null;
-    lastGuidanceSig = null;
     nowBtn.disabled = true;
     clearBtn.disabled = true;
     nowBtn.textContent = '⬆ Update now';
@@ -1293,15 +1282,6 @@ function renderUpdater(u, paused, protocolVersion, capabilities) {
     } else {
       appsEl.innerHTML = '<div class="empty">Click “Update now” for a one-off run, or enable the schedule in Settings.</div>';
     }
-  }
-
-  const guidanceSig = JSON.stringify(u.app_notes || []);
-  const guidanceDirty = guidanceEl.querySelector('.upd-note-editor:not([hidden]) .upd-note-input[data-dirty="1"]');
-  if (guidanceSig !== lastGuidanceSig && !guidanceDirty) {
-    lastGuidanceSig = guidanceSig;
-    const notes = u.app_notes || [];
-    guidanceWrap.style.display = notes.length ? 'block' : 'none';
-    guidanceEl.innerHTML = notes.map(updaterGuidanceRow).join('');
   }
 
   const notesSig = JSON.stringify(u.notes || []);
@@ -1380,8 +1360,7 @@ document.getElementById('updater-apps').addEventListener('click', (e) => {
     .finally(() => { ig.disabled = false; });
 });
 
-// Persistent per-app AI guidance: create from a detected row, then read/edit/delete
-// it either there or in the saved-guidance list after the app leaves recent results.
+// Per-app AI guidance is shown and editable only while that product has an update row.
 document.getElementById('view-updates').addEventListener('input', (e) => {
   if (e.target.classList.contains('upd-note-input')) e.target.dataset.dirty = '1';
 });
@@ -1397,17 +1376,15 @@ document.getElementById('view-updates').addEventListener('click', (e) => {
   if (cancel) {
     cancel.closest('.upd-note-editor').hidden = true;
     lastAppsSig = null;
-    lastGuidanceSig = null;
     refresh();
     return;
   }
   const save = e.target.closest('.upd-note-save');
-  const del = e.target.closest('.upd-note-delete');
-  if (!save && !del) return;
-  const editor = save ? save.closest('.upd-note-editor') : null;
-  const id = save ? editor.dataset.id : del.dataset.id;
-  const note = save ? editor.querySelector('.upd-note-input').value.trim() : '';
-  const btn = save || del;
+  if (!save) return;
+  const editor = save.closest('.upd-note-editor');
+  const id = editor.dataset.id;
+  const note = editor.querySelector('.upd-note-input').value.trim();
+  const btn = save;
   btn.disabled = true;
   invoke('set_app_note', { id, note })
     .then((result) => {
