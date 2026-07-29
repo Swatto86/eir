@@ -34,3 +34,6 @@ windows-service = "0.7"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[lints]
+workspace = true

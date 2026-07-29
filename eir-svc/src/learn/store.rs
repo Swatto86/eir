@@ -251,12 +251,9 @@ pub async fn facts_for_view(pool: &SqlitePool) -> Result<Vec<eir_proto::LearnedF
         let kind: String = r.try_get("kind")?;
         let subject: String = r.try_get("subject")?;
         let ai: Option<String> = r.try_get("ai_explanation")?;
-        let labelled = ai.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-        let summary = if labelled {
-            ai.unwrap()
-        } else {
-            view_summary(&kind, &subject)
-        };
+        let ai = ai.filter(|s| !s.trim().is_empty());
+        let labelled = ai.is_some();
+        let summary = ai.unwrap_or_else(|| view_summary(&kind, &subject));
         // Provenance shown to the user is "ai_labelled" only when an explanation exists;
         // the DB source column stays 'detector' to preserve the decay/clear lifecycle.
         let source = if labelled {

@@ -129,6 +129,23 @@ The early staging and the bundle build's `beforeBuildCommand` both build the ser
 
 The green CI gate is the only pre-release bar (matches the user's "no manual/live-test gate" policy).
 
+### Local gate scripts and lint policy
+
+`scripts/fastcheck.ps1` (fmt + clippy) is the per-edit check; `scripts/verify.ps1` runs
+`check-versions.ps1` → fmt → clippy → tests, mirroring steps 1–5 of CI so a commit arrives
+already green. Neither builds the bundle — that stays a CI/`cargo tauri build` step.
+
+`[workspace.lints.clippy]` (root `Cargo.toml`) sets `unwrap_used` and `expect_used` to
+`warn`, which the `-D warnings` gate turns into build failures; all three crates take
+`[lints] workspace = true`, and `clippy.toml` allows both in tests. A panic in the service
+is an outage, so production exceptions are per-site `#[allow]`s with a stated reason —
+currently only the service install/uninstall CLI paths and the Tokio runtime builds in
+`eir-svc/src/main.rs` (fail-fast by design) plus the two embedded-icon decodes in
+`eir-ui/src/main.rs` (infallible: the PNG is compiled in). `rust.unsafe_code = "forbid"`
+is deliberately absent — cargo rejects a crate holding both `[lints] workspace = true` and
+its own lint table, so a workspace forbid could not be opted out of in `eir-svc`/`eir-ui`,
+which both call Win32 directly.
+
 ### Tag-driven signed release (`.github/workflows/release.yml`)
 
 Triggers: `push` of tags matching `v*`. `permissions: contents: write`. Single job `release` on `windows-latest`:

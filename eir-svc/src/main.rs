@@ -58,6 +58,9 @@ fn svc_main(_arguments: Vec<std::ffi::OsString>) {
     }
 }
 
+// The Tokio runtime build below is fail-fast on purpose: without a runtime there is no
+// service to degrade into, and SCM reports the failure to the event log.
+#[allow(clippy::expect_used)]
 fn run_service() -> windows_service::Result<()> {
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_signal = shutdown.clone();
@@ -133,6 +136,10 @@ fn run_service() -> windows_service::Result<()> {
     Ok(())
 }
 
+// Fail-fast CLI path: `eir-svc install` is run interactively by an admin (or the
+// installer), so a panic with a readable reason is the intended outcome — there is no
+// service to keep alive yet and no caller to hand an error to.
+#[allow(clippy::expect_used)]
 fn install_service() {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::ALL_ACCESS)
         .expect("Failed to connect to service manager (run as Administrator)");
@@ -160,6 +167,8 @@ fn install_service() {
     println!("Stop it with: sc stop {SERVICE_NAME}");
 }
 
+// Fail-fast CLI path — see `install_service`.
+#[allow(clippy::expect_used)]
 fn uninstall_service() {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::ALL_ACCESS)
         .expect("Failed to connect to service manager (run as Administrator)");
@@ -171,6 +180,8 @@ fn uninstall_service() {
     println!("{SERVICE_NAME} uninstalled.");
 }
 
+// Standalone-mode runtime build is fail-fast — see `run_service`.
+#[allow(clippy::expect_used)]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {

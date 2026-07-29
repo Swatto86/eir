@@ -1,3 +1,16 @@
 [workspace]
 members = ["eir-proto", "eir-svc", "eir-ui"]
 resolver = "2"
+
+# Panics are a service outage: EirSvc runs unattended as LocalSystem, so a panicking
+# unwrap in a decision-loop path takes the guardian down instead of surfacing an error.
+# `clippy.toml` allows both in tests. Production exceptions are per-site `#[allow]`s
+# with a stated reason — currently only service install/uninstall CLI paths (fail-fast
+# by design) and the embedded tray icon decode (infallible: the PNG is compiled in).
+#
+# `rust.unsafe_code = "forbid"` is deliberately absent: cargo rejects a crate that has
+# both `[lints] workspace = true` and its own lint table, so a workspace-level forbid
+# could not be opted out of in eir-svc/eir-ui, both of which call Win32 directly.
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

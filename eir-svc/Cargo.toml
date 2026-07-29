@@ -61,3 +61,6 @@ sevenz-rust2 = { version = "0.21", default-features = false, features = ["util",
 
 [dev-dependencies]
 sevenz-rust2 = { version = "0.21", default-features = false, features = ["util", "compress"] }
+
+[lints]
+workspace = true

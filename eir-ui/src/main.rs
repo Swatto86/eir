@@ -664,6 +664,9 @@ const ICON_PNG: &[u8] = include_bytes!("../../icons/128x128@2x.png");
 /// overflow flyout (~28–32px) and only mildly downscaled in the small tray.
 const TRAY_ICON_PX: u32 = 32;
 
+// Infallible: `ICON_PNG` is `include_bytes!`d at compile time, so a decode failure means
+// the committed icon is corrupt — a build-time defect, not a runtime condition.
+#[allow(clippy::expect_used)]
 fn decode_icon() -> IconBase {
     let img = image::load_from_memory(ICON_PNG)
         .expect("embedded icon must decode")
@@ -708,6 +711,9 @@ fn recolor(base: &IconBase, target: [u8; 3]) -> Vec<u8> {
     out
 }
 
+// Infallible: `pixels` is either `base.rgba` cloned or a recolour of it, so its length
+// always matches `base.width * base.height * 4`.
+#[allow(clippy::expect_used)]
 fn make_icon(base: &IconBase, status: &str) -> Image<'static> {
     let pixels = match status_accent(status) {
         None => base.rgba.clone(),
