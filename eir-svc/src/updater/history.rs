@@ -215,16 +215,43 @@ pub async fn last_clean_run(pool: &SqlitePool) -> Result<i64> {
     run_state(pool, LAST_CLEAN_RUN_KEY).await
 }
 
-/// Hide displayed attempt history while preserving the rows used for fair scheduling.
+/// Clear displayed cycle output while preserving scheduler and fair-ordering state.
 pub async fn clear(pool: &SqlitePool) -> Result<()> {
+    let last_run = last_run(pool).await?;
+    let status = (last_run > 0)
+        .then(|| {
+            serde_json::to_string(&StoredCycleStatus {
+                at: last_run,
+                notes: vec![],
+                apps: vec![],
+            })
+        })
+        .transpose()?;
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO app_state (key, value) VALUES (?, ?) \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     )
     .bind(HISTORY_CLEARED_AT_KEY)
     .bind(chrono::Utc::now().to_rfc3339())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    if let Some(status) = status {
+        sqlx::query(
+            "INSERT INTO app_state (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(LAST_CYCLE_STATUS_KEY)
+        .bind(status)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query("DELETE FROM app_state WHERE key = ?")
+            .bind(LAST_CYCLE_STATUS_KEY)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -365,6 +392,12 @@ mod tests {
 
         clear(&pool).await.expect("clear");
         assert!(recent(&pool, 10).await.expect("cleared recent").is_empty());
+        let (_, notes, apps) = last_cycle_status(&pool)
+            .await
+            .expect("read cleared cycle status")
+            .expect("cleared cycle status remains");
+        assert!(notes.is_empty());
+        assert!(apps.is_empty());
         assert!(last_attempt_times(&pool)
             .await
             .expect("preserved attempt ordering")

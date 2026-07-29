@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.34.3. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.34.4. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.34.3. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-29 | Eir | v0.34.4 updater Clear removes current output | The App Updates Clear command now removes the last cycle's app rows, notes, cost, and attempt-history display immediately and persists an empty last-cycle snapshot, so cleared results do not return after a service restart. The scheduler timestamp and private attempt/check ordering remain intact, while Ignore remains the persistent control for suppressing an app in later checks.
 
 2026-07-28 | Eir | v0.34.3 recoverable ignores and Windows-component filtering | The Settings-only App Updates section lists persisted ignored app IDs and reuses the existing `set_app_ignore` command to restore them after they disappear from refreshed update results. Candidate construction now applies the existing system-component/noise filter to every manager and native fallback path, with Windows Subsystem for Linux explicitly excluded because Windows owns its feature/package lifecycle even when an app package remains registered while the optional feature is disabled.
 

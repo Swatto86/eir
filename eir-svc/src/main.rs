@@ -2557,7 +2557,10 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                             Err(format!("Update history could not be cleared: {e}"));
                                     }
                                     Ok(_) => {
+                                        st.updater.apps.clear();
+                                        st.updater.notes.clear();
                                         st.updater.recent.clear();
+                                        st.updater.last_cost_usd = 0.0;
                                         if let Err(e) = learn::clear_detector_facts(&db).await {
                                             warn!("Failed to clear learned facts: {e}");
                                             command_result = Err(format!(
