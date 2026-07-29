@@ -34,10 +34,20 @@ fn soften_exe_fallback(verdict: Verification, from_exe: bool) -> Verification {
     }
 }
 
+/// A verdict worth acting on immediately. A first-read `Mismatch` is re-read once:
+/// right after a successful install the old version can still be the registered one
+/// for a moment, and reporting that as a failed update is worse than a 2s wait. A
+/// genuinely failed install still reads `Mismatch` the second time. Pure.
+fn settled(verdict: Verification) -> bool {
+    verdict != Verification::Mismatch
+}
+
 /// Confirm an app now reports `expected` (or newer). Returns (verdict, found
 /// version). One short retry absorbs the ARP-registration lag right after a fresh
-/// install before declaring a version unverifiable.
+/// install — whether that shows up as no readable version at all or as the previous
+/// version still being registered.
 pub async fn verify_app(target: &VerifyTarget, expected: &str) -> (Verification, String) {
+    let mut last = (Verification::Unverified, String::new());
     for attempt in 0..2 {
         if attempt == 1 {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -55,10 +65,13 @@ pub async fn verify_app(target: &VerifyTarget, expected: &str) -> (Verification,
         };
         if let Some(found) = found {
             let verdict = soften_exe_fallback(classify_version(&found, expected), from_exe);
-            return (verdict, found);
+            if settled(verdict) {
+                return (verdict, found);
+            }
+            last = (verdict, found);
         }
     }
-    (Verification::Unverified, String::new())
+    last
 }
 
 /// Read an installed app's version from `winget list --id <id> --exact`.
@@ -174,6 +187,16 @@ mod tests {
         // Relative / bare paths.
         assert!(!is_local_drive_path("app.exe"));
         assert!(!is_local_drive_path("..\\x.exe"));
+    }
+
+    #[test]
+    fn only_a_mismatch_is_re_read() {
+        // A just-installed app can still report the old version for a moment, so that
+        // one verdict gets the second read; everything else settles on the first.
+        assert!(!settled(Verification::Mismatch));
+        assert!(settled(Verification::Verified));
+        assert!(settled(Verification::Unverified));
+        assert!(settled(Verification::NotChecked));
     }
 
     #[test]

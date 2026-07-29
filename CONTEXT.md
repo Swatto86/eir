@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.34.4. The workspace has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.34.5. The workspace has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. Current release is v0.34.4. The wor
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-29 | Eir | v0.34.5 updater review pass | Focused review of the update subsystem fixed four defects. (1) `verify_app` claimed to absorb post-install ARP-registration lag but only re-read when NO version was readable; the far more common lag symptom — the previous version still registered for a moment — returned `Mismatch`, so a successful update was reported as a failed one. A first-read mismatch now gets the same single 2s re-read; a genuinely failed install still reads mismatch twice. (2) The native staging root's SYSTEM/Administrators lockdown was latched behind a process-lifetime flag, so if anything removed `%ProgramData%\Eir\staging` afterwards, `create_dir_all` silently re-created it inheriting ProgramData's user-writable ACL and every later install staged into it un-hardened. `icacls` now runs on every `ensure_root`, which also makes a transient failure fail only that one install instead of all of them. (3) winget's "No available upgrade found" was treated as an id-resolution failure and triggered a second install-length `winget upgrade` without `--exact` — wasted time on every already-current app, and prefix matching could resolve a neighbouring package. Only the genuine "no package found" / "no installed package" signals now trigger that retry. (4) The native installer watchdog's duplicated 600s literal now reuses `proc::INSTALL`. Gate green (fmt, clippy --all-targets -D warnings, 318 tests, version sync); pure-logic checks accompany (1) and (3), while (2) and the retry timing are compile/unit-verified only — reproducing an ACL-inheritance window or an ARP lag on the real service was not forced.
 
 2026-07-29 | Eir | v0.34.4 updater Clear removes current output | The App Updates Clear command now removes the last cycle's app rows, notes, cost, and attempt-history display immediately and persists an empty last-cycle snapshot, so cleared results do not return after a service restart. The scheduler timestamp and private attempt/check ordering remain intact, while Ignore remains the persistent control for suppressing an app in later checks.
 

@@ -62,12 +62,13 @@ fn upgrade_args(id: &str, force: bool, exact: bool) -> Vec<String> {
 }
 
 /// winget could not resolve the id to an installed/available package — the signature
-/// of a truncated `--id` used with `--exact`.
+/// of a truncated `--id` used with `--exact`. Deliberately NOT "no available upgrade":
+/// that means winget DID resolve the package and it is already current, so re-running
+/// without `--exact` only burns a second install-length run and risks prefix-matching
+/// a different package.
 fn no_package_found(output: &str) -> bool {
     let l = output.to_lowercase();
-    l.contains("no package found")
-        || l.contains("no installed package")
-        || l.contains("no available upgrade")
+    l.contains("no package found") || l.contains("no installed package")
 }
 
 /// Run winget directly and capture its merged output. The service is SYSTEM, so no
@@ -280,6 +281,19 @@ mod tests {
         assert!(portable_modified(out));
         assert!(!portable_modified("Installer failed with exit code: 1603"));
         assert!(!portable_modified("No applicable upgrade found."));
+    }
+
+    #[test]
+    fn already_current_does_not_trigger_the_prefix_retry() {
+        assert!(no_package_found(
+            "No installed package found matching input criteria."
+        ));
+        assert!(no_package_found(
+            "No package found matching input criteria."
+        ));
+        // Resolved but current — retrying without --exact would upgrade nothing at
+        // best, and a prefix-matched neighbour at worst.
+        assert!(!no_package_found("No available upgrade found."));
     }
 
     #[test]

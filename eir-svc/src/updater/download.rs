@@ -36,8 +36,6 @@ fn staging_root() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("eir-staging"))
 }
 
-static ACL_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// Strip inherited ACEs and grant only SYSTEM + Administrators full control, so the
 /// staged installer cannot be read or replaced by a lesser-integrity process.
 /// Returns whether it succeeded — this is a load-bearing control (see `ensure_root`),
@@ -62,23 +60,20 @@ fn lock_down_acl(dir: &Path) -> bool {
 /// not be applied, return an error so no installer is ever staged (let alone run as
 /// SYSTEM) from a directory a non-admin might be able to write.
 fn ensure_root() -> std::io::Result<PathBuf> {
-    use std::sync::atomic::Ordering;
     let root = staging_root();
     std::fs::create_dir_all(&root)?;
-    // Lock the staging root down to SYSTEM+Administrators. Retry on every call until it
-    // succeeds instead of latching a one-shot `Once`: a single transient `icacls` failure
-    // (AV interception, a brief lock) must not permanently disable native installs for the
-    // life of the service. Once it succeeds the atomic short-circuits future calls.
-    if !ACL_OK.load(Ordering::SeqCst) {
-        if lock_down_acl(&root) {
-            ACL_OK.store(true, Ordering::SeqCst);
-        } else {
-            warn!("could not lock down staging dir ACL: {}", root.display());
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "staging directory could not be locked to SYSTEM/Administrators",
-            ));
-        }
+    // Applied on every call, never latched behind a "already done" flag: `create_dir_all`
+    // silently re-creates the root if anything removed it, and a re-created directory
+    // inherits ProgramData's ACL (ordinary users may add files there) until `icacls` runs.
+    // A latch would leave that window open for the rest of the service's life. One ~20ms
+    // spawn per staged installer is nothing next to the download it is guarding, and a
+    // transient failure only fails this one install, not every later one.
+    if !lock_down_acl(&root) {
+        warn!("could not lock down staging dir ACL: {}", root.display());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "staging directory could not be locked to SYSTEM/Administrators",
+        ));
     }
     Ok(root)
 }

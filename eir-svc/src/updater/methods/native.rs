@@ -16,7 +16,6 @@ use crate::updater::plan::{
 use crate::updater::verify::{verify_app, VerifyTarget};
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::time::Duration;
 
 /// CREATE_NO_WINDOW — keep any spawned installer's console hidden.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -362,9 +361,9 @@ async fn sha256_hex_of(path: &Path) -> Result<String, String> {
 }
 
 /// Run a staged installer as SYSTEM (no UAC — the service is already elevated).
-/// Re-hashes the file immediately before launch (TOCTOU) and applies a 10-minute
-/// watchdog. Returns the exit code, or a sentinel: -2 timeout, -3 launch error,
-/// -4 the staged file changed since download.
+/// Re-hashes the file immediately before launch (TOCTOU) and applies the shared
+/// install watchdog. Returns the exit code, or a sentinel: -2 timeout, -3 launch
+/// error, -4 the staged file changed since download.
 async fn run_installer(staged: &Staged, kind: InstallerKind, args: &[String]) -> i32 {
     match sha256_hex_of(&staged.file).await {
         Ok(got) if got.eq_ignore_ascii_case(&staged.sha256) => {}
@@ -391,7 +390,7 @@ async fn run_installer(staged: &Staged, kind: InstallerKind, args: &[String]) ->
         Ok(c) => c,
         Err(_) => return -3,
     };
-    match tokio::time::timeout(Duration::from_secs(600), child.wait()).await {
+    match tokio::time::timeout(crate::updater::proc::INSTALL, child.wait()).await {
         Ok(Ok(status)) => status.code().unwrap_or(-1),
         Ok(Err(_)) => -3,
         Err(_) => {
