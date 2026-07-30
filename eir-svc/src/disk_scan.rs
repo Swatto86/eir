@@ -9,7 +9,7 @@ use eir_proto::DiskEntryView;
 use std::collections::HashMap;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use walkdir::{DirEntry, WalkDir};
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -270,6 +270,25 @@ pub fn scan(deadline: Instant) -> DiskScanResult {
         });
     }
     DiskScanResult { entries, targets }
+}
+
+/// Run one bounded disk scan off the async runtime and return its result (or an error
+/// string the caller sends on its result channel). The blocking walkdir is bounded by
+/// its own `deadline`; the timeout backstop exists because `spawn_blocking` can't be
+/// aborted, but the deadline stops the walk regardless. Lives here — with [`scan`] — so
+/// the decision loop only spawns this and awaits the channel, never holds the walk body.
+pub async fn run_scan() -> Result<DiskScanResult, String> {
+    const SCAN_MAX: Duration = Duration::from_secs(5 * 60);
+    let deadline = Instant::now() + SCAN_MAX;
+    let mut handle = tokio::task::spawn_blocking(move || scan(deadline));
+    match tokio::time::timeout(SCAN_MAX + Duration::from_secs(30), &mut handle).await {
+        Ok(Ok(res)) => Ok(res),
+        Ok(Err(_join)) => Err("disk scan task panicked".to_string()),
+        Err(_elapsed) => {
+            handle.abort();
+            Err("disk scan timed out".to_string())
+        }
+    }
 }
 
 #[cfg(test)]

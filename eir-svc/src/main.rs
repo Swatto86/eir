@@ -2993,27 +2993,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 pipe.broadcast_status(build_status(&st));
                                 let done = disk_done_tx.clone();
                                 tokio::spawn(async move {
-                                    const SCAN_MAX: Duration = Duration::from_secs(5 * 60);
-                                    // The scan bounds its own walk with this deadline; the
-                                    // join timeout is a backstop (spawn_blocking can't be
-                                    // aborted, but the deadline stops the walk regardless).
-                                    let deadline = std::time::Instant::now() + SCAN_MAX;
-                                    let mut handle =
-                                        tokio::task::spawn_blocking(move || disk_scan::scan(deadline));
-                                    let result = match tokio::time::timeout(
-                                        SCAN_MAX + Duration::from_secs(30),
-                                        &mut handle,
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(res)) => Ok(res),
-                                        Ok(Err(_join)) => Err("disk scan task panicked".to_string()),
-                                        Err(_elapsed) => {
-                                            handle.abort();
-                                            Err("disk scan timed out".to_string())
-                                        }
-                                    };
-                                    let _ = done.send(result);
+                                    let _ = done.send(disk_scan::run_scan().await);
                                 });
                             }
                         }
@@ -3079,29 +3059,10 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 let done = startup_done_tx.clone();
                                 let ai_s = ai.clone();
                                 let model_s = cfg.api.update_check_model.clone();
-                                let worker_sid = scan_sid.clone();
                                 tokio::spawn(async move {
-                                    const STARTUP_MAX: Duration = Duration::from_secs(4 * 60);
-                                    let mut inner = tokio::spawn(async move {
-                                        startup_scan::scan(
-                                            ai_s.as_deref(),
-                                            &model_s,
-                                            &worker_sid,
-                                        )
-                                            .await
-                                            .map_err(|e| e.to_string())
-                                    });
                                     let result =
-                                        match tokio::time::timeout(STARTUP_MAX, &mut inner).await {
-                                            Ok(Ok(r)) => r,
-                                            Ok(Err(_join)) => {
-                                                Err("startup scan task panicked".to_string())
-                                            }
-                                            Err(_elapsed) => {
-                                                inner.abort();
-                                                Err("startup scan timed out".to_string())
-                                            }
-                                        };
+                                        startup_scan::run_scan(ai_s, model_s, scan_sid.clone())
+                                            .await;
                                     let _ = done.send((scan_sid, result));
                                 });
                             }

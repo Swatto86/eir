@@ -366,6 +366,32 @@ pub async fn scan(
     })
 }
 
+/// Run one bounded startup scan off the decision loop and return its result (or an error
+/// string the caller sends on its result channel). The registry/folder enumeration +
+/// optional AI classify run in a nested task wrapped in a timeout backstop, so a wedged
+/// classify call can't latch the scan flag for the process lifetime. Lives here — with
+/// [`scan`] — so the loop only spawns this and awaits the channel, never holds the body.
+pub async fn run_scan(
+    ai: Option<std::sync::Arc<AiClient>>,
+    model: String,
+    sid: String,
+) -> Result<StartupScanResult, String> {
+    const STARTUP_MAX: std::time::Duration = std::time::Duration::from_secs(4 * 60);
+    let mut inner = tokio::spawn(async move {
+        scan(ai.as_deref(), &model, &sid)
+            .await
+            .map_err(|e| e.to_string())
+    });
+    match tokio::time::timeout(STARTUP_MAX, &mut inner).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_join)) => Err("startup scan task panicked".to_string()),
+        Err(_elapsed) => {
+            inner.abort();
+            Err("startup scan timed out".to_string())
+        }
+    }
+}
+
 fn valid_verdict(v: &str) -> String {
     match v {
         "keep" | "optional" | "unnecessary" => v.to_string(),
