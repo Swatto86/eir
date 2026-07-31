@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.7. It has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.8. It has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.7
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-07-31 | Eir | v0.34.8 Windows Update signal compatibility | The dashboard labelled Windows Update unavailable on current Windows builds where the legacy `Auto Update\Results\Install` registry key is absent even though update history is healthy. The collector now uses the supported local Windows Update Agent history API and retains the existing last-good/error behavior for real API failures. Reproduced on the affected PC with a failing collector test; the native replacement test and repository gate pass.
 
 2026-07-31 | Eir | v0.34.7 protected in-place upgrade compatibility | The v0.34.6 updater reached the NSIS preinstall hook but aborted while cloning an ordinary single-link `C:\Program Files\Eir\config.toml`: endpoint policy denied file access to PowerShell when it was launched by NSIS, even though the same elevated clone succeeded directly. A failing installer-hook regression now requires the canonical Program Files upgrade path to avoid child PowerShell. That path revalidates the state file, opens it natively without write/delete sharing, copies it with `CopyFileW` into a fresh protected sibling, flushes the destination, then keeps the existing atomic replacement and ACL reset. Legacy custom-path migration retains the handle-based PowerShell clone and therefore fails closed where that child access is denied. The exact v0.34.5→v0.34.7 installed upgrade passed: the installer exited 0, the config hash was unchanged, the installed service binary matched the release build, the service returned running/automatic, and no migration or rollback debris remained.
 

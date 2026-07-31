@@ -11,7 +11,7 @@ use windows::Win32::NetworkManagement::IpHelper::{GetAdaptersInfo, IP_ADAPTER_IN
 use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_DWORD,
-    REG_SZ, REG_VALUE_TYPE,
+    REG_VALUE_TYPE,
 };
 use windows::Win32::System::Services::{
     CloseServiceHandle, EnumServicesStatusExW, OpenSCManagerW, ENUM_SERVICE_STATUS_PROCESSW,
@@ -376,53 +376,22 @@ fn get_network_interfaces() -> Option<Vec<NetworkInterface>> {
 }
 
 fn get_windows_update_status() -> Option<String> {
-    let key_path = wide(
-        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\Results\\Install",
-    );
-    let value_name = wide("LastSuccessTime");
-
-    unsafe {
-        let mut hkey = HKEY::default();
-        if RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(key_path.as_ptr()),
-            0,
-            KEY_READ,
-            &mut hkey,
-        )
-        .is_err()
-        {
-            return None;
-        }
-
-        let mut data = [0u16; 64];
-        let mut data_len = std::mem::size_of_val(&data) as u32;
-        let mut value_type = REG_VALUE_TYPE::default();
-
-        let ok = RegQueryValueExW(
-            hkey,
-            PCWSTR(value_name.as_ptr()),
-            None,
-            Some(&mut value_type),
-            Some(data.as_mut_ptr().cast::<u8>()),
-            Some(&mut data_len),
-        )
-        .is_ok();
-
-        let _ = RegCloseKey(hkey);
-
-        if !ok
-            || value_type != REG_SZ
-            || data_len < 2
-            || data_len as usize > std::mem::size_of_val(&data)
-            || !data_len.is_multiple_of(2)
-        {
-            return None;
-        }
-
-        let chars = &data[..data_len as usize / 2];
-        nul_terminated_utf16(chars).map(|value| format!("last_install: {value}"))
-    }
+    ps_capped(
+        "$s = New-Object -ComObject Microsoft.Update.Session; \
+         $q = $s.CreateUpdateSearcher(); \
+         $n = [Math]::Min($q.GetTotalHistoryCount(), 50); \
+         if ($n -eq 0) { 'unknown' } else { \
+           $h = $q.QueryHistory(0, $n) | \
+             Where-Object { $_.Operation -eq 1 -and $_.ResultCode -eq 2 } | \
+             Select-Object -First 1; \
+           if ($h) { 'last_install: {0:O}' -f $h.Date } else { 'unknown' } \
+         }",
+        std::time::Duration::from_secs(15),
+    )
+    .and_then(|s| {
+        let value = s.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
 }
 
 /// Read a REG_DWORD value, returning None if the key/value is missing or is not a
@@ -795,9 +764,17 @@ pub fn current(shared: &SharedState) -> SystemState {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_firewall, fault_changed, nul_terminated_utf16, parse_defender_status,
-        retain_or_report, utf16_from_buffer,
+        effective_firewall, fault_changed, get_windows_update_status, nul_terminated_utf16,
+        parse_defender_status, retain_or_report, utf16_from_buffer,
     };
+
+    #[test]
+    fn windows_update_probe_works_without_the_legacy_registry_key() {
+        assert!(
+            get_windows_update_status().is_some(),
+            "missing legacy history must not make Windows Update unavailable"
+        );
+    }
 
     #[test]
     fn failed_probe_keeps_last_good_value_and_reports_the_source() {

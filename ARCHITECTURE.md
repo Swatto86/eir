@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-31 · **Code:** v0.34.7
+**Last updated:** 2026-07-31 · **Code:** v0.34.8
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -78,7 +78,7 @@ Eir is a single Cargo workspace (`resolver = "2"`) with three crates, plus a sta
 | `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service: signal collection, AI client, policy, execution, autonomous updater, SQLite audit DB. Heavy `windows` 0.58 feature set. |
 | `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), `windows-service` 0.7 (SCM queries + install from About), tracing. `build-dependencies`: `tauri-build` 2. |
 
-All three crates are versioned in lockstep — currently `0.34.7` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json` and the three corresponding `Cargo.lock` package entries. `scripts/check-versions.ps1` gates all seven values.
+All three crates are versioned in lockstep — currently `0.34.8` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json` and the three corresponding `Cargo.lock` package entries. `scripts/check-versions.ps1` gates all seven values.
 
 The dependency graph is acyclic and points inward: `eir-proto` depends on nothing internal; `eir-svc` and `eir-ui` each depend only on `eir-proto`. The UI and service never link against each other — they are separate processes coupled solely through the `eir-proto` wire contract over `\\.\pipe\EirSvc`.
 
@@ -573,7 +573,7 @@ Eir's signal layer is three independent background collectors that each maintain
   - Disk: `GetDiskFreeSpaceExW` on `C:\` → usage % + free GB (96–115).
   - Services: `OpenSCManagerW` + `EnumServicesStatusExW` (two-pass: size then read) over active Win32 services; counts running and lists names not in `SERVICE_RUNNING` as `failed_services` (117–199).
   - Network interfaces: `GetAdaptersInfo`, marking each up/down by whether it has a non-`0.0.0.0` IPv4 (207–242).
-  - Windows Update: registry read of `…\WindowsUpdate\Auto Update\Results\Install\LastSuccessTime` → `"last_install: <time>"` or `"unknown"` (244–289).
+  - Windows Update: the supported Windows Update Agent history API returns the latest successful installation time, or `"unknown"` when no successful installation exists. A genuine API failure is reported through `signal_errors`.
   - CPU: the **only real WMI call** — `Get-WmiObject Win32_Processor … LoadPercentage` via PowerShell (74–81).
 - **`ps_capped` (the bounded probe):** spawns PowerShell non-interactively, captures stdout/stderr, rejects non-zero exit codes, and kills on deadline. CPU and Defender each have a 15 s cap so one wedged provider cannot stall the whole snapshot; failure is surfaced through `signal_errors` while the last good measurement remains visible.
 - **GPO-aware firewall (`get_firewall` + `effective_firewall`, lines 330–362):** reads `EnableFirewall` REG_DWORD from both the local store (`…SharedAccess\Parameters\FirewallPolicy\{DomainProfile|StandardProfile|PublicProfile}`) and the GPO store (`…Policies\Microsoft\WindowsFirewall\{DomainProfile|PrivateProfile|PublicProfile}`). Note the naming mismatch: local calls private "StandardProfile", GPO calls it "PrivateProfile" (handled at lines 358–360). `effective_firewall` (330–336): policy ON → `Some(true)`; **policy OFF → `None`** (a GPO is deliberately holding it off and `netsh` can't override, so Eir treats it as "not ours to fix," preventing a futile `firewall_enable` loop on managed machines); no policy → the local value. Unreadable stays `None` so the AI never reads "couldn't read it" as "firewall off." `read_reg_dword` (294–321) checks the value **type** is `REG_DWORD` and length is 4, rejecting a 4-byte string/binary value rather than misreading it.
