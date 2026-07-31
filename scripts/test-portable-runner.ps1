@@ -35,7 +35,7 @@ foreach ($fragment in @(
     }
 }
 
-$root = Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..\target')).Path `
+$root = Join-Path ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\target'))) `
     "portable-runner-selftest-$([guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Path $root | Out-Null
 try {
