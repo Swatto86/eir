@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-31 · **Code:** v0.34.6
+**Last updated:** 2026-07-31 · **Code:** v0.34.7
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -78,7 +78,7 @@ Eir is a single Cargo workspace (`resolver = "2"`) with three crates, plus a sta
 | `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service: signal collection, AI client, policy, execution, autonomous updater, SQLite audit DB. Heavy `windows` 0.58 feature set. |
 | `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), `windows-service` 0.7 (SCM queries + install from About), tracing. `build-dependencies`: `tauri-build` 2. |
 
-All three crates are versioned in lockstep — currently `0.34.6` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json` and the three corresponding `Cargo.lock` package entries. `scripts/check-versions.ps1` gates all seven values.
+All three crates are versioned in lockstep — currently `0.34.7` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json` and the three corresponding `Cargo.lock` package entries. `scripts/check-versions.ps1` gates all seven values.
 
 The dependency graph is acyclic and points inward: `eir-proto` depends on nothing internal; `eir-svc` and `eir-ui` each depend only on `eir-proto`. The UI and service never link against each other — they are separate processes coupled solely through the `eir-proto` wire contract over `\\.\pipe\EirSvc`.
 
@@ -206,7 +206,8 @@ transactional at the boundary:
    directory; reject a redirected install root; inspect and stop the retained service;
    preserve its protected binary for rollback; migrate only ordinary, local, single-link
    config/database/log files while each source is held open with write/delete sharing
-   denied, copying into fresh protected paths; and remove every known bundle output
+   denied; use native locked copy/flush for the canonical protected in-place path and the
+   handle-based clone for a legacy custom path; then remove every known bundle output
    before elevated copying.
 - **POSTINSTALL**: reset owner/ACLs on the root and every Eir-owned file; seed config on
   first install; run the service's fail-closed install/update verb; remove validated

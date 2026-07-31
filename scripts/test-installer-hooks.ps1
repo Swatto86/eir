@@ -51,6 +51,17 @@ if ($migration -match 'CopyFiles') {
 Assert-Contains $migration '\[IO\.FileShare\]::Read' 'State migration does not hold a no-write/delete-share source handle.'
 Assert-Contains $migration '\[IO\.FileMode\]::CreateNew' 'State migration does not create a fresh protected destination.'
 Assert-Contains $migration '\.CopyTo\(' 'State migration does not copy from the held source stream.'
+$inPlaceStart = $migration.IndexOf('state_file_copy_in_place:', [StringComparison]::Ordinal)
+$legacyStart = $migration.IndexOf('state_file_copy_legacy:', [StringComparison]::Ordinal)
+if ($inPlaceStart -lt 0 -or $legacyStart -le $inPlaceStart) {
+    throw 'Protected in-place state migration is not separated from legacy migration.'
+}
+$inPlaceMigration = $migration.Substring($inPlaceStart, $legacyStart - $inPlaceStart)
+if ($inPlaceMigration -match 'WindowsPowerShell\\v1\.0\\powershell\.exe') {
+    throw 'Protected in-place state migration must not depend on child PowerShell file access.'
+}
+Assert-Contains $inPlaceMigration '(?s)CreateFileW\(w "\$2", i 0x80000000, i 1,.*?CopyFileW\(w "\$2", w "\$3", i 1\).*?CloseHandle\(p r5\)' 'Protected in-place migration does not hold the source against writes/deletes through the native copy.'
+Assert-Contains $inPlaceMigration 'FlushFileBuffers\(p r5\)' 'Protected in-place migration does not flush the fresh destination.'
 $cloneCommand = [regex]::Match(
     $migration,
     '(?m)^\s*nsExec::Exec `".*?-Command "(?<Script>.*)"`\s*$'

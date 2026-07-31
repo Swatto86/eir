@@ -75,6 +75,38 @@ Function EirMigrateStateFile
   StrCpy $3 "$INSTDIR\.eir-secure-$0"
   Push "$3"
   Call EirRemovePathEntry
+  StrCmp $EirStateSourceDir $INSTDIR state_file_copy_in_place state_file_copy_legacy
+
+  state_file_copy_in_place:
+  ; Program Files is already hardened above. Keep the validated source open without
+  ; write/delete sharing while the native copy runs, avoiding child PowerShell file
+  ; access that endpoint security can deny inside an installer process.
+  Push "$2"
+  Call EirRequireSafeStateFile
+  System::Call 'kernel32::CreateFileW(w "$2", i 0x80000000, i 1, p 0, i 3, i 0x00200000, p 0) p.r5'
+  IntCmp $5 -1 state_file_copy_failed state_file_source_opened state_file_source_opened
+  state_file_source_opened:
+  System::Call 'kernel32::GetFileAttributesW(w "$2") i.r4'
+  IntCmp $4 -1 state_file_copy_in_place_failed 0 0
+  IntOp $4 $4 & 0x400
+  IntCmp $4 0 state_file_copy_in_place_source_safe state_file_copy_in_place_failed state_file_copy_in_place_failed
+  state_file_copy_in_place_source_safe:
+  System::Call 'kernel32::CopyFileW(w "$2", w "$3", i 1) i.r4'
+  StrCmp $4 "0" state_file_copy_in_place_failed
+  System::Call 'kernel32::CloseHandle(p r5)'
+  System::Call 'kernel32::CreateFileW(w "$3", i 0x40000000, i 0, p 0, i 3, i 0x80, p 0) p.r5'
+  IntCmp $5 -1 state_file_copy_failed state_file_destination_opened state_file_destination_opened
+  state_file_destination_opened:
+  System::Call 'kernel32::FlushFileBuffers(p r5) i.r4'
+  System::Call 'kernel32::CloseHandle(p r5)'
+  StrCmp $4 "0" state_file_copy_failed
+  Goto state_file_copy_ok
+
+  state_file_copy_in_place_failed:
+  System::Call 'kernel32::CloseHandle(p r5)'
+  Goto state_file_copy_failed
+
+  state_file_copy_legacy:
   System::Call 'kernel32::SetEnvironmentVariableW(w "EIR_INSTALL_STATE_SOURCE", w "$2") i.r4'
   StrCmp $4 "0" state_environment_failed
   System::Call 'kernel32::SetEnvironmentVariableW(w "EIR_INSTALL_STATE_DEST", w "$3") i.r4'
