@@ -4,7 +4,9 @@
 //! mutates nothing; a "Clean" click maps an entry to an EXISTING safe fix-action
 //! (`DiskCleanup` or `FileDelete`) that is routed through the normal policy gate.
 
+use crate::executor::logs::{checked_local_path, with_active_user};
 use crate::models::FixAction;
+use crate::session::{active_user_profile_dir, system_drive_root};
 use eir_proto::DiskEntryView;
 use std::collections::HashMap;
 use std::os::windows::fs::MetadataExt;
@@ -17,6 +19,8 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 const MIN_REPORT_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
 /// Keep at most this many entries (largest first).
 const MAX_ENTRIES: usize = 25;
+const MAX_USER_PROFILES: usize = 128;
+const MAX_USER_FINDINGS: usize = 4096;
 
 /// The result of a scan: the wire view list plus the server-side id → action map used to
 /// reconstruct a "Clean" click (the wire only carries an opaque id).
@@ -39,9 +43,15 @@ struct Spec {
 /// The static, system-wide targets. Pure (no I/O) so the category → action mapping is
 /// unit-testable. Only three map to an action, each a pre-existing safe one.
 fn system_specs() -> Vec<Spec> {
+    system_specs_at(&system_drive_root())
+}
+
+fn system_specs_at(root: &Path) -> Vec<Spec> {
+    let path = |relative: &str| root.join(relative).to_string_lossy().into_owned();
+    let memory_dump = path("Windows\\MEMORY.DMP");
     vec![
         Spec {
-            path: "C:\\Windows\\Temp".into(),
+            path: path("Windows\\Temp"),
             is_dir: true,
             category: "Temp files",
             note: "Temporary files Windows and apps left behind. Safe to clear now.",
@@ -50,7 +60,7 @@ fn system_specs() -> Vec<Spec> {
             }),
         },
         Spec {
-            path: "C:\\Windows\\Prefetch".into(),
+            path: path("Windows\\Prefetch"),
             is_dir: true,
             category: "Prefetch",
             note:
@@ -60,24 +70,22 @@ fn system_specs() -> Vec<Spec> {
             }),
         },
         Spec {
-            path: "C:\\Windows\\MEMORY.DMP".into(),
+            path: memory_dump.clone(),
             is_dir: false,
             category: "Crash dump",
             note: "A full crash dump from a past blue-screen. Safe to delete once it's no longer \
                    needed for diagnosis.",
-            action: Some(FixAction::FileDelete {
-                path: "C:\\Windows\\MEMORY.DMP".into(),
-            }),
+            action: Some(FixAction::FileDelete { path: memory_dump }),
         },
         Spec {
-            path: "C:\\Windows\\SoftwareDistribution\\Download".into(),
+            path: path("Windows\\SoftwareDistribution\\Download"),
             is_dir: true,
             category: "Windows Update cache",
             note: "Downloaded Windows Update files. Windows clears these itself; safe to leave.",
             action: None,
         },
         Spec {
-            path: "C:\\Windows.old".into(),
+            path: path("Windows.old"),
             is_dir: true,
             category: "Previous Windows",
             note: "Your previous Windows installation, kept for rollback. Remove it via Settings \
@@ -85,14 +93,14 @@ fn system_specs() -> Vec<Spec> {
             action: None,
         },
         Spec {
-            path: "C:\\Windows\\Minidump".into(),
+            path: path("Windows\\Minidump"),
             is_dir: true,
             category: "Crash dumps",
             note: "Small crash dumps from past blue-screens. Harmless to keep.",
             action: None,
         },
         Spec {
-            path: "C:\\$Recycle.Bin".into(),
+            path: path("$Recycle.Bin"),
             is_dir: true,
             category: "Recycle Bin",
             note:
@@ -100,7 +108,7 @@ fn system_specs() -> Vec<Spec> {
             action: None,
         },
         Spec {
-            path: "C:\\hiberfil.sys".into(),
+            path: path("hiberfil.sys"),
             is_dir: false,
             category: "Hibernation file",
             note: "Reserved for hibernation/fast-startup. Reclaim it by turning off hibernation \
@@ -108,7 +116,7 @@ fn system_specs() -> Vec<Spec> {
             action: None,
         },
         Spec {
-            path: "C:\\pagefile.sys".into(),
+            path: path("pagefile.sys"),
             is_dir: false,
             category: "Page file",
             note: "Windows virtual memory. Managed automatically — leave it as is.",
@@ -134,15 +142,12 @@ fn dir_size(path: &Path, deadline: Instant) -> u64 {
         return 0;
     }
     let mut total = 0u64;
-    let mut count = 0u64;
     for entry in WalkDir::new(path)
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| !is_reparse_dir(e))
     {
-        count += 1;
-        // Check the clock only occasionally — Instant::now() per entry would dominate.
-        if count.is_multiple_of(2048) && Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             break;
         }
         let Ok(entry) = entry else { continue };
@@ -164,9 +169,20 @@ fn file_size(path: &Path) -> u64 {
 /// system pseudo-profiles).
 fn user_dirs() -> Vec<PathBuf> {
     let mut v = Vec::new();
-    if let Ok(rd) = std::fs::read_dir("C:\\Users") {
+    let profiles = active_user_profile_dir()
+        .and_then(|profile| profile_container(&profile))
+        .unwrap_or_else(|| system_drive_root().join("Users"));
+    let Ok(Some(profiles)) = checked_local_path(&profiles) else {
+        return v;
+    };
+    if let Ok(rd) = std::fs::read_dir(profiles) {
         for e in rd.flatten() {
-            let p = e.path();
+            if v.len() >= MAX_USER_PROFILES {
+                break;
+            }
+            let Ok(Some(p)) = checked_local_path(&e.path()) else {
+                continue;
+            };
             if !p.is_dir() {
                 continue;
             }
@@ -183,35 +199,62 @@ fn user_dirs() -> Vec<PathBuf> {
     v
 }
 
+fn profile_container(profile: &Path) -> Option<PathBuf> {
+    let parent = profile.parent()?;
+    (parent.components().count() > 2).then(|| parent.to_path_buf())
+}
+
+fn checked_directory(path: &Path) -> Option<PathBuf> {
+    checked_local_path(path)
+        .ok()
+        .flatten()
+        .filter(|path| path.is_dir())
+}
+
 /// Per-user report-only consumers (temp + biggest AppData\Local folders). All are
 /// report-only in v1 — no existing action safely targets an arbitrary user directory.
 fn user_specs(deadline: Instant) -> Vec<(String, u64, &'static str, &'static str)> {
+    match with_active_user(|| Ok(user_specs_for_users(user_dirs(), deadline))) {
+        Ok(specs) => specs,
+        Err(error) => {
+            tracing::warn!("Could not scan user disk usage as the active user: {error}");
+            Vec::new()
+        }
+    }
+}
+
+fn user_specs_for_users(
+    users: Vec<PathBuf>,
+    deadline: Instant,
+) -> Vec<(String, u64, &'static str, &'static str)> {
     let mut out = Vec::new();
-    for user in user_dirs() {
-        if Instant::now() >= deadline {
+    for user in users {
+        if Instant::now() >= deadline || out.len() >= MAX_USER_FINDINGS {
             break;
         }
-        let temp = user.join("AppData\\Local\\Temp");
-        out.push((
-            temp.to_string_lossy().into_owned(),
-            dir_size(&temp, deadline),
-            "Temp files",
-            "This user's temporary files. Usually safe to clear from Disk Cleanup.",
-        ));
-        let local = user.join("AppData\\Local");
+        let Some(local) = checked_directory(&user.join("AppData\\Local")) else {
+            continue;
+        };
+        if let Some(temp) = checked_directory(&local.join("Temp")) {
+            out.push((
+                temp.to_string_lossy().into_owned(),
+                dir_size(&temp, deadline),
+                "Temp files",
+                "This user's temporary files. Usually safe to clear from Disk Cleanup.",
+            ));
+        }
         if let Ok(rd) = std::fs::read_dir(&local) {
             for e in rd.flatten() {
-                if Instant::now() >= deadline {
+                if Instant::now() >= deadline || out.len() >= MAX_USER_FINDINGS {
                     break;
                 }
-                let p = e.path();
-                if !p.is_dir() {
-                    continue;
-                }
                 // Temp is already covered above — don't double-report it.
-                if p.file_name().map(|n| n.eq_ignore_ascii_case("Temp")) == Some(true) {
+                if e.file_name().eq_ignore_ascii_case("Temp") {
                     continue;
                 }
+                let Some(p) = checked_directory(&e.path()) else {
+                    continue;
+                };
                 let size = dir_size(&p, deadline);
                 if size < MIN_REPORT_BYTES {
                     continue;
@@ -322,6 +365,27 @@ mod tests {
     }
 
     #[test]
+    fn system_targets_follow_the_windows_drive() {
+        let specs = system_specs_at(Path::new("D:\\"));
+        assert!(specs.iter().all(|spec| spec.path.starts_with("D:\\")));
+        assert!(specs.iter().any(|spec| {
+            matches!(
+                &spec.action,
+                Some(FixAction::FileDelete { path }) if path == "D:\\Windows\\MEMORY.DMP"
+            )
+        }));
+    }
+
+    #[test]
+    fn profile_container_never_expands_to_a_drive_root() {
+        assert_eq!(
+            profile_container(Path::new("D:\\Profiles\\Alice")),
+            Some(PathBuf::from("D:\\Profiles"))
+        );
+        assert_eq!(profile_container(Path::new("D:\\Alice")), None);
+    }
+
+    #[test]
     fn dir_size_sums_files_and_respects_the_deadline() {
         let dir = std::env::temp_dir().join(format!("eir_disk_scan_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -332,9 +396,58 @@ mod tests {
         assert_eq!(dir_size(&dir, future), 3000);
         // A missing path is 0 (not an error).
         assert_eq!(dir_size(&dir.join("nope"), future), 0);
-        // (The deadline is checked every 2048 entries — a coarse bound for huge walks;
-        // the outer task timeout is the real backstop. A 3-file dir never trips it, so
-        // there's nothing meaningful to assert about a past deadline on this input.)
+        assert_eq!(dir_size(&dir, Instant::now()), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_user_scan_rejects_a_reparse_local_root() {
+        let base =
+            std::env::temp_dir().join(format!("eir_disk_scan_reparse_{}", std::process::id()));
+        let profile = base.join("profile");
+        let target = base.join("target");
+        let local = profile.join("AppData\\Local");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(target.join("Temp")).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&local)
+            .arg(&target)
+            .status()
+            .expect("launch mklink");
+        assert!(status.success(), "create test junction");
+
+        let findings = user_specs_for_users(
+            vec![profile.clone()],
+            Instant::now() + Duration::from_secs(10),
+        );
+        assert!(
+            findings.is_empty(),
+            "a reparse AppData root must not be inspected"
+        );
+
+        std::fs::remove_dir(&local).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        let cache_target = target.join("Cache");
+        std::fs::create_dir_all(&cache_target).unwrap();
+        std::fs::File::create(cache_target.join("large.bin"))
+            .unwrap()
+            .set_len(MIN_REPORT_BYTES)
+            .unwrap();
+        let cache = local.join("Cache");
+        let status = std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&cache)
+            .arg(&cache_target)
+            .status()
+            .expect("launch mklink");
+        assert!(status.success(), "create child test junction");
+        let findings =
+            user_specs_for_users(vec![profile], Instant::now() + Duration::from_secs(10));
+        assert!(findings.is_empty(), "a reparse child must not be inspected");
+
+        std::fs::remove_dir(&cache).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

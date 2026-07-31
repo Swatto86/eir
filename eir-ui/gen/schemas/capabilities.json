@@ -1,1 +1,1 @@
-{}
+{"main-window":{"identifier":"main-window","description":"Allow the main window to hide to the tray when Escape is pressed.","local":true,"windows":["main"],"permissions":["core:window:allow-hide"]}}

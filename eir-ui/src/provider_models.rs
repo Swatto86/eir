@@ -1,5 +1,8 @@
+use crate::util::run_command_capped;
 use serde_json::Value;
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{collections::HashSet, path::PathBuf, process::Stdio, time::Duration};
+
+const MODEL_OUTPUT_CAP: usize = 2 * 1024 * 1024;
 
 const CLAUDE_MODELS: &[&str] = &[
     "haiku",
@@ -67,25 +70,22 @@ async fn openrouter_models() -> Option<Vec<String>> {
     let mut command = tokio::process::Command::new("powershell.exe");
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
-    let output = tokio::time::timeout(
-        Duration::from_secs(20),
+    let (status, stdout, _) = run_command_capped(
         command
             .args([
                 "-NoProfile",
                 "-Command",
                 "try { @((Invoke-RestMethod -Uri 'https://openrouter.ai/api/v1/models' -TimeoutSec 15).data.id) | ConvertTo-Json -Compress } catch { '' }",
             ])
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output(),
+            .stdin(Stdio::null()),
+        Duration::from_secs(20),
+        MODEL_OUTPUT_CAP,
     )
-    .await
-    .ok()?
-    .ok()?;
-    if !output.status.success() {
+    .await?;
+    if !status.success() {
         return None;
     }
-    let mut models: Vec<String> = serde_json::from_slice::<Vec<String>>(&output.stdout)
+    let mut models: Vec<String> = serde_json::from_slice::<Vec<String>>(&stdout)
         .ok()?
         .into_iter()
         .filter(|id| valid_model_id(id))
@@ -110,21 +110,15 @@ async fn cli_models(binary: &str, args: &[&str]) -> Option<String> {
     };
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
-    let output = tokio::time::timeout(
+    let (status, stdout, _) = run_command_capped(
+        command.args(args).stdin(Stdio::null()),
         Duration::from_secs(30),
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output(),
+        MODEL_OUTPUT_CAP,
     )
-    .await
-    .ok()?
-    .ok()?;
-    output
-        .status
+    .await?;
+    status
         .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+        .then(|| String::from_utf8_lossy(&stdout).into_owned())
 }
 
 fn resolve_binary(name: &str) -> PathBuf {
@@ -170,13 +164,14 @@ fn parse_codex_models(output: &str) -> Option<Vec<String>> {
 }
 
 fn parse_line_models(output: &str) -> Option<Vec<String>> {
-    let mut models: Vec<String> = output
+    let mut seen = HashSet::new();
+    let models: Vec<String> = output
         .lines()
         .map(str::trim)
         .filter(|id| valid_model_id(id))
         .map(str::to_string)
+        .filter(|id| seen.insert(id.clone()))
         .collect();
-    models.dedup();
     (!models.is_empty()).then_some(models)
 }
 
@@ -212,5 +207,11 @@ mod tests {
     fn line_catalog_rejects_logs_and_shell_characters() {
         let models = parse_line_models("kilo/openai/gpt-5.6-sol\nlog line\nbad&id\n").unwrap();
         assert_eq!(models, ["kilo/openai/gpt-5.6-sol"]);
+    }
+
+    #[test]
+    fn line_catalog_removes_non_adjacent_duplicates() {
+        let models = parse_line_models("kilo/a\nkilo/b\nkilo/a\n").unwrap();
+        assert_eq!(models, ["kilo/a", "kilo/b"]);
     }
 }

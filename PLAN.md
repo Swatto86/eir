@@ -1,67 +1,66 @@
-# Eir roadmap — v0.33 burn-in and v0.34 Trust Loop
+# Eir roadmap — v0.34.6
 
-**Current release:** v0.33.0
+**Release line:** v0.34.6
 
-## Now: burn in v0.33
+**Current code:** v0.34.6
 
-Use Eir normally for several days and let at least one scheduled updater cycle complete.
-Do not manufacture dangerous faults or approve disruptive actions solely to exercise them.
+## v0.34.6 release gate
 
-Watch for:
+The implementation sweep and local release gate are complete. The full repository gate,
+real NSIS build, and live self-contained portable workflow passed on Windows. Publication
+still follows the repository's mandatory order:
 
-- **Upgrade integrity:** About shows UI and service version `0.33.0`; no mismatch remains
-  after the service reconnects.
-- **Provider path:** Settings → **Test provider** succeeds through the installed
-  LocalSystem service. Provider/model changes apply live; collector-setting changes return
-  a restart result and reconnect.
-- **Updater truthfulness:** Current / Verified / Failed evidence matches the observed
-  result. Last run and last clean run survive restart, visible degraded coverage remains
-  a warning, and Clear hides displayed history without resetting scheduling fairness.
-- **Durability:** naturally occurring approvals survive restart. If a safe registry undo
-  is encountered, it restores only when the live value still matches Eir's write.
-- **Signal honesty:** collector freshness and errors remain visible; a failed probe does
-  not become a healthy zero.
-- **Game Mode:** scheduled work pauses and resumes with the documented lease/latch
-  behaviour.
+1. Push the release commit and wait for CI to pass on that exact SHA.
+2. Apply the exact
+   `v<manifest-version>` tag. The tag workflow must check out that SHA and rerun its
+   gates; it may publish only after the exact installer `.sig`, updater metadata
+   version/tagged URL/signature, smoke-tested portable executable, and checksums agree.
 
-For a burn-in issue, capture the time, the visible message, UI/service versions, and the
-small relevant excerpt from `eir.log`. Do not include API keys or `config.toml`.
+CI owns the elevated v0.34.5→v0.34.6 Program Files/LocalSystem upgrade check that cannot
+be completed unattended in a non-elevated local session.
 
-The burn-in is complete when normal use has covered an upgrade, a LocalSystem provider
-test, and a scheduled updater cycle without an unexplained outage, lost approval, or false
-clean label that contradicts the cycle's visible evidence.
+## What v0.34.6 closes
 
-## Next: v0.34 Trust Loop
+- Service installation and upgrade are confined to protected Program Files paths,
+  reject reparse/hardlink tricks, hold each validated migration source against mutation
+  through the copy, and retain a recoverable prior service across an interrupted
+  in-place upgrade. Uninstall removes only validated Eir paths without traversing
+  reparse points.
+- Privileged user work is bound to the sole active desktop session. CLI providers,
+  Winget, file discovery, and disk scans no longer search or traverse unrelated profiles
+  as LocalSystem.
+- The named pipe authenticates both peers and bounds inbound/outbound frames. AI/Ask,
+  status, config, audit, subprocess, and updater data also have explicit size/count limits.
+- Approval recovery is fail-safe: an accepted row interrupted before durable completion
+  returns to pending for fresh approval instead of replaying automatically.
+- Updater/executor paths fail closed on ambiguous app identity, unsafe installer or
+  verification paths, protected process targets, no-effect operations, and failed
+  uninstall exit codes.
+- Installer and portable artifacts carry a pinned, hash-checked, signed fixed WebView2
+  runtime. Only the CAB is cached; each build re-extracts and authenticates a fresh
+  runtime before packaging. The portable is a single self-extracting executable with a
+  one-per-session, default-token foreground service, a random mutually authenticated
+  same-user pipe, runner-liveness shutdown, and persistent
+  `%LOCALAPPDATA%\EirPortable` state. It does not alter autostart or invoke the installed
+  updater/restart paths. Static CRT linkage plus an import gate keeps unshipped MSVC and
+  WebView2 loader DLLs out of its runtime prerequisites.
 
-Priority order:
+## After v0.34.6
 
-1. **Upgrade CI gate.** Install the previous release, seed representative config/database
-   state, upgrade to the candidate, and prove migrations, preserved settings, service
-   restart, and a correlated protocol-v2 command on the exact release commit.
-2. **Structured action receipts.** Persist accepted → executed → verified outcomes and add
-   guarded undo for startup and task toggles. Undo must compare live state with Eir's
-   applied state before restoring; no generic undo abstraction.
-3. **Better learning inputs.** Feed verified executor postconditions into conservative
-   learning beyond service fixes. Learning may still only skip, deprioritise, or reduce
-   confidence—never expand authority.
-4. **Updater publisher identity.** Anchor expected publisher identity in signed installed
-   software or a curated local mapping rather than an AI claim. Keep Scoop disabled under
-   LocalSystem unless a safe active-user broker is justified.
-5. **Versioned config migration.** Add an explicit schema version and preserve unknown keys
-   across saves before configuration evolves further.
+Keep the next work narrow and evidence-led:
 
-Only add a redacted diagnostic export if burn-in shows that manual evidence collection is
-materially inadequate.
+1. Anchor native-updater publisher identity in signed installed software or a curated
+   local mapping instead of an AI claim.
+2. Add an explicit config schema version and preserve unknown keys before the format
+   evolves further.
+3. Add guarded durable undo receipts for startup and task toggles only when their live
+   state can be compared safely with Eir's applied state.
 
-## Non-goals during burn-in
-
-- No new repair-action families or wider auto-approval.
-- No remote-control surface, plugin system, or general-purpose shell authority.
-- No policy auto-tuning that can make Eir more aggressive.
+Do not add remote control, a plugin system, general-purpose shell authority, new repair
+families, or policy tuning that can expand automatic authority.
 
 ## Release gate
 
-Each behavioural fix starts with a failing regression test. A candidate is ready only when
-formatting, clippy, all-target tests, version checks, fresh-install and upgrade service
-gates, the packaged WebView workflow, and standalone executable smoke tests pass on the
-exact commit to be tagged.
+Every behavioural fix starts with a failing regression check. A candidate is ready only
+when the full local gate, packaged upgrade, real WebView workflow, standalone executable
+smoke, and exact-SHA CI all pass. CI must pass before the tag that starts publication.

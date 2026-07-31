@@ -224,6 +224,12 @@ pub fn deterministic_next(ctx: &StepContext) -> NextStep {
     if ctx.failed.is_terminal() {
         return NextStep::GiveUp("integrity check failed".to_string());
     }
+    if ctx.failed == ErrorCategory::NeedsReboot {
+        return NextStep::GiveUp("reboot required".to_string());
+    }
+    if ctx.failed == ErrorCategory::AlreadyCurrent {
+        return NextStep::GiveUp("already current".to_string());
+    }
     match ctx.available.iter().find(|m| !ctx.tried.contains(m)) {
         Some(&m) => NextStep::SwitchTo(m),
         None => NextStep::GiveUp("all available methods tried".to_string()),
@@ -239,6 +245,18 @@ pub fn deterministic_next(ctx: &StepContext) -> NextStep {
 pub fn validate_next_step(proposed: ProposedStep, ctx: &StepContext) -> NextStep {
     if ctx.failed.is_terminal() {
         return NextStep::GiveUp("integrity check failed".to_string());
+    }
+    if ctx.failed == ErrorCategory::AlreadyCurrent
+        || (ctx.failed == ErrorCategory::NeedsReboot
+            && !matches!(
+                &proposed,
+                ProposedStep::Retry {
+                    remedy: Remedy::RetryAfterReboot,
+                    ..
+                }
+            ))
+    {
+        return deterministic_next(ctx);
     }
     match proposed {
         ProposedStep::GiveUp { reason } => {
@@ -269,10 +287,17 @@ pub fn validate_next_step(proposed: ProposedStep, ctx: &StepContext) -> NextStep
 /// Whether a remedy is valid for the method and the failure that prompted it.
 fn remedy_ok(remedy: &Remedy, method: Method, ctx: &StepContext) -> bool {
     match remedy {
-        Remedy::Force => method.supports_force(),
-        Remedy::ClearManagerLock => method.has_manager_lock(),
+        Remedy::Force => ctx.failed == ErrorCategory::NeedsForce && method.supports_force(),
+        Remedy::ClearManagerLock => {
+            ctx.failed == ErrorCategory::LockHeld && method.has_manager_lock()
+        }
         Remedy::RetryAfterReboot => ctx.failed == ErrorCategory::NeedsReboot,
         Remedy::KillProcess { name } => {
+            if ctx.failed != ErrorCategory::LockHeld
+                || crate::executor::process::validate_kill_target(name).is_err()
+            {
+                return false;
+            }
             let n = name.trim().to_ascii_lowercase();
             let stem = n.strip_suffix(".exe").unwrap_or(&n);
             if stem.len() < 5 {
@@ -523,6 +548,102 @@ mod tests {
             ),
             NextStep::SwitchTo(Method::Choco)
         );
+    }
+
+    #[test]
+    fn remedies_require_the_failure_they_are_meant_to_fix() {
+        let force = StepContext {
+            failed: ErrorCategory::InstallerFailed,
+            tried: &[Method::Winget],
+            available: &[Method::Winget],
+            error_text: "installer exited with code 1",
+        };
+        assert!(matches!(
+            validate_next_step(
+                ProposedStep::Retry {
+                    method: Method::Winget,
+                    remedy: Remedy::Force,
+                },
+                &force
+            ),
+            NextStep::GiveUp(_)
+        ));
+
+        let lock = StepContext {
+            failed: ErrorCategory::NetworkTransient,
+            tried: &[Method::Choco],
+            available: &[Method::Choco],
+            error_text: "connection failed while firefox.exe was open",
+        };
+        for remedy in [
+            Remedy::ClearManagerLock,
+            Remedy::KillProcess {
+                name: "firefox.exe".into(),
+            },
+        ] {
+            assert!(matches!(
+                validate_next_step(
+                    ProposedStep::Retry {
+                        method: Method::Choco,
+                        remedy,
+                    },
+                    &lock
+                ),
+                NextStep::GiveUp(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn pending_reboot_never_switches_to_another_installer() {
+        let ctx = StepContext {
+            failed: ErrorCategory::NeedsReboot,
+            tried: &[Method::Winget],
+            available: &[Method::Winget, Method::Choco],
+            error_text: "restart required",
+        };
+        assert!(matches!(deterministic_next(&ctx), NextStep::GiveUp(_)));
+        assert!(matches!(
+            validate_next_step(
+                ProposedStep::Switch {
+                    method: Method::Choco,
+                },
+                &ctx
+            ),
+            NextStep::GiveUp(_)
+        ));
+        assert_eq!(
+            validate_next_step(
+                ProposedStep::Retry {
+                    method: Method::Winget,
+                    remedy: Remedy::RetryAfterReboot,
+                },
+                &ctx
+            ),
+            NextStep::RetryWith(Method::Winget, Remedy::RetryAfterReboot)
+        );
+    }
+
+    #[test]
+    fn lock_remedy_cannot_kill_a_protected_process() {
+        let ctx = StepContext {
+            failed: ErrorCategory::LockHeld,
+            tried: &[Method::Winget],
+            available: &[Method::Winget],
+            error_text: "installer is locked by lsass.exe",
+        };
+        assert!(matches!(
+            validate_next_step(
+                ProposedStep::Retry {
+                    method: Method::Winget,
+                    remedy: Remedy::KillProcess {
+                        name: "lsass.exe".into(),
+                    },
+                },
+                &ctx
+            ),
+            NextStep::GiveUp(_)
+        ));
     }
 
     #[test]

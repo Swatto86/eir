@@ -15,14 +15,14 @@ use crate::models::{ExecutionResult, FixAction};
 use tracing::{error, info};
 
 fn build_disk_cleanup_script(target: &str) -> Option<String> {
-    let (root, label) = match target.to_ascii_lowercase().as_str() {
-        "temp" | "tmp" => (r"C:\Windows\Temp", "Temp folder"),
-        "prefetch" => (r"C:\Windows\Prefetch", "Prefetch"),
+    let (subdir, label) = match target.to_ascii_lowercase().as_str() {
+        "temp" | "tmp" => ("Temp", "Temp folder"),
+        "prefetch" => ("Prefetch", "Prefetch"),
         _ => return None,
     };
-    let root = powershell::ps_single_quote(root);
+    let subdir = powershell::ps_single_quote(subdir);
     Some(format!(
-        "$ErrorActionPreference='Stop'; $root={root}; \
+        "$ErrorActionPreference='Stop'; $root=Join-Path $env:SystemRoot {subdir}; \
          if (-not (Test-Path -LiteralPath $root -PathType Container -ErrorAction Stop)) {{ \
            Write-Output '{label} is already empty'; return \
          }}; \
@@ -232,7 +232,8 @@ mod tests {
     #[test]
     fn cleanup_and_network_scripts_fail_when_native_effects_fail() {
         let cleanup = build_disk_cleanup_script("temp").expect("known target");
-        assert!(cleanup.contains("C:\\Windows\\Temp"));
+        assert!(cleanup.contains("$env:SystemRoot"));
+        assert!(!cleanup.contains("C:\\Windows"));
         assert!(cleanup.contains("Test-Path"));
         assert!(cleanup.contains("$removed -eq 0"));
         assert!(!cleanup.contains("SilentlyContinue"));

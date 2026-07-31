@@ -13,6 +13,7 @@ mod models;
 mod pipe_server;
 mod policy;
 mod safety;
+mod service_install;
 mod session;
 mod signals;
 mod startup_scan;
@@ -29,16 +30,15 @@ use models::{
 use sqlx::SqlitePool;
 use std::{
     collections::{HashSet, VecDeque},
-    ffi::OsString,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 use windows_service::{
     define_windows_service,
     service::{
-        ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-        ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+        ServiceAccess, ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState,
+        ServiceStatus, ServiceType,
     },
     service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher,
@@ -62,6 +62,12 @@ fn svc_main(_arguments: Vec<std::ffi::OsString>) {
 // service to degrade into, and SCM reports the failure to the event log.
 #[allow(clippy::expect_used)]
 fn run_service() -> windows_service::Result<()> {
+    service_install::validate_current_binary().map_err(|error| {
+        windows_service::Error::Winapi(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing insecure service registration: {error:#}"),
+        ))
+    })?;
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_signal = shutdown.clone();
 
@@ -113,15 +119,18 @@ fn run_service() -> windows_service::Result<()> {
         .build()
         .expect("Tokio runtime");
 
-    rt.block_on(eir_main(async move {
-        // Poll the atomic flag until Stop/Shutdown is received
-        loop {
-            if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-                return;
+    rt.block_on(eir_main(
+        async move {
+            // Poll the atomic flag until Stop/Shutdown is received
+            loop {
+                if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-    }));
+        },
+        None,
+    ));
 
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -141,28 +150,8 @@ fn run_service() -> windows_service::Result<()> {
 // service to keep alive yet and no caller to hand an error to.
 #[allow(clippy::expect_used)]
 fn install_service() {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::ALL_ACCESS)
-        .expect("Failed to connect to service manager (run as Administrator)");
-    let exe_path = std::env::current_exe().expect("Cannot get executable path");
-    let svc_info = ServiceInfo {
-        name: SERVICE_NAME.into(),
-        display_name: SERVICE_DISPLAY.into(),
-        service_type: ServiceType::OWN_PROCESS,
-        start_type: ServiceStartType::AutoStart,
-        error_control: ServiceErrorControl::Normal,
-        executable_path: exe_path,
-        launch_arguments: vec![],
-        dependencies: vec![],
-        account_name: None, // LocalSystem
-        account_password: None,
-    };
-    let svc = manager
-        .create_service(&svc_info, ServiceAccess::ALL_ACCESS)
-        .expect("Failed to create service");
-    svc.set_description("Autonomous Windows system repair agent powered by AI")
-        .expect("Failed to set description");
-    svc.start(&[] as &[OsString])
-        .expect("Failed to start service");
+    service_install::install_or_update(SERVICE_NAME, SERVICE_DISPLAY)
+        .expect("Failed to securely install or update service");
     println!("{SERVICE_NAME} installed and started.");
     println!("Stop it with: sc stop {SERVICE_NAME}");
 }
@@ -180,6 +169,46 @@ fn uninstall_service() {
     println!("{SERVICE_NAME} uninstalled.");
 }
 
+fn validated_portable_sentinel_at(sentinel: &Path, executable: &Path) -> Option<PathBuf> {
+    if sentinel.file_name()?.to_string_lossy() != "eir-portable.running" {
+        return None;
+    }
+    let sentinel = executor::logs::checked_local_path(sentinel).ok()??;
+    let executable = executor::logs::checked_local_path(executable).ok()??;
+    sentinel
+        .parent()?
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&executable.parent()?.to_string_lossy())
+        .then_some(sentinel)
+}
+
+fn validated_portable_sentinel(value: &str) -> Option<PathBuf> {
+    validated_portable_sentinel_at(Path::new(value), &std::env::current_exe().ok()?)
+}
+
+fn validated_portable_pipe_name(value: &str) -> Option<String> {
+    const PREFIX: &str = r"\\.\pipe\EirSvcPortable-";
+    let nonce = value.strip_prefix(PREFIX)?;
+    (nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| value.to_string())
+}
+
+fn validated_portable_state_root_at(value: &Path, local_app_data: &Path) -> Option<PathBuf> {
+    let value = executor::logs::checked_local_path(value).ok()??;
+    let expected =
+        executor::logs::checked_local_path(&local_app_data.join("EirPortable")).ok()??;
+    (value.is_dir()
+        && value
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&expected.to_string_lossy()))
+    .then_some(value)
+}
+
+fn validated_portable_state_root(value: &str) -> Option<PathBuf> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")?;
+    validated_portable_state_root_at(Path::new(value), Path::new(&local_app_data))
+}
+
 // Standalone-mode runtime build is fail-fast — see `run_service`.
 #[allow(clippy::expect_used)]
 fn main() {
@@ -187,6 +216,49 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("install") => install_service(),
         Some("uninstall") => uninstall_service(),
+        Some("portable") => {
+            if !pipe_server::current_process_portable_allowed() {
+                eprintln!("portable mode refuses split-token elevation or LocalSystem execution");
+                std::process::exit(2);
+            }
+            let Some(sentinel) = args
+                .get(2)
+                .and_then(|value| validated_portable_sentinel(value))
+            else {
+                eprintln!("portable mode requires the trusted sibling sentinel");
+                std::process::exit(2);
+            };
+            let Some(pipe_name) = args
+                .get(3)
+                .and_then(|value| validated_portable_pipe_name(value))
+            else {
+                eprintln!("portable mode requires a private pipe name");
+                std::process::exit(2);
+            };
+            let Some(state_root) = args
+                .get(4)
+                .and_then(|value| validated_portable_state_root(value))
+            else {
+                eprintln!("portable mode requires its trusted persistent state directory");
+                std::process::exit(2);
+            };
+            if let Err(error) = config::set_runtime_root(state_root) {
+                eprintln!("portable mode could not configure its state directory: {error}");
+                std::process::exit(2);
+            }
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("Tokio runtime");
+            rt.block_on(eir_main(
+                async move {
+                    while tokio::fs::symlink_metadata(&sentinel).await.is_ok() {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                },
+                Some(pipe_name),
+            ));
+        }
         _ => {
             // Try SCM dispatch; on failure run standalone (development / debugging).
             if service_dispatcher::start(SERVICE_NAME, ffi_service_main).is_err() {
@@ -195,11 +267,84 @@ fn main() {
                     .build()
                     .expect("Tokio runtime");
                 // Standalone: run until Ctrl-C
-                rt.block_on(eir_main(async {
-                    let _ = tokio::signal::ctrl_c().await;
-                }));
+                rt.block_on(eir_main(
+                    async {
+                        let _ = tokio::signal::ctrl_c().await;
+                    },
+                    None,
+                ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod portable_mode_tests {
+    use super::*;
+
+    #[test]
+    fn portable_sentinel_must_be_a_regular_sibling_of_the_service() {
+        let root =
+            std::env::temp_dir().join(format!("eir-portable-sentinel-{}", std::process::id()));
+        let other = root.join("other");
+        let service = root.join("eir-svc.exe");
+        let sentinel = root.join("eir-portable.running");
+        let outside = other.join("eir-portable.running");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(&service, b"test").unwrap();
+        std::fs::write(&sentinel, b"running").unwrap();
+        std::fs::write(&outside, b"running").unwrap();
+
+        assert_eq!(
+            validated_portable_sentinel_at(&sentinel, &service),
+            std::fs::canonicalize(&sentinel).ok()
+        );
+        assert_eq!(validated_portable_sentinel_at(&outside, &service), None);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn portable_pipe_name_is_random_and_bounded() {
+        assert!(validated_portable_pipe_name(
+            r"\\.\pipe\EirSvcPortable-0123456789abcdef0123456789abcdef"
+        )
+        .is_some());
+        assert!(validated_portable_pipe_name(eir_proto::PIPE_NAME).is_none());
+        assert!(validated_portable_pipe_name(
+            r"\\.\pipe\EirSvcPortable-0123456789abcdef0123456789abcde!"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn portable_state_root_is_exact_local_app_data_directory() {
+        let root = std::env::temp_dir().join(format!("eir-portable-state-{}", std::process::id()));
+        let local_app_data = root.join("AppData").join("Local");
+        let expected = local_app_data.join("EirPortable");
+        let outside = local_app_data.join("Other");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&expected).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        assert_eq!(
+            validated_portable_state_root_at(&expected, &local_app_data),
+            std::fs::canonicalize(&expected).ok()
+        );
+        assert_eq!(
+            validated_portable_state_root_at(&outside, &local_app_data),
+            None
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn portable_settings_never_invoke_the_installed_service_restart() {
+        assert!(should_restart_service_after_settings(true, false));
+        assert!(!should_restart_service_after_settings(true, true));
+        assert!(!should_restart_service_after_settings(false, false));
     }
 }
 
@@ -361,7 +506,11 @@ fn apply_set_gaming(st: &mut SvcState, on: bool, manual: bool, now: i64, lease_s
             st.gaming_until = 0;
         }
     } else {
-        st.gaming_until = if on { now + lease_secs } else { 0 };
+        st.gaming_until = if on {
+            now.saturating_add(lease_secs)
+        } else {
+            0
+        };
     }
 }
 
@@ -374,7 +523,7 @@ fn updater_due(enabled: bool, interval_secs: i64, last_run: i64, st: &SvcState, 
         && !st.paused
         && !st.updater_running
         && !is_gaming_at(st, now)
-        && (last_run == 0 || now - last_run >= interval_secs)
+        && (last_run == 0 || now.saturating_sub(last_run) >= interval_secs)
 }
 
 fn failed_update_for_retry(
@@ -386,6 +535,10 @@ fn failed_update_for_retry(
             .find(|app| app.id.eq_ignore_ascii_case(id) && app.state == "failed")
             .cloned()
     })?
+}
+
+fn should_restart_service_after_settings(needs_restart: bool, portable_mode: bool) -> bool {
+    needs_restart && !portable_mode
 }
 
 /// Restart the service to apply new settings: a detached helper waits for this
@@ -410,6 +563,7 @@ fn restart_self() -> bool {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     let log = config::resolve("eir-restart.log");
+    let log_q = crate::executor::powershell::ps_single_quote(&log.to_string_lossy());
     let script = format!(
         "& {{ Get-Date -Format o; \
          $d=(Get-Date).AddSeconds(60); \
@@ -423,8 +577,7 @@ fn restart_self() -> bool {
              Start-Sleep -Seconds 1 }}; \
          Get-Date -Format o; \
          Get-Service EirSvc -ErrorAction SilentlyContinue | Format-List Name,Status,StartType }} \
-         *> '{}'",
-        log.display()
+         *> {log_q}",
     );
     match std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -444,6 +597,85 @@ fn restart_self() -> bool {
 
 fn startup_owner_matches(owner_sid: Option<&str>, active_sid: Option<&str>) -> bool {
     matches!((owner_sid, active_sid), (Some(owner), Some(active)) if owner.eq_ignore_ascii_case(active))
+}
+
+fn optional_sids_match(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        _ => false,
+    }
+}
+
+fn watch_roots_need_clearing(owner_sid: Option<&str>, active_sid: Option<&str>) -> bool {
+    owner_sid.is_some() && !optional_sids_match(owner_sid, active_sid)
+}
+
+fn discover_watch_dirs_for_stable_user(extra: &[String]) -> Option<(String, Vec<PathBuf>)> {
+    let before = executor::startup::active_user_sid().ok()?;
+    let directories = signals::file_watch::discover_watch_dirs(extra)?;
+    let after = executor::startup::active_user_sid().ok()?;
+    before
+        .eq_ignore_ascii_case(&after)
+        .then_some((before, directories))
+}
+
+async fn abort_task<T>(handle: tokio::task::JoinHandle<T>) {
+    handle.abort();
+    let _ = handle.await;
+}
+
+fn spawn_watch_session_reconciler(
+    mut owner_sid: Option<String>,
+    extra: Vec<String>,
+    updates: signals::file_watch::DirUpdateSender,
+) {
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let current =
+                match tokio::task::spawn_blocking(|| executor::startup::active_user_sid().ok())
+                    .await
+                {
+                    Ok(sid) => sid,
+                    Err(error) => {
+                        warn!("Active-user watcher check failed: {error}");
+                        continue;
+                    }
+                };
+            if optional_sids_match(owner_sid.as_deref(), current.as_deref()) {
+                continue;
+            }
+            // Stop observing the previous user's roots before discovery. Discovery
+            // may transiently fail during sign-in; retaining old SYSTEM watches
+            // during that retry window would cross the session boundary.
+            if watch_roots_need_clearing(owner_sid.as_deref(), current.as_deref()) {
+                if updates.send(Vec::new()).is_err() {
+                    break;
+                }
+                owner_sid = None;
+            }
+            let Some(expected_sid) = current else {
+                continue;
+            };
+            let extra = extra.clone();
+            let discovery =
+                tokio::task::spawn_blocking(move || discover_watch_dirs_for_stable_user(&extra))
+                    .await;
+            let Ok(Some((discovered_sid, directories))) = discovery else {
+                continue;
+            };
+            if !expected_sid.eq_ignore_ascii_case(&discovered_sid) {
+                continue;
+            }
+            if updates.send(directories).is_err() {
+                break;
+            }
+            owner_sid = Some(discovered_sid);
+        }
+    });
 }
 
 fn clear_stale_startup_cache(st: &mut SvcState, active_sid: Option<&str>) -> bool {
@@ -559,7 +791,7 @@ fn spawn_update_cycle(
     progress_tx: &updater::orchestrator::ProgressTx,
     retry: Option<eir_proto::UpdaterAppRow>,
 ) {
-    let ai = ai::client::AiClient::new(&cfg.api).ok();
+    let api = cfg.api.clone();
     let updater_cfg = cfg.updater.clone();
     let model = cfg.api.update_check_model.clone();
     let pool = db.clone();
@@ -578,6 +810,7 @@ fn spawn_update_cycle(
         // and `updater_running` is released, so the updater can never latch "running"
         // forever and wedge every future cycle.
         let mut inner = tokio::spawn(async move {
+            let ai = ai::client::AiClient::new(&api).await.ok();
             let ctx = updater::orchestrator::EngineCtx {
                 ai: ai.as_ref(),
                 config: &updater_cfg,
@@ -602,7 +835,7 @@ fn spawn_update_cycle(
                 learned_guidance: None,
             },
             Err(_elapsed) => {
-                inner.abort();
+                abort_task(inner).await;
                 updater::orchestrator::CycleSummary {
                     results: Vec::new(),
                     notes: vec![format!(
@@ -1006,7 +1239,7 @@ async fn route_user_action(
                 undo_instructions: String::new(),
                 action_summary: explanation.summary,
                 target: explanation.target,
-                target_details: explain::target_details(&action),
+                target_details: explain::target_details(&action).await,
                 reversible: explanation.reversible,
                 created_at: chrono::Utc::now().timestamp(),
             };
@@ -1146,7 +1379,7 @@ fn push_execution(
 
 // ── Decision loop ─────────────────────────────────────────────────────────────
 
-async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
+async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pipe: Option<String>) {
     // Log to a file next to the executable. A Windows service has no console, so
     // stdout is discarded — the file is the only way to see what the service did.
     let log_dir = config::resolve(".");
@@ -1164,7 +1397,11 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         .with_target(false)
         .init();
 
-    let (pipe, mut ui_rx) = pipe_server::spawn();
+    let portable_mode = portable_pipe.is_some();
+    let (pipe, mut ui_rx) = match portable_pipe {
+        Some(pipe_name) => pipe_server::spawn_portable(pipe_name),
+        None => pipe_server::spawn(),
+    };
     let mut st = SvcState::default();
 
     macro_rules! fatal {
@@ -1211,9 +1448,20 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     // Crash-safe Game Mode power restore: if the service died mid-game with a boosted power
     // plan, the pre-boost scheme GUID is persisted — restore it now.
     game_mode::restore(&db).await;
+    // Power-plan edges must run in the same order the decision loop observes them.
+    // Spawning each edge independently let a rapid on→off race restore first and then
+    // apply the boost, potentially leaving High Performance active with no saved undo.
+    let (game_mode_edge_tx, mut game_mode_edge_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(bool, bool)>();
+    let game_mode_db = db.clone();
+    let game_mode_edge_handle = tokio::spawn(async move {
+        while let Some((power_boost, on)) = game_mode_edge_rx.recv().await {
+            game_mode::on_gaming_edge(power_boost, on, &game_mode_db).await;
+        }
+    });
     // Seed the updater status from config + history, and clear any stale install
     // staging left by a previous run.
-    updater::download::cleanup_stale_staging();
+    updater::download::cleanup_stale_staging_async().await;
     st.updater = UpdaterStatus {
         enabled: cfg.updater.enabled,
         settings: cfg.updater.to_view(),
@@ -1281,14 +1529,14 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     if let Ok(Some((text, at))) = audit::latest_digest(&db).await {
         st.last_digest_at = at;
         st.digest = Some(eir_proto::DigestView {
-            text,
+            text: digest::bound_digest(text),
             generated_at: at,
         });
     }
     // A bad AI config must NOT kill the service — degrade instead, so the pipe
     // and UI stay alive and the user can fix it in Settings.
     let mut ai: Option<std::sync::Arc<ai::client::AiClient>> =
-        match ai::client::AiClient::new(&cfg.api) {
+        match ai::client::AiClient::new(&cfg.api).await {
             Ok(c) => Some(std::sync::Arc::new(c)),
             Err(e) => {
                 error!("AI client init failed: {e}");
@@ -1310,12 +1558,16 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         cfg.monitoring.event_log_poll_interval_secs,
         trigger_tx.clone(),
     );
-    let extra_log_dirs = cfg.monitoring.log_directories.clone();
-    let initial_watch_dirs = tokio::task::spawn_blocking(move || {
-        signals::file_watch::discover_watch_dirs(&extra_log_dirs)
-    })
-    .await
-    .unwrap_or_default();
+    let watch_extra_dirs = cfg.monitoring.log_directories.clone();
+    let initial_extra = watch_extra_dirs.clone();
+    let initial_watch =
+        tokio::task::spawn_blocking(move || discover_watch_dirs_for_stable_user(&initial_extra))
+            .await
+            .ok()
+            .flatten();
+    let (initial_watch_sid, initial_watch_dirs) = initial_watch
+        .map(|(sid, directories)| (Some(sid), directories))
+        .unwrap_or_default();
     info!(
         count = initial_watch_dirs.len(),
         "Log directories auto-discovered"
@@ -1323,6 +1575,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     let mut known_watch_dirs: HashSet<PathBuf> = initial_watch_dirs.iter().cloned().collect();
     let (file_watch_shared, _fw_shutdown, dir_update_tx) =
         signals::file_watch::spawn(initial_watch_dirs, trigger_tx.clone());
+    spawn_watch_session_reconciler(initial_watch_sid, watch_extra_dirs, dir_update_tx.clone());
     let (wmi_shared, _wmi_shutdown) =
         signals::wmi::spawn(cfg.monitoring.wmi_poll_interval_secs, trigger_tx);
 
@@ -1339,6 +1592,23 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     if let Ok(s) = audit::usage_summary(&db).await {
         st.usage = Some(s);
     }
+    // An `approved` row may already have produced an external side effect before a
+    // crash. Replaying it cannot be made transactionally at-most-once, so require a
+    // fresh click after every restart.
+    match audit::requeue_claimed_approvals_on_startup(&db).await {
+        Ok(count) if count > 0 => {
+            warn!(
+                count,
+                "Requeued interrupted approved actions for fresh user approval"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!("Failed to recover interrupted approvals: {e}");
+            st.status = "Error".to_string();
+            st.error = Some(format!("Interrupted approvals could not be recovered: {e}"));
+        }
+    }
     // Restore approvals queued before the last restart (e.g. a settings change)
     // so the user can still act on them — they are not lost on restart.
     match audit::load_pending_approvals(&db).await {
@@ -1353,14 +1623,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         }
         Err(e) => warn!("Failed to load pending approvals: {e}"),
     }
-    let claimed_approvals = match audit::load_claimed_approvals(&db).await {
-        Ok(approvals) => approvals,
-        Err(e) => {
-            warn!("Failed to load claimed approvals: {e}");
-            Vec::new()
-        }
-    };
-    if ai.is_some() {
+    if ai.is_some() && st.error.is_none() {
         st.status = resting_status(&st);
     }
     pipe.broadcast_status(build_status(&st));
@@ -1387,51 +1650,6 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
     // blocking ui_rx on the restore's PowerShell call.
     let undo_done_tx = exec_done_tx.clone();
     let exec_handle = spawn_executor(&db, exec_rx, exec_done_tx);
-    for approval in claimed_approvals {
-        let id = approval.info.id;
-        let key = approval.action.dedup_key();
-        match approved_action_ready(&pol, &db, &approval).await {
-            Ok(()) if st.in_flight.insert(key.clone()) => {
-                let label = approval.info.action.clone();
-                if let Err(e) = exec_tx.send(ExecJob {
-                    action: approval.action,
-                    decision_id: approval.decision_id,
-                    baseline: approval.baseline,
-                    key: key.clone(),
-                    label,
-                    diagnosis: approval.info.diagnosis,
-                    confidence: approval.info.confidence,
-                    reason: Some("approved before service restart".into()),
-                    approval_id: Some(id),
-                }) {
-                    st.in_flight.remove(&key);
-                    warn!("Could not restore approved action {id}: {e}");
-                }
-            }
-            Ok(()) => {
-                info!(id, "Dropping duplicate claimed approval");
-                let _ = audit::delete_pending_approval(&db, id).await;
-            }
-            Err(ApprovalPreflightError::Resolved(reason)) => {
-                warn!(id, %reason, "Claimed approval no longer passes safety preflight");
-                let _ = audit::delete_pending_approval(&db, id).await;
-            }
-            Err(ApprovalPreflightError::Retry(reason)) => {
-                warn!(id, %reason, "Claimed approval safety preflight could not complete");
-                st.status = "Error".to_string();
-                st.error = Some(format!(
-                    "Approved action {id} is saved but could not pass safety checks: {reason}"
-                ));
-                pipe.broadcast_status(build_status(&st));
-            }
-        }
-    }
-    if !st.in_flight.is_empty() {
-        if st.status != "Error" {
-            st.status = resting_status(&st);
-        }
-        pipe.broadcast_status(build_status(&st));
-    }
     // AI analysis (and its optional advisor escalation) runs off the loop too — see
     // the analysis_done_rx arm below — so a multi-minute call never delays ui_rx.
     let (analysis_done_tx, mut analysis_done_rx) =
@@ -1546,7 +1764,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 .set_learned_guidance(&learning.id, &learning.note)
                             {
                                 Ok(_) => {
-                                    if let Err(e) = config::save(&next, "config.toml") {
+                                    if let Err(e) = config::save_async(&next, "config.toml").await {
                                         warn!("Failed to save learned update guidance: {e}");
                                         summary.notes.push(format!(
                                             "The update succeeded, but its guidance could not be learned: {e}"
@@ -1611,7 +1829,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             st.updater.recent = recent;
                         }
                         st.updater.next_run = if cfg.updater.enabled {
-                            st.updater.last_run + cfg.updater.schedule_interval_secs as i64
+                            st.updater
+                                .last_run
+                                .saturating_add(cfg.updater.schedule_interval_secs as i64)
                         } else {
                             0
                         };
@@ -1756,7 +1976,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 }
                                 st.ask_entries.push_front(eir_proto::AskEntry {
                                     question,
-                                    answer,
+                                    answer: ask::bound_answer(answer),
                                     at: chrono::Utc::now().timestamp(),
                                     attachments,
                                 });
@@ -2105,7 +2325,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                         undo_instructions: problem.undo_instructions.clone(),
                                         action_summary:    explanation.summary,
                                         target:            explanation.target,
-                                        target_details:    explain::target_details(&action),
+                                        target_details:    explain::target_details(&action).await,
                                         reversible:        explanation.reversible,
                                         created_at:        chrono::Utc::now().timestamp(),
                                     };
@@ -2221,27 +2441,20 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             // manual latch is still set must NOT restore power mid-game.
                             // (A manual off clears both inputs, so it does restore.)
                             let is_now = is_gaming_at(&st, now);
-                            // Drive the power plan off-loop — powercfg can take up to 10s and
-                            // this arm shares the single decision-loop select! with every
-                            // other UI command / ticker, so it must never block inline.
+                            // Queue power-plan edges off-loop — powercfg can take up to 10s,
+                            // and the single worker preserves rapid on/off ordering.
                             if !was && is_now {
                                 // Gaming started: apply the power boost (Phase 2, only if the
                                 // opt-in setting is on). Applied once per session.
                                 was_gaming = true;
                                 let power_boost = cfg.monitoring.game_mode_power_boost;
-                                let db_g = db.clone();
-                                tokio::spawn(async move {
-                                    game_mode::on_gaming_edge(power_boost, true, &db_g).await;
-                                });
+                                let _ = game_mode_edge_tx.send((power_boost, true));
                             } else if was && !is_now {
                                 // Gaming ended: restore the power plan (a no-op if not
                                 // boosted), and force a fresh analysis (an unchanged
                                 // fingerprint would otherwise be idle-skipped) + a prompt
                                 // reaction, so anything noticed during the game is handled now.
-                                let db_g = db.clone();
-                                tokio::spawn(async move {
-                                    game_mode::on_gaming_edge(false, false, &db_g).await;
-                                });
+                                let _ = game_mode_edge_tx.send((false, false));
                                 was_gaming = false;
                                 last_fingerprint = None;
                                 if react_at.is_none() {
@@ -2270,7 +2483,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 command_result =
                                     Err("A provider test is already running".to_string());
                             } else {
-                            match ai::client::AiClient::new(&cfg.api) {
+                            match ai::client::AiClient::new(&cfg.api).await {
                                 Err(e) => {
                                     provider_test_running
                                         .store(false, std::sync::atomic::Ordering::Release);
@@ -2323,10 +2536,11 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         UiMsg::UpdateSettings(update) => {
                             let needs_restart = cfg.settings_update_needs_restart(&update);
                             let mut next = cfg.clone();
-                            match next
-                                .apply_update(*update)
-                                .and_then(|()| ai::client::AiClient::new(&next.api))
-                            {
+                            let next_ai = match next.apply_update(*update) {
+                                Ok(()) => ai::client::AiClient::new(&next.api).await,
+                                Err(e) => Err(e),
+                            };
+                            match next_ai {
                                 Err(e) => {
                                     warn!("Rejected settings: {e}");
                                     st.error = Some(format!("Settings not applied — {e}"));
@@ -2334,7 +2548,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                     pipe.broadcast_status(build_status(&st));
                                 }
                                 Ok(new_ai) => {
-                                    if let Err(e) = config::save(&next, "config.toml") {
+                                    if let Err(e) = config::save_async(&next, "config.toml").await {
                                         error!("Failed to save settings: {e}");
                                         st.error = Some(format!("Save settings: {e}"));
                                         command_result =
@@ -2359,13 +2573,23 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                             st.error = None;
                                         }
                                         st.status = resting_status(&st);
-                                        command_result = Ok(if needs_restart {
-                                            "Settings saved; restarting service".to_string()
-                                        } else {
-                                            "Settings saved and applied".to_string()
+                                        command_result = Ok(match (needs_restart, portable_mode) {
+                                            (true, true) => {
+                                                "Settings saved; restart portable Eir to apply collector changes"
+                                                    .to_string()
+                                            }
+                                            (true, false) => {
+                                                "Settings saved; restarting service".to_string()
+                                            }
+                                            (false, _) => {
+                                                "Settings saved and applied".to_string()
+                                            }
                                         });
                                         pipe.broadcast_status(build_status(&st));
-                                        if needs_restart {
+                                        if should_restart_service_after_settings(
+                                            needs_restart,
+                                            portable_mode,
+                                        ) {
                                             info!("Settings saved — restarting service to apply collector changes");
                                             st.status = "Restarting".to_string();
                                             pipe.broadcast_status(build_status(&st));
@@ -2603,7 +2827,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         UiMsg::UpdateUpdaterSettings(update) => {
                             let mut next = cfg.clone();
                             next.updater.apply_view(*update);
-                            if let Err(e) = config::save(&next, "config.toml") {
+                            if let Err(e) = config::save_async(&next, "config.toml").await {
                                 warn!("Failed to save updater settings: {e}");
                                 command_result =
                                     Err(format!("Updater settings could not be saved: {e}"));
@@ -2614,11 +2838,13 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 st.updater.next_run = if !cfg.updater.enabled {
                                     0
                                 } else if st.updater.last_run > 0 {
-                                    st.updater.last_run
-                                        + cfg.updater.schedule_interval_secs as i64
+                                    st.updater
+                                        .last_run
+                                        .saturating_add(cfg.updater.schedule_interval_secs as i64)
                                 } else {
-                                    chrono::Utc::now().timestamp()
-                                        + cfg.updater.schedule_interval_secs as i64
+                                    chrono::Utc::now()
+                                        .timestamp()
+                                        .saturating_add(cfg.updater.schedule_interval_secs as i64)
                                 };
                                 command_result = Ok("Updater settings saved".to_string());
                                 pipe.broadcast_status(build_status(&st));
@@ -2660,7 +2886,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                 }
                             }
                             if command_result.is_ok() && changed {
-                                if let Err(e) = config::save(&next, "config.toml") {
+                                if let Err(e) = config::save_async(&next, "config.toml").await {
                                     warn!("Failed to save app setting: {e}");
                                     command_result =
                                         Err(format!("App setting could not be saved: {e}"));
@@ -2703,7 +2929,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             let mut next = cfg.clone();
                             match next.updater.set_app_note(&key, &note) {
                                 Ok(true) => {
-                                    if let Err(e) = config::save(&next, "config.toml") {
+                                    if let Err(e) = config::save_async(&next, "config.toml").await {
                                         warn!("Failed to save app note: {e}");
                                         command_result =
                                             Err(format!("App note could not be saved: {e}"));
@@ -2736,7 +2962,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         UiMsg::SetAdvisorSettings(update) => {
                             let mut next = cfg.clone();
                             next.advisor.apply_view(*update);
-                            if let Err(e) = config::save(&next, "config.toml") {
+                            if let Err(e) = config::save_async(&next, "config.toml").await {
                                 warn!("Failed to save advisor settings: {e}");
                                 command_result =
                                     Err(format!("Advisor settings could not be saved: {e}"));
@@ -2819,13 +3045,15 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             attachments,
                         } => {
                             let now = chrono::Utc::now().timestamp();
-                            if let Some(reason) = ask::ask_rejection_reason(
+                            let rejection = ask::ask_rejection_reason(
                                 &question,
                                 ai.is_some(),
                                 st.ask_running,
                                 st.last_ask_at,
                                 now,
-                            ) {
+                            )
+                            .or_else(|| ask::attachment_rejection_reason(&attachments));
+                            if let Some(reason) = rejection {
                                 refresh_ask(&mut st, Some(reason.to_string()));
                                 command_result = Err(reason.to_string());
                                 pipe.broadcast_status(build_status(&st));
@@ -2947,7 +3175,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                                                 Err("the answer task panicked".to_string())
                                             }
                                             Err(_elapsed) => {
-                                                inner.abort();
+                                                abort_task(inner).await;
                                                 Err("answering timed out".to_string())
                                             }
                                         };
@@ -2956,13 +3184,17 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             }
                         }
                         UiMsg::ClearAsk => {
-                            // Wipe the in-memory history and reset the spend guard so the
-                            // next question starts a fresh conversation.
-                            st.ask_entries.clear();
-                            st.last_ask_at = 0;
-                            refresh_ask(&mut st, None);
-                            command_result = Ok("Ask history cleared".to_string());
-                            pipe.broadcast_status(build_status(&st));
+                            if let Some(reason) = ask::clear_rejection_reason(st.ask_running) {
+                                command_result = Err(reason.to_string());
+                            } else {
+                                // Wipe the in-memory history and reset the spend guard so the
+                                // next question starts a fresh conversation.
+                                st.ask_entries.clear();
+                                st.last_ask_at = 0;
+                                refresh_ask(&mut st, None);
+                                command_result = Ok("Ask history cleared".to_string());
+                                pipe.broadcast_status(build_status(&st));
+                            }
                         }
                         UiMsg::ScanDisk => {
                             // Gate on the scan-in-flight flag and pause (a paused guardian
@@ -3156,25 +3388,22 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                 // Re-discover log directories every 20 cycles
                 if cycle_count.is_multiple_of(20) {
                     let extra = cfg.monitoring.log_directories.clone();
-                    if let Ok(all) = tokio::task::spawn_blocking(move || {
-                        signals::file_watch::discover_watch_dirs(&extra)
+                    if let Ok(Some((_owner_sid, all))) = tokio::task::spawn_blocking(move || {
+                        discover_watch_dirs_for_stable_user(&extra)
                     })
                     .await
                     {
-                        let mut added = 0u32;
-                        for dir in all {
-                            if known_watch_dirs.insert(dir.clone()) {
-                                added += 1;
+                        let replacement: HashSet<PathBuf> = all.iter().cloned().collect();
+                        let added = replacement.difference(&known_watch_dirs).count();
+                        let removed = known_watch_dirs.difference(&replacement).count();
+                        if dir_update_tx.send(all).is_ok() {
+                            known_watch_dirs = replacement;
+                            if added > 0 || removed > 0 {
+                                info!(
+                                    added,
+                                    removed, "Reconciled discovered log directories"
+                                );
                             }
-                            // Send EVERY discovered dir each pass, not just newly-found
-                            // ones, so the watcher re-arms a watch whose OS handle died
-                            // when the directory was deleted+recreated (re-watching an
-                            // already-watched path is a harmless no-op). Gating the send
-                            // on "newly inserted" left a recreated dir dark until restart.
-                            let _ = dir_update_tx.send(dir);
-                        }
-                        if added > 0 {
-                            info!(count = added, "Added newly discovered log directories");
                         }
                     }
                 }
@@ -3187,8 +3416,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                 {
                     let g = is_gaming(&st);
                     if was_gaming && !g {
-                        let db_g = db.clone();
-                        tokio::spawn(async move { game_mode::restore(&db_g).await });
+                        let _ = game_mode_edge_tx.send((false, false));
                         last_fingerprint = None;
                     }
                     was_gaming = g;
@@ -3293,7 +3521,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             Ok(Ok(r)) => r,
                             Ok(Err(_join)) => Err(anyhow::anyhow!("digest task panicked")),
                             Err(_elapsed) => {
-                                inner.abort();
+                                abort_task(inner).await;
                                 Err(anyhow::anyhow!("digest generation timed out"))
                             }
                         };
@@ -3392,7 +3620,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                             learn::label_one(&db_i, &ai_i, &model_i).await;
                         });
                         if tokio::time::timeout(LABEL_MAX, &mut inner).await.is_err() {
-                            inner.abort();
+                            abort_task(inner).await;
                             warn!(
                                 "labeller exceeded {}m and was stopped",
                                 LABEL_MAX.as_secs() / 60
@@ -3541,7 +3769,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
                         Ok(Ok(result)) => result,
                         Ok(Err(_join)) => Err("analysis task panicked".to_string()),
                         Err(_elapsed) => {
-                            inner.abort();
+                            abort_task(inner).await;
                             Err(format!(
                                 "analysis exceeded {}m and was stopped",
                                 ANALYSIS_MAX.as_secs() / 60
@@ -3558,25 +3786,59 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F) {
         }
     }
 
+    // Cancel the serial power-plan worker before restoring. If it were left detached,
+    // a queued boost could run after shutdown restoration and leave High Performance
+    // active indefinitely (especially on uninstall, when there may be no next startup).
+    drop(game_mode_edge_tx);
+    game_mode_edge_handle.abort();
+    let _ = game_mode_edge_handle.await;
+    game_mode::restore(&db).await;
+
     // Drain the executor before the runtime is dropped. Both exit paths land here: a
     // settings-save `restart_self()` returns out of the loop block, and a shutdown/SCM
     // stop (including the self-updater's `sc stop`) cancels it. An approved fix that was
     // queued or executing gets to finish and log (execution_log / undo snapshot / feedback)
     // instead of being aborted when the runtime drops — PROVIDED it completes within the
     // drain window. Dropping the only `ExecJob` sender closes the job channel so the worker
-    // stops once its queue is empty; the idle case joins instantly. The 30s cap matches
-    // SCM's own stop timeout (run_service reports StopPending + a 35s wait_hint so SCM
-    // waits): a genuinely long repair (SFC/DISM, tens of minutes) can still be cut off by
-    // SCM force-killing the process, which no in-process drain can outlast — those remain
-    // best-effort, not guaranteed.
+    // stops once its queue is empty; the idle case joins instantly. The 20s cap plus
+    // Game Mode's bounded 10s restore stays inside SCM's 35s StopPending hint. A genuinely
+    // long repair (SFC/DISM, tens of minutes) can still be cut off by SCM force-killing
+    // the process, which no in-process drain can outlast — those remain best-effort.
     drop(exec_tx);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), exec_handle).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(20), exec_handle).await;
     info!("Executor drained — service loop stopped");
 }
 
 #[cfg(test)]
 mod status_tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abort_task_waits_until_the_cancelled_future_is_dropped() {
+        struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_in_task = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _dropped = Dropped(dropped_in_task);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("task started");
+
+        abort_task(handle).await;
+
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Acquire),
+            "abort completion must be observed before in-flight state is released"
+        );
+    }
 
     /// resting_status must order Paused > Gaming > PendingApproval > Executing > Active.
     #[test]
@@ -3627,6 +3889,16 @@ mod status_tests {
         assert!(st.startup_owner_sid.is_none());
         assert!(!st.startup_scan_running);
         assert!(st.startup_targets.is_empty());
+    }
+
+    #[test]
+    fn watcher_roots_fail_closed_before_user_switch_discovery() {
+        let old = "S-1-5-21-1-2-3-1001";
+        let new = "S-1-5-21-9-8-7-1002";
+        assert!(watch_roots_need_clearing(Some(old), Some(new)));
+        assert!(watch_roots_need_clearing(Some(old), None));
+        assert!(!watch_roots_need_clearing(Some(old), Some(old)));
+        assert!(!watch_roots_need_clearing(None, Some(new)));
     }
 
     /// Game Mode is a lease: active only while `gaming_until > now`, so a crashed/closed
@@ -3692,6 +3964,13 @@ mod status_tests {
         assert!(!updater_due(true, 3600, 0, &st, now));
         st.paused = false;
         assert!(!updater_due(true, 3600, now, &st, now)); // just ran
+    }
+
+    #[test]
+    fn updater_due_handles_corrupt_extreme_timestamps() {
+        let st = SvcState::default();
+        assert!(updater_due(true, 3600, i64::MIN, &st, 1));
+        assert!(!updater_due(true, 3600, i64::MAX, &st, 1));
     }
 
     #[test]

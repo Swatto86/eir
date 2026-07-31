@@ -189,6 +189,11 @@ pub struct Problem {
     pub undo_instructions: String,
 }
 
+const MAX_MODEL_PROBLEMS: usize = 5;
+const MAX_MODEL_DECISION_TEXT_BYTES: usize = 16 * 1024;
+const MAX_MODEL_ACTION_STRING_BYTES: usize = 16 * 1024;
+const MAX_MODEL_ACTION_BYTES: usize = 64 * 1024;
+
 impl Problem {
     pub fn parse_fix_action(&self) -> Option<FixAction> {
         serde_json::from_value(self.proposed_fix.clone()).ok()
@@ -308,7 +313,9 @@ impl FixAction {
             FixAction::ServiceStop { service_name } => ("service_stop", service_name),
             FixAction::ServiceStart { service_name } => ("service_start", service_name),
             // days_old excluded: cleaning the same path is the same issue.
-            FixAction::LogCleanup { path, .. } => ("log_cleanup", path),
+            FixAction::LogCleanup { path, .. } => {
+                return format!("log_cleanup|{}", normalized_windows_target(path));
+            }
             FixAction::DiskCleanup { target } => ("disk_cleanup", target),
             // The script body is regenerated every analysis run, so it can't identify
             // the issue. Key on the variant alone: at most one SYSTEM-script card is
@@ -317,8 +324,12 @@ impl FixAction {
             FixAction::PowerShellDiagnostic { .. } => {
                 return "powershell_diagnostic".to_string();
             }
-            FixAction::TaskDisable { task_name } => ("task_disable", task_name),
-            FixAction::TaskEnable { task_name } => ("task_enable", task_name),
+            FixAction::TaskDisable { task_name } => {
+                return format!("task_disable|{}", normalized_windows_target(task_name));
+            }
+            FixAction::TaskEnable { task_name } => {
+                return format!("task_enable|{}", normalized_windows_target(task_name));
+            }
             // value_data excluded: resetting the same value is the same issue.
             FixAction::RegistryReset {
                 key_path,
@@ -327,7 +338,7 @@ impl FixAction {
             } => {
                 return format!(
                     "registry_reset|{}|{}",
-                    key_path.to_ascii_lowercase(),
+                    normalized_windows_target(key_path),
                     value_name.to_ascii_lowercase()
                 );
             }
@@ -338,7 +349,9 @@ impl FixAction {
             // value excluded: changing the same boot element is the same issue.
             FixAction::BcdEdit { element, .. } => ("bcd_edit", element),
             FixAction::ProcessKill { process_name } => ("process_kill", process_name),
-            FixAction::FileDelete { path } => ("file_delete", path),
+            FixAction::FileDelete { path } => {
+                return format!("file_delete|{}", normalized_windows_target(path));
+            }
             FixAction::FirewallEnable { profile } => ("firewall_enable", profile),
             FixAction::DefenderSignatureUpdate => return "defender_signature_update".to_string(),
             FixAction::DefenderRealtimeEnable => return "defender_realtime_enable".to_string(),
@@ -383,6 +396,10 @@ pub enum RegistryScalarKind {
     ExpandString,
     DWord,
     QWord,
+}
+
+fn normalized_windows_target(target: &str) -> String {
+    crate::policy::normalize_path_lexical(target).join("\\")
 }
 
 impl RegistryScalarKind {
@@ -454,6 +471,57 @@ pub struct ClaudeDecision {
     pub needs_deeper_analysis: bool,
 }
 
+impl ClaudeDecision {
+    /// Enforce the model's response contract before any output is logged, displayed, or
+    /// routed to policy. Prose can be shortened safely; an oversized action is dropped
+    /// whole because truncating a path, service name, script, or registry value could
+    /// change the privileged operation.
+    pub fn bound_model_output(&mut self) {
+        truncate_utf8_bytes(&mut self.analysis, MAX_MODEL_DECISION_TEXT_BYTES);
+        for problem in &mut self.problems {
+            truncate_utf8_bytes(&mut problem.diagnosis, MAX_MODEL_DECISION_TEXT_BYTES);
+            truncate_utf8_bytes(&mut problem.root_cause, MAX_MODEL_DECISION_TEXT_BYTES);
+            truncate_utf8_bytes(&mut problem.reasoning, MAX_MODEL_DECISION_TEXT_BYTES);
+            truncate_utf8_bytes(&mut problem.side_effects, MAX_MODEL_DECISION_TEXT_BYTES);
+            truncate_utf8_bytes(
+                &mut problem.undo_instructions,
+                MAX_MODEL_DECISION_TEXT_BYTES,
+            );
+        }
+        self.problems.retain(|problem| {
+            json_strings_within(&problem.proposed_fix, MAX_MODEL_ACTION_STRING_BYTES)
+                && serde_json::to_vec(&problem.proposed_fix)
+                    .is_ok_and(|json| json.len() <= MAX_MODEL_ACTION_BYTES)
+                && problem.parse_fix_action().is_some()
+        });
+        self.problems.truncate(MAX_MODEL_PROBLEMS);
+    }
+}
+
+fn json_strings_within(value: &serde_json::Value, max_bytes: usize) -> bool {
+    match value {
+        serde_json::Value::String(value) => value.len() <= max_bytes,
+        serde_json::Value::Array(values) => values
+            .iter()
+            .all(|value| json_strings_within(value, max_bytes)),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .all(|(key, value)| key.len() <= max_bytes && json_strings_within(value, max_bytes)),
+        _ => true,
+    }
+}
+
+pub(crate) fn truncate_utf8_bytes(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+}
+
 /// Token + cost usage for a single AI call. Cost is provider-reported
 /// (OpenRouter) or estimated from list pricing (Anthropic); 0 when unknown.
 #[derive(Debug, Clone, Default)]
@@ -468,6 +536,48 @@ pub struct CallUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model_problem(fix: serde_json::Value) -> Problem {
+        Problem {
+            diagnosis: "diagnosis".into(),
+            root_cause: "root cause".into(),
+            confidence: 0.9,
+            proposed_fix: fix,
+            reasoning: "reasoning".into(),
+            side_effects: "side effects".into(),
+            undo_instructions: "undo".into(),
+        }
+    }
+
+    #[test]
+    fn model_decision_is_bounded_without_truncating_action_fields() {
+        let valid = serde_json::json!({
+            "action": "service_restart",
+            "service_name": "Spooler",
+        });
+        let oversized_target = "x".repeat(MAX_MODEL_ACTION_STRING_BYTES + 1);
+        let mut decision = ClaudeDecision {
+            analysis: format!("a{}", "é".repeat(MAX_MODEL_DECISION_TEXT_BYTES)),
+            problems: std::iter::repeat_with(|| model_problem(valid.clone()))
+                .take(MAX_MODEL_PROBLEMS + 1)
+                .collect(),
+            needs_deeper_analysis: false,
+        };
+        decision.problems[0].proposed_fix = serde_json::json!({
+            "action": "service_restart",
+            "service_name": oversized_target,
+        });
+
+        decision.bound_model_output();
+
+        assert!(decision.analysis.len() <= MAX_MODEL_DECISION_TEXT_BYTES);
+        assert!(decision.analysis.ends_with('é'));
+        assert_eq!(decision.problems.len(), MAX_MODEL_PROBLEMS);
+        assert!(decision
+            .problems
+            .iter()
+            .all(|problem| { problem.proposed_fix["service_name"].as_str() == Some("Spooler") }));
+    }
 
     fn state_with_disk_health(dh: &str) -> SystemState {
         SystemState {
@@ -570,6 +680,56 @@ mod tests {
             enable,
         };
         assert_ne!(startup(true).dedup_key(), startup(false).dedup_key());
+    }
+
+    #[test]
+    fn dedup_key_normalizes_equivalent_windows_targets() {
+        assert_eq!(
+            FixAction::LogCleanup {
+                path: r"C:\Logs\.\App".into(),
+                days_old: 30,
+            }
+            .dedup_key(),
+            FixAction::LogCleanup {
+                path: "c:/logs/app/".into(),
+                days_old: 7,
+            }
+            .dedup_key(),
+        );
+        assert_eq!(
+            FixAction::FileDelete {
+                path: r"C:\Temp\Old\..\cache.bin".into(),
+            }
+            .dedup_key(),
+            FixAction::FileDelete {
+                path: "c:/temp/cache.bin".into(),
+            }
+            .dedup_key(),
+        );
+        assert_eq!(
+            FixAction::RegistryReset {
+                key_path: r"HKEY_LOCAL_MACHINE\Software\Eir".into(),
+                value_name: "State".into(),
+                value_data: "1".into(),
+            }
+            .dedup_key(),
+            FixAction::RegistryReset {
+                key_path: "hklm:/software/eir/".into(),
+                value_name: "state".into(),
+                value_data: "2".into(),
+            }
+            .dedup_key(),
+        );
+        assert_eq!(
+            FixAction::TaskDisable {
+                task_name: r"\Vendor\\Updater".into(),
+            }
+            .dedup_key(),
+            FixAction::TaskDisable {
+                task_name: r"\vendor\updater".into(),
+            }
+            .dedup_key(),
+        );
     }
 
     #[test]

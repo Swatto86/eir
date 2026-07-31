@@ -113,7 +113,14 @@ impl LearnedFacts {
             .get(action_label)
             .copied()
             .unwrap_or(0.0);
-        (by_type + by_label).min(MAX_CONFIDENCE_PENALTY)
+        let bounded = |amount: f32| {
+            if amount.is_finite() {
+                amount.clamp(0.0, MAX_CONFIDENCE_PENALTY)
+            } else {
+                0.0
+            }
+        };
+        (bounded(by_type) + bounded(by_label)).min(MAX_CONFIDENCE_PENALTY)
     }
 
     /// A read-only "what Eir has learned on this machine" block for the issue-analysis
@@ -185,6 +192,15 @@ mod tests {
             f.confidence_penalty("DiskCleanup { target: \"temp\" }"),
             0.0
         );
+    }
+
+    #[test]
+    fn malformed_penalties_can_never_raise_or_poison_confidence() {
+        let negative = facts_with(&[("ServiceRestart", -0.2)], &[]);
+        assert_eq!(negative.confidence_penalty("ServiceRestart"), 0.0);
+
+        let non_finite = facts_with(&[("ServiceRestart", f32::NAN)], &[]);
+        assert_eq!(non_finite.confidence_penalty("ServiceRestart"), 0.0);
     }
 
     #[test]

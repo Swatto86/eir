@@ -38,8 +38,9 @@ pub async fn on_gaming_edge(power_boost: bool, on: bool, db: &SqlitePool) {
                 warn!("Game Mode: couldn't persist power-restore GUID, not switching: {e}");
                 return;
             }
-            set_scheme(HIGH_PERF_GUID).await;
-            info!("Game Mode: switched to High Performance power plan (was {cur})");
+            if set_scheme(HIGH_PERF_GUID).await {
+                info!("Game Mode: switched to High Performance power plan (was {cur})");
+            }
         }
         None => warn!("Game Mode: couldn't read the active power scheme; not switching"),
     }
@@ -51,10 +52,13 @@ pub async fn on_gaming_edge(power_boost: bool, on: bool, db: &SqlitePool) {
 pub async fn restore(db: &SqlitePool) {
     match audit::get_state(db, RESTORE_KEY).await {
         Ok(Some(guid)) => {
-            set_scheme(&guid).await;
-            info!("Game Mode: restored power plan to {guid}");
-            if let Err(e) = audit::delete_state(db, RESTORE_KEY).await {
-                warn!("Game Mode: couldn't clear power-restore GUID: {e}");
+            if set_scheme(&guid).await {
+                info!("Game Mode: restored power plan to {guid}");
+                if let Err(e) = audit::delete_state(db, RESTORE_KEY).await {
+                    warn!("Game Mode: couldn't clear power-restore GUID: {e}");
+                }
+            } else {
+                warn!("Game Mode: keeping power-restore GUID for a later retry");
             }
         }
         Ok(None) => {}
@@ -66,12 +70,14 @@ async fn active_scheme_guid() -> Option<String> {
     parse_scheme_guid(&run_powercfg(&["/getactivescheme"]).await?)
 }
 
-async fn set_scheme(guid: &str) {
+async fn set_scheme(guid: &str) -> bool {
     // `guid` is always our const or a value previously read from powercfg — a real GUID,
     // never user/AI text, so no injection surface into the argv.
-    if run_powercfg(&["/setactive", guid]).await.is_none() {
+    let changed = run_powercfg(&["/setactive", guid]).await.is_some();
+    if !changed {
         warn!("Game Mode: powercfg /setactive {guid} did not succeed");
     }
+    changed
 }
 
 /// Run `powercfg.exe` with a 10 s bound, returning stdout on success. Plain exe with a
@@ -139,5 +145,31 @@ mod tests {
         assert!(!is_guid("1234-5678"));
         assert!(!is_guid("381b4222f69441f09685ff5bb260df2e"));
         assert!(is_guid("8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"));
+    }
+
+    #[tokio::test]
+    async fn failed_restore_keeps_the_saved_scheme_for_a_later_retry() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("database");
+        sqlx::query("CREATE TABLE app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("schema");
+        audit::set_state(&pool, RESTORE_KEY, "not-a-guid")
+            .await
+            .expect("saved restore state");
+
+        restore(&pool).await;
+
+        assert_eq!(
+            audit::get_state(&pool, RESTORE_KEY)
+                .await
+                .expect("read restore state")
+                .as_deref(),
+            Some("not-a-guid")
+        );
     }
 }

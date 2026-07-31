@@ -172,7 +172,7 @@
     /* ── Ask Eir ── */
     .ask-compose { padding: 14px 15px; display: flex; flex-direction: column; gap: 10px; }
     .ask-compose textarea { width: 100%; resize: vertical; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 13.5px; font-family: inherit; line-height: 1.55; }
-    .ask-compose textarea:focus { outline: none; border-color: var(--accent); }
+    .ask-compose textarea:focus { border-color: var(--accent); }
     .ask-actions { display: flex; align-items: center; gap: 12px; }
     .ask-q { display: flex; gap: 8px; padding: 11px 15px; font-weight: 650; font-size: 13.5px; border-bottom: 1px solid var(--border); user-select: text; }
     .ask-q .qmark { color: var(--accent); flex-shrink: 0; }
@@ -180,7 +180,7 @@
     .ask-attach-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 15px 0; }
     .ask-chip { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px; padding: 3px 4px 3px 8px; max-width: 240px; }
     .ask-chip .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .ask-chip .rm { cursor: pointer; opacity: .55; padding: 0 4px; }
+    .ask-chip .rm { border: 0; background: transparent; color: inherit; cursor: pointer; opacity: .55; padding: 0 4px; font: inherit; }
     .ask-chip .rm:hover { opacity: 1; }
     .ask-att-tag { font-size: 11px; color: var(--muted); margin-top: 2px; }
     .ask-when { padding: 0 15px 11px; font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 8px; }
@@ -314,21 +314,10 @@
     .about-ver { font-size: 12.5px; color: var(--muted); }
     .about-body { padding: 0 20px 18px; font-size: 13px; color: var(--muted); line-height: 1.65; max-width: 640px; }
     .about-actions { display: flex; gap: 8px; padding: 0 20px 20px; align-items: center; }
-    .about-warning { display: none; margin: 0 20px 14px; padding: 10px 14px; border-radius: 8px; background: color-mix(in srgb, var(--err) 12%, transparent); color: var(--err); font-size: 13px; line-height: 1.5; }
+    .about-warning { display: none; margin: 0 20px 14px; padding: 10px 14px; border-radius: 8px; background: color-mix(in srgb, var(--red) 12%, transparent); color: var(--red); font-size: 13px; line-height: 1.5; }
 
     /* ── Service disconnected: freeze interaction so a click can't be silently dropped ── */
-    /* #dash-approvals-go is excluded — it's a pure client-side view switch, not a pipe command. */
-    body.svc-down .btn.primary:not(#dash-approvals-go),
-    body.svc-down #pause-btn,
-    body.svc-down #game-btn,
-    body.svc-down .approval-actions button,
-    body.svc-down .disk-clean,
-    body.svc-down .startup-toggle,
-    body.svc-down .upd-ignore,
-    body.svc-down .upd-note-save,
-    body.svc-down .learned-act,
-    body.svc-down #refresh-status,
-    body.svc-down .act-undo { pointer-events: none; opacity: .5; }
+    button[aria-disabled="true"] { pointer-events: none; opacity: .5; }
     body.svc-down .metric-grid,
     body.svc-down #history-card { opacity: .6; }
 
@@ -367,12 +356,12 @@
 
   <aside class="side">
     <div class="brand"><div id="status-dot"></div><h1>Eir</h1></div>
-    <nav id="nav">
-      <button class="nav-btn active" data-view="dashboard"><span class="nav-ico">⌂</span>Dashboard</button>
+    <nav id="nav" aria-label="Main navigation">
+      <button class="nav-btn active" data-view="dashboard" aria-current="page"><span class="nav-ico">⌂</span>Dashboard</button>
       <button class="nav-btn" data-view="ask"><span class="nav-ico">✦</span>Ask Eir</button>
       <button class="nav-btn" data-view="approvals"><span class="nav-ico">✋</span>Approvals<span class="badge" id="nav-approvals"></span></button>
       <button class="nav-btn" data-view="activity"><span class="nav-ico">☰</span>Activity</button>
-      <button class="nav-btn" data-view="updates"><span class="nav-ico">⭳</span>App Updates</button>
+      <button class="nav-btn" id="nav-updates" data-view="updates" hidden><span class="nav-ico">⭳</span>App Updates</button>
       <button class="nav-btn" data-view="disk"><span class="nav-ico">▤</span>Disk Space</button>
       <button class="nav-btn" data-view="startup"><span class="nav-ico">⏻</span>Startup</button>
       <button class="nav-btn" data-view="learned"><span class="nav-ico">◎</span>Learned</button>
@@ -381,15 +370,15 @@
     </nav>
     <div class="side-foot">
       <button class="foot-btn" id="theme-btn" title="Cycle theme (system / light / dark)"><span id="theme-ico">◐</span><span id="theme-label">System</span></button>
-      <button class="foot-btn" id="game-btn" title="Game Mode: pause Eir's updates &amp; housekeeping while you play"><span id="game-ico">🎮</span><span id="game-label">Game Mode</span></button>
-      <button class="foot-btn" id="pause-btn"><span id="pause-ico">⏸</span><span id="pause-label">Pause</span></button>
+      <button class="foot-btn" id="game-btn" aria-pressed="false" title="Game Mode: pause Eir's updates &amp; housekeeping while you play"><span id="game-ico">🎮</span><span id="game-label">Game Mode</span></button>
+      <button class="foot-btn" id="pause-btn" aria-pressed="false"><span id="pause-ico">⏸</span><span id="pause-label">Pause</span></button>
     </div>
   </aside>
 
   <main>
     <header>
       <span id="view-title">Dashboard</span>
-      <span id="status-text">Initializing…</span>
+      <span id="status-text" role="status">Initializing…</span>
       <div class="spacer"></div>
       <span id="model-label" class="model-label"></span>
     </header>
@@ -401,7 +390,7 @@
         <div class="hero-main">
           <div class="hero-status" id="hero-status">Initializing…</div>
           <div class="hero-sub">System guardian — watching Windows and reacting to errors as they happen.</div>
-          <div class="hero-err" id="hero-err" style="display:none"></div>
+          <div class="hero-err" id="hero-err" role="alert" style="display:none"></div>
           <div class="hero-actions" id="hero-actions" style="display:none;gap:8px;margin-top:8px">
             <button class="btn small" id="hero-fix" style="display:none">Open Settings</button>
             <button class="btn small" id="hero-copy">Copy error</button>
@@ -473,13 +462,13 @@
       <div class="card">
         <div class="card-header">Ask about your PC<span class="hspacer"></span><button class="btn small" id="clear-ask">Clear</button></div>
         <div class="ask-compose">
-          <textarea id="ask-input" maxlength="1000" rows="3"
+          <textarea id="ask-input" aria-label="Question for Eir" maxlength="1000" rows="3"
             placeholder="e.g. Why is my PC slow right now?  Is my disk OK?  What was that error about?  (Enter to send · Shift+Enter for a new line)"></textarea>
-          <div id="ask-attach-chips" class="ask-attach-chips"></div>
+          <div id="ask-attach-chips" class="ask-attach-chips" aria-live="polite" aria-label="Attached files"></div>
           <div class="ask-actions">
             <button class="btn" id="ask-attach-files" title="Attach files or images as context">📎 Files</button>
             <button class="btn" id="ask-attach-folder" title="Attach a folder's text files as context">📁 Folder</button>
-            <span class="set-status" id="ask-status"></span>
+            <span class="set-status" id="ask-status" role="status"></span>
             <div style="flex:1"></div>
             <button class="btn primary" id="ask-send">Ask Eir</button>
           </div>
@@ -498,11 +487,11 @@
     <section class="view" id="view-activity">
       <div class="card">
         <div class="card-header">Diagnoses &amp; fixes<span class="hspacer"></span><button class="btn small" id="clear-activity">Clear</button></div>
-        <div class="filter-row" id="activity-filter">
-          <button class="chip active" data-filter="all">All</button>
-          <button class="chip" data-filter="fix">Fixes</button>
-          <button class="chip" data-filter="diag">Diagnoses</button>
-          <button class="chip" data-filter="fail">Failures</button>
+        <div class="filter-row" id="activity-filter" role="group" aria-label="Filter activity">
+          <button class="chip active" data-filter="all" aria-pressed="true">All</button>
+          <button class="chip" data-filter="fix" aria-pressed="false">Fixes</button>
+          <button class="chip" data-filter="diag" aria-pressed="false">Diagnoses</button>
+          <button class="chip" data-filter="fail" aria-pressed="false">Failures</button>
         </div>
         <div id="activity-list"><div class="empty">No activity yet</div></div>
       </div>
@@ -536,7 +525,7 @@
           <span class="hspacer"></span>
           <button class="btn small primary" id="disk-scan">Scan now</button>
         </div>
-        <div id="disk-error" class="upd-note" style="display:none;color:var(--red)"></div>
+        <div id="disk-error" class="upd-note" role="alert" style="display:none;color:var(--red)"></div>
         <div id="disk-list"><div class="empty">Click “Scan now” to find what's taking up space.</div></div>
       </div>
       <div class="set-note" style="padding:0 2px">“Clean” routes through Eir's normal safety checks — reversible cleanups run right away, anything riskier waits in Approvals. Items marked report-only are shown for awareness and aren't touched.</div>
@@ -551,7 +540,7 @@
           <label class="hdr-toggle" title="Hide entries whose file is signed by Microsoft"><input type="checkbox" id="startup-hide-ms" checked> Hide Windows</label>
           <button class="btn small primary" id="startup-scan">Scan now</button>
         </div>
-        <div id="startup-error" class="upd-note" style="display:none;color:var(--red)"></div>
+        <div id="startup-error" class="upd-note" role="alert" style="display:none;color:var(--red)"></div>
         <div id="startup-list"><div class="empty">Click “Scan now” to see what starts with Windows.</div></div>
       </div>
       <div class="set-note" style="padding:0 2px">Covers Run keys (including 32-bit), Startup folders, RunOnce and policy keys, Winlogon anomalies, logon scheduled tasks, and auto-start services. Publisher names come from each file's digital signature; the keep/optional/unnecessary hints and descriptions are AI suggestions, not automatic actions. Disabling is reversible (Task-Manager-style flag or task disable) and asks for confirmation in Approvals; locations with no safe switch are shown report-only.</div>
@@ -568,7 +557,7 @@
     <!-- ── Settings ── -->
     <section class="view" id="view-settings">
 
-      <div class="card" id="card-autostart">
+      <div class="card" id="card-autostart" hidden>
         <div class="card-header">Windows startup</div>
         <div class="set-section-desc">Launch Eir automatically when you sign in. Startup launches stay hidden in the tray; manual launches open this window.</div>
         <div class="set-grid">
@@ -577,7 +566,7 @@
         </div>
         <div class="set-actions">
           <button class="btn" id="set-autostart-save">Save startup setting</button>
-          <span class="set-status" id="set-autostart-status"></span>
+          <span class="set-status" id="set-autostart-status" role="status"></span>
         </div>
       </div>
 
@@ -624,11 +613,11 @@
           <label for="set-conf">Auto-fix confidence (%)</label>
           <input id="set-conf" type="number" min="50" max="95" step="5" placeholder="80">
           <label for="set-decint">Decision interval (s)</label>
-          <input id="set-decint" type="number" min="10">
+          <input id="set-decint" type="number" min="10" max="604800">
           <label for="set-elpoll">Event-log poll (s)</label>
-          <input id="set-elpoll" type="number" min="5">
+          <input id="set-elpoll" type="number" min="5" max="604800">
           <label for="set-wmipoll">System poll (s)</label>
-          <input id="set-wmipoll" type="number" min="30">
+          <input id="set-wmipoll" type="number" min="30" max="604800">
           <label for="set-channels">Event-log channels</label>
           <input id="set-channels" type="text" placeholder="System, Application, Security">
           <label for="set-dirs">Extra log directories</label>
@@ -640,9 +629,9 @@
         </div>
         <div class="set-note">Eir reacts to errors the moment they land (debounced ~10&nbsp;s); the decision interval is just the background sweep. Game Mode pauses the updater &amp; housekeeping while a fullscreen game runs.</div>
         <div class="set-actions">
-          <button class="btn primary" id="set-save">Save settings</button>
+          <button class="btn primary" id="set-save" disabled>Save settings</button>
           <button class="btn" id="test-provider" title="Update the Eir service to enable provider testing" disabled>Test provider</button>
-          <span class="set-status" id="set-status"></span>
+          <span class="set-status" id="set-status" role="status"></span>
         </div>
       </div>
 
@@ -668,21 +657,21 @@
         </div>
         <div class="set-note">Escalations are capped at <code>24/day</code> regardless of provider.</div>
         <div class="set-actions">
-          <button class="btn" id="set-adv-save">Save advisor settings</button>
-          <span class="set-status" id="set-adv-status"></span>
+          <button class="btn" id="set-adv-save" disabled>Save advisor settings</button>
+          <span class="set-status" id="set-adv-status" role="status"></span>
         </div>
       </div>
 
-      <div class="card" id="card-updater">
+      <div class="card" id="card-updater" hidden>
         <div class="card-header">App updates</div>
         <div class="set-section-desc">Eir updates your apps unattended — no UAC prompts — through the methods you allow below. Applies live.</div>
         <div class="set-grid">
           <label for="set-upd-enabled">Auto-update apps</label>
           <input id="set-upd-enabled" type="checkbox">
           <label for="set-upd-interval">Check interval (hours)</label>
-          <input id="set-upd-interval" type="number" min="1" placeholder="24">
-          <label>Update via</label>
-          <div class="methods-row" id="set-methods">
+          <input id="set-upd-interval" type="number" min="1" max="8760" placeholder="24">
+          <label id="set-methods-label">Update via</label>
+          <div class="methods-row" id="set-methods" role="group" aria-labelledby="set-methods-label">
             <label><input type="checkbox" id="m-winget"> winget</label>
             <label><input type="checkbox" id="m-choco"> Chocolatey</label>
             <label title="Unavailable while Eir runs as a Windows service"><input type="checkbox" id="m-scoop" disabled> Scoop (unavailable under service)</label>
@@ -703,8 +692,8 @@
         </div>
         <div class="set-note">Strictest → least-safe. This gates only <em>AI-found installers</em>; winget/Chocolatey/Store packages are trusted by their source. “Publisher match” needs a valid signature first, so unsigned installers (e.g. AutoHotkey and some open-source tools) are blocked under both signature options — update those via Chocolatey instead, or choose “Allow unsigned” (not recommended for unattended installs).</div>
         <div class="set-actions">
-          <button class="btn" id="set-upd-save">Save updater settings</button>
-          <span class="set-status" id="set-upd-status"></span>
+          <button class="btn" id="set-upd-save" disabled>Save updater settings</button>
+          <span class="set-status" id="set-upd-status" role="status"></span>
         </div>
       </div>
     </section>
@@ -720,19 +709,16 @@
             <div class="about-ver" id="about-service-version">Service: —</div>
           </div>
         </div>
-        <div id="about-version-warning" class="about-warning" style="display:none"></div>
-        <div class="about-body">
-          Eir is an autonomous Windows system guardian. A LocalSystem service watches the
-          event log, application logs, services and security posture; an AI model diagnoses
-          problems the moment they appear; reversible whitelisted fixes run automatically and
-          anything disruptive waits here for your approval. It also keeps your installed apps
-          up to date unattended, and learns this machine's quirks as it goes.
+        <div id="about-version-warning" class="about-warning" role="alert" style="display:none"></div>
+        <div class="about-body" id="about-description">
+          Eir monitors Windows system health, diagnoses problems, and routes repairs through
+          its approval system.
         </div>
         <div class="about-actions">
-          <button class="btn" id="about-updates">Check for updates</button>
+          <button class="btn" id="about-updates" style="display:none">Check for updates</button>
           <button class="btn" id="about-install-svc" style="display:none">Install service</button>
           <button class="btn" id="about-github">GitHub</button>
-          <span class="set-status" id="about-status"></span>
+          <span class="set-status" id="about-status" role="status"></span>
         </div>
         <div class="about-body" style="padding-top:0">Named for the Norse goddess of healing. © Swatto — MIT licence.</div>
       </div>

@@ -69,6 +69,7 @@ pub async fn update_after_states(pool: &SqlitePool, state: &SystemState) -> Resu
     // and are measured a later cycle. No LIMIT — executions per cycle are few, so the
     // eligible set is small; a LIMIT would strand older rows at NULL forever.
     let cutoff = settle_cutoff(Utc::now());
+    let mut tx = pool.begin().await?;
     let rows = sqlx::query(
         "SELECT id, cpu_before, memory_before, failed_services_before, disk_before, target
          FROM execution_feedback
@@ -76,7 +77,7 @@ pub async fn update_after_states(pool: &SqlitePool, state: &SystemState) -> Resu
          ORDER BY id DESC",
     )
     .bind(&cutoff)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
 
     let cpu_after = state.cpu_usage_percent as f64;
@@ -132,9 +133,10 @@ pub async fn update_after_states(pool: &SqlitePool, state: &SystemState) -> Resu
         .bind(score)
         .bind(resolved)
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -214,7 +216,7 @@ pub async fn recent_summary(pool: &SqlitePool, limit: i64) -> Result<String> {
         let resolved: Option<i64> = row.try_get("resolved")?;
         let ts: String = row.try_get("recorded_at")?;
         let output: Option<String> = row.try_get("output")?;
-        let short_ts = &ts[..ts.len().min(16)];
+        let short_ts = short_timestamp(&ts);
 
         let succeeded = succeeded != 0;
         let outcome = if succeeded { "SUCCESS" } else { "FAILURE" };
@@ -249,9 +251,67 @@ pub async fn recent_summary(pool: &SqlitePool, limit: i64) -> Result<String> {
     Ok(lines.join("\n"))
 }
 
+fn short_timestamp(ts: &str) -> &str {
+    ts.char_indices()
+        .nth(16)
+        .map_or(ts, |(byte_offset, _)| &ts[..byte_offset])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn after_state_batch_rolls_back_when_any_row_fails() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("db");
+        sqlx::query(
+            "CREATE TABLE execution_feedback (
+                id INTEGER PRIMARY KEY,
+                cpu_before REAL,
+                memory_before REAL,
+                failed_services_before INTEGER,
+                disk_before REAL,
+                target TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                cpu_after REAL,
+                memory_after REAL,
+                failed_services_after INTEGER,
+                disk_after REAL,
+                improvement_score REAL,
+                resolved INTEGER
+            );
+            INSERT INTO execution_feedback
+                (id, target, recorded_at) VALUES
+                (1, 'A', '2020-01-01T00:00:00+00:00'),
+                (2, 'B', '2020-01-01T00:00:00+00:00');
+            CREATE TRIGGER reject_first BEFORE UPDATE ON execution_feedback
+            WHEN OLD.id = 1
+            BEGIN SELECT RAISE(ABORT, 'write failed'); END;",
+        )
+        .execute(&pool)
+        .await
+        .expect("schema");
+
+        assert!(update_after_states(&pool, &SystemState::default())
+            .await
+            .is_err());
+        let updated: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution_feedback WHERE cpu_after IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(updated, 0);
+    }
+
+    #[test]
+    fn short_timestamp_never_splits_a_utf8_character() {
+        assert_eq!(short_timestamp("123456789012345érest"), "123456789012345é");
+    }
 
     #[test]
     fn action_target_is_the_service_name_for_service_actions_only() {

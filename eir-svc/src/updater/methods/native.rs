@@ -9,7 +9,7 @@ use crate::updater::config::SignaturePolicy;
 use crate::updater::domain::{
     classify_error, AttemptOutcome, ErrorCategory, Method, UpdateCandidate, Verification,
 };
-use crate::updater::download::{download_and_check, Staged};
+use crate::updater::download::{download_and_check, remove_staging_dir, Staged};
 use crate::updater::plan::{
     plan_runnable, sanitise_args, validate_plan, InstallPlan, InstallPlanRaw, InstallerKind,
 };
@@ -37,8 +37,7 @@ with high confidence>\",\"releases_url\":\"<official https releases/download pag
 \"expected_version\":\"<version this installer produces>\",\"installer_kind\":\"exe|msi|zip|7z|tar|tar.gz\",\
 \"silent_args\":[<documented silent switches: NSIS [\\\"/S\\\"]; Inno [\\\"/VERYSILENT\\\",\\\"/NORESTART\\\"]; \
 MSI [\\\"/qn\\\",\\\"/norestart\\\"]>],\"sha256\":\"<vendor-published 64-hex hash, or null>\",\
-\"publisher\":\"<expected Authenticode signing subject, e.g. 'Mozilla Corporation', or null>\",\
-\"verify_exe\":\"<absolute path to an installed .exe whose version proves success, or null>\"}}\n\n\
+\"publisher\":\"<expected Authenticode signing subject, e.g. 'Mozilla Corporation', or null>\"}}\n\n\
 Rules: if winget can manage this app, set installer_url=null. Never return a URL behind a login, ad \
 redirect, or file-locker. If unsure of a direct release asset, set installer_url=null and give \
 releases_url only. Prefer a direct .msi or setup .exe; if neither exists, use a ZIP, 7z, TAR, or \
@@ -277,21 +276,20 @@ pub async fn update_native(
         silent_args = vec!["/qn".to_string(), "/norestart".to_string()];
     }
     if staged.kind == InstallerKind::Exe && silent_args.is_empty() {
-        let _ = std::fs::remove_dir_all(&staged.dir);
+        remove_staging_dir(&staged.dir).await;
         out.category = Some(ErrorCategory::NotFound);
         out.detail = "archive installer has no known silent-install switch".to_string();
         return out;
     }
 
     let code = run_installer(&staged, staged.kind, &silent_args).await;
-    let _ = std::fs::remove_dir_all(&staged.dir);
+    remove_staging_dir(&staged.dir).await;
     out.exit_code = Some(code);
 
     if install_ok(code) {
         let (verification, found) = verify_app(
             &VerifyTarget::ByName {
                 name: plan.name.clone(),
-                verify_exe: plan.verify_exe.clone(),
             },
             &plan.expected_version,
         )

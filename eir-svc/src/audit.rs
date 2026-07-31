@@ -9,9 +9,14 @@ use sha2::{Digest, Sha384};
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{Row, SqlitePool};
-use std::str::FromStr;
 use std::time::Duration;
 use tracing::{info, warn};
+
+pub(crate) const MAX_ACTIVE_APPROVALS: usize = 256;
+const MAX_APPROVAL_ACTION_BYTES: usize = 64 * 1024;
+const MAX_APPROVAL_INFO_BYTES: usize = 256 * 1024;
+const MAX_APPROVAL_BASELINE_BYTES: usize = 1024 * 1024;
+const MAX_DIGEST_TEXT_BYTES: usize = 64 * 1024;
 
 /// Set a value in the small `app_state` key/value store (upsert). For transient state
 /// that must survive a restart — currently Game Mode's power-restore GUID.
@@ -54,7 +59,8 @@ pub async fn init_db(path: &str) -> Result<SqlitePool> {
     // journal; a generous busy_timeout absorbs the remaining writer contention so a
     // burst doesn't drop audit rows (which would break the rate-limit circuit
     // breaker and NULL effectiveness feedback).
-    let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=rwc"))?
+    let opts = SqliteConnectOptions::new()
+        .filename(path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(Duration::from_secs(15));
@@ -143,6 +149,10 @@ pub async fn log_decision(
         .iter()
         .map(|p| p.confidence)
         .fold(0f32, f32::max);
+    let state = &snapshot.system_state;
+    let failed_count = state.failed_services.len() as i64;
+    let state_json = serde_json::to_string(state)?;
+    let mut tx = pool.begin().await?;
 
     let id = sqlx::query(
         "INSERT INTO decisions (timestamp, signal_snapshot, claude_response, confidence, executed)
@@ -152,13 +162,9 @@ pub async fn log_decision(
     .bind(&snapshot_json)
     .bind(&response_json)
     .bind(max_confidence as f64)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .last_insert_rowid();
-
-    let state = &snapshot.system_state;
-    let failed_count = state.failed_services.len() as i64;
-    let state_json = serde_json::to_string(state)?;
 
     sqlx::query(
         "INSERT INTO system_state_history
@@ -171,9 +177,10 @@ pub async fn log_decision(
     .bind(state.disk_usage_percent as f64)
     .bind(failed_count)
     .bind(&state_json)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -219,12 +226,13 @@ pub async fn get_recent_decisions(pool: &SqlitePool, limit: i64) -> Result<Vec<P
         let response_str: String = row.try_get("claude_response")?;
         let confidence: f64 = row.try_get("confidence")?;
 
-        let response: ClaudeDecision =
+        let mut response: ClaudeDecision =
             serde_json::from_str(&response_str).unwrap_or_else(|_| ClaudeDecision {
                 analysis: String::new(),
                 problems: vec![],
                 needs_deeper_analysis: false,
             });
+        response.bound_model_output();
 
         if response.problems.is_empty() {
             decisions.push(PastDecision {
@@ -258,8 +266,16 @@ pub async fn load_advisor_day(pool: &SqlitePool, day: &str) -> Result<(f64, u32)
     match row {
         Some(r) => {
             let spent: f64 = r.try_get(0)?;
+            let spent = if spent.is_finite() {
+                spent.max(0.0)
+            } else {
+                0.0
+            };
             let escalations: i64 = r.try_get(1)?;
-            Ok((spent, escalations.max(0) as u32))
+            let bounded = escalations.clamp(0, i64::from(u32::MAX));
+            let escalations =
+                u32::try_from(bounded).context("advisor escalation count was out of range")?;
+            Ok((spent, escalations))
         }
         None => Ok((0.0, 0)),
     }
@@ -454,12 +470,14 @@ pub async fn digest_stats(pool: &SqlitePool, cutoff_rfc3339: &str) -> Result<Dig
     s.updates_total = u.0;
     s.updates_success = u.1;
 
-    let c: (f64,) =
-        sqlx::query_as("SELECT COALESCE(SUM(cost_usd), 0) FROM usage_log WHERE timestamp >= ?")
-            .bind(cutoff_rfc3339)
-            .fetch_one(pool)
-            .await?;
-    s.spend_usd = c.0;
+    let c: (f64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(MAX(cost_usd, 0.0)), 0.0)
+         FROM usage_log WHERE timestamp >= ?",
+    )
+    .bind(cutoff_rfc3339)
+    .fetch_one(pool)
+    .await?;
+    s.spend_usd = if c.0.is_finite() { c.0 } else { 0.0 };
 
     let f: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM learned_facts")
         .fetch_one(pool)
@@ -481,12 +499,18 @@ pub async fn save_digest(pool: &SqlitePool, text: &str) -> Result<()> {
 
 /// The most recent health digest as (text, unix-seconds), or `None` if none exists.
 pub async fn latest_digest(pool: &SqlitePool) -> Result<Option<(String, i64)>> {
-    let row = sqlx::query("SELECT text, generated_at FROM health_digest ORDER BY id DESC LIMIT 1")
-        .fetch_optional(pool)
-        .await?;
+    let row = sqlx::query(
+        "SELECT substr(CAST(text AS BLOB), 1, ?), generated_at
+         FROM health_digest ORDER BY id DESC LIMIT 1",
+    )
+    .bind(i64::try_from(MAX_DIGEST_TEXT_BYTES)?)
+    .fetch_optional(pool)
+    .await?;
     match row {
         Some(r) => {
-            let text: String = r.try_get(0)?;
+            let bytes: Vec<u8> = r.try_get(0)?;
+            let mut text = String::from_utf8_lossy(&bytes).into_owned();
+            crate::models::truncate_utf8_bytes(&mut text, MAX_DIGEST_TEXT_BYTES);
             let ts: String = r.try_get(1)?;
             let at = chrono::DateTime::parse_from_rfc3339(&ts)
                 .map(|d| d.timestamp())
@@ -565,6 +589,23 @@ pub async fn unclaim_registry_undo(pool: &SqlitePool, id: i64) -> Result<()> {
 }
 
 pub async fn log_usage(pool: &SqlitePool, usage: &CallUsage) -> Result<()> {
+    let input_tokens =
+        i64::try_from(usage.input_tokens).context("input token count exceeds database range")?;
+    let output_tokens =
+        i64::try_from(usage.output_tokens).context("output token count exceeds database range")?;
+    let cache_creation = i64::try_from(usage.cache_creation)
+        .context("cache creation count exceeds database range")?;
+    let cache_read =
+        i64::try_from(usage.cache_read).context("cache read count exceeds database range")?;
+    input_tokens
+        .checked_add(output_tokens)
+        .and_then(|total| total.checked_add(cache_creation))
+        .and_then(|total| total.checked_add(cache_read))
+        .context("total token count exceeds database range")?;
+    anyhow::ensure!(
+        usage.cost_usd.is_finite() && usage.cost_usd >= 0.0,
+        "usage cost must be finite and non-negative"
+    );
     let ts = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO usage_log
@@ -572,10 +613,10 @@ pub async fn log_usage(pool: &SqlitePool, usage: &CallUsage) -> Result<()> {
          VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&ts)
-    .bind(usage.input_tokens as i64)
-    .bind(usage.output_tokens as i64)
-    .bind(usage.cache_creation as i64)
-    .bind(usage.cache_read as i64)
+    .bind(input_tokens)
+    .bind(output_tokens)
+    .bind(cache_creation)
+    .bind(cache_read)
     .bind(usage.cost_usd)
     .execute(pool)
     .await?;
@@ -587,17 +628,29 @@ pub async fn usage_summary(pool: &SqlitePool) -> Result<UsageSummary> {
     async fn agg(pool: &SqlitePool, cutoff: &str) -> Result<(u64, u64, f64)> {
         let row = sqlx::query(
             "SELECT COUNT(*),
-                    COALESCE(SUM(input_tokens + output_tokens + cache_creation + cache_read), 0),
-                    COALESCE(SUM(cost_usd), 0)
+                    CAST(COALESCE(SUM(
+                        CAST(MAX(input_tokens, 0) AS REAL)
+                        + CAST(MAX(output_tokens, 0) AS REAL)
+                        + CAST(MAX(cache_creation, 0) AS REAL)
+                        + CAST(MAX(cache_read, 0) AS REAL)
+                    ), 0.0) AS REAL),
+                    COALESCE(SUM(MAX(cost_usd, 0.0)), 0.0)
              FROM usage_log WHERE timestamp > ?",
         )
         .bind(cutoff)
         .fetch_one(pool)
         .await?;
         let calls: i64 = row.try_get(0)?;
-        let tokens: i64 = row.try_get(1)?;
+        let tokens: f64 = row.try_get(1)?;
         let cost: f64 = row.try_get(2)?;
-        Ok((calls as u64, tokens as u64, cost))
+        let calls = u64::try_from(calls).context("usage call count was negative")?;
+        let tokens = if tokens.is_finite() && tokens > 0.0 {
+            tokens as u64
+        } else {
+            0
+        };
+        let cost = if cost.is_finite() { cost } else { 0.0 };
+        Ok((calls, tokens, cost))
     }
 
     let now = Utc::now();
@@ -632,10 +685,15 @@ pub async fn insert_pending_approval(
     let action_json = serde_json::to_string(action)?;
     let info_json = serde_json::to_string(info)?;
     let baseline_json = serde_json::to_string(baseline)?;
-    let id = sqlx::query(
+    ensure_approval_row_bounded(&action_json, &info_json, &baseline_json)?;
+    let inserted = sqlx::query(
         "INSERT INTO pending_approvals
          (created_at, decision_id, action_json, info_json, baseline_json, action_key)
-         VALUES (?, ?, ?, ?, ?, ?)",
+         SELECT ?, ?, ?, ?, ?, ?
+         WHERE (
+             SELECT COUNT(*) FROM pending_approvals
+             WHERE status IN ('pending', 'approved')
+         ) < ?",
     )
     .bind(&created_at)
     .bind(decision_id)
@@ -643,10 +701,86 @@ pub async fn insert_pending_approval(
     .bind(&info_json)
     .bind(&baseline_json)
     .bind(action.dedup_key())
+    .bind(i64::try_from(MAX_ACTIVE_APPROVALS)?)
+    .execute(pool)
+    .await?;
+    anyhow::ensure!(
+        inserted.rows_affected() == 1,
+        "approval queue is full (maximum {MAX_ACTIVE_APPROVALS})"
+    );
+    let id = inserted.last_insert_rowid();
+    u64::try_from(id).map_err(|_| anyhow::anyhow!("pending approval row id was negative"))
+}
+
+fn ensure_approval_row_bounded(
+    action_json: &str,
+    info_json: &str,
+    baseline_json: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        action_json.len() <= MAX_APPROVAL_ACTION_BYTES,
+        "approval action exceeds the {MAX_APPROVAL_ACTION_BYTES}-byte limit"
+    );
+    anyhow::ensure!(
+        info_json.len() <= MAX_APPROVAL_INFO_BYTES,
+        "approval details exceed the {MAX_APPROVAL_INFO_BYTES}-byte limit"
+    );
+    anyhow::ensure!(
+        baseline_json.len() <= MAX_APPROVAL_BASELINE_BYTES,
+        "approval baseline exceeds the {MAX_APPROVAL_BASELINE_BYTES}-byte limit"
+    );
+    serde_json::from_str::<FixAction>(action_json)
+        .context("approval action is not round-trippable")?;
+    serde_json::from_str::<ApprovalInfo>(info_json)
+        .context("approval details are not round-trippable")?;
+    serde_json::from_str::<SystemState>(baseline_json)
+        .context("approval baseline is not round-trippable")?;
+    Ok(())
+}
+
+async fn sanitize_active_approval_rows(pool: &SqlitePool) -> Result<()> {
+    let oversized = sqlx::query(
+        "DELETE FROM pending_approvals
+         WHERE status IN ('pending', 'approved')
+           AND (
+             length(CAST(action_json AS BLOB)) > ?
+             OR length(CAST(info_json AS BLOB)) > ?
+             OR length(CAST(baseline_json AS BLOB)) > ?
+           )",
+    )
+    .bind(i64::try_from(MAX_APPROVAL_ACTION_BYTES)?)
+    .bind(i64::try_from(MAX_APPROVAL_INFO_BYTES)?)
+    .bind(i64::try_from(MAX_APPROVAL_BASELINE_BYTES)?)
     .execute(pool)
     .await?
-    .last_insert_rowid();
-    u64::try_from(id).map_err(|_| anyhow::anyhow!("pending approval row id was negative"))
+    .rows_affected();
+    if oversized > 0 {
+        warn!(oversized, "Dropped oversized active approval rows");
+    }
+
+    // Preserve approved rows first, then the freshest pending evidence. Anything
+    // discarded is never executed; a live problem may be proposed again later.
+    let overflow = sqlx::query(
+        "DELETE FROM pending_approvals
+         WHERE status IN ('pending', 'approved')
+           AND id NOT IN (
+             SELECT id FROM pending_approvals
+             WHERE status IN ('pending', 'approved')
+             ORDER BY CASE status WHEN 'approved' THEN 0 ELSE 1 END, id DESC
+             LIMIT ?
+           )",
+    )
+    .bind(i64::try_from(MAX_ACTIVE_APPROVALS)?)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if overflow > 0 {
+        warn!(
+            overflow,
+            "Dropped active approval rows beyond the queue limit"
+        );
+    }
+    Ok(())
 }
 
 /// Upgrade legacy active approvals whose additive `action_key` column is NULL and
@@ -721,6 +855,7 @@ pub async fn load_pending_approvals(pool: &SqlitePool) -> Result<Vec<PendingAppr
     sqlx::query("DELETE FROM pending_approvals WHERE status = 'rejected'")
         .execute(pool)
         .await?;
+    sanitize_active_approval_rows(pool).await?;
     normalize_active_approval_keys(pool).await?;
     let rows = sqlx::query(
         "SELECT id, decision_id, action_json, info_json, baseline_json
@@ -732,26 +867,7 @@ pub async fn load_pending_approvals(pool: &SqlitePool) -> Result<Vec<PendingAppr
     let mut out = Vec::new();
     for row in rows {
         let id: i64 = row.try_get("id")?;
-        let decision_id: i64 = row.try_get("decision_id")?;
-        let action_json: String = row.try_get("action_json")?;
-        let info_json: String = row.try_get("info_json")?;
-        let baseline_json: String = row.try_get("baseline_json")?;
-
-        let parsed = (|| -> Result<PendingApproval> {
-            let action: FixAction = serde_json::from_str(&action_json)?;
-            let mut info: ApprovalInfo = serde_json::from_str(&info_json)?;
-            // The row id is the source of truth for the approval id.
-            info.id = u64::try_from(id)?;
-            let baseline: SystemState = serde_json::from_str(&baseline_json)?;
-            Ok(PendingApproval {
-                info,
-                action,
-                decision_id,
-                baseline,
-            })
-        })();
-
-        match parsed {
+        match parse_pending_approval(&row) {
             Ok(pa) => out.push(pa),
             Err(e) => {
                 warn!(id, "Dropping unreadable pending approval: {e}");
@@ -784,7 +900,9 @@ pub async fn load_pending_approvals(pool: &SqlitePool) -> Result<Vec<PendingAppr
     Ok(keep)
 }
 
+#[cfg(test)]
 pub async fn load_claimed_approvals(pool: &SqlitePool) -> Result<Vec<PendingApproval>> {
+    sanitize_active_approval_rows(pool).await?;
     normalize_active_approval_keys(pool).await?;
     let rows = sqlx::query(
         "SELECT id, decision_id, action_json, info_json, baseline_json
@@ -809,6 +927,21 @@ pub async fn load_claimed_approvals(pool: &SqlitePool) -> Result<Vec<PendingAppr
     Ok(out)
 }
 
+/// A persisted `approved` row means execution may have started before the process
+/// stopped. External side effects cannot be made transactionally at-most-once with
+/// SQLite, so startup fails safe: require a fresh user approval instead of replaying
+/// an action that may already have run.
+pub async fn requeue_claimed_approvals_on_startup(pool: &SqlitePool) -> Result<u64> {
+    Ok(sqlx::query(
+        "UPDATE pending_approvals
+         SET status = 'pending', claimed_at = NULL
+         WHERE status = 'approved'",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
 /// Atomically records the user's decision. Only a still-pending row can be claimed,
 /// so repeated clicks/connections cannot enqueue the same privileged action twice.
 pub async fn claim_pending_approval(
@@ -818,6 +951,7 @@ pub async fn claim_pending_approval(
 ) -> Result<Option<PendingApproval>> {
     let id = i64::try_from(id)?;
     let status = if approved { "approved" } else { "rejected" };
+    let mut tx = pool.begin().await?;
     let row = sqlx::query(
         "UPDATE pending_approvals
          SET status = ?, claimed_at = ?
@@ -827,18 +961,24 @@ pub async fn claim_pending_approval(
     .bind(status)
     .bind(Utc::now().to_rfc3339())
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    row.as_ref().map(parse_pending_approval).transpose()
+    let approval = row.as_ref().map(parse_pending_approval).transpose()?;
+    tx.commit().await?;
+    Ok(approval)
 }
 
 fn parse_pending_approval(row: &sqlx::sqlite::SqliteRow) -> Result<PendingApproval> {
     let id: i64 = row.try_get("id")?;
     let decision_id: i64 = row.try_get("decision_id")?;
-    let action: FixAction = serde_json::from_str(&row.try_get::<String, _>("action_json")?)?;
-    let mut info: ApprovalInfo = serde_json::from_str(&row.try_get::<String, _>("info_json")?)?;
+    let action_json: String = row.try_get("action_json")?;
+    let info_json: String = row.try_get("info_json")?;
+    let baseline_json: String = row.try_get("baseline_json")?;
+    ensure_approval_row_bounded(&action_json, &info_json, &baseline_json)?;
+    let action: FixAction = serde_json::from_str(&action_json)?;
+    let mut info: ApprovalInfo = serde_json::from_str(&info_json)?;
     info.id = u64::try_from(id)?;
-    let baseline: SystemState = serde_json::from_str(&row.try_get::<String, _>("baseline_json")?)?;
+    let baseline: SystemState = serde_json::from_str(&baseline_json)?;
     Ok(PendingApproval {
         info,
         action,
@@ -984,7 +1124,7 @@ pub async fn persist_execution(
     })
 }
 
-/// Delete rows older than `days` from the three high-frequency audit tables that
+/// Delete rows older than `days` from the high-frequency audit tables that
 /// otherwise grow without bound (~52k rows/yr each at the default cadence). The
 /// dashboard timeline reads only the last 24h and the trend detector only the last few
 /// rows, so a 90-day window keeps every reader whole. Mirrors `feedback::prune_old`;
@@ -995,6 +1135,7 @@ pub async fn prune_old(pool: &SqlitePool, days: i64) -> anyhow::Result<u64> {
     for (table, col) in [
         ("system_state_history", "timestamp"),
         ("execution_log", "executed_at"),
+        ("update_attempts", "created_at"),
     ] {
         let res = sqlx::query(&format!("DELETE FROM {table} WHERE {col} < ?"))
             .bind(&cutoff)
@@ -1020,6 +1161,342 @@ pub async fn prune_old(pool: &SqlitePool, days: i64) -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn init_db_accepts_a_canonical_windows_path() {
+        let root = std::env::temp_dir().join(format!("eir-canonical-db-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create database test directory");
+        let canonical = std::fs::canonicalize(&root).expect("canonical database directory");
+        assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
+        let path = canonical.join("eir.db");
+
+        let pool = init_db(&path.to_string_lossy())
+            .await
+            .expect("open database through a verbatim Windows path");
+        pool.close().await;
+        assert!(path.is_file());
+
+        // SQLite can retain the WAL mapping until the test process exits on Windows.
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn prune_old_removes_expired_update_attempts_only() {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("open db");
+        sqlx::query(
+            "CREATE TABLE system_state_history (timestamp TEXT NOT NULL);
+             CREATE TABLE execution_log (executed_at TEXT NOT NULL);
+             CREATE TABLE update_attempts (created_at TEXT NOT NULL);
+             CREATE TABLE decisions (id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL);
+             CREATE TABLE pending_approvals (decision_id INTEGER NOT NULL);
+             INSERT INTO update_attempts VALUES
+                 ('2000-01-01T00:00:00+00:00'),
+                 ('9999-01-01T00:00:00+00:00');",
+        )
+        .execute(&pool)
+        .await
+        .expect("schema");
+
+        prune_old(&pool, 90).await.expect("prune");
+
+        let remaining: Vec<String> =
+            sqlx::query_scalar("SELECT created_at FROM update_attempts ORDER BY created_at")
+                .fetch_all(&pool)
+                .await
+                .expect("remaining attempts");
+        assert_eq!(remaining, ["9999-01-01T00:00:00+00:00"]);
+    }
+
+    #[tokio::test]
+    async fn failed_state_snapshot_does_not_leave_a_ghost_decision() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("db");
+        sqlx::query(
+            "CREATE TABLE decisions (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                signal_snapshot TEXT NOT NULL,
+                claude_response TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                executed INTEGER NOT NULL
+            );
+            CREATE TABLE system_state_history (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                cpu_usage REAL,
+                memory_usage REAL,
+                disk_usage REAL,
+                failed_services_count INTEGER,
+                snapshot TEXT
+            );
+            CREATE TRIGGER reject_state BEFORE INSERT ON system_state_history
+            BEGIN SELECT RAISE(ABORT, 'state write failed'); END;",
+        )
+        .execute(&pool)
+        .await
+        .expect("schema");
+        let snapshot = SignalSnapshot {
+            timestamp: Utc::now(),
+            event_log: vec![],
+            file_changes: vec![],
+            system_state: SystemState::default(),
+            decision_history: vec![],
+        };
+        let decision = ClaudeDecision {
+            analysis: "healthy".into(),
+            problems: vec![],
+            needs_deeper_analysis: false,
+        };
+
+        assert!(log_decision(&pool, &snapshot, &decision).await.is_err());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM decisions")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_provider_usage_is_not_persisted_as_negative_usage() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("db");
+        sqlx::query(
+            "CREATE TABLE usage_log (
+                timestamp TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cache_creation INTEGER NOT NULL,
+                cache_read INTEGER NOT NULL,
+                cost_usd REAL NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("schema");
+
+        let usage = CallUsage {
+            input_tokens: u64::MAX,
+            ..CallUsage::default()
+        };
+        assert!(log_usage(&pool, &usage).await.is_err());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_log")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 0);
+
+        let overflowing_total = CallUsage {
+            input_tokens: i64::MAX as u64,
+            output_tokens: 1,
+            ..CallUsage::default()
+        };
+        assert!(log_usage(&pool, &overflowing_total).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_decision_history_is_bounded_before_reuse() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("db");
+        sqlx::query(
+            "CREATE TABLE decisions (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                claude_response TEXT NOT NULL,
+                confidence REAL NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("schema");
+        let problem = crate::models::Problem {
+            diagnosis: "x".repeat(100_000),
+            root_cause: "root".into(),
+            confidence: 0.9,
+            proposed_fix: serde_json::json!({
+                "action": "service_restart",
+                "service_name": "Spooler",
+            }),
+            reasoning: "reason".into(),
+            side_effects: "side effects".into(),
+            undo_instructions: "undo".into(),
+        };
+        let response = ClaudeDecision {
+            analysis: String::new(),
+            problems: vec![problem; 6],
+            needs_deeper_analysis: false,
+        };
+        sqlx::query(
+            "INSERT INTO decisions (timestamp, claude_response, confidence)
+             VALUES (?, ?, ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(serde_json::to_string(&response).expect("response"))
+        .bind(0.9)
+        .execute(&pool)
+        .await
+        .expect("legacy decision");
+
+        let history = get_recent_decisions(&pool, 5).await.expect("history");
+        assert_eq!(history.len(), 5);
+        assert!(history
+            .iter()
+            .all(|decision| decision.diagnosis.len() <= 16 * 1024));
+    }
+
+    #[tokio::test]
+    async fn usage_summary_ignores_legacy_negative_counters() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("db");
+        sqlx::query(
+            "CREATE TABLE usage_log (
+                timestamp TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cache_creation INTEGER NOT NULL,
+                cache_read INTEGER NOT NULL,
+                cost_usd REAL NOT NULL
+            );
+            INSERT INTO usage_log VALUES
+                ('9999-01-01T00:00:00+00:00', -1, -2, -3, -4, -0.5);",
+        )
+        .execute(&pool)
+        .await
+        .expect("schema");
+
+        let summary = usage_summary(&pool).await.expect("summary");
+        assert_eq!(summary.tokens_today, 0);
+        assert_eq!(summary.tokens_week, 0);
+        assert_eq!(summary.cost_today_usd, 0.0);
+        assert_eq!(summary.cost_week_usd, 0.0);
+    }
+
+    #[tokio::test]
+    async fn usage_summary_clamps_legacy_counter_overflow() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("db");
+        sqlx::query(
+            "CREATE TABLE usage_log (
+                timestamp TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cache_creation INTEGER NOT NULL,
+                cache_read INTEGER NOT NULL,
+                cost_usd REAL NOT NULL
+            );
+            INSERT INTO usage_log VALUES
+                ('9999-01-01T00:00:00+00:00',
+                 9223372036854775807, 9223372036854775807,
+                 9223372036854775807, 9223372036854775807, 0.0);",
+        )
+        .execute(&pool)
+        .await
+        .expect("schema");
+
+        let summary = usage_summary(&pool).await.expect("summary");
+        assert_eq!(summary.tokens_today, u64::MAX);
+        assert_eq!(summary.tokens_week, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn digest_stats_ignores_invalid_legacy_costs() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("db");
+        sqlx::query(
+            "CREATE TABLE decisions (timestamp TEXT NOT NULL);
+             CREATE TABLE execution_log (executed_at TEXT NOT NULL, success INTEGER NOT NULL);
+             CREATE TABLE update_attempts (created_at TEXT NOT NULL, success INTEGER NOT NULL);
+             CREATE TABLE usage_log (timestamp TEXT NOT NULL, cost_usd REAL NOT NULL);
+             CREATE TABLE learned_facts (id INTEGER);
+             INSERT INTO usage_log VALUES ('9999-01-01T00:00:00+00:00', -4.5);",
+        )
+        .execute(&pool)
+        .await
+        .expect("schema");
+        sqlx::query("INSERT INTO usage_log VALUES (?, ?)")
+            .bind("9999-01-01T00:00:01+00:00")
+            .bind(f64::INFINITY)
+            .execute(&pool)
+            .await
+            .expect("legacy infinity");
+
+        let stats = digest_stats(&pool, "0000").await.expect("digest");
+        assert_eq!(stats.spend_usd, 0.0);
+    }
+
+    #[tokio::test]
+    async fn latest_legacy_digest_is_bounded_at_the_database_read_boundary() {
+        const LIMIT: usize = 64 * 1024;
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("db");
+        sqlx::query(
+            "CREATE TABLE health_digest (
+                id INTEGER PRIMARY KEY,
+                text TEXT NOT NULL,
+                generated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("schema");
+        sqlx::query("INSERT INTO health_digest (text, generated_at) VALUES (?, ?)")
+            .bind(format!("a{}", "é".repeat(LIMIT)))
+            .bind(Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await
+            .expect("legacy digest");
+
+        let (text, _) = latest_digest(&pool).await.expect("read").expect("digest");
+        assert!(text.len() <= LIMIT);
+        assert!(text.ends_with('é'));
+    }
+
+    #[tokio::test]
+    async fn advisor_escalation_count_clamps_corrupt_database_values() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("db");
+        sqlx::query(
+            "CREATE TABLE advisor_daily_spend (
+                day TEXT PRIMARY KEY,
+                spent_usd REAL NOT NULL,
+                escalations INTEGER NOT NULL
+            );
+            INSERT INTO advisor_daily_spend VALUES ('2026-07-31', -1.0, 4294967300);",
+        )
+        .execute(&pool)
+        .await
+        .expect("schema");
+
+        let (spent, escalations) = load_advisor_day(&pool, "2026-07-31").await.expect("load");
+        assert_eq!(spent, 0.0);
+        assert_eq!(escalations, u32::MAX);
+    }
 
     #[test]
     fn migration_checksum_reconciliation_allows_only_line_endings() {
@@ -1287,6 +1764,23 @@ mod tests {
             load_claimed_approvals(&pool).await.expect("claimed").len(),
             1
         );
+        assert_eq!(
+            requeue_claimed_approvals_on_startup(&pool)
+                .await
+                .expect("requeue after restart"),
+            1
+        );
+        assert_eq!(
+            load_pending_approvals(&pool)
+                .await
+                .expect("reapproval required")
+                .len(),
+            1
+        );
+        assert!(load_claimed_approvals(&pool)
+            .await
+            .expect("claimed row was requeued")
+            .is_empty());
         delete_pending_approval(&pool, id).await.expect("complete");
         assert!(load_claimed_approvals(&pool)
             .await
@@ -1347,6 +1841,250 @@ mod tests {
                 .await
                 .expect("count corrupt claim");
         assert_eq!(corrupt_remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn approval_storage_rejects_oversized_rows_and_a_full_active_queue() {
+        let path =
+            std::env::temp_dir().join(format!("eir-approval-bounds-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let pool = init_db(&path.to_string_lossy()).await.expect("db");
+        let decision_id = log_manual_decision(&pool, "bounds")
+            .await
+            .expect("decision");
+        let action = FixAction::ServiceRestart {
+            service_name: "Spooler".into(),
+        };
+        let mut info = ApprovalInfo {
+            id: 0,
+            diagnosis: "test".into(),
+            confidence: 0.9,
+            action: "restart".into(),
+            reason: "test".into(),
+            reversible: true,
+            root_cause: String::new(),
+            side_effects: String::new(),
+            undo_instructions: String::new(),
+            action_summary: String::new(),
+            target: String::new(),
+            target_details: String::new(),
+            created_at: 0,
+        };
+        info.diagnosis = "x".repeat(MAX_APPROVAL_INFO_BYTES);
+        assert!(insert_pending_approval(
+            &pool,
+            decision_id,
+            &action,
+            &info,
+            &SystemState::default()
+        )
+        .await
+        .is_err());
+        let non_finite_baseline = SystemState {
+            cpu_usage_percent: f32::NAN,
+            ..SystemState::default()
+        };
+        info.diagnosis = "test".into();
+        assert!(
+            insert_pending_approval(&pool, decision_id, &action, &info, &non_finite_baseline,)
+                .await
+                .is_err()
+        );
+
+        let action_json = serde_json::to_string(&action).expect("action");
+        let info_json = serde_json::to_string(&ApprovalInfo {
+            diagnosis: "test".into(),
+            ..info.clone()
+        })
+        .expect("info");
+        let baseline_json = serde_json::to_string(&SystemState::default()).expect("baseline");
+        for index in 0..MAX_ACTIVE_APPROVALS {
+            sqlx::query(
+                "INSERT INTO pending_approvals
+                 (created_at, decision_id, action_json, info_json, baseline_json, action_key)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(decision_id)
+            .bind(&action_json)
+            .bind(&info_json)
+            .bind(&baseline_json)
+            .bind(format!("seed-{index}"))
+            .execute(&pool)
+            .await
+            .expect("seed active approval");
+        }
+        info.diagnosis = "test".into();
+        assert!(insert_pending_approval(
+            &pool,
+            decision_id,
+            &FixAction::ServiceRestart {
+                service_name: "OtherService".into(),
+            },
+            &info,
+            &SystemState::default(),
+        )
+        .await
+        .is_err());
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pending_approvals
+             WHERE status IN ('pending', 'approved')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("active count");
+        assert_eq!(count, MAX_ACTIVE_APPROVALS as i64);
+    }
+
+    #[tokio::test]
+    async fn malformed_legacy_approval_claim_rolls_back_to_pending() {
+        let path = std::env::temp_dir().join(format!(
+            "eir-legacy-approval-claim-rollback-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let pool = init_db(&path.to_string_lossy()).await.expect("db");
+        let decision_id = log_manual_decision(&pool, "legacy")
+            .await
+            .expect("decision");
+        let action = FixAction::ServiceRestart {
+            service_name: "Spooler".into(),
+        };
+        let info = ApprovalInfo {
+            id: 0,
+            diagnosis: "legacy".into(),
+            confidence: 0.9,
+            action: "restart".into(),
+            reason: "test".into(),
+            reversible: true,
+            root_cause: String::new(),
+            side_effects: String::new(),
+            undo_instructions: String::new(),
+            action_summary: String::new(),
+            target: String::new(),
+            target_details: String::new(),
+            created_at: 0,
+        };
+        let baseline = SystemState {
+            cpu_usage_percent: f32::NAN,
+            ..SystemState::default()
+        };
+        let baseline_json = serde_json::to_string(&baseline).expect("baseline");
+        assert!(baseline_json.contains("null"));
+        let id = sqlx::query(
+            "INSERT INTO pending_approvals
+             (created_at, decision_id, action_json, info_json, baseline_json, action_key)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(decision_id)
+        .bind(serde_json::to_string(&action).expect("action"))
+        .bind(serde_json::to_string(&info).expect("info"))
+        .bind(&baseline_json)
+        .bind(action.dedup_key())
+        .execute(&pool)
+        .await
+        .expect("legacy row")
+        .last_insert_rowid();
+
+        assert!(
+            claim_pending_approval(&pool, u64::try_from(id).expect("id"), true)
+                .await
+                .is_err()
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM pending_approvals WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("status");
+        assert_eq!(status, "pending");
+    }
+
+    #[tokio::test]
+    async fn legacy_oversized_approval_is_dropped_on_load() {
+        let path = std::env::temp_dir().join(format!(
+            "eir-legacy-approval-bounds-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let pool = init_db(&path.to_string_lossy()).await.expect("db");
+        let decision_id = log_manual_decision(&pool, "legacy")
+            .await
+            .expect("decision");
+        let action = FixAction::ServiceRestart {
+            service_name: "Spooler".into(),
+        };
+        sqlx::query(
+            "INSERT INTO pending_approvals
+             (created_at, decision_id, action_json, info_json, baseline_json, action_key)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(decision_id)
+        .bind(serde_json::to_string(&action).expect("action"))
+        .bind("x".repeat(MAX_APPROVAL_INFO_BYTES + 1))
+        .bind(serde_json::to_string(&SystemState::default()).expect("baseline"))
+        .bind(action.dedup_key())
+        .execute(&pool)
+        .await
+        .expect("legacy row");
+
+        assert!(load_pending_approvals(&pool)
+            .await
+            .expect("load")
+            .is_empty());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_approvals")
+            .fetch_one(&pool)
+            .await
+            .expect("remaining count");
+        assert_eq!(count, 0);
+
+        let info = ApprovalInfo {
+            id: 0,
+            diagnosis: "legacy".into(),
+            confidence: 0.9,
+            action: "restart".into(),
+            reason: "test".into(),
+            reversible: true,
+            root_cause: String::new(),
+            side_effects: String::new(),
+            undo_instructions: String::new(),
+            action_summary: String::new(),
+            target: String::new(),
+            target_details: String::new(),
+            created_at: 0,
+        };
+        let info_json = serde_json::to_string(&info).expect("info");
+        let baseline_json = serde_json::to_string(&SystemState::default()).expect("baseline");
+        for index in 0..=MAX_ACTIVE_APPROVALS {
+            let action = FixAction::ServiceRestart {
+                service_name: format!("Service{index}"),
+            };
+            sqlx::query(
+                "INSERT INTO pending_approvals
+                 (created_at, decision_id, action_json, info_json, baseline_json, action_key)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(decision_id)
+            .bind(serde_json::to_string(&action).expect("action"))
+            .bind(&info_json)
+            .bind(&baseline_json)
+            .bind(action.dedup_key())
+            .execute(&pool)
+            .await
+            .expect("legacy active row");
+        }
+
+        let pending = load_pending_approvals(&pool).await.expect("bounded load");
+        assert_eq!(pending.len(), MAX_ACTIVE_APPROVALS);
+        assert!(pending.iter().all(|approval| {
+            !matches!(
+                &approval.action,
+                FixAction::ServiceRestart { service_name } if service_name == "Service0"
+            )
+        }));
     }
 
     #[tokio::test]

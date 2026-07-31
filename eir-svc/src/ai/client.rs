@@ -47,6 +47,17 @@ const MAX_AI_RETRIES: u32 = 2;
 /// 4096 the structured JSON was truncated mid-object and the whole cycle failed to
 /// parse. Current models comfortably support this larger budget (billed on actual use).
 const MAX_TOKENS: u32 = 8192;
+/// A provider response is bounded even if it ignores `max_tokens` or sends a
+/// never-terminated SSE line.
+const MAX_AI_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+fn provider_cost(cost: f64) -> f64 {
+    if cost.is_finite() && cost >= 0.0 {
+        cost
+    } else {
+        0.0
+    }
+}
 
 // ── OpenAI-compatible request/response (OpenRouter) ────────────────────────────
 
@@ -141,15 +152,28 @@ struct ClaudeCliUsage {
 /// a multi-byte UTF-8 character straddles a chunk boundary.
 struct SseLineBuf {
     buf: Vec<u8>,
+    received: usize,
 }
 
 impl SseLineBuf {
     fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self {
+            buf: Vec::new(),
+            received: 0,
+        }
     }
 
-    fn push(&mut self, chunk: &[u8]) {
+    fn push(&mut self, chunk: &[u8]) -> Result<()> {
+        if self.received.saturating_add(chunk.len()) > MAX_AI_RESPONSE_BYTES {
+            self.buf.clear();
+            bail!(
+                "AI response exceeded the {}-byte limit",
+                MAX_AI_RESPONSE_BYTES
+            );
+        }
+        self.received += chunk.len();
         self.buf.extend_from_slice(chunk);
+        Ok(())
     }
 
     /// Next complete, trimmed line — or None until one arrives.
@@ -158,6 +182,31 @@ impl SseLineBuf {
         let line: Vec<u8> = self.buf.drain(..=pos).collect();
         Some(String::from_utf8_lossy(&line).trim().to_string())
     }
+}
+
+async fn response_text_capped(resp: reqwest::Response) -> Result<String> {
+    if resp
+        .content_length()
+        .is_some_and(|length| length > MAX_AI_RESPONSE_BYTES as u64)
+    {
+        bail!(
+            "AI response exceeded the {}-byte limit",
+            MAX_AI_RESPONSE_BYTES
+        );
+    }
+    let mut body = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("AI response read failed")?;
+        if body.len().saturating_add(chunk.len()) > MAX_AI_RESPONSE_BYTES {
+            bail!(
+                "AI response exceeded the {}-byte limit",
+                MAX_AI_RESPONSE_BYTES
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// A base64-encoded image attachment for a multimodal completion. Only the HTTP
@@ -201,7 +250,7 @@ enum AiClientConfig {
         model: String,
     },
     OpenRouter {
-        api_key: String,
+        api_key: Option<String>,
         model: String,
     },
     /// Kilo Code via the local `kilo` CLI — borrows the machine's logged-in
@@ -215,7 +264,7 @@ enum AiClientConfig {
 }
 
 impl AiClient {
-    pub fn new(cfg: &ApiConfig) -> Result<Self> {
+    pub async fn new(cfg: &ApiConfig) -> Result<Self> {
         let inner = match cfg.provider {
             ApiProvider::Anthropic => {
                 let key = cfg
@@ -236,10 +285,11 @@ impl AiClient {
                 // subscription session. Profile and binary are auto-detected
                 // when not configured.
                 let user_profile = resolve_cli_user_profile(
-                    cfg.user_profile.as_deref(),
+                    cfg.user_profile.clone(),
                     running_as_local_system(),
                     resolve_user_profile,
-                );
+                )
+                .await;
                 info!(
                     configured_binary = cfg.claude_cli_path.as_deref().unwrap_or("<auto>"),
                     user_profile = user_profile.as_deref().unwrap_or("<not found>"),
@@ -268,10 +318,7 @@ impl AiClient {
                     .openrouter_api_key
                     .clone()
                     .filter(|k| !k.trim().is_empty())
-                    .or_else(resolve_openrouter_key)
-                    .context(
-                        "[api] OpenRouter needs an API key — add it in Settings, or log in with the OpenRouter CLI (~/.openrouter/config.json)",
-                    )?;
+                    .map(|key| key.trim().to_string());
                 // Blank model defaults to the free auto-routing meta-model.
                 let model = if cfg.model.trim().is_empty() {
                     "openrouter/free".to_string()
@@ -286,10 +333,11 @@ impl AiClient {
                 // through it transparently). Profile and binary are
                 // auto-detected when not configured.
                 let user_profile = resolve_cli_user_profile(
-                    cfg.kilo_cli_user_profile.as_deref(),
+                    cfg.kilo_cli_user_profile.clone(),
                     running_as_local_system(),
                     resolve_kilo_cli_profile,
-                );
+                )
+                .await;
                 if cfg.model.trim().is_empty() {
                     bail!("[api] a model is required for provider = \"kilo_cli\" (e.g. kilo/minimax/minimax-m3 or kilo/anthropic/claude-sonnet-5)");
                 }
@@ -394,7 +442,8 @@ impl AiClient {
                 }
                 AiClientConfig::OpenRouter { api_key, model } => {
                     let m = model_ov.unwrap_or(model);
-                    self.call_openai_style(OPENROUTER_BASE, api_key, m, effort, &prompt, &[])
+                    let api_key = openrouter_api_key(api_key.as_deref()).await?;
+                    self.call_openai_style(OPENROUTER_BASE, &api_key, m, effort, &prompt, &[])
                         .await
                 }
                 AiClientConfig::KiloCli {
@@ -451,6 +500,21 @@ impl AiClient {
                 })?
             }
         };
+
+        let reported_problems = decision.problems.len();
+        decision.bound_model_output();
+        if decision.problems.len() < reported_problems.min(5) {
+            warn!(
+                reported_problems,
+                accepted_problems = decision.problems.len(),
+                "Dropped invalid or oversized model problems"
+            );
+        } else if reported_problems > 5 {
+            warn!(
+                reported_problems,
+                "Model returned more than five problems; ignored the remainder"
+            );
+        }
 
         // Defensive clamp: the model could emit a confidence outside [0,1] (a garbled
         // "5.0" would render as "500%" in the UI). The policy gate is a `<` comparison
@@ -539,7 +603,9 @@ impl AiClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = response_text_capped(resp)
+                .await
+                .context("Read Anthropic error response")?;
             bail!("Anthropic API {status}: {}", char_preview(&text, 2000));
         }
 
@@ -555,7 +621,7 @@ impl AiClient {
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("Anthropic stream read error")?;
-            lines.push(&chunk);
+            lines.push(&chunk)?;
             while let Some(line) = lines.next_line() {
                 let Some(data) = line.strip_prefix("data: ") else {
                     continue;
@@ -570,7 +636,14 @@ impl AiClient {
                     Some("content_block_delta")
                         if ev["delta"]["type"].as_str() == Some("text_delta") =>
                     {
-                        out.push_str(ev["delta"]["text"].as_str().unwrap_or(""));
+                        let delta = ev["delta"]["text"].as_str().unwrap_or("");
+                        if out.len().saturating_add(delta.len()) > MAX_AI_RESPONSE_BYTES {
+                            bail!(
+                                "Anthropic response exceeded the {}-byte limit",
+                                MAX_AI_RESPONSE_BYTES
+                            );
+                        }
+                        out.push_str(delta);
                     }
                     Some("message_start") => {
                         let u = &ev["message"]["usage"];
@@ -679,7 +752,9 @@ impl AiClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = response_text_capped(resp)
+                .await
+                .context("Read model API error response")?;
             bail!("model API {status}: {}", char_preview(&text, 2000));
         }
 
@@ -694,7 +769,7 @@ impl AiClient {
                 break;
             }
             let chunk = chunk.context("stream read error")?;
-            lines.push(&chunk);
+            lines.push(&chunk)?;
             while let Some(line) = lines.next_line() {
                 // SSE comments (": OPENROUTER PROCESSING" heartbeats) — skip.
                 if line.starts_with(':') {
@@ -718,12 +793,20 @@ impl AiClient {
                                 output_tokens: u.completion_tokens.unwrap_or(0),
                                 cache_creation: 0,
                                 cache_read: 0,
-                                cost_usd: u.cost.unwrap_or(0.0),
+                                cost_usd: provider_cost(u.cost.unwrap_or(0.0)),
                             });
                         }
                         if let Some(choices) = chunk.choices {
                             if let Some(choice) = choices.into_iter().next() {
                                 if let Some(content) = choice.delta.content {
+                                    if out.len().saturating_add(content.len())
+                                        > MAX_AI_RESPONSE_BYTES
+                                    {
+                                        bail!(
+                                            "model response exceeded the {}-byte limit",
+                                            MAX_AI_RESPONSE_BYTES
+                                        );
+                                    }
                                     out.push_str(&content);
                                 }
                             }
@@ -784,7 +867,17 @@ impl AiClient {
             .await
             .context("Join Claude user-process task")??
         } else {
-            let binary = resolve_claude_binary(configured_binary, user_profile);
+            let configured_binary = configured_binary.map(str::to_owned);
+            let user_profile = user_profile.map(str::to_owned);
+            let profile_for_resolution = user_profile.clone();
+            let binary = tokio::task::spawn_blocking(move || {
+                resolve_claude_binary(
+                    configured_binary.as_deref(),
+                    profile_for_resolution.as_deref(),
+                )
+            })
+            .await
+            .context("Join Claude binary resolution task")?;
             let mut command = cli_process(&binary);
             command
                 .args(&args)
@@ -792,7 +885,7 @@ impl AiClient {
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            if let Some(profile) = user_profile {
+            if let Some(profile) = user_profile.as_deref() {
                 command
                     .env("USERPROFILE", profile)
                     .env("HOME", profile)
@@ -847,7 +940,7 @@ impl AiClient {
                     output_tokens: u.output_tokens.unwrap_or(0),
                     cache_creation: u.cache_creation_input_tokens.unwrap_or(0),
                     cache_read: u.cache_read_input_tokens.unwrap_or(0),
-                    cost_usd: env.total_cost_usd.unwrap_or(0.0),
+                    cost_usd: provider_cost(env.total_cost_usd.unwrap_or(0.0)),
                 });
                 Ok((text, usage))
             }
@@ -937,10 +1030,22 @@ impl AiClient {
             .await
             .context("Join Kilo user-process task")??
         } else {
-            let binary = resolve_kilo_cli_binary(configured_binary, user_profile);
+            let configured_binary = configured_binary.map(str::to_owned);
+            let user_profile = user_profile.map(str::to_owned);
+            let profile_for_resolution = user_profile.clone();
+            let binary = tokio::task::spawn_blocking(move || {
+                resolve_kilo_cli_binary(
+                    configured_binary.as_deref(),
+                    profile_for_resolution.as_deref(),
+                )
+            })
+            .await
+            .context("Join Kilo binary resolution task")?;
             let workspace =
                 std::env::temp_dir().join(format!("eir-kilo-{}-{seq}", std::process::id()));
-            std::fs::create_dir_all(&workspace).context("Create Kilo scratch workspace")?;
+            tokio::fs::create_dir_all(&workspace)
+                .await
+                .context("Create Kilo scratch workspace")?;
             let mut command = cli_process(&binary);
             command
                 .args(&args)
@@ -951,7 +1056,7 @@ impl AiClient {
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            if let Some(profile) = user_profile {
+            if let Some(profile) = user_profile.as_deref() {
                 command
                     .env("USERPROFILE", profile)
                     .env("HOME", profile)
@@ -965,7 +1070,7 @@ impl AiClient {
                 Ok(child) => wait_capped(child, "kilo CLI", Some(prompt.as_bytes().to_vec())).await,
                 Err(error) => Err(error),
             };
-            let _ = std::fs::remove_dir_all(&workspace);
+            let _ = tokio::fs::remove_dir_all(&workspace).await;
             let (status, stdout, stderr) = waited?;
             CliProcessOutput {
                 code: status.code().map(|code| code as u32).unwrap_or(u32::MAX),
@@ -1069,7 +1174,8 @@ impl AiClient {
         match &self.config {
             AiClientConfig::OpenRouter { api_key, model } => {
                 let m = if ov.is_empty() { model.as_str() } else { ov };
-                self.call_openrouter_web(api_key, m, prompt).await
+                let api_key = openrouter_api_key(api_key.as_deref()).await?;
+                self.call_openrouter_web(&api_key, m, prompt).await
             }
             AiClientConfig::Anthropic { api_key, .. } => {
                 let m = anthropic_web_model(ov);
@@ -1162,7 +1268,8 @@ impl AiClient {
             }
             AiClientConfig::OpenRouter { api_key, model } => {
                 let m = if ov.is_empty() { model.as_str() } else { ov };
-                self.call_openai_style(OPENROUTER_BASE, api_key, m, "", prompt, &[])
+                let api_key = openrouter_api_key(api_key.as_deref()).await?;
+                self.call_openai_style(OPENROUTER_BASE, &api_key, m, "", prompt, &[])
                     .await
             }
             AiClientConfig::KiloCli {
@@ -1215,7 +1322,8 @@ impl AiClient {
             }
             AiClientConfig::OpenRouter { api_key, model } => {
                 let m = if ov.is_empty() { model.as_str() } else { ov };
-                self.call_openai_style(OPENROUTER_BASE, api_key, m, "", prompt, images)
+                let api_key = openrouter_api_key(api_key.as_deref()).await?;
+                self.call_openai_style(OPENROUTER_BASE, &api_key, m, "", prompt, images)
                     .await
             }
             // CLI providers can't take images — answer text-only (the handler warns).
@@ -1254,7 +1362,9 @@ impl AiClient {
             .context("OpenRouter request failed")?;
 
         let status = resp.status();
-        let text = resp.text().await.context("OpenRouter read failed")?;
+        let text = response_text_capped(resp)
+            .await
+            .context("OpenRouter read failed")?;
         if !status.is_success() {
             let detail: String = text.chars().take(400).collect();
             bail!("OpenRouter error ({status}): {detail}");
@@ -1276,7 +1386,7 @@ impl AiClient {
             output_tokens: u.completion_tokens.unwrap_or(0),
             cache_creation: 0,
             cache_read: 0,
-            cost_usd: u.cost.unwrap_or(0.0),
+            cost_usd: provider_cost(u.cost.unwrap_or(0.0)),
         });
         Ok((content, usage))
     }
@@ -1307,7 +1417,9 @@ impl AiClient {
             .context("Anthropic API request failed")?;
 
         let status = resp.status();
-        let text = resp.text().await.context("Anthropic read failed")?;
+        let text = response_text_capped(resp)
+            .await
+            .context("Anthropic read failed")?;
         if !status.is_success() {
             let detail: String = text.chars().take(400).collect();
             bail!("Anthropic error ({status}): {detail}");
@@ -1479,33 +1591,51 @@ fn is_real(value: &str) -> bool {
     !v.is_empty() && !v.contains("YourName")
 }
 
-fn resolve_cli_user_profile(
-    configured: Option<&str>,
+async fn resolve_cli_user_profile(
+    configured: Option<String>,
     running_as_local_system: bool,
     resolver: fn(Option<&str>) -> Option<String>,
 ) -> Option<String> {
     if running_as_local_system {
         None
     } else {
-        resolver(configured)
+        tokio::task::spawn_blocking(move || resolver(configured.as_deref()))
+            .await
+            .ok()
+            .flatten()
     }
 }
 
 /// Resolve the Windows user profile whose logged-in `claude` session the service
-/// should borrow. Uses the configured value when set, otherwise scans `C:\Users`
-/// for the first profile holding a Claude CLI credentials file.
+/// should borrow. Uses the configured value when set, otherwise the process user.
 fn resolve_user_profile(configured: Option<&str>) -> Option<String> {
-    if let Some(p) = configured.filter(|p| is_real(p)) {
-        return Some(p.trim().to_string());
+    resolve_profile_with_marker(
+        configured,
+        current_user_profile(),
+        &[".claude", ".credentials.json"],
+    )
+}
+
+fn current_user_profile() -> Option<std::path::PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(Into::into)
+}
+
+fn resolve_profile_with_marker(
+    configured: Option<&str>,
+    current: Option<std::path::PathBuf>,
+    marker: &[&str],
+) -> Option<String> {
+    if let Some(profile) = configured.filter(|profile| is_real(profile)) {
+        return Some(profile.trim().to_string());
     }
-    let users = std::fs::read_dir("C:\\Users").ok()?;
-    for entry in users.flatten() {
-        let dir = entry.path();
-        if dir.join(".claude").join(".credentials.json").is_file() {
-            return Some(dir.to_string_lossy().into_owned());
-        }
-    }
-    None
+    let profile = current?;
+    marker
+        .iter()
+        .fold(profile.clone(), |path, component| path.join(component))
+        .is_file()
+        .then(|| profile.to_string_lossy().into_owned())
 }
 
 /// Resolve the path to the `claude` binary. Uses the configured value when set,
@@ -1611,8 +1741,13 @@ async fn run_codex_cli(
         .context("Join Codex user-process task")?;
     }
 
+    let configured_binary = configured_binary.map(str::to_owned);
     let profile = std::env::var("USERPROFILE").ok();
-    let binary = resolve_codex_binary(configured_binary, profile.as_deref());
+    let binary = tokio::task::spawn_blocking(move || {
+        resolve_codex_binary(configured_binary.as_deref(), profile.as_deref())
+    })
+    .await
+    .context("Join Codex binary resolution task")?;
     let workspace = std::env::temp_dir().join(format!("eir-codex-{}-{seq}", std::process::id()));
     tokio::fs::create_dir_all(&workspace)
         .await
@@ -2074,30 +2209,17 @@ pub(crate) async fn run_winget_as_active_user(
 }
 
 /// Resolve the Windows user profile whose logged-in Kilo session the service
-/// should borrow. Uses the configured value when set, otherwise scans
-/// `C:\Users` for the first profile holding the Kilo CLI's session file at
-/// `.local\share\kilo\auth.json` — a single JSON object keyed by provider
+/// should borrow. Uses the configured value when set, otherwise the process
+/// user's Kilo CLI session file at `.local\share\kilo\auth.json` — a single JSON object keyed by provider
 /// name (`"kilo": {"type":"oauth",...}` for the Kilo Pass/Token-Plan login,
 /// plus any BYOK provider entries added via `kilo auth login`, e.g.
 /// `"openrouter": {"type":"api",...}`).
 fn resolve_kilo_cli_profile(configured: Option<&str>) -> Option<String> {
-    if let Some(p) = configured.filter(|p| is_real(p)) {
-        return Some(p.trim().to_string());
-    }
-    let users = std::fs::read_dir("C:\\Users").ok()?;
-    for entry in users.flatten() {
-        let dir = entry.path();
-        if dir
-            .join(".local")
-            .join("share")
-            .join("kilo")
-            .join("auth.json")
-            .is_file()
-        {
-            return Some(dir.to_string_lossy().into_owned());
-        }
-    }
-    None
+    resolve_profile_with_marker(
+        configured,
+        current_user_profile(),
+        &[".local", "share", "kilo", "auth.json"],
+    )
 }
 
 /// Resolve the path to the `kilo` binary. Uses the configured value when set,
@@ -2174,24 +2296,51 @@ pub(crate) fn extract_json(s: &str) -> &str {
     }
 }
 
-/// Scan `C:\Users` for a logged-in OpenRouter CLI config and return its API
-/// key. Lets an OpenRouter user run with nothing pasted into Settings.
-fn resolve_openrouter_key() -> Option<String> {
-    let users = std::fs::read_dir("C:\\Users").ok()?;
-    for entry in users.flatten() {
-        let path = entry.path().join(".openrouter").join("config.json");
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let key = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| v.get("apiKey").and_then(|k| k.as_str()).map(str::to_string))
-            .filter(|k| !k.trim().is_empty());
-        if let Some(k) = key {
-            return Some(k.trim().to_string());
-        }
+async fn openrouter_api_key(configured: Option<&str>) -> Result<String> {
+    if let Some(key) = configured.filter(|key| !key.trim().is_empty()) {
+        return Ok(key.trim().to_string());
     }
-    None
+    resolve_openrouter_key().await.context(
+        "[api] OpenRouter needs an API key — add it in Settings, or log in with the OpenRouter CLI (~/.openrouter/config.json)",
+    )
+}
+
+/// Read the active user's OpenRouter CLI key without blocking the async loop.
+async fn resolve_openrouter_key() -> Option<String> {
+    tokio::task::spawn_blocking(resolve_openrouter_key_blocking)
+        .await
+        .ok()
+        .flatten()
+}
+
+#[cfg(windows)]
+fn resolve_openrouter_key_blocking() -> Option<String> {
+    if !running_as_local_system() {
+        let profile = std::path::PathBuf::from(std::env::var_os("USERPROFILE")?);
+        return read_openrouter_key(&profile);
+    }
+    let session = active_user_session_id()?;
+    let mut token = HANDLE::default();
+    unsafe { WTSQueryUserToken(session, &mut token) }.ok()?;
+    let _token = WinHandle(token);
+    let profile = user_profile_for_token(token).ok()?;
+    let _user = UserImpersonation::new(token).ok()?;
+    read_openrouter_key(std::path::Path::new(&profile))
+}
+
+#[cfg(not(windows))]
+fn resolve_openrouter_key_blocking() -> Option<String> {
+    let profile = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    read_openrouter_key(&profile)
+}
+
+fn read_openrouter_key(profile: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(profile.join(".openrouter").join("config.json")).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("apiKey").and_then(|k| k.as_str()).map(str::to_string))
+        .filter(|key| !key.trim().is_empty())
+        .map(|key| key.trim().to_string())
 }
 
 /// Extract the outermost JSON object (first `{` to last `}`) — a fallback for
@@ -2329,7 +2478,7 @@ fn parse_kilo_ndjson(stdout: &str) -> Result<(String, Option<CallUsage>)> {
             output_tokens: output,
             cache_creation: cache_write,
             cache_read,
-            cost_usd: cost,
+            cost_usd: provider_cost(cost),
         }
     });
     Ok((text, usage))
@@ -2504,11 +2653,69 @@ mod tests {
         assert_eq!(claude_cli_model("openrouter/free"), "haiku");
     }
 
-    #[test]
-    fn local_system_does_not_bind_a_subscription_cli_to_another_profile() {
+    #[tokio::test]
+    async fn local_system_does_not_bind_a_subscription_cli_to_another_profile() {
         assert_eq!(
-            resolve_cli_user_profile(Some(r"C:\Users\WrongProfile"), true, resolve_user_profile),
+            resolve_cli_user_profile(
+                Some(r"C:\Users\WrongProfile".to_string()),
+                true,
+                resolve_user_profile
+            )
+            .await,
             None
+        );
+    }
+
+    #[test]
+    fn automatic_cli_profile_is_scoped_to_the_process_user() {
+        let root = std::env::temp_dir().join(format!("eir-cli-profile-{}", std::process::id()));
+        let wrong = root.join("wrong");
+        let current = root.join("current");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(wrong.join(".claude")).unwrap();
+        std::fs::create_dir_all(current.join(".claude")).unwrap();
+        std::fs::write(wrong.join(".claude\\.credentials.json"), b"{}").unwrap();
+        std::fs::write(current.join(".claude\\.credentials.json"), b"{}").unwrap();
+
+        assert_eq!(
+            resolve_profile_with_marker(
+                None,
+                Some(current.clone()),
+                &[".claude", ".credentials.json"]
+            ),
+            Some(current.to_string_lossy().into_owned())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn openrouter_key_read_is_profile_scoped() {
+        let root = std::env::temp_dir().join(format!("eir-openrouter-scan-{}", std::process::id()));
+        let attacker = root.join("attacker");
+        let active = root.join("active");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(attacker.join(".openrouter")).unwrap();
+        std::fs::create_dir_all(active.join(".openrouter")).unwrap();
+        std::fs::write(
+            attacker.join(".openrouter\\config.json"),
+            br#"{"apiKey":"wrong-user-key"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            active.join(".openrouter\\config.json"),
+            br#"{"apiKey":" active-key "}"#,
+        )
+        .unwrap();
+
+        assert_eq!(read_openrouter_key(&active), Some("active-key".to_string()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn configured_openrouter_key_wins_without_profile_lookup() {
+        assert_eq!(
+            openrouter_api_key(Some(" configured-key ")).await.unwrap(),
+            "configured-key"
         );
     }
 
@@ -2771,9 +2978,9 @@ mod tests {
         let payload = "data: {\"t\":\"caf\u{e9} — done\"}\n".as_bytes();
         let split = payload.iter().position(|&b| b == 0xC3).unwrap() + 1; // mid-codepoint
         let mut buf = SseLineBuf::new();
-        buf.push(&payload[..split]);
+        buf.push(&payload[..split]).expect("first chunk");
         assert_eq!(buf.next_line(), None, "no full line yet");
-        buf.push(&payload[split..]);
+        buf.push(&payload[split..]).expect("second chunk");
         assert_eq!(
             buf.next_line().as_deref(),
             Some("data: {\"t\":\"caf\u{e9} — done\"}")
@@ -2784,12 +2991,79 @@ mod tests {
     #[test]
     fn sse_line_buf_yields_multiple_lines_per_chunk() {
         let mut buf = SseLineBuf::new();
-        buf.push(b"event: x\ndata: 1\n\ndata: [DONE]\n");
+        buf.push(b"event: x\ndata: 1\n\ndata: [DONE]\n")
+            .expect("bounded chunk");
         assert_eq!(buf.next_line().as_deref(), Some("event: x"));
         assert_eq!(buf.next_line().as_deref(), Some("data: 1"));
         assert_eq!(buf.next_line().as_deref(), Some(""));
         assert_eq!(buf.next_line().as_deref(), Some("data: [DONE]"));
         assert_eq!(buf.next_line(), None);
+    }
+
+    #[test]
+    fn sse_line_buf_does_not_retain_an_unbounded_line() {
+        let mut buf = SseLineBuf::new();
+        let error = buf
+            .push(&vec![b'x'; MAX_AI_RESPONSE_BYTES + 1])
+            .expect_err("oversized line must fail");
+        assert!(error.to_string().contains("exceeded"));
+        assert!(
+            buf.buf.len() <= MAX_AI_RESPONSE_BYTES,
+            "an unterminated provider line grew past the response cap"
+        );
+    }
+
+    #[test]
+    fn sse_line_buf_caps_complete_lines_in_aggregate() {
+        let mut buf = SseLineBuf::new();
+        let mut line = vec![b'x'; 1024 * 1024 - 1];
+        line.push(b'\n');
+        for _ in 0..4 {
+            buf.push(&line).expect("response is at the cap");
+            assert!(buf.next_line().is_some());
+        }
+        assert!(buf.push(b"\n").is_err());
+    }
+
+    #[test]
+    fn invalid_provider_cost_is_zeroed_at_the_boundary() {
+        assert_eq!(provider_cost(-1.0), 0.0);
+        assert_eq!(provider_cost(f64::NAN), 0.0);
+        assert_eq!(provider_cost(f64::INFINITY), 0.0);
+        assert_eq!(provider_cost(1.25), 1.25);
+    }
+
+    #[tokio::test]
+    async fn nonstream_response_rejects_an_oversized_declared_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_AI_RESPONSE_BYTES + 1
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("response");
+        });
+
+        let response = Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .expect("request");
+        let error = response_text_capped(response)
+            .await
+            .expect_err("oversized body must fail before allocation");
+        assert!(error.to_string().contains("exceeded"));
     }
 
     #[test]

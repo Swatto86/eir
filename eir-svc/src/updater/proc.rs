@@ -20,7 +20,6 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub const TIMED_OUT: i32 = -4;
 
 /// Quick presence probes (`where`, `--version`).
-pub const PROBE: Duration = Duration::from_secs(30);
 /// Listing available updates — a winget/choco/scoop query whose source refresh can be slow.
 pub const LIST: Duration = Duration::from_secs(150);
 /// Applying one update: download + run an installer.

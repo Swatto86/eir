@@ -2,10 +2,12 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-cargo build -p eir-svc --release
+& (Join-Path $PSScriptRoot '..\scripts\prepare-webview2.ps1') | Out-Null
+
+cargo build --locked -p eir-svc --release
 if ($LASTEXITCODE -ne 0) { exit 1 }
 
-$targetDir = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).target_directory
+$targetDir = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).target_directory
 $src = Join-Path $targetDir 'release\eir-svc.exe'
 $dst = Join-Path $PSScriptRoot 'bin\eir-svc.exe'
 

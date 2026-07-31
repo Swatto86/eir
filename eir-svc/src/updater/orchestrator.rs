@@ -12,7 +12,7 @@ use crate::updater::domain::{
 };
 use crate::updater::methods::{choco, detect, msstore, native, scoop, winget};
 use crate::updater::verify::{verify_app, VerifyTarget};
-use crate::updater::{check, diagnose, history, proc};
+use crate::updater::{check, diagnose, history};
 use sqlx::SqlitePool;
 use tracing::warn;
 
@@ -29,25 +29,6 @@ pub struct EngineCtx<'a> {
     pub model_override: &'a str,
 }
 
-/// Kill a process the AI named as holding a lock. The name was already validated to
-/// appear in the captured error text; it is further reduced to a safe image-name
-/// charset and passed as an argument (never a shell string).
-async fn kill_process(name: &str) {
-    let safe: String = name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-        .collect();
-    if safe.len() < 3 {
-        return;
-    }
-    let _ = proc::run_capped(
-        "taskkill",
-        &["/IM".to_string(), safe, "/F".to_string()],
-        proc::PROBE,
-    )
-    .await;
-}
-
 /// Run one method against one candidate, first applying any allow-listed remedy the
 /// diagnostician requested (kill a locking process, or force the upgrade).
 async fn dispatch(
@@ -57,7 +38,13 @@ async fn dispatch(
     ctx: &EngineCtx<'_>,
 ) -> AttemptOutcome {
     if let Some(Remedy::KillProcess { name }) = remedy {
-        kill_process(name).await;
+        if let Err(error) = crate::executor::process::kill(name).await {
+            return AttemptOutcome::failed(
+                method,
+                ErrorCategory::LockHeld,
+                format!("Lock-holder remedy was refused or failed: {error}"),
+            );
+        }
     }
     // A stale manager lock is almost always transient (a prior operation releasing).
     // We can't safely delete a package manager's lock file, and killing the holder is
@@ -98,17 +85,26 @@ async fn dispatch(
 /// The deterministic next-method choice: stop on success or a terminal integrity
 /// failure, otherwise the first available method not yet tried. Pure — this is the
 /// loop core, and Phase 6's AI diagnostician is layered on top of it as a fallback.
+fn stops_healing(category: Option<ErrorCategory>) -> bool {
+    category
+        .map(|category| {
+            category.is_terminal()
+                || matches!(
+                    category,
+                    ErrorCategory::AlreadyCurrent | ErrorCategory::NeedsReboot
+                )
+        })
+        .unwrap_or(false)
+}
+
 fn next_method(order: &[Method], tried: &[Method], last: &AttemptOutcome) -> Option<Method> {
     if last.success {
         return None;
     }
     // A terminal integrity failure, or "already current" (the app is up to date, so
-    // switching to another method would needlessly reinstall it), stops the ladder.
-    if last
-        .category
-        .map(|c| c.is_terminal() || c == ErrorCategory::AlreadyCurrent)
-        .unwrap_or(false)
-    {
+    // switching to another method would needlessly reinstall it), or a pending reboot
+    // stops the ladder.
+    if stops_healing(last.category) {
         return None;
     }
     order.iter().copied().find(|m| !tried.contains(m))
@@ -170,13 +166,8 @@ pub async fn heal(
         tried.push(method);
 
         // Stop on success, a terminal integrity failure, "already current" (no work
-        // to do), or the last allowed attempt.
-        let done = outcome.success
-            || outcome
-                .category
-                .map(|c| c.is_terminal() || c == ErrorCategory::AlreadyCurrent)
-                .unwrap_or(false)
-            || attempts.len() + 1 >= max;
+        // to do), a pending reboot, or the last allowed attempt.
+        let done = outcome.success || stops_healing(outcome.category) || attempts.len() + 1 >= max;
         if done {
             attempts.push(outcome);
             break;
@@ -209,11 +200,16 @@ pub async fn available_methods(cfg: &UpdaterConfig, ai: Option<&AiClient>) -> Ve
         .collect();
     let has = |m: Method| enabled.contains(&m);
     let mut v = Vec::new();
-    if has(Method::Winget) && detect::winget_available() {
+    let winget_present = if has(Method::Winget) || has(Method::MsStore) {
+        detect::winget_available_async().await
+    } else {
+        false
+    };
+    if has(Method::Winget) && winget_present {
         v.push(Method::Winget);
     }
     if has(Method::Choco) {
-        let mut present = detect::choco_available();
+        let mut present = detect::choco_available_async().await;
         if !present && cfg.bootstrap_managers {
             present = detect::bootstrap_choco().await;
         }
@@ -224,7 +220,7 @@ pub async fn available_methods(cfg: &UpdaterConfig, ai: Option<&AiClient>) -> Ve
     if has(Method::Scoop) && detect::scoop_available() {
         v.push(Method::Scoop);
     }
-    if has(Method::MsStore) && detect::winget_available() {
+    if has(Method::MsStore) && winget_present {
         v.push(Method::MsStore);
     }
     if cfg.native_enabled && ai.is_some() {
@@ -662,7 +658,6 @@ pub async fn run_retry(
             verify_app(
                 &VerifyTarget::ByName {
                     name: prior.name.clone(),
-                    verify_exe: None,
                 },
                 &prior.to,
             )
@@ -790,6 +785,13 @@ mod tests {
         );
         // Even though winget is untried, a terminal integrity failure ends it.
         assert_eq!(next_method(&order, &[Method::Native], &last), None);
+    }
+
+    #[test]
+    fn next_method_stops_when_a_reboot_is_required() {
+        let order = [Method::Winget, Method::Choco];
+        let last = outcome(Method::Winget, false, Some(ErrorCategory::NeedsReboot));
+        assert_eq!(next_method(&order, &[Method::Winget], &last), None);
     }
 
     #[test]

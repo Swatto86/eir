@@ -1,6 +1,13 @@
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
+use std::path::{Component, Path, PathBuf, Prefix};
+use windows::core::PWSTR;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::RemoteDesktop::{
-    WTSActive, WTSEnumerateSessionsW, WTSFreeMemory, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW,
+    WTSActive, WTSEnumerateSessionsW, WTSFreeMemory, WTSQueryUserToken, WTS_CURRENT_SERVER_HANDLE,
+    WTS_SESSION_INFOW,
 };
+use windows::Win32::UI::Shell::GetUserProfileDirectoryW;
 
 /// The sole active interactive user session, whether console or RDP. Multiple
 /// simultaneous active users fail closed because Eir has no user-selection UI.
@@ -19,6 +26,57 @@ pub fn active_user_session_id() -> Option<u32> {
         unsafe { WTSFreeMemory(sessions.cast()) };
     }
     active
+}
+
+pub fn active_user_profile_dir() -> Option<PathBuf> {
+    let session = active_user_session_id()?;
+    let mut token = HANDLE::default();
+    unsafe { WTSQueryUserToken(session, &mut token) }.ok()?;
+    let result = user_profile_dir_for_token(token);
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    result
+}
+
+pub(crate) fn user_profile_dir_for_token(token: HANDLE) -> Option<PathBuf> {
+    let mut chars = 0;
+    unsafe {
+        let _ = GetUserProfileDirectoryW(token, PWSTR::null(), &mut chars);
+    }
+    if chars == 0 || chars > 32_768 {
+        return None;
+    }
+    let mut buffer = vec![0u16; chars as usize];
+    unsafe {
+        GetUserProfileDirectoryW(token, PWSTR(buffer.as_mut_ptr()), &mut chars).ok()?;
+    }
+    let end = buffer.iter().position(|&c| c == 0)?;
+    Some(PathBuf::from(OsString::from_wide(&buffer[..end])))
+}
+
+pub fn system_drive_root() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .and_then(|windows| drive_root(Path::new(&windows)))
+        .unwrap_or_else(|| PathBuf::from("C:\\"))
+}
+
+fn drive_root(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    let prefix = match components.next()? {
+        Component::Prefix(prefix)
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) =>
+        {
+            prefix
+        }
+        _ => return None,
+    };
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return None;
+    }
+    let mut root = PathBuf::from(prefix.as_os_str());
+    root.push("\\");
+    Some(root)
 }
 
 fn sole_active_session(sessions: &[WTS_SESSION_INFOW]) -> Option<u32> {
@@ -51,5 +109,19 @@ mod tests {
         };
         assert_eq!(sole_active_session(&[active, disconnected]), Some(2));
         assert_eq!(sole_active_session(&[active, active]), None);
+    }
+
+    #[test]
+    fn derives_the_real_windows_drive_root() {
+        assert_eq!(
+            drive_root(Path::new("D:\\Windows")),
+            Some(PathBuf::from("D:\\"))
+        );
+        assert_eq!(
+            drive_root(Path::new("\\\\?\\E:\\Windows")),
+            Some(PathBuf::from("\\\\?\\E:\\"))
+        );
+        assert_eq!(drive_root(Path::new("\\\\server\\share\\Windows")), None);
+        assert_eq!(drive_root(Path::new("Windows")), None);
     }
 }

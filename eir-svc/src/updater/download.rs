@@ -93,6 +93,20 @@ pub fn cleanup_stale_staging() {
     let _ = std::fs::remove_dir_all(staging_root());
 }
 
+pub async fn cleanup_stale_staging_async() {
+    if let Err(error) = tokio::task::spawn_blocking(cleanup_stale_staging).await {
+        warn!("stale staging cleanup task failed: {error}");
+    }
+}
+
+pub async fn remove_staging_dir(dir: &Path) {
+    if let Err(error) = tokio::fs::remove_dir_all(dir).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!("could not remove staging dir {}: {error}", dir.display());
+        }
+    }
+}
+
 // ── Authenticode signature ───────────────────────────────────────────────────
 
 /// Parsed Authenticode result for a staged file.
@@ -613,7 +627,10 @@ pub async fn download_and_check(
     max_bytes: u64,
     policy: SignaturePolicy,
 ) -> Result<Staged, String> {
-    let dir = stage_dir().map_err(|e| format!("could not create staging dir: {e}"))?;
+    let dir = tokio::task::spawn_blocking(stage_dir)
+        .await
+        .map_err(|e| format!("staging task failed: {e}"))?
+        .map_err(|e| format!("could not create staging dir: {e}"))?;
     let artifact = dir.join(match plan.kind {
         InstallerKind::Msi => "installer.msi",
         InstallerKind::Exe => "installer.exe",
@@ -673,7 +690,7 @@ pub async fn download_and_check(
     .await;
 
     if result.is_err() {
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_staging_dir(&dir).await;
     }
     result
 }

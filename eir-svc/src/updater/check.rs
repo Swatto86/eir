@@ -231,8 +231,7 @@ pub async fn collect(
     // The AI web-search pass over apps no manager covers -> native candidates.
     if native_avail {
         if let Some(ai) = ai {
-            let winget_list_available =
-                available.contains(&Method::Winget) && detect::winget_available();
+            let winget_list_available = available.contains(&Method::Winget);
             let (native_cands, c, check_notes, check_had_errors) = check_unmanaged(
                 pool,
                 ai,
@@ -385,9 +384,14 @@ async fn check_unmanaged(
             }
         }
     } else {
-        notes.push(detect::winget_unavailability_reason().unwrap_or_else(|| {
-            "winget not available — using registry inventory only for non-manager apps.".to_string()
-        }));
+        notes.push(
+            detect::winget_unavailability_reason_async()
+                .await
+                .unwrap_or_else(|| {
+                    "winget not available — using registry inventory only for non-manager apps."
+                        .to_string()
+                }),
+        );
     }
 
     // Merge in registry inventory as a fallback/supplement. Registry version is

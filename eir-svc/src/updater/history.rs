@@ -34,6 +34,7 @@ pub async fn record_attempts(
     outcomes: &[AttemptOutcome],
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
     for o in outcomes {
         sqlx::query(
             "INSERT INTO update_attempts \
@@ -55,9 +56,10 @@ pub async fn record_attempts(
         .bind(&o.detail)
         .bind(o.cost_usd)
         .bind(&now)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -293,6 +295,62 @@ pub async fn recent(pool: &SqlitePool, limit: i64) -> Result<Vec<eir_proto::Upda
 mod tests {
     use super::*;
     use crate::updater::domain::{Method, Verification};
+
+    #[tokio::test]
+    async fn attempt_batch_rolls_back_when_any_row_fails() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("db");
+        sqlx::query(
+            "CREATE TABLE update_attempts (
+                id INTEGER PRIMARY KEY,
+                cycle_id INTEGER NOT NULL,
+                app_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                from_version TEXT,
+                to_version TEXT,
+                method TEXT NOT NULL,
+                success INTEGER NOT NULL,
+                category TEXT,
+                exit_code INTEGER,
+                signature TEXT,
+                sha256 TEXT,
+                detail TEXT,
+                cost_usd REAL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TRIGGER reject_native BEFORE INSERT ON update_attempts
+            WHEN NEW.method = 'native'
+            BEGIN SELECT RAISE(ABORT, 'write failed'); END;",
+        )
+        .execute(&pool)
+        .await
+        .expect("schema");
+        let candidate = UpdateCandidate {
+            id: "tool".into(),
+            name: "Tool".into(),
+            current: "1".into(),
+            available: "2".into(),
+            package_id: None,
+            guidance: None,
+            methods: vec![Method::Winget, Method::Native],
+        };
+        let outcomes = [
+            AttemptOutcome::failed(Method::Winget, ErrorCategory::NotFound, "missing"),
+            AttemptOutcome::failed(Method::Native, ErrorCategory::NotFound, "missing"),
+        ];
+
+        assert!(record_attempts(&pool, 1, &candidate, &outcomes)
+            .await
+            .is_err());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM update_attempts")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 0);
+    }
 
     #[tokio::test]
     async fn migration_applies_and_attempt_round_trips() {

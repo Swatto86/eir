@@ -16,6 +16,8 @@ const MAX_TEXT_FILE_CHARS: usize = 100 * 1024;
 const MAX_IMAGE_EDGE: u32 = 1568;
 /// Max files pulled from a single folder pick.
 const MAX_FOLDER_FILES: usize = 25;
+/// Max directory entries inspected for one folder pick, including skipped files.
+const MAX_FOLDER_SCAN_ENTRIES: usize = 4096;
 /// Total text budget across a folder pick (bytes).
 const MAX_FOLDER_TOTAL_BYTES: usize = 400 * 1024;
 /// Hard cap on the pending-attachment list (across multiple picks).
@@ -49,15 +51,36 @@ pub struct AttachmentMeta {
 
 /// Process explicitly-picked files (each becomes an image if it decodes as one, else a
 /// bounded text attachment; unreadable/binary non-images are skipped).
-pub fn process_files(paths: &[PathBuf]) -> Vec<AskAttachment> {
-    paths.iter().filter_map(|p| process_one(p)).collect()
+pub fn process_files(
+    paths: &[PathBuf],
+    max_count: usize,
+    max_total_bytes: usize,
+) -> Vec<AskAttachment> {
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    for path in paths.iter().take(max_count) {
+        if total >= max_total_bytes {
+            break;
+        }
+        let Some(attachment) = process_one(path) else {
+            continue;
+        };
+        if total.saturating_add(attachment.content.len()) > max_total_bytes {
+            continue;
+        }
+        total += attachment.content.len();
+        out.push(attachment);
+    }
+    out
 }
 
 /// Enumerate a folder's top-level files as bounded text attachments, skipping
 /// binaries/secrets, capped by count + total bytes.
-pub fn process_folder(dir: &Path) -> Vec<AskAttachment> {
+pub fn process_folder(dir: &Path, max_count: usize, max_total_bytes: usize) -> Vec<AskAttachment> {
     let mut out = Vec::new();
     let mut total = 0usize;
+    let max_count = max_count.min(MAX_FOLDER_FILES);
+    let max_total_bytes = max_total_bytes.min(MAX_FOLDER_TOTAL_BYTES);
     let base = dir
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -65,8 +88,8 @@ pub fn process_folder(dir: &Path) -> Vec<AskAttachment> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return out;
     };
-    for entry in rd.flatten() {
-        if out.len() >= MAX_FOLDER_FILES || total >= MAX_FOLDER_TOTAL_BYTES {
+    for entry in rd.flatten().take(MAX_FOLDER_SCAN_ENTRIES) {
+        if out.len() >= max_count || total >= max_total_bytes {
             break;
         }
         // Skip symlinks/junctions: `entry.metadata()` does NOT follow the link, so we can
@@ -89,6 +112,9 @@ pub fn process_folder(dir: &Path) -> Vec<AskAttachment> {
         let Some(text) = as_text(&bytes) else {
             continue;
         };
+        if total.saturating_add(text.len()) > max_total_bytes {
+            continue;
+        }
         total += text.len();
         out.push(AskAttachment {
             name: format!("{base}/{name}"),
@@ -233,6 +259,66 @@ mod tests {
         let big = "a".repeat(MAX_TEXT_FILE_CHARS + 1000);
         let out = as_text(big.as_bytes()).unwrap();
         assert_eq!(out.chars().count(), MAX_TEXT_FILE_CHARS);
+    }
+
+    #[test]
+    fn explicit_file_processing_stops_at_the_pending_attachment_limit() {
+        let path = std::env::temp_dir().join(format!(
+            "eir-attachment-limit-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, "small text attachment").expect("write test attachment");
+        let paths = vec![path.clone(); MAX_ATTACHMENTS + 1];
+
+        let processed = process_files(&paths, MAX_ATTACHMENTS, MAX_TOTAL_BYTES);
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(processed.len(), MAX_ATTACHMENTS);
+    }
+
+    #[test]
+    fn explicit_file_processing_respects_the_remaining_byte_budget() {
+        let path = std::env::temp_dir().join(format!(
+            "eir-attachment-budget-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, "ten bytes!").expect("write test attachment");
+
+        let processed = process_files(std::slice::from_ref(&path), MAX_ATTACHMENTS, 9);
+        let _ = std::fs::remove_file(path);
+
+        assert!(processed.is_empty());
+    }
+
+    #[test]
+    fn oversized_file_does_not_hide_a_later_attachment_that_fits() {
+        let root = std::env::temp_dir().join(format!(
+            "eir-attachment-order-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create attachment test directory");
+        let oversized = root.join("oversized.txt");
+        let fitting = root.join("fitting.txt");
+        std::fs::write(&oversized, "too large").expect("write oversized attachment");
+        std::fs::write(&fitting, "ok").expect("write fitting attachment");
+
+        let processed = process_files(&[oversized, fitting], MAX_ATTACHMENTS, 2);
+        let _ = std::fs::remove_dir_all(root);
+
+        assert_eq!(processed.len(), 1);
+        assert_eq!(processed[0].name, "fitting.txt");
     }
 
     #[test]

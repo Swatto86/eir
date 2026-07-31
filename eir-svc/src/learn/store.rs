@@ -3,7 +3,7 @@
 //! 0008/0009). Same bare-query/bind style as `audit.rs` and `updater::history`.
 
 use super::detect::{AttemptRow, FeedbackRow, RejectionRow};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sqlx::{Row, SqlitePool};
 use std::collections::HashSet;
 
@@ -26,11 +26,16 @@ pub async fn update_attempt_rows(pool: &SqlitePool, window_days: i64) -> Result<
     .await?;
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
+        let exit_code = r
+            .try_get::<Option<i64>, _>("exit_code")?
+            .map(i32::try_from)
+            .transpose()
+            .context("stored update exit code was out of range")?;
         out.push(AttemptRow {
             app_id: r.try_get("app_id")?,
             cycle_id: r.try_get("cycle_id")?,
             success: r.try_get::<i64, _>("success")? != 0,
-            exit_code: r.try_get::<Option<i64>, _>("exit_code")?.map(|v| v as i32),
+            exit_code,
             category: r.try_get::<Option<String>, _>("category")?,
             method: r.try_get("method").unwrap_or_default(),
             detail: r.try_get("detail").unwrap_or_default(),
@@ -326,13 +331,12 @@ pub async fn set_ai_explanation(pool: &SqlitePool, id: i64, explanation: &str) -
 /// Apply a user override to a learned fact by id: "pin" (always keep), "disable"
 /// (always ignore), or "forget" (delete the row).
 pub async fn set_learned_fact(pool: &SqlitePool, id: i64, op: &str) -> Result<()> {
-    match op {
-        "forget" => {
-            sqlx::query("DELETE FROM learned_facts WHERE id = ?")
-                .bind(id)
-                .execute(pool)
-                .await?;
-        }
+    let changed = match op {
+        "forget" => sqlx::query("DELETE FROM learned_facts WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await?
+            .rows_affected(),
         "pin" | "disable" => {
             let status = if op == "pin" {
                 "user_pinned"
@@ -343,10 +347,12 @@ pub async fn set_learned_fact(pool: &SqlitePool, id: i64, op: &str) -> Result<()
                 .bind(status)
                 .bind(id)
                 .execute(pool)
-                .await?;
+                .await?
+                .rows_affected()
         }
-        _ => {}
-    }
+        _ => anyhow::bail!("unknown learned-fact operation"),
+    };
+    anyhow::ensure!(changed == 1, "learned fact not found");
     Ok(())
 }
 
@@ -384,6 +390,33 @@ mod tests {
             .await
             .expect("migrate");
         pool
+    }
+
+    #[tokio::test]
+    async fn out_of_range_exit_code_is_not_reinterpreted_as_a_timeout() {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("open db");
+        sqlx::query(
+            "CREATE TABLE update_attempts (
+                app_id TEXT NOT NULL,
+                cycle_id INTEGER NOT NULL,
+                success INTEGER NOT NULL,
+                exit_code INTEGER,
+                category TEXT,
+                method TEXT,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO update_attempts VALUES
+                ('app', 1, 0, 4294967292, 'network', 'native', 'failed',
+                 '9999-01-01T00:00:00+00:00');",
+        )
+        .execute(&pool)
+        .await
+        .expect("schema");
+
+        assert!(update_attempt_rows(&pool, 30).await.is_err());
     }
 
     #[tokio::test]
@@ -465,6 +498,35 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].action_label, "ProcessKill { process_name: \"x\" }");
         drop(pool);
+    }
+
+    #[tokio::test]
+    async fn learned_fact_mutations_do_not_report_no_ops_as_success() {
+        let pool = test_pool("mutate").await;
+        upsert_fact(
+            &pool,
+            LearnedFactKind::SelfUpdaterSuspected.as_token(),
+            "tool",
+            &Effect::Skip.to_json(),
+            "3 timeouts",
+            30,
+        )
+        .await
+        .expect("fact");
+        let id: i64 = sqlx::query_scalar("SELECT id FROM learned_facts")
+            .fetch_one(&pool)
+            .await
+            .expect("id");
+
+        assert!(set_learned_fact(&pool, id, "bogus").await.is_err());
+        assert!(set_learned_fact(&pool, id + 1, "pin").await.is_err());
+        set_learned_fact(&pool, id, "pin").await.expect("pin");
+        let status: String = sqlx::query_scalar("SELECT status FROM learned_facts WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("status");
+        assert_eq!(status, "user_pinned");
     }
 
     #[tokio::test]

@@ -6,21 +6,81 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Audit Rust dependencies
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+          arguments: --target x86_64-pc-windows-msvc
+
   release:
+    needs: dependency-audit
     runs-on: windows-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
 
       - name: Cache Rust build artefacts
         uses: swatinem/rust-cache@v2
+
+      - name: Cache fixed WebView2 runtime
+        uses: actions/cache@v5
+        with:
+          path: target/webview2
+          key: webview2-fixed-150.0.4078.105-x64
+
+      - name: Verify checkout and release version
+        shell: pwsh
+        run: |
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -ne $env:GITHUB_SHA) {
+            throw "Checkout $head does not match release SHA $env:GITHUB_SHA"
+          }
+          ./scripts/check-versions.ps1 -ExpectedTag $env:GITHUB_REF_NAME
+
+      - name: Check packaging gates
+        shell: pwsh
+        run: |
+          ./scripts/test-installer-hooks.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/test-release-gates.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/test-portable-runner.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check ui/main.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo fmt --all --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Stage service binary
+        shell: pwsh
+        run: ./eir-ui/build-svc.ps1
+
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --workspace --all-targets
 
       - name: Build installer and create draft release
         uses: tauri-apps/tauri-action@v0
@@ -30,6 +90,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: eir-ui
+          args: -- --locked
           tagName: ${{ github.ref_name }}
           releaseName: Eir ${{ github.ref_name }}
           releaseBody: |
@@ -49,12 +110,36 @@ jobs:
 
             ### Portable
             `Eir_${{ github.ref_name }}_windows-x64.exe` launches directly with no installer.
-            Installing the background service still requires the setup package.
+            It uses a session-scoped non-admin foreground service; installing the
+            LocalSystem background service still requires the setup package.
 
             ### Uninstall
             Use **Add or Remove Programs** — the uninstaller stops and unregisters the service automatically.
           releaseDraft: true
           prerelease: false
+
+      - name: Check portable dependency imports
+        shell: pwsh
+        run: ./scripts/check-portable-imports.ps1 -EirExe target/release/eir.exe -ServiceExe target/release/eir-svc.exe
+
+      - name: Smoke installed LocalSystem service
+        shell: pwsh
+        run: ./scripts/service-smoke.ps1 -ServiceBinary target/release/eir-svc.exe
+
+      - name: Smoke standalone executable
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target/release/eir.exe).Path
+          $process = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 5
+          if ($process.HasExited) {
+            throw "Standalone Eir exited with code $($process.ExitCode)"
+          }
+          Stop-Process -Id $process.Id
+
+      - name: Build and smoke self-contained portable executable
+        shell: pwsh
+        run: ./scripts/portable-smoke.ps1 -EirExe target/release/eir.exe -ServiceExe target/release/eir-svc.exe -Output "target/release/Eir_${env:GITHUB_REF_NAME}_windows-x64.exe"
 
       - name: Upload, verify, and publish release
         shell: pwsh
@@ -62,16 +147,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
           $tag = $env:GITHUB_REF_NAME
           $version = $tag -replace '^v', ''
           $portable = "target/release/Eir_${tag}_windows-x64.exe"
-          Copy-Item target/release/eir.exe $portable
-          $installers = @(Get-ChildItem target/release/bundle/nsis -Filter '*-setup.exe' |
-            Where-Object { $_.Name -match [regex]::Escape($version) })
-          if ($installers.Count -ne 1) {
-            throw "Expected one NSIS installer for $version, found $($installers.Count)"
+          if (-not (Test-Path -LiteralPath $portable -PathType Leaf)) {
+            throw "Smoke-tested portable package is missing: $portable"
           }
-          $installer = $installers[0]
+          $installerName = "Eir_${version}_x64-setup.exe"
+          $installerPath = Join-Path 'target/release/bundle/nsis' $installerName
+          if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
+            throw "Expected NSIS installer is missing: $installerName"
+          }
+          $installer = Get-Item -LiteralPath $installerPath
+          $installerSignatureName = "$($installer.Name).sig"
           $checksums = "target/release/Eir_${tag}_SHA256SUMS.txt"
           @($portable, $installer.FullName) | ForEach-Object {
             $hash = (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -98,6 +187,7 @@ jobs:
           $assetNames = @($release.assets | ForEach-Object { $_.name })
           $requiredAssets = @(
             $installer.Name
+            $installerSignatureName
             'latest.json'
             (Split-Path $portable -Leaf)
             (Split-Path $checksums -Leaf)
@@ -107,13 +197,31 @@ jobs:
             throw "Release assets missing: $($missingAssets -join ', ')"
           }
 
-          $signatureAssets = @($assetNames | Where-Object { $_ -like '*.sig' })
-          if ($signatureAssets.Count -eq 0) { throw 'Updater signature asset missing' }
-          $unpairedSignatures = @($signatureAssets | Where-Object {
-            $assetNames -notcontains $_.Substring(0, $_.Length - 4)
-          })
-          if ($unpairedSignatures.Count -gt 0) {
-            throw "Updater artifacts missing for: $($unpairedSignatures -join ', ')"
+          $validationDir = Join-Path $env:RUNNER_TEMP "eir-release-$([guid]::NewGuid().ToString('N'))"
+          New-Item -ItemType Directory -Path $validationDir | Out-Null
+          gh release download $tag --pattern latest.json --dir $validationDir
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download latest.json for validation' }
+          gh release download $tag --pattern $installerSignatureName --dir $validationDir
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download $installerSignatureName for validation" }
+
+          $latest = Get-Content (Join-Path $validationDir 'latest.json') -Raw | ConvertFrom-Json
+          if ($latest.version -ne $version) {
+            throw "latest.json version '$($latest.version)' does not match '$version'"
+          }
+          $platforms = @($latest.platforms.PSObject.Properties |
+            Where-Object { $_.Name -eq 'windows-x86_64' })
+          if ($platforms.Count -ne 1) {
+            throw 'latest.json must contain exactly one windows-x86_64 updater target'
+          }
+          $platform = $platforms[0].Value
+          $expectedUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/$($installer.Name)"
+          if (-not [string]::Equals([string]$platform.url, $expectedUrl, [StringComparison]::Ordinal)) {
+            throw "latest.json URL '$($platform.url)' does not target '$expectedUrl'"
+          }
+          $installerSignature = (Get-Content (Join-Path $validationDir $installerSignatureName) -Raw).Trim()
+          $metadataSignature = ([string]$platform.signature).Trim()
+          if (-not [string]::Equals($metadataSignature, $installerSignature, [StringComparison]::Ordinal)) {
+            throw 'latest.json signature does not match the exact installer signature asset'
           }
 
           gh release edit $tag --draft=false

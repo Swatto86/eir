@@ -20,6 +20,8 @@ const MAX_PER_POLL: usize = 100;
 /// decision cycles); oldest entries are dropped first.
 const BUFFER_CAP: usize = 100;
 const MAX_EVENT_DETAIL_CHARS: usize = 2048;
+const MAX_EVENT_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_EVENT_SOURCE_CHARS: usize = 256;
 
 // READ_EVENT_LOG_READ_FLAGS values
 const SEQUENTIAL_BACKWARDS: READ_EVENT_LOG_READ_FLAGS = READ_EVENT_LOG_READ_FLAGS(0x0008 | 0x0001);
@@ -46,6 +48,34 @@ fn level_name(event_type: REPORT_EVENT_TYPE) -> Option<&'static str> {
         ETYPE_INFORMATION => Some("Information"),
         _ => None,
     }
+}
+
+fn parse_record(bytes: &[u8]) -> Option<(EVENTLOGRECORD, &[u8])> {
+    let header_len = std::mem::size_of::<EVENTLOGRECORD>();
+    if bytes.len() < header_len {
+        return None;
+    }
+
+    // The Win32 buffer packs variable-length records without guaranteeing Rust
+    // alignment. Copy the fixed header only after proving it is fully present.
+    let record = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<EVENTLOGRECORD>()) };
+    let length = record.Length as usize;
+    (header_len..=bytes.len())
+        .contains(&length)
+        .then(|| (record, &bytes[..length]))
+}
+
+fn source_name(record: &[u8]) -> String {
+    let header_len = std::mem::size_of::<EVENTLOGRECORD>();
+    let units = record
+        .get(header_len..)
+        .unwrap_or_default()
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take(MAX_EVENT_SOURCE_CHARS)
+        .take_while(|unit| *unit != 0)
+        .collect::<Vec<_>>();
+    String::from_utf16_lossy(&units)
 }
 
 /// Read entries newer than `last_record` from a single event log channel.
@@ -96,20 +126,31 @@ fn read_channel_since(channel: &str, last_record: u32, prime: bool) -> (Vec<Even
             // A single record larger than the buffer sets min_bytes_needed; grow and
             // retry so one big record can't silently end the whole channel read.
             if min_bytes_needed as usize > buf.len() {
+                if min_bytes_needed as usize > MAX_EVENT_RECORD_BYTES {
+                    warn!(
+                        channel,
+                        bytes = min_bytes_needed,
+                        "Refusing oversized event-log record"
+                    );
+                    break;
+                }
                 buf.resize(min_bytes_needed as usize, 0);
                 continue;
             }
             break;
         }
 
+        let bytes_read = (bytes_read as usize).min(buf.len());
         let mut offset = 0usize;
-        while offset < bytes_read as usize {
-            let record = unsafe { &*(buf.as_ptr().add(offset) as *const EVENTLOGRECORD) };
-
-            if record.Length == 0 {
+        while offset < bytes_read {
+            let Some((record, record_bytes)) = parse_record(&buf[offset..bytes_read]) else {
+                warn!(
+                    channel,
+                    offset, bytes_read, "Ignoring malformed event-log record"
+                );
                 done = true;
                 break;
-            }
+            };
 
             // The first record is the newest (we read backwards): it defines the
             // channel's current high-water mark and reveals a log reset.
@@ -140,27 +181,7 @@ fn read_channel_since(channel: &str, last_record: u32, prime: bool) -> (Vec<Even
             }
 
             if let Some(level) = level_name(record.EventType) {
-                let rec_end = offset
-                    .saturating_add(record.Length as usize)
-                    .min(bytes_read as usize);
-                let record_bytes = &buf[offset..rec_end];
-                let source_ptr = unsafe {
-                    (record as *const EVENTLOGRECORD as *const u8)
-                        .add(std::mem::size_of::<EVENTLOGRECORD>())
-                        as *const u16
-                };
-                let source = unsafe {
-                    // Bound the NUL scan to the record's own extent (clamped to the
-                    // bytes actually read): a malformed record whose source field is
-                    // not NUL-terminated within itself must not walk past the buffer.
-                    let header = std::mem::size_of::<EVENTLOGRECORD>();
-                    let avail_u16 = rec_end.saturating_sub(offset + header) / 2;
-                    let mut len = 0usize;
-                    while len < avail_u16 && *source_ptr.add(len) != 0 {
-                        len += 1;
-                    }
-                    String::from_utf16_lossy(std::slice::from_raw_parts(source_ptr, len))
-                };
+                let source = source_name(record_bytes);
 
                 let timestamp = win32_time_to_datetime(record.TimeGenerated);
                 let event_id = record.EventID & 0xFFFF;
@@ -184,7 +205,7 @@ fn read_channel_since(channel: &str, last_record: u32, prime: bool) -> (Vec<Even
                 });
             }
 
-            offset += record.Length as usize;
+            offset += record_bytes.len();
 
             if entries.len() >= MAX_PER_POLL {
                 done = true;
@@ -350,7 +371,7 @@ pub fn drain(shared: &SharedEntries) -> Vec<EventLogEntry> {
 
 #[cfg(test)]
 mod tests {
-    use super::insertion_strings;
+    use super::{insertion_strings, parse_record, EVENTLOGRECORD};
 
     #[test]
     fn insertion_strings_recover_event_details_with_bounds() {
@@ -369,5 +390,14 @@ mod tests {
             Vec::<String>::new()
         );
         assert_eq!(insertion_strings(&bytes, 12, 2, 7), vec!["service"]);
+    }
+
+    #[test]
+    fn malformed_record_header_is_rejected_before_it_is_read() {
+        assert!(parse_record(&[0u8; 4]).is_none());
+
+        let mut truncated = vec![0u8; std::mem::size_of::<EVENTLOGRECORD>()];
+        truncated[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_record(&truncated).is_none());
     }
 }

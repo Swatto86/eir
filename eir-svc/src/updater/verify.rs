@@ -1,37 +1,20 @@
 //! Post-update verification: confirm an app now reports the version we expected to
-//! install. Reads the installed version from winget (by id or by name) or, as a
-//! second signal for native installs, an installed exe's ProductVersion, and maps
-//! it to a [`Verification`] verdict via [`super::version::classify_version`]. The
+//! install. Reads the installed version from winget (by id or by name) and maps it
+//! to a [`Verification`] verdict via [`super::version::classify_version`]. The
 //! comparison itself is pure and unit-tested in `version`; this module is the I/O.
 
 use super::domain::Verification;
 use super::methods::winget;
-use super::proc::{self, VERIFY};
-use super::version::classify_version;
+use super::names::{app_id, match_installed_entry};
+use super::proc::VERIFY;
+use super::version::{classify_version, version_cmp};
 use super::winget_parse::{column, winget_table};
-use std::path::Path;
 use std::time::Duration;
 
 /// What to read the installed version from.
 pub enum VerifyTarget {
-    Winget {
-        id: String,
-    },
-    ByName {
-        name: String,
-        verify_exe: Option<String>,
-    },
-}
-
-/// A binary's ProductVersion is often a 4-part FILEVERSION that trails the
-/// marketing/release version, so don't hard-fail a native install on an exe-fallback
-/// "mismatch" — soften it to Unverified. Pure.
-fn soften_exe_fallback(verdict: Verification, from_exe: bool) -> Verification {
-    if from_exe && verdict == Verification::Mismatch {
-        Verification::Unverified
-    } else {
-        verdict
-    }
+    Winget { id: String },
+    ByName { name: String },
 }
 
 /// A verdict worth acting on immediately. A first-read `Mismatch` is re-read once:
@@ -52,19 +35,12 @@ pub async fn verify_app(target: &VerifyTarget, expected: &str) -> (Verification,
         if attempt == 1 {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        let (found, from_exe) = match target {
-            VerifyTarget::Winget { id } => (winget_installed_version(id).await, false),
-            VerifyTarget::ByName { name, verify_exe } => {
-                let v = winget_installed_version_by_name(name).await;
-                match (v, verify_exe) {
-                    (Some(v), _) => (Some(v), false),
-                    (None, Some(exe)) => (exe_file_version(exe).await, true),
-                    (None, None) => (None, false),
-                }
-            }
+        let found = match target {
+            VerifyTarget::Winget { id } => winget_installed_version(id).await,
+            VerifyTarget::ByName { name } => winget_installed_version_by_name(name).await,
         };
         if let Some(found) = found {
-            let verdict = soften_exe_fallback(classify_version(&found, expected), from_exe);
+            let verdict = classify_version(&found, expected);
             if settled(verdict) {
                 return (verdict, found);
             }
@@ -108,16 +84,15 @@ async fn winget_installed_version_by_name(name: &str) -> Option<String> {
         VERIFY,
     )
     .await;
-    let (offsets, rows) = winget_table(&text);
-    let lname = name.to_lowercase();
-    // An exact (case-insensitive) name match is authoritative. Otherwise collect the
-    // containment matches: a bare bidirectional `contains` verified "Git" against
-    // "GitHub Desktop", so only accept a containment result when it is UNAMBIGUOUS
-    // (a single distinct version) — else return None (→ Unverified) rather than
-    // reading the wrong app's version and declaring a false Verified/Mismatch.
-    let mut contains: Vec<String> = Vec::new();
+    installed_version_by_name(&text, name)
+}
+
+fn installed_version_by_name(text: &str, name: &str) -> Option<String> {
+    let (offsets, rows) = winget_table(text);
+    let mut installed = std::collections::HashMap::new();
+    let mut ambiguous = std::collections::HashSet::new();
     for r in &rows {
-        let n = column(&offsets, r, "Name").to_lowercase();
+        let n = column(&offsets, r, "Name");
         if n.is_empty() {
             continue;
         }
@@ -125,69 +100,30 @@ async fn winget_installed_version_by_name(name: &str) -> Option<String> {
         if v.is_empty() {
             continue;
         }
-        if n == lname {
-            return Some(v);
+        let key = app_id(&n);
+        if ambiguous.contains(&key) {
+            continue;
         }
-        if n.contains(&lname) || lname.contains(&n) {
-            contains.push(v);
+        match installed.entry(key.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(v);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let same = v.eq_ignore_ascii_case(entry.get())
+                    || version_cmp(&v, entry.get()) == Some(std::cmp::Ordering::Equal);
+                if !same {
+                    entry.remove();
+                    ambiguous.insert(key);
+                }
+            }
         }
     }
-    match contains.first() {
-        Some(first) if contains.iter().all(|v| v == first) => Some(first.clone()),
-        _ => None,
-    }
-}
-
-/// Read FileVersion/ProductVersion of an absolute exe path (a second confirmation
-/// signal for native installs). Returns None for relative paths or missing files.
-/// Whether `path` is an absolute drive-letter path (`C:\...`). Rejects relative paths
-/// AND UNC / verbatim-UNC paths (`\\host\share\...`): `is_absolute()` is true for UNC,
-/// which Windows would resolve over SMB, making the LocalSystem machine account
-/// authenticate to an attacker-controlled host (a forced-auth / NTLM-relay primitive).
-/// The AI supplies this path, so the guard must be explicit.
-fn is_local_drive_path(path: &str) -> bool {
-    let p = Path::new(path);
-    p.is_absolute()
-        && matches!(
-            p.components().next(),
-            Some(std::path::Component::Prefix(pre)) if matches!(pre.kind(), std::path::Prefix::Disk(_))
-        )
-}
-
-async fn exe_file_version(path: &str) -> Option<String> {
-    if !is_local_drive_path(path) {
-        return None;
-    }
-    let script = format!(
-        "try {{ (Get-Item -LiteralPath '{}').VersionInfo.ProductVersion }} catch {{ '' }}",
-        path.replace('\'', "''")
-    );
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.args(["-NoProfile", "-Command", &script]);
-    let (_code, out) = proc::run_capped_cmd(cmd, VERIFY).await;
-    let v = out.trim().to_string();
-    if v.is_empty() {
-        None
-    } else {
-        Some(v)
-    }
+    match_installed_entry(&installed, name).map(|(_, version)| version.clone())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn is_local_drive_path_rejects_unc_and_relative() {
-        assert!(is_local_drive_path("C:\\Program Files\\App\\app.exe"));
-        assert!(is_local_drive_path("D:\\x.exe"));
-        // UNC would force LocalSystem to authenticate to a remote SMB host.
-        assert!(!is_local_drive_path("\\\\attacker.example\\share\\x.exe"));
-        assert!(!is_local_drive_path("\\\\?\\UNC\\host\\share\\x.exe"));
-        // Relative / bare paths.
-        assert!(!is_local_drive_path("app.exe"));
-        assert!(!is_local_drive_path("..\\x.exe"));
-    }
 
     #[test]
     fn only_a_mismatch_is_re_read() {
@@ -200,25 +136,44 @@ mod tests {
     }
 
     #[test]
-    fn exe_fallback_softens_only_a_real_mismatch() {
-        // An exe-fallback mismatch (4-part FILEVERSION below marketing) is softened…
-        assert_eq!(
-            soften_exe_fallback(Verification::Mismatch, true),
-            Verification::Unverified
+    fn by_name_verification_does_not_match_a_substring_namesake() {
+        let table = format!(
+            "{:<16}{:<18}{:<10}{}\n{}\n{:<16}{:<18}{:<10}{}",
+            "Name",
+            "Id",
+            "Version",
+            "Source",
+            "-".repeat(50),
+            "GitHub Desktop",
+            "GitHub.Desktop",
+            "3.4.0",
+            "winget"
         );
-        // …but a winget (non-exe) mismatch stays a mismatch (the update didn't take).
+        assert_eq!(installed_version_by_name(&table, "Git"), None);
         assert_eq!(
-            soften_exe_fallback(Verification::Mismatch, false),
-            Verification::Mismatch
+            installed_version_by_name(&table, "GitHub Desktop").as_deref(),
+            Some("3.4.0")
         );
-        // Verified/Unverified are untouched regardless of source.
-        assert_eq!(
-            soften_exe_fallback(Verification::Verified, true),
-            Verification::Verified
+    }
+
+    #[test]
+    fn by_name_verification_rejects_differing_duplicate_registrations() {
+        let table = format!(
+            "{:<16}{:<18}{:<10}{}\n{}\n{:<16}{:<18}{:<10}{}\n{:<16}{:<18}{:<10}{}",
+            "Name",
+            "Id",
+            "Version",
+            "Source",
+            "-".repeat(50),
+            "Example Tool",
+            "Example.Tool",
+            "1.0.0",
+            "winget",
+            "Example Tool",
+            "Example.Tool",
+            "2.0.0",
+            "winget"
         );
-        assert_eq!(
-            soften_exe_fallback(Verification::Unverified, true),
-            Verification::Unverified
-        );
+        assert_eq!(installed_version_by_name(&table, "Example Tool"), None);
     }
 }

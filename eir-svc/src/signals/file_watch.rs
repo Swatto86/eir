@@ -1,21 +1,35 @@
+use crate::executor::logs::{checked_local_path, root_too_broad};
 use crate::models::FileChange;
-use crate::session::active_user_session_id;
+use crate::session::{active_user_session_id, system_drive_root, user_profile_dir_for_token};
 use chrono::Utc;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf, Prefix};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
+use windows::core::PCWSTR;
 use windows::Win32::{
     Foundation::{CloseHandle, HANDLE},
     Security::{ImpersonateLoggedOnUser, RevertToSelf},
+    Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    },
     System::RemoteDesktop::WTSQueryUserToken,
 };
 
 const RING_SIZE: usize = 50;
+const EVENT_QUEUE_SIZE: usize = 256;
 const MAX_READ_BYTES: u64 = 65_536;
 const DISCOVERY_WINDOW_DAYS: u64 = 30;
+const DISCOVERY_MAX: Duration = Duration::from_secs(30);
+const MAX_AUTO_WATCH_DIRS: usize = 96;
+const MAX_DISCOVERY_ENTRIES_PER_ROOT: usize = 4096;
 
 pub const TEXT_EXTENSIONS: &[&str] = &[
     "log", "txt", "csv", "json", "xml", "ini", "cfg", "conf", "err", "out", "trace", "debug",
@@ -23,8 +37,8 @@ pub const TEXT_EXTENSIONS: &[&str] = &[
 ];
 
 pub type SharedChanges = Arc<Mutex<VecDeque<FileChange>>>;
-/// Send new directories to the running watcher thread after startup.
-pub type DirUpdateSender = std::sync::mpsc::Sender<PathBuf>;
+/// Send the complete desired directory set to the running watcher thread.
+pub type DirUpdateSender = std::sync::mpsc::Sender<Vec<PathBuf>>;
 /// Dropping this handle signals the watcher thread to exit.
 pub type ShutdownHandle = std::sync::mpsc::SyncSender<()>;
 
@@ -57,15 +71,19 @@ impl ActiveUserImpersonation {
     fn new() -> Option<Self> {
         let session = active_user_session_id()?;
         let mut token = HANDLE::default();
-        unsafe {
-            WTSQueryUserToken(session, &mut token).ok()?;
-            if let Err(e) = ImpersonateLoggedOnUser(token) {
+        unsafe { WTSQueryUserToken(session, &mut token) }.ok()?;
+        if let Err(e) = unsafe { ImpersonateLoggedOnUser(token) } {
+            unsafe {
                 let _ = CloseHandle(token);
-                warn!("Cannot impersonate active user for configured log path: {e}");
-                return None;
             }
+            warn!("Cannot impersonate active user for configured log path: {e}");
+            return None;
         }
         Some(Self(token))
+    }
+
+    fn profile_dir(&self) -> Option<PathBuf> {
+        user_profile_dir_for_token(self.0)
     }
 }
 
@@ -76,6 +94,94 @@ impl Drop for ActiveUserImpersonation {
             let _ = CloseHandle(self.0);
         }
     }
+}
+
+struct WatchPathGuard(Vec<HANDLE>);
+
+impl WatchPathGuard {
+    fn open(path: &Path) -> Result<Self, String> {
+        let mut guard = Self(Vec::new());
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::Prefix(prefix)
+                    if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) =>
+                {
+                    current.push(component.as_os_str());
+                }
+                Component::RootDir => current.push(component.as_os_str()),
+                Component::Normal(_) => {
+                    current.push(component.as_os_str());
+                    let wide: Vec<u16> = current
+                        .as_os_str()
+                        .encode_wide()
+                        .chain(std::iter::once(0))
+                        .collect();
+                    let handle = unsafe {
+                        CreateFileW(
+                            PCWSTR(wide.as_ptr()),
+                            FILE_LIST_DIRECTORY.0 | FILE_READ_ATTRIBUTES.0,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            None,
+                            OPEN_EXISTING,
+                            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                            HANDLE::default(),
+                        )
+                    }
+                    .map_err(|e| format!("Cannot lock '{}': {e}", current.display()))?;
+                    guard.0.push(handle);
+                    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+                    unsafe { GetFileInformationByHandle(handle, &mut info) }
+                        .map_err(|e| format!("Cannot inspect '{}': {e}", current.display()))?;
+                    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+                        || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0
+                    {
+                        return Err(format!(
+                            "Refusing '{}' because a path component is not a plain directory",
+                            path.display()
+                        ));
+                    }
+                }
+                Component::CurDir => {}
+                _ => {
+                    return Err(format!(
+                        "Refusing '{}' because it is not a plain local path",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        if guard.0.is_empty() {
+            return Err(format!("Refusing broad watch path '{}'", path.display()));
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for WatchPathGuard {
+    fn drop(&mut self) {
+        for handle in self.0.drain(..).rev() {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+        }
+    }
+}
+
+fn arm_watch(watcher: &mut RecommendedWatcher, path: &Path) -> Result<(), String> {
+    let _user = ActiveUserImpersonation::new()
+        .ok_or_else(|| "active-user token is unavailable".to_string())?;
+    // notify opens the real directory handle on its own SYSTEM worker thread. Hold
+    // every path component open without delete-sharing until that open is acknowledged,
+    // so a user-controlled directory cannot be swapped for a reparse point in between.
+    let _path_guard = WatchPathGuard::open(path)?;
+    watcher
+        .watch(path, RecursiveMode::Recursive)
+        .map_err(|e| e.to_string())
+}
+
+fn replacement_watch_dirs(directories: &[PathBuf]) -> HashSet<PathBuf> {
+    directories.iter().cloned().collect()
 }
 
 fn parse_path(path: &Path, as_active_user: bool) -> Option<(u64, crate::models::LogEvent)> {
@@ -118,48 +224,57 @@ fn read_tail(path: &Path, max_bytes: u64) -> Option<String> {
 ///
 /// Always includes any `extra` paths from `config.toml` that exist on disk,
 /// regardless of age. Designed to run via `tokio::task::spawn_blocking`.
-pub fn discover_watch_dirs(extra: &[String]) -> Vec<PathBuf> {
-    let Some(_user) = ActiveUserImpersonation::new() else {
+pub fn discover_watch_dirs(extra: &[String]) -> Option<Vec<PathBuf>> {
+    let Some(user) = ActiveUserImpersonation::new() else {
         warn!("Log directory discovery deferred: active user token unavailable");
-        return Vec::new();
+        return None;
     };
     let cutoff = SystemTime::now()
         .checked_sub(Duration::from_secs(DISCOVERY_WINDOW_DAYS * 86400))
         .unwrap_or(UNIX_EPOCH);
+    let deadline = Instant::now() + DISCOVERY_MAX;
 
-    // Roots to scan: fixed system paths + env-var-based user paths
-    let auto_roots: Vec<PathBuf> = [
-        "C:\\Windows\\Logs",
-        "C:\\Windows\\Temp",
-        "C:\\Temp",
-        "C:\\Logs",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .chain(
-        ["LOCALAPPDATA", "APPDATA", "PROGRAMDATA", "TEMP", "TMP"]
-            .iter()
-            .filter_map(|v| std::env::var(v).ok().map(PathBuf::from)),
-    )
-    .collect();
+    let system_drive = system_drive_root();
+    let windows = system_drive.join("Windows");
+    let mut auto_roots = vec![
+        windows.join("Logs"),
+        windows.join("Temp"),
+        system_drive.join("Temp"),
+        system_drive.join("Logs"),
+        std::env::var_os("PROGRAMDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| system_drive.join("ProgramData")),
+    ];
+    if let Some(profile) = user.profile_dir() {
+        auto_roots.extend(profile_watch_roots(&profile));
+    }
 
     let mut result: HashSet<PathBuf> = HashSet::new();
 
-    for root in &auto_roots {
-        if !root.exists() {
+    for root in auto_roots {
+        if result.len() >= MAX_AUTO_WATCH_DIRS || Instant::now() >= deadline {
+            break;
+        }
+        let Ok(Some(root)) = checked_local_path(&root) else {
+            continue;
+        };
+        if !root.is_dir() || root_too_broad(&root.to_string_lossy()) {
             continue;
         }
 
         // If the root itself has recent log files at depth ≤ 1, watch it directly
-        if has_recent_log_files(root, cutoff, 1) {
+        if has_recent_log_files(&root, cutoff, 1, deadline) {
             result.insert(root.clone());
         }
 
         // Scan one level of subdirectories; add those with recent log activity
-        if let Ok(entries) = std::fs::read_dir(root) {
+        if let Ok(entries) = std::fs::read_dir(&root) {
             for entry in entries.flatten() {
+                if result.len() >= MAX_AUTO_WATCH_DIRS || Instant::now() >= deadline {
+                    break;
+                }
                 let sub = entry.path();
-                if sub.is_dir() && has_recent_log_files(&sub, cutoff, 2) {
+                if sub.is_dir() && has_recent_log_files(&sub, cutoff, 2, deadline) {
                     result.insert(sub);
                 }
             }
@@ -172,22 +287,30 @@ pub fn discover_watch_dirs(extra: &[String]) -> Vec<PathBuf> {
 
     let mut dirs: Vec<PathBuf> = result.into_iter().collect();
     dirs.sort();
-    dirs
+    Some(dirs)
+}
+
+fn profile_watch_roots(profile: &Path) -> [PathBuf; 3] {
+    [
+        profile.join("AppData\\Local"),
+        profile.join("AppData\\Roaming"),
+        profile.join("AppData\\Local\\Temp"),
+    ]
 }
 
 /// Resolve configured roots while already impersonating the active desktop user.
 fn configured_watch_dirs_current_user(extra: &[String]) -> Vec<PathBuf> {
     let mut dirs = HashSet::new();
     for path in extra {
-        let canonical = std::fs::canonicalize(path);
-        match canonical {
-            Ok(path) if path.is_dir() && canonical_is_local_drive(&path) => {
-                dirs.insert(path);
+        match checked_local_path(Path::new(path)) {
+            Ok(Some(canonical))
+                if canonical.is_dir() && !root_too_broad(&canonical.to_string_lossy()) =>
+            {
+                dirs.insert(canonical);
             }
-            Ok(_) => warn!("Configured log directory did not resolve to a local drive: {path}"),
-            Err(e) => {
-                warn!("Configured log directory is unavailable to the active user ({path}): {e}")
-            }
+            Ok(Some(_)) => warn!("Configured log directory is too broad or unsafe: {path}"),
+            Ok(None) => warn!("Configured log directory does not exist: {path}"),
+            Err(e) => warn!("Configured log directory is unsafe or unavailable ({path}): {e}"),
         }
     }
     let mut dirs: Vec<_> = dirs.into_iter().collect();
@@ -195,47 +318,69 @@ fn configured_watch_dirs_current_user(extra: &[String]) -> Vec<PathBuf> {
     dirs
 }
 
-fn canonical_is_local_drive(path: &Path) -> bool {
-    use std::path::{Component, Prefix};
-    let mut components = path.components();
-    matches!(
-        components.next(),
-        Some(Component::Prefix(prefix))
-            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
-    ) && matches!(components.next(), Some(Component::RootDir))
-}
-
 /// Returns true if `dir` contains at least one recognised text-extension file
 /// modified after `cutoff`, looking no deeper than `max_depth` levels.
-fn has_recent_log_files(dir: &Path, cutoff: SystemTime, max_depth: usize) -> bool {
-    walkdir::WalkDir::new(dir)
+fn has_recent_log_files(
+    dir: &Path,
+    cutoff: SystemTime,
+    max_depth: usize,
+    deadline: Instant,
+) -> bool {
+    for entry in walkdir::WalkDir::new(dir)
         .max_depth(max_depth)
         .follow_links(false)
         .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .any(|e| {
-            let ext = e
-                .path()
-                .extension()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_lowercase())
-                .unwrap_or_default();
-            TEXT_EXTENSIONS.contains(&ext.as_str())
-                && e.metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .map(|t| t > cutoff)
-                    .unwrap_or(false)
-        })
+        .take(MAX_DISCOVERY_ENTRIES_PER_ROOT)
+    {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let ext = entry
+            .path()
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_lowercase)
+            .unwrap_or_default();
+        if TEXT_EXTENSIONS.contains(&ext.as_str())
+            && entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .is_some_and(|modified| modified > cutoff)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // ── Spawn ─────────────────────────────────────────────────────────────────────
 
+fn create_watcher(
+    event_tx: std::sync::mpsc::SyncSender<notify::Result<Event>>,
+    overflowed: Arc<AtomicBool>,
+) -> notify::Result<RecommendedWatcher> {
+    RecommendedWatcher::new(
+        move |event| {
+            if matches!(
+                event_tx.try_send(event),
+                Err(std::sync::mpsc::TrySendError::Full(_))
+            ) {
+                overflowed.store(true, Ordering::Relaxed);
+            }
+        },
+        Config::default(),
+    )
+}
+
 /// Start the file-watch background thread watching `directories`.
 ///
 /// Returns a `ShutdownHandle` — dropping it signals the thread to exit — and a
-/// `DirUpdateSender` for adding new directories at runtime.
+/// `DirUpdateSender` for replacing the complete directory set at runtime.
 pub fn spawn(
     directories: Vec<PathBuf>,
     trigger: super::TriggerTx,
@@ -245,11 +390,13 @@ pub fn spawn(
     // SyncSender with cap 0: never blocks on send; drops when caller drops the handle,
     // causing try_recv in the thread to return Disconnected → thread exits.
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel::<()>(0);
-    let (dir_tx, dir_rx) = std::sync::mpsc::channel::<PathBuf>();
+    let (dir_tx, dir_rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
 
-    let (event_tx, event_rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
+    let (event_tx, event_rx) =
+        std::sync::mpsc::sync_channel::<notify::Result<Event>>(EVENT_QUEUE_SIZE);
+    let event_overflowed = Arc::new(AtomicBool::new(false));
 
-    let mut watcher = match RecommendedWatcher::new(event_tx, Config::default()) {
+    let mut watcher = match create_watcher(event_tx.clone(), event_overflowed.clone()) {
         Ok(w) => w,
         Err(e) => {
             warn!("Failed to create file watcher: {e}");
@@ -259,14 +406,7 @@ pub fn spawn(
 
     let mut watched: HashSet<PathBuf> = HashSet::new();
     for dir in &directories {
-        let Some(_user) = ActiveUserImpersonation::new() else {
-            warn!(
-                "Cannot watch directory without active-user token: {}",
-                dir.display()
-            );
-            continue;
-        };
-        match watcher.watch(dir, RecursiveMode::Recursive) {
+        match arm_watch(&mut watcher, dir) {
             Ok(()) => {
                 watched.insert(dir.clone());
             }
@@ -276,37 +416,52 @@ pub fn spawn(
     info!(dirs = watched.len(), "File watcher started");
 
     std::thread::spawn(move || {
-        let mut watcher = watcher;
+        let mut watcher = Some(watcher);
         let mut watched_dirs = watched;
 
         while let Err(std::sync::mpsc::TryRecvError::Empty) = shutdown_rx.try_recv() {
-            // Check for directories added by the main loop's re-discovery
-            while let Ok(new_dir) = dir_rx.try_recv() {
-                let Some(_user) = ActiveUserImpersonation::new() else {
-                    warn!(
-                        "Cannot re-watch directory without active-user token: {}",
-                        new_dir.display()
-                    );
-                    continue;
-                };
-                if !new_dir.exists() {
-                    continue;
-                }
-                // Re-issue watch() even for a dir we already track. If a watched
-                // directory was deleted and recreated, the OS handle behind the old
-                // ReadDirectoryChangesW watch is dead and notify silently stops
-                // delivering its events — with no error to tell us which watch died.
-                // notify re-arms an already-watched path harmlessly, so re-watching on
-                // each rediscovery repairs a stale watch without a service restart.
-                let already = watched_dirs.contains(&new_dir);
-                match watcher.watch(&new_dir, RecursiveMode::Recursive) {
-                    Ok(()) => {
-                        if !already {
-                            info!("Now watching: {}", new_dir.display());
-                            watched_dirs.insert(new_dir);
+            if event_overflowed.swap(false, Ordering::Relaxed) {
+                warn!("File watch event burst exceeded the bounded queue; some activity may be missing");
+            }
+            // A replacement is authoritative: rebuild the notify watcher so roots from
+            // the previous desktop user cannot survive a fast-user-switch. Rebuilding
+            // also re-arms paths whose old OS handle died after delete/recreate.
+            while let Ok(directories) = dir_rx.try_recv() {
+                let desired = replacement_watch_dirs(&directories);
+                let mut replacement =
+                    match create_watcher(event_tx.clone(), event_overflowed.clone()) {
+                        Ok(watcher) => Some(watcher),
+                        Err(e) => {
+                            warn!("Failed to rebuild file watcher: {e}");
+                            None
+                        }
+                    };
+                let mut armed = HashSet::new();
+                if let Some(next) = replacement.as_mut() {
+                    for dir in &desired {
+                        match arm_watch(next, dir) {
+                            Ok(()) => {
+                                armed.insert(dir.clone());
+                            }
+                            Err(e) => warn!("Cannot watch {}: {e}", dir.display()),
                         }
                     }
-                    Err(e) => warn!("Cannot watch {}: {e}", new_dir.display()),
+                }
+                let removed = watched_dirs.difference(&armed).count();
+                let added = armed.difference(&watched_dirs).count();
+                drop(std::mem::replace(&mut watcher, replacement));
+                watched_dirs = armed;
+                // Drop already-parsed and queued events from the old user's roots.
+                if let Ok(mut changes) = shared_clone.lock() {
+                    changes.clear();
+                }
+                while event_rx.try_recv().is_ok() {}
+                info!(
+                    dirs = watched_dirs.len(),
+                    added, removed, "File watcher roots replaced"
+                );
+                if watcher.is_none() {
+                    warn!("File watcher is inactive after rebuild failure");
                 }
             }
 
@@ -399,5 +554,77 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(tail.contains("line1"));
         assert!(tail.contains("ERROR boom"));
+    }
+
+    #[test]
+    fn discovery_stops_at_its_deadline() {
+        let dir =
+            std::env::temp_dir().join(format!("eir-discovery-deadline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("recent.log"), "ERROR").unwrap();
+        assert!(!has_recent_log_files(&dir, UNIX_EPOCH, 1, Instant::now()));
+        assert!(has_recent_log_files(
+            &dir,
+            UNIX_EPOCH,
+            1,
+            Instant::now() + Duration::from_secs(5)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn configured_watch_dirs_reject_drive_roots_and_traversal() {
+        assert!(configured_watch_dirs_current_user(&["C:\\".into()]).is_empty());
+        assert!(configured_watch_dirs_current_user(&["C:\\Windows\\..".into()]).is_empty());
+    }
+
+    #[test]
+    fn automatic_user_roots_come_from_the_active_profile() {
+        let roots = profile_watch_roots(Path::new("D:\\Profiles\\Active"));
+        assert_eq!(
+            roots[0],
+            PathBuf::from("D:\\Profiles\\Active\\AppData\\Local")
+        );
+        assert_eq!(
+            roots[1],
+            PathBuf::from("D:\\Profiles\\Active\\AppData\\Roaming")
+        );
+        assert_eq!(
+            roots[2],
+            PathBuf::from("D:\\Profiles\\Active\\AppData\\Local\\Temp")
+        );
+    }
+
+    #[test]
+    fn watch_guard_prevents_a_checked_path_from_being_replaced() {
+        // Keep the path relative so this test exercises the guarded descendants,
+        // without requiring directory-list access to every sandbox-owned ancestor.
+        let base = PathBuf::from("target").join(format!("eir-watch-guard-{}", std::process::id()));
+        let watched = base.join("watched");
+        let moved = base.join("moved");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&watched).unwrap();
+
+        let guard = WatchPathGuard::open(&watched).expect("lock watched path");
+        assert!(
+            std::fs::rename(&watched, &moved).is_err(),
+            "a guarded path must not be replaceable before notify opens it"
+        );
+        drop(guard);
+        std::fs::rename(&watched, &moved).expect("rename after guard release");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn replacement_update_drops_previous_user_roots_and_keeps_shared_roots() {
+        let old_user = PathBuf::from(r"C:\Users\Old\AppData\Local\App");
+        let new_user = PathBuf::from(r"C:\Users\New\AppData\Local\App");
+        let shared = PathBuf::from(r"C:\ProgramData\App");
+        let desired = replacement_watch_dirs(&[new_user.clone(), shared.clone()]);
+
+        assert!(!desired.contains(&old_user));
+        assert!(desired.contains(&new_user));
+        assert!(desired.contains(&shared));
     }
 }

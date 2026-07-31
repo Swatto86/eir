@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Eir",
-  "version": "0.34.5",
+  "version": "0.34.6",
   "identifier": "co.swatto.eir",
   "build": {
     "frontendDist": "../ui",
@@ -25,7 +25,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'"
     }
   },
   "plugins": {
@@ -58,6 +58,10 @@
     },
     "windows": {
       "allowDowngrades": false,
+      "webviewInstallMode": {
+        "type": "fixedRuntime",
+        "path": "Microsoft.WebView2.FixedVersionRuntime.150.0.4078.105.x64"
+      },
       "nsis": {
         "installMode": "perMachine",
         "installerHooks": "installer-hooks.nsh",

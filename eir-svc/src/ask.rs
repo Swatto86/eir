@@ -30,6 +30,51 @@ const MAX_HISTORY_ENTRIES: usize = 5;
 /// How much of each previous answer to keep (characters), so a long earlier answer
 /// doesn't dominate the current question's budget.
 const MAX_HISTORY_ANSWER_CHARS: usize = 1500;
+pub const MAX_STORED_ANSWER_BYTES: usize = 64 * 1024;
+const MAX_ASK_ATTACHMENTS: usize = 12;
+const MAX_ATTACHMENT_NAME_BYTES: usize = 4 * 1024;
+const MAX_ATTACHMENT_CONTENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ATTACHMENT_MEDIA_TYPE_BYTES: usize = 64;
+
+pub fn bound_answer(mut answer: String) -> String {
+    crate::models::truncate_utf8_bytes(&mut answer, MAX_STORED_ANSWER_BYTES);
+    answer
+}
+
+pub fn attachment_rejection_reason(
+    attachments: &[eir_proto::AskAttachment],
+) -> Option<&'static str> {
+    if attachments.len() > MAX_ASK_ATTACHMENTS {
+        return Some("Too many attachments (max 12).");
+    }
+    let mut content_bytes = 0usize;
+    for attachment in attachments {
+        if attachment.name.is_empty()
+            || attachment.name.len() > MAX_ATTACHMENT_NAME_BYTES
+            || attachment.name.chars().any(char::is_control)
+        {
+            return Some("An attachment name is invalid or too long.");
+        }
+        if attachment.media_type.len() > MAX_ATTACHMENT_MEDIA_TYPE_BYTES {
+            return Some("An attachment media type is too long.");
+        }
+        match attachment.kind.as_str() {
+            "text" if attachment.media_type.is_empty() => {}
+            "image"
+                if !attachment.content.is_empty()
+                    && matches!(
+                        attachment.media_type.as_str(),
+                        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+                    ) => {}
+            _ => return Some("An attachment has an unsupported type."),
+        }
+        content_bytes = content_bytes.saturating_add(attachment.content.len());
+        if content_bytes > MAX_ATTACHMENT_CONTENT_BYTES {
+            return Some("Attachments are too large (8 MiB total).");
+        }
+    }
+    None
+}
 
 /// Why an Ask request should be rejected, or `None` to proceed. Pure, unit-tested.
 pub fn ask_rejection_reason(
@@ -56,6 +101,10 @@ pub fn ask_rejection_reason(
         return Some("Please wait a few seconds between questions.");
     }
     None
+}
+
+pub fn clear_rejection_reason(running: bool) -> Option<&'static str> {
+    running.then_some("Wait for the current answer before clearing Ask history.")
 }
 
 /// Build the bounded prompt (pure, testable). Grounds the answer in current context and
@@ -175,6 +224,43 @@ mod tests {
     use super::*;
     use eir_proto::AskEntry;
 
+    #[test]
+    fn stored_answer_is_bounded_on_a_utf8_boundary() {
+        let answer = bound_answer(format!("a{}", "é".repeat(MAX_STORED_ANSWER_BYTES)));
+        assert!(answer.len() <= MAX_STORED_ANSWER_BYTES);
+        assert!(answer.ends_with('é'));
+    }
+
+    #[test]
+    fn service_rejects_unbounded_attachment_metadata_and_content() {
+        let attachment = |name: String, content: String| eir_proto::AskAttachment {
+            name,
+            kind: "text".into(),
+            content,
+            media_type: String::new(),
+        };
+        assert!(attachment_rejection_reason(&vec![
+            attachment("ok.txt".into(), String::new());
+            MAX_ASK_ATTACHMENTS
+        ])
+        .is_none());
+        assert!(attachment_rejection_reason(&vec![
+            attachment("extra.txt".into(), String::new());
+            MAX_ASK_ATTACHMENTS + 1
+        ])
+        .is_some());
+        assert!(attachment_rejection_reason(&[attachment(
+            "x".repeat(MAX_ATTACHMENT_NAME_BYTES + 1),
+            String::new(),
+        )])
+        .is_some());
+        assert!(attachment_rejection_reason(&[attachment(
+            "big.txt".into(),
+            "x".repeat(MAX_ATTACHMENT_CONTENT_BYTES + 1),
+        )])
+        .is_some());
+    }
+
     fn ctx() -> AskContext {
         AskContext {
             cpu: 12.0,
@@ -276,5 +362,11 @@ mod tests {
         assert!(ask_rejection_reason("hi", true, false, 100, 200).is_none());
         // First-ever question (last_ask_at == 0) is allowed immediately.
         assert!(ask_rejection_reason("hi", true, false, 0, 1).is_none());
+    }
+
+    #[test]
+    fn clear_gate_refuses_to_resurrect_an_in_flight_answer() {
+        assert!(clear_rejection_reason(true).is_some());
+        assert!(clear_rejection_reason(false).is_none());
     }
 }

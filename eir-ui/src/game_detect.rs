@@ -10,8 +10,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 use windows::Win32::UI::Shell::{
-    SHQueryUserNotificationState, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
+    SHQueryUserNotificationState, QUERY_USER_NOTIFICATION_STATE, QUNS_BUSY,
+    QUNS_RUNNING_D3D_FULL_SCREEN,
 };
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 const POLL: Duration = Duration::from_secs(5);
 /// Re-assert the auto lease this often while a game runs (the service lease is 90s).
@@ -23,9 +25,26 @@ const EXIT_DEBOUNCE: Duration = Duration::from_secs(60);
 /// True if a fullscreen (game/exclusive) app is foreground. `SHQueryUserNotificationState`
 /// is the OS's own "should I show toasts?" signal: `QUNS_RUNNING_D3D_FULL_SCREEN` is a D3D
 /// game, `QUNS_BUSY` is a fullscreen app generally — either means "don't interrupt."
+fn notification_state_is_game(
+    state: QUERY_USER_NOTIFICATION_STATE,
+    foreground_process_id: Option<u32>,
+    own_process_id: u32,
+) -> bool {
+    (state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_BUSY)
+        && foreground_process_id != Some(own_process_id)
+}
+
+fn foreground_process_id() -> Option<u32> {
+    let mut process_id = 0;
+    unsafe {
+        GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut process_id));
+    }
+    (process_id != 0).then_some(process_id)
+}
+
 fn is_fullscreen_app() -> bool {
     match unsafe { SHQueryUserNotificationState() } {
-        Ok(state) => state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_BUSY,
+        Ok(state) => notification_state_is_game(state, foreground_process_id(), std::process::id()),
         Err(_) => false,
     }
 }
@@ -90,6 +109,17 @@ pub async fn run(status: SharedStatus, cmd_tx: Sender<UiRequest>, connected: Arc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fullscreen_state_ignores_eirs_own_foreground_window() {
+        assert!(!notification_state_is_game(QUNS_BUSY, Some(42), 42));
+        assert!(notification_state_is_game(QUNS_BUSY, Some(7), 42));
+        assert!(notification_state_is_game(
+            QUNS_RUNNING_D3D_FULL_SCREEN,
+            None,
+            42
+        ));
+    }
 
     #[test]
     fn full_queue_reports_unsent_transition() {

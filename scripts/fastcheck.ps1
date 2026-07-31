@@ -22,7 +22,11 @@ function Invoke-Step {
     }
 }
 
+Invoke-Step 'node --check ui/main.js' { node --check ui/main.js }
 Invoke-Step 'cargo fmt --check' { cargo fmt --all -- --check }
-Invoke-Step 'cargo clippy' { cargo clippy --workspace --all-targets -- -D warnings }
+if (-not (Test-Path 'eir-ui/bin/eir-svc.exe')) {
+    Invoke-Step 'stage service binary' { & eir-ui/build-svc.ps1 }
+}
+Invoke-Step 'cargo clippy' { cargo clippy --locked --workspace --all-targets -- -D warnings }
 
 Write-Host 'fastcheck OK' -ForegroundColor Green

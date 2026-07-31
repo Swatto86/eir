@@ -199,14 +199,28 @@ fn build_applied_value_guard(normalised: &str, undo: &RegistryUndo) -> Result<St
         .applied_data
         .as_deref()
         .context("Registry undo is missing Eir's applied value data")?;
+    build_existing_value_guard(
+        normalised,
+        &undo.value_name,
+        kind,
+        data,
+        "Registry value changed since Eir applied it — refusing to overwrite the newer value",
+    )
+}
+
+fn build_existing_value_guard(
+    normalised: &str,
+    value_name: &str,
+    kind: RegistryScalarKind,
+    data: &str,
+    changed_message: &str,
+) -> Result<String> {
     let canonical = canonical_data(kind, data)?;
     let path_q = super::powershell::ps_single_quote(normalised);
-    let name_q = super::powershell::ps_single_quote(&undo.value_name);
+    let name_q = super::powershell::ps_single_quote(value_name);
     let kind_q = super::powershell::ps_single_quote(kind.as_str());
     let data_q = super::powershell::ps_single_quote(&canonical);
-    let changed_q = super::powershell::ps_single_quote(
-        "Registry value changed since Eir applied it — refusing to overwrite the newer value",
-    );
+    let changed_q = super::powershell::ps_single_quote(changed_message);
     let actual_expression = actual_data_expression(kind);
     Ok(format!(
         "$ErrorActionPreference='Stop'; \
@@ -218,6 +232,39 @@ fn build_applied_value_guard(normalised: &str, undo: &RegistryUndo) -> Result<St
          $actual = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); \
          $actualData = {actual_expression}; \
          if ($actualData -cne {data_q}) {{ throw {changed_q} }}"
+    ))
+}
+
+fn build_prior_value_guard(normalised: &str, undo: &RegistryUndo) -> Result<String> {
+    if undo.prior_existed {
+        let kind = undo
+            .prior_kind
+            .context("Existing registry rollback snapshot has no scalar type")?;
+        let data = undo
+            .prior_data
+            .as_deref()
+            .context("Existing registry rollback snapshot has no scalar data")?;
+        return build_existing_value_guard(
+            normalised,
+            &undo.value_name,
+            kind,
+            data,
+            "Registry value changed since Eir snapshotted it — refusing to overwrite the newer value",
+        );
+    }
+    if undo.prior_kind.is_some() || undo.prior_data.is_some() {
+        bail!("Absent registry rollback snapshot unexpectedly contains a type or value");
+    }
+    let path_q = super::powershell::ps_single_quote(normalised);
+    let name_q = super::powershell::ps_single_quote(&undo.value_name);
+    let changed_q = super::powershell::ps_single_quote(
+        "Registry value appeared since Eir snapshotted it — refusing to overwrite the newer value",
+    );
+    Ok(format!(
+        "$ErrorActionPreference='Stop'; \
+         $key = Get-Item -LiteralPath {path_q} -ErrorAction Stop; \
+         $name = {name_q}; \
+         if (@($key.GetValueNames()) -contains $name) {{ throw {changed_q} }}"
     ))
 }
 
@@ -359,7 +406,10 @@ fn normalise_key(key_path: &str) -> String {
         ("HKEY_LOCAL_MACHINE/", "HKLM:\\"),
         ("HKEY_CURRENT_USER/", "HKCU:\\"),
     ] {
-        if out.len() >= from.len() && out[..from.len()].eq_ignore_ascii_case(from) {
+        if out
+            .get(..from.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(from))
+        {
             out = format!("{to}{}", &out[from.len()..]);
             break;
         }
@@ -395,6 +445,7 @@ fn build_reset_script(
         bail!("Registry applied-value guard does not match the requested write");
     }
 
+    let prior_guard = build_prior_value_guard(normalised_path, undo)?;
     let write = build_typed_write_script(
         normalised_path,
         value_name,
@@ -407,13 +458,24 @@ fn build_reset_script(
         undo,
         "Registry rollback did not restore the prior value",
     )?;
+    let rollback_guard = build_applied_value_guard(normalised_path, undo)?;
     let safe_name = value_name.replace('\'', "''");
     Ok(format!(
-        "try {{ {write} }} catch {{ \
+        "{prior_guard}; \
+         try {{ {write} }} catch {{ \
            $eirWriteError = $_.Exception.Message; \
+           $eirPriorUnchanged = $false; \
+           try {{ {prior_guard}; $eirPriorUnchanged = $true }} catch {{ }}; \
+           if ($eirPriorUnchanged) {{ \
+             throw ('Registry write failed; prior value remains unchanged: ' + $eirWriteError) \
+           }}; \
+           try {{ {rollback_guard} }} catch {{ \
+             $eirStateError = $_.Exception.Message; \
+             throw ('Registry write failed; value matched neither the prior nor applied state, so rollback was refused: ' + $eirWriteError + '; state check: ' + $eirStateError) \
+           }}; \
            try {{ {rollback} }} catch {{ \
              $eirRollbackError = $_.Exception.Message; \
-             throw ('Registry write failed and rollback failed: ' + $eirWriteError + '; rollback: ' + $eirRollbackError) \
+             throw ('Registry write failed; value matched the applied state recorded by Eir, but rollback failed: ' + $eirWriteError + '; rollback: ' + $eirRollbackError) \
            }}; \
            throw ('Registry write failed and was rolled back: ' + $eirWriteError) \
          }}; \
@@ -563,6 +625,10 @@ mod tests {
             script.contains("Registry write failed and was rolled back"),
             "{script}"
         );
+        assert!(
+            script.contains("changed since Eir applied it"),
+            "rollback must not overwrite a concurrent newer value: {script}"
+        );
 
         let created = build_reset_script(
             TEST_KEY,
@@ -574,6 +640,78 @@ mod tests {
         .expect("script");
         assert!(created.contains("catch"), "{created}");
         assert!(created.contains("Remove-ItemProperty"), "{created}");
+    }
+
+    #[test]
+    fn reset_classifies_an_unchanged_prior_value_before_attempting_rollback() {
+        let script = build_reset_script(
+            TEST_KEY,
+            "Setting",
+            RegistryScalarKind::DWord,
+            "7",
+            &present_undo("Setting", RegistryScalarKind::DWord, "42", "7"),
+        )
+        .expect("script");
+        let catch = script
+            .find("$eirWriteError")
+            .expect("write-failure handler");
+        let handler = &script[catch..];
+
+        assert!(
+            handler.contains("prior value remains unchanged"),
+            "a pre-write failure must not be reported as a rollback failure: {script}"
+        );
+        assert!(
+            handler.contains("changed since Eir snapshotted it"),
+            "the catch path must check whether the prior value still exists: {script}"
+        );
+        assert!(
+            handler.find("changed since Eir snapshotted it")
+                < handler.find("changed since Eir applied it"),
+            "classify prior/applied/unknown in that order: {script}"
+        );
+        assert!(
+            handler.contains("matched the applied state recorded by Eir, but rollback failed"),
+            "an attempted rollback failure must not be mislabeled as an unknown state: {script}"
+        );
+    }
+
+    #[test]
+    fn reset_refuses_to_overwrite_a_value_changed_after_snapshot() {
+        let script = build_reset_script(
+            TEST_KEY,
+            "Setting",
+            RegistryScalarKind::DWord,
+            "7",
+            &present_undo("Setting", RegistryScalarKind::DWord, "42", "7"),
+        )
+        .expect("script");
+        let guard = script
+            .find("changed since Eir snapshotted it")
+            .expect("snapshot guard");
+        let write = script.find("try {").expect("guarded write");
+        assert!(
+            guard < write,
+            "snapshot guard must run before the write: {script}"
+        );
+
+        let created = build_reset_script(
+            TEST_KEY,
+            "NewSetting",
+            RegistryScalarKind::String,
+            "new",
+            &absent_undo("NewSetting", "new"),
+        )
+        .expect("script");
+        assert!(
+            created.contains("appeared since Eir snapshotted it"),
+            "{created}"
+        );
+        assert!(
+            created.find("appeared since Eir snapshotted it").unwrap()
+                < created.find("try {").unwrap(),
+            "absence guard must run before the write: {created}"
+        );
     }
 
     #[test]
@@ -755,5 +893,11 @@ mod tests {
             "HKCU:\\Software/Y"
         );
         assert_eq!(normalise_key("HKLM:\\SYSTEM\\Z"), "HKLM:\\SYSTEM\\Z");
+    }
+
+    #[test]
+    fn normalise_key_does_not_slice_inside_utf8() {
+        let key = format!("{}é", "a".repeat(18));
+        assert_eq!(normalise_key(&key), key);
     }
 }

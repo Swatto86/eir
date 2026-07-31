@@ -1,4 +1,4 @@
-use crate::policy::{is_network_path, is_within, normalize_path_lexical};
+use crate::policy::{is_network_path, normalize_path_lexical};
 use crate::session::active_user_session_id;
 use anyhow::{bail, Context, Result};
 use std::path::{Component, Path, PathBuf, Prefix};
@@ -52,36 +52,64 @@ pub(crate) fn with_active_user<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 /// transaction logs here, and removing them can destabilise the OS. Matched on
 /// component boundaries (shared with the policy blocklist), so a cleanup rooted at a
 /// broad path can't recurse in and delete them.
-const PROTECTED_DIRS: &[&str] = &[
-    "C:\\Windows\\System32",
-    "C:\\Windows\\SysWOW64",
-    "C:\\Windows\\WinSxS",
-    "C:\\Windows\\Boot",
-    "C:\\Windows\\Fonts",
+const PROTECTED_DIRS: &[&[&str]] = &[
+    &["windows", "system32"],
+    &["windows", "syswow64"],
+    &["windows", "winsxs"],
+    &["windows", "boot"],
+    &["windows", "fonts"],
 ];
+
+fn drive_relative_components(components: &[String]) -> Option<&[String]> {
+    let drive = components.first()?.as_bytes();
+    (drive.len() == 2 && drive[0].is_ascii_alphabetic() && drive[1] == b':')
+        .then_some(&components[1..])
+}
+
+fn components_start_with(path: &[String], prefix: &[&str]) -> bool {
+    path.len() >= prefix.len()
+        && path
+            .iter()
+            .zip(prefix)
+            .all(|(component, expected)| component == expected)
+}
 
 /// A scan root is too broad if it is a bare drive/filesystem root, or an ancestor of
 /// (or equal to / inside) a protected system directory. The policy layer only checks
 /// the root against its path blocklist; a root like `C:\` or `C:\Windows` passes that
 /// yet would recurse into `System32`, so this is the executor's own gate.
-fn root_too_broad(path: &str) -> bool {
+pub(crate) fn root_too_broad(path: &str) -> bool {
+    let components = normalize_path_lexical(path);
     // Fewer than two components means a drive root (`C:\`) or empty — never a
     // specific-enough log location.
-    if normalize_path_lexical(path).len() < 2 {
+    if components.len() < 2 {
         return true;
     }
+    let Some(relative) = drive_relative_components(&components) else {
+        return false;
+    };
     // Reject if the root sits inside a protected dir, OR is an ancestor of one
-    // (`is_within(protected, root)` means the root contains that protected dir).
-    PROTECTED_DIRS
-        .iter()
-        .any(|d| is_within(path, d) || is_within(d, path))
+    // on any local drive. Windows is normally on C:, but that is not guaranteed.
+    PROTECTED_DIRS.iter().any(|dir| {
+        components_start_with(relative, dir)
+            || (dir.len() >= relative.len()
+                && dir
+                    .iter()
+                    .zip(relative)
+                    .all(|(expected, component)| component == expected))
+    })
 }
 
 /// A specific file that must not be deleted because it lives under a protected dir.
 /// Belt-and-suspenders against junctions/edge roots that slip past [`root_too_broad`].
 /// Shared with the `FileDelete` executor, which canonicalises then re-checks here.
 pub(crate) fn is_protected_file(path: &str) -> bool {
-    PROTECTED_DIRS.iter().any(|d| is_within(path, d))
+    let components = normalize_path_lexical(path);
+    drive_relative_components(&components).is_some_and(|relative| {
+        PROTECTED_DIRS
+            .iter()
+            .any(|dir| components_start_with(relative, dir))
+    })
 }
 
 pub(crate) fn checked_local_path(path: &Path) -> Result<Option<PathBuf>> {
@@ -164,6 +192,16 @@ fn validate_cleanup_result(
     Ok(())
 }
 
+fn cleanable_extension(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    CLEANABLE_EXTENSIONS
+        .iter()
+        .any(|cleanable| cleanable.eq_ignore_ascii_case(extension))
+}
+
 pub fn cleanup(path: &str, days_old: u32) -> Result<String> {
     // days_old == 0 makes the cutoff "now", matching every existing file — a mass
     // delete disguised as a log cleanup. Require a real age window.
@@ -223,8 +261,7 @@ pub fn cleanup(path: &str, days_old: u32) -> Result<String> {
             break;
         }
         let p = entry.path();
-        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !CLEANABLE_EXTENSIONS.contains(&ext) {
+        if !cleanable_extension(p) {
             continue;
         }
 
@@ -340,10 +377,26 @@ mod tests {
     }
 
     #[test]
+    fn protected_windows_dirs_are_not_tied_to_the_c_drive() {
+        assert!(root_too_broad("D:\\Windows"));
+        assert!(root_too_broad("D:\\Windows\\System32\\config"));
+        assert!(is_protected_file(
+            "D:\\Windows\\System32\\LogFiles\\trace.etl"
+        ));
+    }
+
+    #[test]
     fn allows_specific_log_dirs() {
         assert!(!root_too_broad("C:\\ProgramData\\SomeApp\\logs"));
         assert!(!root_too_broad("C:\\Windows\\Logs")); // a real, safe log location
         assert!(!root_too_broad("C:\\Users\\me\\AppData\\Local\\App\\logs"));
+    }
+
+    #[test]
+    fn cleanable_extensions_are_case_insensitive_on_windows() {
+        assert!(cleanable_extension(Path::new("old.log")));
+        assert!(cleanable_extension(Path::new("old.LOG")));
+        assert!(cleanable_extension(Path::new("trace.EtL")));
     }
 
     #[test]

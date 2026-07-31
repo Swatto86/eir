@@ -1,27 +1,12 @@
 use anyhow::{bail, Result};
 
 const PROTECTED_PROCESSES: &[&str] = &[
-    "System", "Idle", "lsass", "winlogon", "csrss", "smss", "wininit", "services", "ntoskrnl",
+    "System", "Idle", "lsass", "winlogon", "csrss", "smss", "wininit", "services", "svchost",
+    "ntoskrnl", "eir-svc", "MsMpEng",
 ];
 
 pub async fn kill(process_name: &str) -> Result<String> {
-    // Stop-Process -Name glob-expands `*?[]` even inside a single-quoted literal
-    // (globbing is cmdlet-level, not string interpolation), so `lsass*` would match
-    // and kill lsass without ever equalling the exact-match blocklist entry. Refuse
-    // wildcards up front — mirrors the has_glob_meta guard in tasks.rs/registry.rs.
-    if process_name.contains(['*', '?', '[', ']']) {
-        bail!("Process name '{process_name}' contains wildcard characters — refusing");
-    }
-    let lower = process_name
-        .strip_suffix(".exe")
-        .unwrap_or(process_name)
-        .to_lowercase();
-    if PROTECTED_PROCESSES
-        .iter()
-        .any(|&p| p.to_lowercase() == lower)
-    {
-        bail!("Refusing to kill protected process: {process_name}");
-    }
+    validate_kill_target(process_name)?;
     let safe_name = process_name.replace('\'', "''");
     // Report success only if a process actually existed and was stopped. The old script
     // used `-ErrorAction SilentlyContinue` and unconditionally wrote success, so a typo'd/
@@ -40,6 +25,25 @@ pub async fn kill(process_name: &str) -> Result<String> {
     super::powershell::run_diagnostic(&script).await
 }
 
+pub(crate) fn validate_kill_target(process_name: &str) -> Result<()> {
+    // Stop-Process -Name glob-expands `*?[]` even inside a single-quoted literal
+    // (globbing is cmdlet-level, not string interpolation), so `lsass*` would match
+    // and kill lsass without ever equalling the exact-match blocklist entry. Refuse
+    // wildcards up front — mirrors the has_glob_meta guard in tasks.rs/registry.rs.
+    if process_name.contains(['*', '?', '[', ']']) {
+        bail!("Process name '{process_name}' contains wildcard characters — refusing");
+    }
+    let lower = process_name.to_lowercase();
+    let lower = lower.strip_suffix(".exe").unwrap_or(&lower);
+    if PROTECTED_PROCESSES
+        .iter()
+        .any(|protected| protected.eq_ignore_ascii_case(lower))
+    {
+        bail!("Refusing to kill protected process: {process_name}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,9 +60,27 @@ mod tests {
 
     #[tokio::test]
     async fn protected_processes_are_refused() {
-        for name in ["lsass", "lsass.exe"] {
+        for name in [
+            "lsass",
+            "lsass.exe",
+            "SVCHOST.EXE",
+            "eir-svc.exe",
+            "MSMPENG.EXE",
+        ] {
             let err = kill(name).await.unwrap_err();
             assert!(err.to_string().contains("protected"), "{err}");
+        }
+    }
+
+    #[test]
+    fn shared_service_hosts_and_eir_are_protected_targets() {
+        for name in ["svchost", "eir-svc", "MsMpEng"] {
+            assert!(
+                PROTECTED_PROCESSES
+                    .iter()
+                    .any(|protected| protected.eq_ignore_ascii_case(name)),
+                "{name} must never be killed"
+            );
         }
     }
 }

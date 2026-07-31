@@ -13,8 +13,9 @@ use eir_proto::{
 use pipe_client::{CommandWaiters, SharedStatus};
 use serde::{Deserialize, Serialize};
 use std::{
+    ffi::OsStr,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -25,6 +26,7 @@ use tauri::{
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
+    webview::PageLoadEvent,
     AppHandle, Manager, State, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt as _;
@@ -53,6 +55,27 @@ struct UiCmdTx {
 /// service is down (or restarting) fails loudly instead of being queued and then
 /// silently dropped when the dead connection's command backlog is drained.
 struct ConnState(Arc<AtomicBool>);
+
+/// Serialises startup synchronisation with user-initiated autostart changes. All work
+/// guarded by this lock runs on Tauri's blocking pool, never the UI thread.
+struct AutostartIo(Arc<Mutex<()>>);
+
+#[derive(Clone, Copy)]
+struct RuntimeMode {
+    portable: bool,
+}
+
+fn portable_ui_mode_at(flag: Option<&OsStr>) -> bool {
+    flag == Some(OsStr::new("1"))
+}
+
+fn portable_ui_mode() -> bool {
+    portable_ui_mode_at(std::env::var_os("EIR_PORTABLE").as_deref())
+}
+
+fn installed_integrations_enabled(portable: bool) -> bool {
+    !portable
+}
 
 /// Reject a pipe command when the service is disconnected. The UI's catch paths
 /// then re-enable the buttons / show "Failed: …" instead of leaving a control
@@ -276,22 +299,39 @@ async fn ask_eir(
     tx: State<'_, UiCmdTx>,
     atts: State<'_, AskAttachments>,
 ) -> Result<String, String> {
-    let attachments = atts.0.lock().map_err(|e| e.to_string())?.clone();
+    let attachments = take_ask_attachments(&atts)?;
     let result = send_command(
         &tx,
         UiMsg::AskEir {
             question,
-            attachments,
+            attachments: attachments.clone(),
         },
     )
-    .await?;
-    // Keep attachments when a capable service rejects the question.
-    atts.0.lock().map_err(|e| e.to_string())?.clear();
-    Ok(result)
+    .await;
+    if result.is_err() {
+        restore_ask_attachments(&atts, attachments)?;
+    }
+    result
 }
 
 /// Pending Ask attachments, collected by the picker and consumed on the next `ask_eir`.
 struct AskAttachments(std::sync::Mutex<Vec<eir_proto::AskAttachment>>);
+
+fn take_ask_attachments(atts: &AskAttachments) -> Result<Vec<eir_proto::AskAttachment>, String> {
+    Ok(std::mem::take(
+        &mut *atts.0.lock().map_err(|e| e.to_string())?,
+    ))
+}
+
+fn restore_ask_attachments(
+    atts: &AskAttachments,
+    mut failed: Vec<eir_proto::AskAttachment>,
+) -> Result<(), String> {
+    let mut pending = atts.0.lock().map_err(|e| e.to_string())?;
+    failed.append(&mut pending);
+    *pending = failed;
+    Ok(())
+}
 
 #[tauri::command]
 async fn add_ask_attachments(
@@ -299,6 +339,24 @@ async fn add_ask_attachments(
     app: AppHandle,
     atts: State<'_, AskAttachments>,
 ) -> Result<Vec<ask_attach::AttachmentMeta>, String> {
+    let (remaining_count, remaining_bytes) = {
+        let guard = atts.0.lock().map_err(|e| e.to_string())?;
+        let used_bytes: usize = guard.iter().map(|a| a.content.len()).sum();
+        (
+            ask_attach::MAX_ATTACHMENTS.saturating_sub(guard.len()),
+            ask_attach::MAX_TOTAL_BYTES.saturating_sub(used_bytes),
+        )
+    };
+    if remaining_count == 0 || remaining_bytes == 0 {
+        let guard = atts.0.lock().map_err(|e| e.to_string())?;
+        return Ok(guard
+            .iter()
+            .map(|a| ask_attach::AttachmentMeta {
+                name: a.name.clone(),
+                kind: a.kind.clone(),
+            })
+            .collect());
+    }
     let app2 = app.clone();
     // Dialog + file reads + image transcode all off the async runtime.
     let processed: Vec<eir_proto::AskAttachment> =
@@ -309,7 +367,7 @@ async fn add_ask_attachments(
                     Some(fp) => fp
                         .into_path()
                         .ok()
-                        .map(|p| ask_attach::process_folder(&p))
+                        .map(|p| ask_attach::process_folder(&p, remaining_count, remaining_bytes))
                         .unwrap_or_default(),
                     None => vec![],
                 }
@@ -320,7 +378,7 @@ async fn add_ask_attachments(
                             .into_iter()
                             .filter_map(|fp| fp.into_path().ok())
                             .collect();
-                        ask_attach::process_files(&paths)
+                        ask_attach::process_files(&paths, remaining_count, remaining_bytes)
                     }
                     None => vec![],
                 }
@@ -520,11 +578,19 @@ fn get_service_version(status: State<'_, SharedStatus>) -> Option<String> {
     pipe_client::lock_status(&status).svc_version.clone()
 }
 
+#[tauri::command]
+fn is_portable(mode: State<'_, RuntimeMode>) -> bool {
+    mode.portable
+}
+
+fn runtime_service_state(portable: bool, connected: bool) -> Option<&'static str> {
+    portable.then_some(if connected { "running" } else { "stopped" })
+}
+
 /// Query the SCM directly for the Eir service state, independent of the pipe
 /// connection. Used by the About view to offer an Install button when the
 /// service is not registered.
-#[tauri::command]
-fn get_service_state() -> Result<String, String> {
+fn query_service_state() -> Result<String, String> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|e| format!("Service manager: {e}"))?;
     let svc = match manager.open_service("EirSvc", ServiceAccess::QUERY_STATUS) {
@@ -550,38 +616,61 @@ fn get_service_state() -> Result<String, String> {
     Ok(state.to_string())
 }
 
+#[tauri::command]
+async fn get_service_state(
+    mode: State<'_, RuntimeMode>,
+    connection: State<'_, ConnState>,
+) -> Result<String, String> {
+    if let Some(state) = runtime_service_state(
+        mode.portable,
+        connection.0.load(std::sync::atomic::Ordering::Relaxed),
+    ) {
+        return Ok(state.to_string());
+    }
+    tauri::async_runtime::spawn_blocking(query_service_state)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Install the bundled service binary. The installer has already placed
 /// `eir-svc.exe` next to the UI exe; this command re-runs that binary with
 /// the `install` verb elevated via a UAC prompt.
-#[tauri::command]
-async fn install_service() -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("Current exe: {e}"))?;
-    let dir = exe
+fn service_install_command(svc: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("powershell.exe");
+    command.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "hidden",
+        "-Command",
+        "$ErrorActionPreference='Stop'; exit (Start-Process -Verb RunAs -FilePath $env:EIR_SERVICE_EXE -ArgumentList 'install' -Wait -PassThru).ExitCode",
+    ])
+    .env("EIR_SERVICE_EXE", svc);
+    command
+}
+
+fn service_install_path_at(executable: &Path, portable: bool) -> Result<PathBuf, String> {
+    if !installed_integrations_enabled(portable) {
+        return Err("Service installation is unavailable in portable mode.".to_string());
+    }
+    executable
         .parent()
-        .ok_or_else(|| "Could not resolve install directory".to_string())?;
-    let svc = dir.join("eir-svc.exe");
+        .map(|directory| directory.join("eir-svc.exe"))
+        .ok_or_else(|| "Could not resolve install directory".to_string())
+}
+
+#[tauri::command]
+async fn install_service(mode: State<'_, RuntimeMode>) -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("Current exe: {e}"))?;
+    let svc = service_install_path_at(&exe, mode.portable)?;
     if !svc.exists() {
         return Err(format!("Service binary not found: {}", svc.display()));
     }
 
     // Run PowerShell elevated and wait so the UI can refresh state once the
     // service is registered and started.
-    let path = svc.to_string_lossy();
-    let quoted = path.replace('"', "\\\"");
-    let script = format!(
-        "Start-Process -Verb RunAs -FilePath \"{}\" -ArgumentList 'install' -Wait",
-        quoted
-    );
-    let status = tokio::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-WindowStyle",
-            "hidden",
-            "-Command",
-            &script,
-        ])
+    let status = service_install_command(&svc)
         .status()
         .await
         .map_err(|e| format!("Failed to launch installer: {e}"))?;
@@ -598,7 +687,13 @@ async fn install_service() -> Result<String, String> {
 /// newer signed release exists (mirroring the background checker), otherwise
 /// reports the current state as a string for the UI to display.
 #[tauri::command]
-async fn check_updates_now(handle: AppHandle) -> Result<String, String> {
+async fn check_updates_now(
+    handle: AppHandle,
+    mode: State<'_, RuntimeMode>,
+) -> Result<String, String> {
+    if !installed_integrations_enabled(mode.portable) {
+        return Ok("Portable Eir updates by downloading the latest portable release.".to_string());
+    }
     if UPDATE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
         return Ok("An update is already downloading.".to_string());
     }
@@ -633,17 +728,44 @@ async fn check_updates_inner(handle: &AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn get_autostart_enabled(handle: AppHandle) -> Result<bool, String> {
-    handle.autolaunch().is_enabled().map_err(|e| e.to_string())
+async fn get_autostart_enabled(
+    handle: AppHandle,
+    io: State<'_, AutostartIo>,
+    mode: State<'_, RuntimeMode>,
+) -> Result<bool, String> {
+    if !installed_integrations_enabled(mode.portable) {
+        return Ok(false);
+    }
+    let io = io.0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = io.lock().unwrap_or_else(|p| p.into_inner());
+        handle.autolaunch().is_enabled().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn set_autostart_enabled(enabled: bool, handle: AppHandle) -> Result<bool, String> {
-    let preferences = UiPreferences {
-        autostart_enabled: enabled,
-    };
-    save_preferences(&handle, &preferences)?;
-    apply_autostart_preference(&handle, enabled)
+async fn set_autostart_enabled(
+    enabled: bool,
+    handle: AppHandle,
+    io: State<'_, AutostartIo>,
+    mode: State<'_, RuntimeMode>,
+) -> Result<bool, String> {
+    if !installed_integrations_enabled(mode.portable) {
+        return Err("Start with Windows is unavailable in portable mode.".to_string());
+    }
+    let io = io.0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = io.lock().unwrap_or_else(|p| p.into_inner());
+        let preferences = UiPreferences {
+            autostart_enabled: enabled,
+        };
+        save_preferences(&handle, &preferences)?;
+        apply_autostart_preference(&handle, enabled)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ── Tray helpers ──────────────────────────────────────────────────────────────
@@ -896,6 +1018,7 @@ async fn check_for_update(handle: &tauri::AppHandle) {
 
 fn main() {
     tracing_subscriber::fmt().with_target(false).init();
+    let portable = portable_ui_mode();
 
     let status: SharedStatus = Arc::new(Mutex::new(StatusPayload {
         status: "Connecting".to_string(),
@@ -908,6 +1031,8 @@ fn main() {
     let connected: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let connected_for_pipe = connected.clone();
     let waiters_for_pipe = command_waiters.clone();
+    let autostart_io = Arc::new(Mutex::new(()));
+    let autostart_for_setup = autostart_io.clone();
 
     let status_for_loop = status.clone();
 
@@ -923,15 +1048,11 @@ fn main() {
         next_id: AtomicU64::new(request_id_seed()),
     };
 
-    tauri::Builder::default()
-        // Must be the FIRST plugin. Eir is tray-resident and auto-hides its window, so
-        // users forget it's running and re-launch it; a second process would start a
-        // second tray icon and spin forever on the single-client pipe. Instead, focus
-        // the existing window and let the new process exit.
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            // Don't surface the window if the second launch was itself a hidden
-            // autostart (--hidden) — honour the tray-only intent as the primary
-            // launch does. A manual re-launch (no --hidden) shows/focuses it.
+    let builder = tauri::Builder::default();
+    // Installed Eir remains single-instance. Each self-extracted portable has its own
+    // private service/pipe and must not collide with an installed tray process.
+    let builder = if installed_integrations_enabled(portable) {
+        builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             if argv.iter().any(|a| a == AUTOSTART_ARG) {
                 return;
             }
@@ -941,6 +1062,11 @@ fn main() {
                 let _ = w.set_focus();
             }
         }))
+    } else {
+        builder
+    };
+
+    builder
         .plugin(
             tauri_plugin_autostart::Builder::new()
                 .app_name("Eir")
@@ -953,22 +1079,39 @@ fn main() {
         .manage(status)
         .manage(ui_cmd_state)
         .manage(ConnState(connected))
+        .manage(AutostartIo(autostart_io))
+        .manage(RuntimeMode { portable })
         .manage(AskAttachments(std::sync::Mutex::new(Vec::new())))
+        .on_page_load(|webview, payload| {
+            if matches!(payload.event(), PageLoadEvent::Finished)
+                && webview.label() == "main"
+                && !launched_hidden()
+            {
+                let window = webview.window();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        })
         .setup(move |app| {
             let icon_base = Arc::new(decode_icon());
-            let start_hidden = launched_hidden();
 
-            // One-time move of legacy reverse-DNS config folder to the friendly `Eir`
-            // folder. Run before anything reads/writes preferences.
-            if let Err(e) = migrate_app_folder(app.handle()) {
-                warn!("Could not migrate app folder: {e}");
+            if installed_integrations_enabled(portable) {
+                // Keep filesystem and registry I/O off the UI thread. The shared lock
+                // preserves migration → read → apply ordering against a fast user save.
+                let autostart_handle = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let _guard = autostart_for_setup
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    if let Err(e) = migrate_app_folder(&autostart_handle) {
+                        warn!("Could not migrate app folder: {e}");
+                    }
+                    sync_autostart_on_startup(&autostart_handle);
+                });
+
+                // The updater installs NSIS and therefore belongs only to installed Eir.
+                spawn_update_checker(app.handle().clone());
             }
-
-            sync_autostart_on_startup(app.handle());
-
-            // Background auto-update: check on startup, then every 6 hours.
-            // If a newer signed release exists, download, install, and relaunch.
-            spawn_update_checker(app.handle().clone());
 
             let open_item = MenuItem::with_id(app, "open", "Open Status", true, None::<&str>)?;
             let pause_item =
@@ -1024,13 +1167,6 @@ fn main() {
                     }
                 })
                 .build(app)?;
-
-            if !start_hidden {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
-            }
 
             // Background: pipe client + tray colour sync
             let status_pipe = status_for_loop.clone();
@@ -1093,8 +1229,8 @@ fn main() {
             // Closing the window hides it to the tray; the service keeps running.
             // Use "Quit Eir" from the tray menu to exit completely.
             if let WindowEvent::CloseRequested { api, .. } = event {
-                let _ = window.hide();
                 api.prevent_close();
+                let _ = window.hide();
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1127,6 +1263,7 @@ fn main() {
             set_advisor_settings,
             get_app_version,
             get_service_version,
+            is_portable,
             get_service_state,
             install_service,
             check_updates_now,
@@ -1164,6 +1301,44 @@ mod tests {
     }
 
     #[test]
+    fn portable_ui_isolated_from_installed_integrations() {
+        assert!(portable_ui_mode_at(Some(std::ffi::OsStr::new("1"))));
+        assert!(!portable_ui_mode_at(None));
+        assert!(!installed_integrations_enabled(true));
+        assert!(installed_integrations_enabled(false));
+        assert!(
+            service_install_path_at(std::path::Path::new(r"C:\Temp\Eir\eir.exe"), true).is_err()
+        );
+        assert_eq!(runtime_service_state(true, true), Some("running"));
+        assert_eq!(runtime_service_state(true, false), Some("stopped"));
+        assert_eq!(runtime_service_state(false, true), None);
+    }
+
+    #[test]
+    fn portable_frontend_hides_privileged_update_ui_and_labels_its_runtime() {
+        let html = include_str!("../../ui/index.html");
+        let javascript = include_str!("../../ui/main.js");
+
+        for id in ["nav-updates", "card-updater", "about-description"] {
+            assert!(
+                html.contains(&format!("id=\"{id}\"")),
+                "missing portable-aware element {id}"
+            );
+        }
+        for marker in [
+            "navUpdates.hidden = portable",
+            "updaterCard.hidden = portable",
+            "Portable service: ",
+            "aboutDescription.textContent = portable",
+        ] {
+            assert!(
+                javascript.contains(marker),
+                "portable UI policy is missing {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn rejected_command_result_is_an_error() {
         assert_eq!(
             command_result(CommandResult {
@@ -1172,6 +1347,53 @@ mod tests {
                 message: "paused".to_string(),
             }),
             Err("paused".to_string())
+        );
+    }
+
+    #[test]
+    fn ask_attachment_batches_do_not_consume_new_picks() {
+        let attachment = |name: &str| eir_proto::AskAttachment {
+            name: name.to_string(),
+            kind: "text".to_string(),
+            content: name.to_string(),
+            media_type: String::new(),
+        };
+        let atts = AskAttachments(std::sync::Mutex::new(vec![attachment("sent.txt")]));
+
+        let sent = take_ask_attachments(&atts).expect("take submitted batch");
+        atts.0
+            .lock()
+            .expect("lock pending attachments")
+            .push(attachment("next.txt"));
+        restore_ask_attachments(&atts, sent).expect("restore failed batch");
+
+        let names = atts
+            .0
+            .lock()
+            .expect("lock restored attachments")
+            .iter()
+            .map(|attachment| attachment.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["sent.txt", "next.txt"]);
+    }
+
+    #[test]
+    fn service_install_command_is_safe_and_propagates_exit() {
+        let hostile = Path::new(r#"C:\Eir`"; throw 'injected'; #\eir-svc.exe"#);
+        let command = service_install_command(hostile);
+        let std = command.as_std();
+        let args = std
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!args.contains("throw 'injected'"));
+        assert!(args.contains(".ExitCode"));
+        assert_eq!(
+            std.get_envs()
+                .find(|(key, _)| *key == "EIR_SERVICE_EXE")
+                .and_then(|(_, value)| value),
+            Some(hostile.as_os_str())
         );
     }
 }

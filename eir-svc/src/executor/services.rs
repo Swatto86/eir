@@ -30,6 +30,12 @@ const CRITICAL_SERVICES: &[&str] = &[
     "brokerinfrastructure",
     "power",
     "lsass",
+    // Eir must not auto-stop itself, and service actions must never weaken the
+    // machine's firewall or antimalware protection even if policy.toml is edited.
+    "eirsvc",
+    "windefend",
+    "mpssvc",
+    "bfe",
 ];
 
 fn wide(s: &str) -> Vec<u16> {
@@ -190,7 +196,7 @@ fn wait_for(name: &str, target: SERVICE_STATUS_CURRENT_STATE, timeout_secs: u64)
 
 #[cfg(test)]
 mod tests {
-    use super::{start, stop};
+    use super::{start, stop, CRITICAL_SERVICES};
 
     #[test]
     fn critical_services_are_refused_before_any_scm_call() {
@@ -198,6 +204,18 @@ mod tests {
         for name in ["RpcSs", "rpcss", "EventLog", "Winmgmt", "DcomLaunch"] {
             let err = stop(name).unwrap_err().to_string();
             assert!(err.contains("critical"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn self_and_security_services_are_critical_targets() {
+        for name in ["EirSvc", "WinDefend", "MpsSvc", "BFE"] {
+            assert!(
+                CRITICAL_SERVICES
+                    .iter()
+                    .any(|critical| critical.eq_ignore_ascii_case(name)),
+                "{name} must never be stopped by an auto-approved service action"
+            );
         }
     }
 

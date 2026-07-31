@@ -1,8 +1,15 @@
 use crate::updater::config::UpdaterConfig;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use eir_proto::{SettingsUpdate, UiSettings};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, path::Component};
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Component, Path, PathBuf},
+    sync::OnceLock,
+};
+
+static RUNTIME_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
@@ -60,7 +67,7 @@ impl AdvisorConfig {
         self.enabled = u.enabled;
         self.escalation_model = u.escalation_model.trim().to_string();
         self.escalation_effort = normalize_effort(&u.escalation_effort);
-        self.low_confidence_threshold = u.low_confidence_threshold.clamp(0.0, 0.95);
+        self.low_confidence_threshold = finite_or(u.low_confidence_threshold, 0.0, 0.95, 0.6);
     }
 }
 
@@ -143,9 +150,8 @@ pub struct ApiConfig {
     /// (`<profile>\.local\bin\claude.exe`, then PATH).
     #[serde(default)]
     pub claude_cli_path: Option<String>,
-    /// claude_cli: the Windows user profile root (e.g. C:\Users\You) whose
-    /// logged-in Claude session the LocalSystem service borrows. Blank =
-    /// auto-detect by scanning C:\Users for `.claude\.credentials.json`.
+    /// claude_cli: optional profile hint for interactive/dev runs. The LocalSystem
+    /// service always uses the sole active desktop user's profile and token.
     #[serde(default)]
     pub user_profile: Option<String>,
     /// codex_cli: path to the codex binary. Blank = auto-detect under the
@@ -156,10 +162,9 @@ pub struct ApiConfig {
     /// or the standalone Windows zip). Blank = "kilo" on PATH.
     #[serde(default)]
     pub kilo_cli_path: Option<String>,
-    /// kilo_cli: the Windows user profile root (e.g. C:\Users\You) whose
-    /// logged-in Kilo session the LocalSystem service borrows — the Kilo CLI
-    /// stores its session in that profile's `.local\share\kilo\auth.json`.
-    /// Blank = auto-detect by scanning C:\Users for that file.
+    /// kilo_cli: optional profile hint for interactive/dev runs. The Kilo CLI
+    /// stores its session in `.local\share\kilo\auth.json`; the LocalSystem
+    /// service always uses the sole active desktop user's profile and token.
     #[serde(default)]
     pub kilo_cli_user_profile: Option<String>,
 }
@@ -229,8 +234,66 @@ pub struct PersistenceConfig {
     pub audit_db: String,
 }
 
+fn finite_or(value: f32, min: f32, max: f32, default: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        default
+    }
+}
+
 const MAX_LOG_DIRECTORIES: usize = 16;
 const MAX_LOG_DIRECTORY_CHARS: usize = 1024;
+const MAX_EVENT_LOG_CHANNELS: usize = 64;
+const MAX_EVENT_LOG_CHANNEL_CHARS: usize = 256;
+const MAX_MONITORING_INTERVAL_SECS: u64 = 7 * 24 * 3600;
+
+fn normalize_event_log_channels(channels: Vec<String>) -> Result<Vec<String>> {
+    if channels.len() > MAX_EVENT_LOG_CHANNELS {
+        anyhow::bail!("at most {MAX_EVENT_LOG_CHANNELS} event-log channels are allowed");
+    }
+    let mut seen = HashSet::new();
+    let mut safe = Vec::new();
+    for raw in channels {
+        let channel = raw.trim();
+        if channel.is_empty() {
+            continue;
+        }
+        if channel.chars().count() > MAX_EVENT_LOG_CHANNEL_CHARS {
+            anyhow::bail!("event-log channel name is too long");
+        }
+        if channel.chars().any(char::is_control) {
+            anyhow::bail!("event-log channel name contains control characters");
+        }
+        if seen.insert(channel.to_ascii_lowercase()) {
+            safe.push(channel.to_string());
+        }
+    }
+    Ok(safe)
+}
+
+fn sanitize_loaded_event_log_channels(channels: Vec<String>) -> Vec<String> {
+    if channels.len() > MAX_EVENT_LOG_CHANNELS {
+        tracing::warn!(
+            "Ignoring configured event-log channels past the {MAX_EVENT_LOG_CHANNELS}-channel limit"
+        );
+    }
+    let mut safe = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in channels.into_iter().take(MAX_EVENT_LOG_CHANNELS) {
+        match normalize_event_log_channels(vec![raw]) {
+            Ok(channels) => {
+                for channel in channels {
+                    if seen.insert(channel.to_ascii_lowercase()) {
+                        safe.push(channel);
+                    }
+                }
+            }
+            Err(error) => tracing::warn!("Ignoring unsafe event-log channel: {error}"),
+        }
+    }
+    safe
+}
 
 fn normalize_log_directories(directories: Vec<String>) -> Result<Vec<String>> {
     if directories.len() > MAX_LOG_DIRECTORIES {
@@ -331,6 +394,7 @@ impl Config {
 
     /// Apply an update from the UI. Empty/None secret fields keep the stored value.
     pub fn apply_update(&mut self, u: SettingsUpdate) -> Result<()> {
+        let event_log_channels = normalize_event_log_channels(u.event_log_channels)?;
         let log_directories = normalize_log_directories(u.log_directories)?;
         let provider = ApiProvider::parse(&u.provider);
         if provider != self.api.provider {
@@ -360,14 +424,21 @@ impl Config {
         // override on every unrelated settings save.
         keep(&mut self.api.kilo_cli_user_profile, u.kilo_cli_user_profile);
         keep(&mut self.api.kilo_cli_path, u.kilo_cli_path);
-        self.monitoring.decision_interval_secs = u.decision_interval_secs.max(10);
-        self.monitoring.event_log_poll_interval_secs = u.event_log_poll_interval_secs.max(5);
-        self.monitoring.wmi_poll_interval_secs = u.wmi_poll_interval_secs.max(30);
-        self.monitoring.event_log_channels = u.event_log_channels;
+        self.monitoring.decision_interval_secs = u
+            .decision_interval_secs
+            .clamp(10, MAX_MONITORING_INTERVAL_SECS);
+        self.monitoring.event_log_poll_interval_secs = u
+            .event_log_poll_interval_secs
+            .clamp(5, MAX_MONITORING_INTERVAL_SECS);
+        self.monitoring.wmi_poll_interval_secs = u
+            .wmi_poll_interval_secs
+            .clamp(30, MAX_MONITORING_INTERVAL_SECS);
+        self.monitoring.event_log_channels = event_log_channels;
         self.monitoring.log_directories = log_directories;
         // Clamp to a sane range: never 0 (would auto-run everything) nor ≥1.0
         // (would never run anything).
-        self.monitoring.confidence_threshold = u.confidence_threshold.clamp(0.50, 0.95);
+        self.monitoring.confidence_threshold =
+            finite_or(u.confidence_threshold, 0.50, 0.95, default_confidence());
         self.monitoring.game_mode_auto = u.game_mode_auto;
         self.monitoring.game_mode_power_boost = u.game_mode_power_boost;
         Ok(())
@@ -402,17 +473,71 @@ pub fn save(config: &Config, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Resolve a path relative to the executable's directory (not cwd).
-/// Absolute paths are returned unchanged.
-pub fn resolve(rel: &str) -> std::path::PathBuf {
-    let p = std::path::PathBuf::from(rel);
+pub async fn save_async(config: &Config, path: &str) -> Result<()> {
+    let config = config.clone();
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || save(&config, &path)).await?
+}
+
+pub fn set_runtime_root(root: PathBuf) -> Result<()> {
+    RUNTIME_ROOT
+        .set(root)
+        .map_err(|_| anyhow!("runtime root is already configured"))
+}
+
+fn resolve_at(rel: &str, runtime_root: Option<&Path>, executable: Option<&Path>) -> PathBuf {
+    let p = PathBuf::from(rel);
     if p.is_absolute() {
         return p;
     }
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(rel)))
+    runtime_root
+        .map(|root| root.join(rel))
+        .or_else(|| executable.and_then(Path::parent).map(|dir| dir.join(rel)))
         .unwrap_or(p)
+}
+
+/// Resolve relative state paths beneath the configured runtime root, or beside
+/// the executable for installed/development runs. Absolute paths are unchanged.
+pub fn resolve(rel: &str) -> PathBuf {
+    let executable = std::env::current_exe().ok();
+    resolve_at(
+        rel,
+        RUNTIME_ROOT.get().map(PathBuf::as_path),
+        executable.as_deref(),
+    )
+}
+
+fn sanitize_loaded(mut cfg: Config) -> Config {
+    cfg.monitoring.event_log_channels =
+        sanitize_loaded_event_log_channels(cfg.monitoring.event_log_channels);
+    cfg.monitoring.log_directories =
+        sanitize_loaded_log_directories(cfg.monitoring.log_directories);
+    cfg.monitoring.decision_interval_secs = cfg
+        .monitoring
+        .decision_interval_secs
+        .clamp(10, MAX_MONITORING_INTERVAL_SECS);
+    cfg.monitoring.event_log_poll_interval_secs = cfg
+        .monitoring
+        .event_log_poll_interval_secs
+        .clamp(5, MAX_MONITORING_INTERVAL_SECS);
+    cfg.monitoring.wmi_poll_interval_secs = cfg
+        .monitoring
+        .wmi_poll_interval_secs
+        .clamp(30, MAX_MONITORING_INTERVAL_SECS);
+    cfg.monitoring.confidence_threshold = finite_or(
+        cfg.monitoring.confidence_threshold,
+        0.50,
+        0.95,
+        default_confidence(),
+    );
+    cfg.advisor.low_confidence_threshold = finite_or(
+        cfg.advisor.low_confidence_threshold,
+        0.0,
+        0.95,
+        AdvisorConfig::default().low_confidence_threshold,
+    );
+    cfg.updater.sanitize();
+    cfg
 }
 
 pub fn load(path: &str) -> Result<Config> {
@@ -420,11 +545,7 @@ pub fn load(path: &str) -> Result<Config> {
     let contents = fs::read_to_string(&resolved)
         .with_context(|| format!("Failed to read config file: {}", resolved.display()))?;
     match toml::from_str::<Config>(&contents) {
-        Ok(mut cfg) => {
-            cfg.monitoring.log_directories =
-                sanitize_loaded_log_directories(cfg.monitoring.log_directories);
-            Ok(cfg)
-        }
+        Ok(cfg) => Ok(sanitize_loaded(cfg)),
         Err(primary) => {
             // The live config didn't parse (e.g. truncated by a crash mid-write).
             // Recover from the last-known-good backup rather than going fatal — a
@@ -434,14 +555,12 @@ pub fn load(path: &str) -> Result<Config> {
                 .ok()
                 .and_then(|c| toml::from_str::<Config>(&c).ok());
             match recovered {
-                Some(mut cfg) => {
-                    cfg.monitoring.log_directories =
-                        sanitize_loaded_log_directories(cfg.monitoring.log_directories);
+                Some(cfg) => {
                     tracing::warn!(
                         "config.toml failed to parse ({primary}); recovered from {}",
                         bak.display()
                     );
-                    Ok(cfg)
+                    Ok(sanitize_loaded(cfg))
                 }
                 None => Err(primary).context("Failed to parse config TOML"),
             }
@@ -466,6 +585,21 @@ decision_interval_secs = 600
 [persistence]
 audit_db = "./eir.db"
 "#;
+
+    #[test]
+    fn portable_root_overrides_executable_directory_for_relative_state() {
+        let portable_root = std::path::Path::new(r"C:\Users\Alice\AppData\Local\EirPortable");
+        let executable = std::path::Path::new(r"C:\Temp\IXP001.TMP\eir-svc.exe");
+
+        assert_eq!(
+            resolve_at("config.toml", Some(portable_root), Some(executable)),
+            portable_root.join("config.toml")
+        );
+        assert_eq!(
+            resolve_at(r"D:\state\eir.db", Some(portable_root), Some(executable)),
+            std::path::PathBuf::from(r"D:\state\eir.db")
+        );
+    }
 
     #[test]
     fn apply_update_then_toml_round_trips() {
@@ -572,6 +706,30 @@ audit_db = "./eir.db"
     }
 
     #[test]
+    fn event_log_channels_reject_unbounded_or_control_character_input() {
+        let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
+        let before = toml::to_string(&cfg).unwrap();
+        let too_many = (0..=MAX_EVENT_LOG_CHANNELS)
+            .map(|index| format!("Channel-{index}"))
+            .collect();
+        assert!(cfg
+            .apply_update(SettingsUpdate {
+                event_log_channels: too_many,
+                ..Default::default()
+            })
+            .is_err());
+        assert_eq!(toml::to_string(&cfg).unwrap(), before);
+
+        assert!(cfg
+            .apply_update(SettingsUpdate {
+                event_log_channels: vec!["System\nInjected".into()],
+                ..Default::default()
+            })
+            .is_err());
+        assert_eq!(toml::to_string(&cfg).unwrap(), before);
+    }
+
+    #[test]
     fn unsafe_legacy_log_roots_are_skipped_without_bricking_config() {
         let roots = sanitize_loaded_log_directories(vec![
             r"relative\logs".into(),
@@ -594,6 +752,32 @@ audit_db = "./eir.db"
         };
         assert!(cfg.apply_update(update).is_err());
         assert_eq!(toml::to_string(&cfg).unwrap(), before);
+    }
+
+    #[test]
+    fn extreme_settings_values_are_bounded_before_runtime_use() {
+        let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
+        cfg.apply_update(SettingsUpdate {
+            decision_interval_secs: u64::MAX,
+            event_log_poll_interval_secs: u64::MAX,
+            wmi_poll_interval_secs: u64::MAX,
+            confidence_threshold: f32::NAN,
+            ..Default::default()
+        })
+        .expect("apply");
+        assert_eq!(
+            cfg.monitoring.decision_interval_secs,
+            MAX_MONITORING_INTERVAL_SECS
+        );
+        assert_eq!(
+            cfg.monitoring.event_log_poll_interval_secs,
+            MAX_MONITORING_INTERVAL_SECS
+        );
+        assert_eq!(
+            cfg.monitoring.wmi_poll_interval_secs,
+            MAX_MONITORING_INTERVAL_SECS
+        );
+        assert!(cfg.monitoring.confidence_threshold.is_finite());
     }
 
     #[test]
@@ -643,6 +827,57 @@ audit_db = "./eir.db"
         assert_eq!(reparsed.updater.enabled, cfg.updater.enabled);
         assert_eq!(reparsed.updater.methods, cfg.updater.methods);
         assert_eq!(reparsed.updater.notes, cfg.updater.notes);
+    }
+
+    #[test]
+    fn loaded_numeric_settings_are_bounded_before_runtime_arithmetic() {
+        let dir = std::env::temp_dir().join(format!("eir-cfg-schedule-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        let source = SAMPLE
+            .replace(
+                r#"event_log_channels = ["System"]"#,
+                r#"event_log_channels = [" System ", "system", "bad\nchannel"]"#,
+            )
+            .replace(
+                "event_log_poll_interval_secs = 30",
+                &format!("event_log_poll_interval_secs = {}", i64::MAX),
+            )
+            .replace(
+                "wmi_poll_interval_secs = 300",
+                &format!("wmi_poll_interval_secs = {}", i64::MAX),
+            )
+            .replace(
+                "decision_interval_secs = 600",
+                &format!("decision_interval_secs = {}", i64::MAX),
+            )
+            .replace("[persistence]", "confidence_threshold = nan\n[persistence]");
+        fs::write(
+            &path,
+            format!(
+                "{source}\n[updater]\nschedule_interval_secs = {}\n\
+                 max_attempts_per_app = {}\nmax_apps_per_run = {}\nmax_installer_mb = {}\n",
+                i64::MAX,
+                u32::MAX,
+                u32::MAX,
+                i64::MAX,
+            ),
+        )
+        .expect("config");
+        let cfg = load(&path.to_string_lossy()).expect("load");
+        assert!(
+            cfg.updater.schedule_interval_secs
+                <= crate::updater::config::MAX_SCHEDULE_INTERVAL_SECS
+        );
+        assert!(cfg.updater.max_attempts_per_app <= crate::updater::config::MAX_ATTEMPTS_PER_APP);
+        assert!(cfg.updater.max_apps_per_run <= crate::updater::config::MAX_APPS_PER_RUN);
+        assert!(cfg.updater.max_installer_mb <= crate::updater::config::MAX_INSTALLER_MB);
+        assert!(cfg.monitoring.decision_interval_secs <= MAX_MONITORING_INTERVAL_SECS);
+        assert!(cfg.monitoring.event_log_poll_interval_secs <= MAX_MONITORING_INTERVAL_SECS);
+        assert!(cfg.monitoring.wmi_poll_interval_secs <= MAX_MONITORING_INTERVAL_SECS);
+        assert!(cfg.monitoring.confidence_threshold.is_finite());
+        assert_eq!(cfg.monitoring.event_log_channels, ["System"]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

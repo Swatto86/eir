@@ -1,8 +1,7 @@
 use crate::models::{
     DefenderStatus, FirewallStatus, NetworkInterface, SecurityPosture, SystemState,
 };
-use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
+use crate::session::system_drive_root;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -12,18 +11,48 @@ use windows::Win32::NetworkManagement::IpHelper::{GetAdaptersInfo, IP_ADAPTER_IN
 use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_DWORD,
-    REG_VALUE_TYPE,
+    REG_SZ, REG_VALUE_TYPE,
 };
 use windows::Win32::System::Services::{
     CloseServiceHandle, EnumServicesStatusExW, OpenSCManagerW, ENUM_SERVICE_STATUS_PROCESSW,
-    SC_ENUM_PROCESS_INFO, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_RUNNING, SERVICE_STATE_ALL,
-    SERVICE_STOPPED, SERVICE_WIN32,
+    SC_ENUM_PROCESS_INFO, SC_HANDLE, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_RUNNING,
+    SERVICE_STATE_ALL, SERVICE_STOPPED, SERVICE_WIN32,
 };
 use windows::Win32::System::SystemInformation::{
     GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX,
 };
 
 pub type SharedState = Arc<Mutex<Option<SystemState>>>;
+
+fn pointer_fits<T>(ptr: *const T, base: *const u8, bytes: usize) -> bool {
+    let address = ptr as usize;
+    let start = base as usize;
+    let Some(end) = start.checked_add(bytes) else {
+        return false;
+    };
+    address >= start
+        && address.is_multiple_of(std::mem::align_of::<T>())
+        && address
+            .checked_add(std::mem::size_of::<T>())
+            .is_some_and(|ptr_end| ptr_end <= end)
+}
+
+fn nul_terminated_utf16(chars: &[u16]) -> Option<String> {
+    let end = chars.iter().position(|&c| c == 0)?;
+    Some(String::from_utf16_lossy(&chars[..end]))
+}
+
+fn utf16_from_buffer(ptr: *const u16, base: *const u8, bytes: usize) -> Option<String> {
+    if !pointer_fits(ptr, base, bytes) {
+        return None;
+    }
+    let remaining = (base as usize)
+        .checked_add(bytes)?
+        .checked_sub(ptr as usize)?
+        / std::mem::size_of::<u16>();
+    let chars = unsafe { std::slice::from_raw_parts(ptr, remaining) };
+    nul_terminated_utf16(chars)
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -63,7 +92,11 @@ fn ps_capped(command: &str, timeout: std::time::Duration) -> Option<String> {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            Err(_) => return None,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
     }
     let out = child.wait_with_output().ok()?;
@@ -98,7 +131,7 @@ fn get_memory() -> Option<(f32, f32)> {
 fn get_disk() -> Option<(f32, f32)> {
     let mut free_bytes: u64 = 0;
     let mut total_bytes: u64 = 0;
-    let path = wide("C:\\");
+    let path = wide(&system_drive_root().to_string_lossy());
     if unsafe {
         GetDiskFreeSpaceExW(
             PCWSTR(path.as_ptr()),
@@ -174,17 +207,32 @@ fn get_network_errors() -> Option<u32> {
 /// stopped by design.
 fn get_services() -> Option<(usize, Vec<String>)> {
     const ERROR_SERVICE_NEVER_STARTED: u32 = 1077;
-    let manager = match unsafe {
-        OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ENUMERATE_SERVICE)
-    } {
-        Ok(h) => h,
-        Err(_) => return None,
-    };
+    // EnumServicesStatusEx documents a 256 KiB maximum buffer.
+    const MAX_BUFFER_BYTES: usize = 256 * 1024;
+
+    struct Manager(SC_HANDLE);
+    impl Drop for Manager {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseServiceHandle(self.0);
+            }
+        }
+    }
+
+    let manager = Manager(
+        match unsafe {
+            OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ENUMERATE_SERVICE)
+        } {
+            Ok(h) => h,
+            Err(_) => return None,
+        },
+    );
 
     let mut running = 0usize;
     let mut failed: Vec<String> = Vec::new();
     let mut resume_handle: u32 = 0;
-    let mut buf = vec![0u8; 256 * 1024];
+    let record_size = std::mem::size_of::<ENUM_SERVICE_STATUS_PROCESSW>();
+    let mut buf = vec![ENUM_SERVICE_STATUS_PROCESSW::default(); MAX_BUFFER_BYTES / record_size];
     let mut complete = false;
 
     // Bounded loop over resume batches (guards against a pathological non-advancing
@@ -192,36 +240,48 @@ fn get_services() -> Option<(usize, Vec<String>)> {
     for _ in 0..64 {
         let mut bytes_needed: u32 = 0;
         let mut services_returned: u32 = 0;
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                buf.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of_val(buf.as_slice()),
+            )
+        };
         let result = unsafe {
             EnumServicesStatusExW(
-                manager,
+                manager.0,
                 SC_ENUM_PROCESS_INFO,
                 SERVICE_WIN32,
                 SERVICE_STATE_ALL,
-                Some(&mut buf),
+                Some(bytes),
                 &mut bytes_needed,
                 &mut services_returned,
                 Some(&mut resume_handle),
                 PCWSTR::null(),
             )
         };
-
         if services_returned == 0 {
             // Buffer too small for even one record — grow and retry; else nothing left.
-            if bytes_needed as usize > buf.len() {
-                buf.resize(bytes_needed as usize, 0);
+            if bytes_needed as usize > std::mem::size_of_val(buf.as_slice()) {
+                if bytes_needed as usize > MAX_BUFFER_BYTES {
+                    break;
+                }
+                let records = (bytes_needed as usize).div_ceil(record_size);
+                if records.saturating_mul(record_size) > MAX_BUFFER_BYTES {
+                    break;
+                }
+                buf.resize(records, ENUM_SERVICE_STATUS_PROCESSW::default());
                 continue;
             }
             complete = result.is_ok();
             break;
         }
 
-        let records = unsafe {
-            std::slice::from_raw_parts(
-                buf.as_ptr() as *const ENUM_SERVICE_STATUS_PROCESSW,
-                services_returned as usize,
-            )
-        };
+        if services_returned as usize > buf.len() {
+            break;
+        }
+        let records = &buf[..services_returned as usize];
+        let base = buf.as_ptr().cast::<u8>();
+        let bytes = std::mem::size_of_val(buf.as_slice());
         for svc in records {
             let ssp = &svc.ServiceStatusProcess;
             if ssp.dwCurrentState == SERVICE_RUNNING {
@@ -232,16 +292,7 @@ fn get_services() -> Option<(usize, Vec<String>)> {
                 && ssp.dwWin32ExitCode != 0
                 && ssp.dwWin32ExitCode != ERROR_SERVICE_NEVER_STARTED
             {
-                let name = unsafe {
-                    let ptr = svc.lpServiceName.0;
-                    let mut len = 0;
-                    while *ptr.add(len) != 0 {
-                        len += 1;
-                    }
-                    OsString::from_wide(std::slice::from_raw_parts(ptr, len))
-                        .to_string_lossy()
-                        .to_string()
-                };
+                let name = utf16_from_buffer(svc.lpServiceName.0, base, bytes)?;
                 failed.push(name);
             }
         }
@@ -258,9 +309,6 @@ fn get_services() -> Option<(usize, Vec<String>)> {
         }
     }
 
-    unsafe {
-        let _ = CloseServiceHandle(manager);
-    }
     complete.then_some((running, failed))
 }
 
@@ -271,36 +319,40 @@ fn i8_array_to_string(arr: &[i8]) -> String {
 }
 
 fn get_network_interfaces() -> Option<Vec<NetworkInterface>> {
+    const MAX_BUFFER_BYTES: u32 = 16 * 1024 * 1024;
+
     let mut interfaces = Vec::new();
     let mut buf_size: u32 = 16384;
-    let mut buf = vec![0u8; buf_size as usize];
+    let item_size = std::mem::size_of::<IP_ADAPTER_INFO>();
+    let mut buf = vec![IP_ADAPTER_INFO::default(); (buf_size as usize).div_ceil(item_size)];
 
-    let mut result = unsafe {
-        GetAdaptersInfo(
-            Some(buf.as_mut_ptr() as *mut IP_ADAPTER_INFO),
-            &mut buf_size,
-        )
-    };
+    let mut result = unsafe { GetAdaptersInfo(Some(buf.as_mut_ptr()), &mut buf_size) };
 
     // On a machine with many adapters (VPN/Hyper-V/Docker) 16 KiB is too small;
     // GetAdaptersInfo returns ERROR_BUFFER_OVERFLOW and writes the needed size into
     // buf_size. Grow and retry once instead of reporting zero interfaces.
     if result == ERROR_BUFFER_OVERFLOW.0 {
-        buf = vec![0u8; buf_size as usize];
-        result = unsafe {
-            GetAdaptersInfo(
-                Some(buf.as_mut_ptr() as *mut IP_ADAPTER_INFO),
-                &mut buf_size,
-            )
-        };
+        if buf_size == 0 || buf_size > MAX_BUFFER_BYTES {
+            return None;
+        }
+        buf.resize(
+            (buf_size as usize).div_ceil(item_size),
+            IP_ADAPTER_INFO::default(),
+        );
+        result = unsafe { GetAdaptersInfo(Some(buf.as_mut_ptr()), &mut buf_size) };
     }
 
     if result != 0 {
         return None;
     }
 
-    let mut adapter_ptr = buf.as_ptr() as *const IP_ADAPTER_INFO;
-    while !adapter_ptr.is_null() {
+    let base = buf.as_ptr().cast::<u8>();
+    let bytes = std::mem::size_of_val(buf.as_slice());
+    let mut adapter_ptr = base.cast::<IP_ADAPTER_INFO>();
+    for _ in 0..buf.len() {
+        if !pointer_fits(adapter_ptr, base, bytes) {
+            return None;
+        }
         let adapter = unsafe { &*adapter_ptr };
         let name = i8_array_to_string(&adapter.Description);
         let ip = i8_array_to_string(&adapter.IpAddressList.IpAddress.String);
@@ -315,9 +367,12 @@ fn get_network_interfaces() -> Option<Vec<NetworkInterface>> {
             ipv4,
         });
         adapter_ptr = adapter.Next;
+        if adapter_ptr.is_null() {
+            return Some(interfaces);
+        }
     }
 
-    Some(interfaces)
+    None
 }
 
 fn get_windows_update_status() -> Option<String> {
@@ -340,30 +395,33 @@ fn get_windows_update_status() -> Option<String> {
             return None;
         }
 
-        let mut data = vec![0u8; 128];
-        let mut data_len = data.len() as u32;
+        let mut data = [0u16; 64];
+        let mut data_len = std::mem::size_of_val(&data) as u32;
+        let mut value_type = REG_VALUE_TYPE::default();
 
         let ok = RegQueryValueExW(
             hkey,
             PCWSTR(value_name.as_ptr()),
             None,
-            None,
-            Some(data.as_mut_ptr()),
+            Some(&mut value_type),
+            Some(data.as_mut_ptr().cast::<u8>()),
             Some(&mut data_len),
         )
         .is_ok();
 
         let _ = RegCloseKey(hkey);
 
-        if !ok || data_len < 2 {
+        if !ok
+            || value_type != REG_SZ
+            || data_len < 2
+            || data_len as usize > std::mem::size_of_val(&data)
+            || !data_len.is_multiple_of(2)
+        {
             return None;
         }
 
-        let chars: &[u16] = std::slice::from_raw_parts(
-            data.as_ptr() as *const u16,
-            (data_len as usize / 2).saturating_sub(1),
-        );
-        Some(format!("last_install: {}", String::from_utf16_lossy(chars)))
+        let chars = &data[..data_len as usize / 2];
+        nul_terminated_utf16(chars).map(|value| format!("last_install: {value}"))
     }
 }
 
@@ -492,8 +550,24 @@ fn retain_or_report<T: Clone>(
 fn snapshot_state(previous: SystemState) -> SystemState {
     let mut collector_errors = Vec::new();
     let uptime_secs = get_uptime_secs();
+    // These independent PowerShell probes each have a 15-second watchdog. Running them
+    // together keeps one degraded WMI host from stretching a snapshot (and service
+    // shutdown) to four consecutive watchdog periods.
+    let (cpu_probe, network_errors_probe, disk_health_probe, defender_probe) =
+        std::thread::scope(|scope| {
+            let cpu = scope.spawn(get_cpu_usage);
+            let network_errors = scope.spawn(get_network_errors);
+            let disk_health = scope.spawn(get_disk_health);
+            let defender = scope.spawn(get_defender);
+            (
+                cpu.join().unwrap_or(None),
+                network_errors.join().unwrap_or(None),
+                disk_health.join().unwrap_or(None),
+                defender.join().unwrap_or(None),
+            )
+        });
     let cpu_usage_percent = retain_or_report(
-        get_cpu_usage(),
+        cpu_probe,
         &previous.cpu_usage_percent,
         "cpu",
         &mut collector_errors,
@@ -526,13 +600,13 @@ fn snapshot_state(previous: SystemState) -> SystemState {
         &mut collector_errors,
     );
     let network_errors = retain_or_report(
-        get_network_errors(),
+        network_errors_probe,
         &previous.network_errors,
         "network_errors",
         &mut collector_errors,
     );
     let disk_health = retain_or_report(
-        get_disk_health(),
+        disk_health_probe,
         &previous.disk_health,
         "disk_health",
         &mut collector_errors,
@@ -554,7 +628,7 @@ fn snapshot_state(previous: SystemState) -> SystemState {
         &mut collector_errors,
     );
     let defender = retain_or_report(
-        get_defender(),
+        defender_probe,
         &previous.security.defender,
         "defender",
         &mut collector_errors,
@@ -720,13 +794,37 @@ pub fn current(shared: &SharedState) -> SystemState {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_firewall, fault_changed, parse_defender_status, retain_or_report};
+    use super::{
+        effective_firewall, fault_changed, nul_terminated_utf16, parse_defender_status,
+        retain_or_report, utf16_from_buffer,
+    };
 
     #[test]
     fn failed_probe_keeps_last_good_value_and_reports_the_source() {
         let mut errors = Vec::new();
         assert_eq!(retain_or_report(None, &42_u32, "network", &mut errors), 42);
         assert_eq!(errors, ["network"]);
+    }
+
+    #[test]
+    fn win32_utf16_reads_are_nul_terminated_and_buffer_bounded() {
+        let chars = [
+            u16::from(b'E'),
+            u16::from(b'i'),
+            u16::from(b'r'),
+            0,
+            u16::from(b'x'),
+        ];
+        let base = chars.as_ptr().cast::<u8>();
+        let bytes = std::mem::size_of_val(&chars);
+        assert_eq!(
+            utf16_from_buffer(chars.as_ptr(), base, bytes).as_deref(),
+            Some("Eir")
+        );
+        assert!(
+            utf16_from_buffer(unsafe { chars.as_ptr().add(chars.len()) }, base, bytes).is_none()
+        );
+        assert!(nul_terminated_utf16(&chars[..3]).is_none());
     }
 
     #[tokio::test]

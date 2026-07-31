@@ -46,8 +46,6 @@ pub struct InstallPlanRaw {
     pub sha256: Option<String>,
     #[serde(default, deserialize_with = "de_null_string")]
     pub publisher: String,
-    #[serde(default)]
-    pub verify_exe: Option<String>,
 }
 
 /// Deserialize a string that the AI may send as JSON `null` (or omit) — both map
@@ -75,7 +73,6 @@ pub struct InstallPlan {
     pub silent_args: Vec<String>,
     pub sha256: Option<String>,
     pub expected_publisher: Option<String>,
-    pub verify_exe: Option<String>,
 }
 
 /// Multi-tenant release hosts trusted to serve any vendor's installer. A specific
@@ -408,10 +405,6 @@ pub fn validate_plan(
             Some(p.to_string())
         }
     };
-    let verify_exe = raw
-        .verify_exe
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"));
     // An MSI must always run silently; if no usable switch survived, use msiexec's
     // standard quiet flags. An .exe with no known switch stays empty and is then
     // routed to manual install (running it hidden would hang).
@@ -431,7 +424,6 @@ pub fn validate_plan(
         silent_args,
         sha256,
         expected_publisher,
-        verify_exe,
     })
 }
 
@@ -454,7 +446,6 @@ mod tests {
             silent_args: vec!["/S".to_string()],
             sha256: None,
             publisher: String::new(),
-            verify_exe: None,
         }
     }
 
@@ -489,6 +480,23 @@ mod tests {
         assert_eq!(p.kind, InstallerKind::Exe);
         assert_eq!(p.host, "github.com");
         assert_eq!(p.silent_args, vec!["/S".to_string()]);
+    }
+
+    #[test]
+    fn validated_plan_discards_the_model_supplied_verification_path() {
+        let proposed: InstallPlanRaw = serde_json::from_value(serde_json::json!({
+            "installer_url": "https://github.com/foo/bar/releases/download/v2/Bar-setup.exe",
+            "expected_version": "2.0.0",
+            "silent_args": ["/S"],
+            "verify_exe": r"\\attacker.example\share\bar.exe"
+        }))
+        .unwrap();
+        let plan = validate_plan(proposed, "Bar App", "1.0.0").unwrap();
+        let plan = serde_json::to_value(plan).unwrap();
+        assert!(
+            plan.get("verify_exe").is_none(),
+            "model-supplied filesystem paths must not survive validation"
+        );
     }
 
     #[test]

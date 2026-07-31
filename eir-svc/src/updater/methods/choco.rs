@@ -62,7 +62,7 @@ fn outdated_ok(code: i32) -> bool {
 
 /// List outdated Chocolatey packages.
 pub async fn list_outdated() -> Result<Vec<ChocoUpdate>, String> {
-    let Some(choco) = detect::choco_path() else {
+    let Some(choco) = detect::choco_path_async().await else {
         return Err("Chocolatey is not installed".to_string());
     };
     let (code, out) = run(
@@ -110,7 +110,7 @@ fn upgrade_args(pkg: &str, force: bool) -> Vec<String> {
 /// `--force`: previously the remedy was validated and accepted but never reached the
 /// command, so a "force" retry re-ran the identical failed args and burned an attempt.
 pub async fn attempt_with(candidate: &UpdateCandidate, force: bool) -> AttemptOutcome {
-    let Some(choco) = detect::choco_path() else {
+    let Some(choco) = detect::choco_path_async().await else {
         return AttemptOutcome::failed(
             Method::Choco,
             ErrorCategory::NotFound,
@@ -132,7 +132,6 @@ pub async fn attempt_with(candidate: &UpdateCandidate, force: bool) -> AttemptOu
         let (verification, found) = verify_app(
             &VerifyTarget::ByName {
                 name: candidate.name.clone(),
-                verify_exe: None,
             },
             &candidate.available,
         )

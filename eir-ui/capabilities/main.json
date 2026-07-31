@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Allow the main window to hide to the tray when Escape is pressed.",
+  "windows": ["main"],
+  "permissions": ["core:window:allow-hide"]
+}

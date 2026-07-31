@@ -9,6 +9,13 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use sqlx::SqlitePool;
 
+pub const MAX_STORED_DIGEST_BYTES: usize = 64 * 1024;
+
+pub fn bound_digest(mut text: String) -> String {
+    crate::models::truncate_utf8_bytes(&mut text, MAX_STORED_DIGEST_BYTES);
+    text
+}
+
 /// Aggregate the last 7 days and ask the model for a short digest. Returns the digest
 /// text plus the call's usage (so the caller can bill it), leaving persistence to the
 /// caller.
@@ -21,7 +28,7 @@ pub async fn generate(
     let stats = audit::digest_stats(db, &cutoff).await?;
     let prompt = build_prompt(&stats);
     let (text, usage) = ai.complete_text(&prompt, model).await?;
-    let text = text.trim().to_string();
+    let text = bound_digest(text.trim().to_string());
     if text.is_empty() {
         anyhow::bail!("digest model returned empty text");
     }
@@ -56,6 +63,13 @@ fn build_prompt(s: &DigestStats) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_digest_is_bounded_on_a_utf8_boundary() {
+        let digest = bound_digest(format!("a{}", "é".repeat(MAX_STORED_DIGEST_BYTES)));
+        assert!(digest.len() <= MAX_STORED_DIGEST_BYTES);
+        assert!(digest.ends_with('é'));
+    }
 
     #[test]
     fn prompt_includes_every_count_and_no_raw_data() {

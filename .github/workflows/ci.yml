@@ -9,16 +9,36 @@ permissions:
   contents: read
 
 jobs:
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Audit Rust dependencies
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+          arguments: --target x86_64-pc-windows-msvc
+
   verify:
     runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # The release version lives in four manifests that must move together; nothing
-      # else enforces it, so a partial bump would ship a mismatched installer/updater.
+      # The release version lives in four manifests and three Cargo.lock entries.
       - name: Check version sync
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-versions.ps1
+
+      - name: Check installer hooks
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-installer-hooks.ps1
+
+      - name: Check release gates
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-release-gates.ps1
+
+      - name: Check portable runner
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-portable-runner.ps1
 
       # Pinned to match rust-toolchain.toml (and local dev) so a stable bump can't
       # introduce new clippy/rustfmt behaviour that diverges from local verify.
@@ -30,8 +50,17 @@ jobs:
       - name: Cache Rust build artefacts
         uses: swatinem/rust-cache@v2
 
+      - name: Cache fixed WebView2 runtime
+        uses: actions/cache@v5
+        with:
+          path: target/webview2
+          key: webview2-fixed-150.0.4078.105-x64
+
       - name: Format
         run: cargo fmt --all --check
+
+      - name: Check frontend JavaScript
+        run: node --check ui/main.js
 
       # eir-ui's tauri_build validates the bundle resources (incl. bin/eir-svc.exe,
       # a gitignored artifact) during a bare `cargo clippy`/`cargo test`, so stage the
@@ -40,10 +69,10 @@ jobs:
         run: powershell -NoProfile -ExecutionPolicy Bypass -File eir-ui/build-svc.ps1
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets
 
       # The full bundle build runs beforeBuildCommand (stages eir-svc.exe) and signs
       # the updater artefacts, so a broken bundle can't ship green. Build-only — no
@@ -55,6 +84,11 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: eir-ui
+          args: -- --locked
+
+      - name: Check portable dependency imports
+        shell: pwsh
+        run: ./scripts/check-portable-imports.ps1 -EirExe target/release/eir.exe -ServiceExe target/release/eir-svc.exe
 
       - name: Smoke installed LocalSystem service
         shell: pwsh
@@ -70,3 +104,7 @@ jobs:
             throw "Standalone Eir exited with code $($process.ExitCode)"
           }
           Stop-Process -Id $process.Id
+
+      - name: Build and smoke self-contained portable executable
+        shell: pwsh
+        run: ./scripts/portable-smoke.ps1 -EirExe target/release/eir.exe -ServiceExe target/release/eir-svc.exe -Output target/release/Eir_ci_windows-x64.exe

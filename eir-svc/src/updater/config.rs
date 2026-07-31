@@ -10,10 +10,56 @@ pub const MAX_APP_NOTES: usize = 500;
 pub const MAX_APP_NOTE_CHARS: usize = 2_000;
 pub const MAX_APP_ID_CHARS: usize = 200;
 pub const MAX_IGNORED_APPS: usize = 500;
+pub const MAX_SCHEDULE_INTERVAL_SECS: u64 = 365 * 24 * 3600;
+pub const MAX_ATTEMPTS_PER_APP: u32 = 10;
+pub const MAX_APPS_PER_RUN: u32 = 100;
+pub const MAX_INSTALLER_MB: u64 = 4_096;
 
 pub fn valid_app_id(id: &str) -> bool {
     let id = id.trim();
     !id.is_empty() && id.chars().count() <= MAX_APP_ID_CHARS && !id.chars().any(char::is_control)
+}
+
+fn sanitize_methods(methods: Vec<String>) -> Vec<String> {
+    let mut safe = Vec::new();
+    for method in methods {
+        let method = method.trim().to_ascii_lowercase();
+        if matches!(method.as_str(), "winget" | "choco" | "scoop" | "msstore")
+            && !safe.contains(&method)
+        {
+            safe.push(method);
+        }
+    }
+    safe
+}
+
+fn sanitize_ignored(ids: Vec<String>) -> Vec<String> {
+    let mut safe = Vec::new();
+    for id in ids {
+        if safe.len() >= MAX_IGNORED_APPS {
+            break;
+        }
+        let id = id.trim().to_lowercase();
+        if valid_app_id(&id) && !safe.contains(&id) {
+            safe.push(id);
+        }
+    }
+    safe
+}
+
+fn sanitize_notes(notes: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut safe = BTreeMap::new();
+    for (id, note) in notes {
+        if safe.len() >= MAX_APP_NOTES {
+            break;
+        }
+        let id = id.trim().to_lowercase();
+        let note = note.trim();
+        if valid_app_id(&id) && !note.is_empty() && note.chars().count() <= MAX_APP_NOTE_CHARS {
+            safe.insert(id, note.to_string());
+        }
+    }
+    safe
 }
 
 /// How strictly a downloaded AI-found native installer must be signed before it
@@ -92,6 +138,23 @@ pub struct UpdaterConfig {
 }
 
 impl UpdaterConfig {
+    /// Bound values loaded from disk before they can control loops, batch size, or
+    /// native download limits.
+    pub fn sanitize(&mut self) {
+        self.schedule_interval_secs = self
+            .schedule_interval_secs
+            .clamp(300, MAX_SCHEDULE_INTERVAL_SECS);
+        self.max_attempts_per_app = self.max_attempts_per_app.clamp(1, MAX_ATTEMPTS_PER_APP);
+        self.max_apps_per_run = self.max_apps_per_run.clamp(1, MAX_APPS_PER_RUN);
+        self.max_installer_mb = self.max_installer_mb.clamp(1, MAX_INSTALLER_MB);
+        self.methods = sanitize_methods(std::mem::take(&mut self.methods));
+        self.ignored = sanitize_ignored(std::mem::take(&mut self.ignored));
+        self.notes = sanitize_notes(std::mem::take(&mut self.notes));
+        self.learned_notes = sanitize_notes(std::mem::take(&mut self.learned_notes));
+        self.learned_notes
+            .retain(|id, note| self.notes.get(id) == Some(note));
+    }
+
     /// The settings the UI shows (no secrets here).
     pub fn to_view(&self) -> eir_proto::UpdaterSettingsView {
         eir_proto::UpdaterSettingsView {
@@ -108,9 +171,14 @@ impl UpdaterConfig {
     /// and an empty method list is ignored (keeps the existing one).
     pub fn apply_view(&mut self, u: eir_proto::UpdaterSettingsUpdate) {
         self.enabled = u.enabled;
-        self.schedule_interval_secs = u.schedule_interval_secs.max(300);
+        self.schedule_interval_secs = u
+            .schedule_interval_secs
+            .clamp(300, MAX_SCHEDULE_INTERVAL_SECS);
         if !u.methods.is_empty() {
-            self.methods = u.methods;
+            let methods = sanitize_methods(u.methods);
+            if !methods.is_empty() {
+                self.methods = methods;
+            }
         }
         self.native_enabled = u.native_enabled;
         self.native_signature_policy = SignaturePolicy::from_token(&u.native_signature_policy);
@@ -366,5 +434,57 @@ mod tests {
         };
         assert!(cfg.set_app_ignored("one too many", true).is_err());
         assert!(!cfg.set_app_ignored("APP 0", true).expect("existing"));
+    }
+
+    #[test]
+    fn schedule_interval_cannot_wrap_the_signed_scheduler_timestamp() {
+        let mut cfg = UpdaterConfig::default();
+        cfg.apply_view(eir_proto::UpdaterSettingsUpdate {
+            schedule_interval_secs: u64::MAX,
+            ..Default::default()
+        });
+        assert!(cfg.schedule_interval_secs <= i64::MAX as u64);
+        assert_ne!(cfg.schedule_interval_secs, u64::MAX);
+    }
+
+    #[test]
+    fn loaded_updater_collections_are_normalized_and_bounded() {
+        let mut cfg = UpdaterConfig {
+            methods: vec![
+                " WINGET ".into(),
+                "winget".into(),
+                "unknown".into(),
+                "CHOCO".into(),
+            ],
+            ignored: (0..=MAX_IGNORED_APPS)
+                .map(|index| format!(" APP {index} "))
+                .chain(["".into(), "bad\nid".into()])
+                .collect(),
+            notes: (0..=MAX_APP_NOTES)
+                .map(|index| (format!(" APP {index} "), " guidance ".into()))
+                .chain([("bad\nid".into(), "unsafe".into())])
+                .collect(),
+            learned_notes: BTreeMap::from([
+                (" APP 0 ".into(), " guidance ".into()),
+                ("orphan".into(), "unused".into()),
+            ]),
+            ..UpdaterConfig::default()
+        };
+
+        cfg.sanitize();
+
+        assert_eq!(cfg.methods, ["winget", "choco"]);
+        assert_eq!(cfg.ignored.len(), MAX_IGNORED_APPS);
+        assert!(cfg.ignored.iter().all(|id| valid_app_id(id)));
+        assert_eq!(cfg.notes.len(), MAX_APP_NOTES);
+        assert!(cfg
+            .notes
+            .iter()
+            .all(|(id, note)| { valid_app_id(id) && note.chars().count() <= MAX_APP_NOTE_CHARS }));
+        assert_eq!(
+            cfg.learned_notes.get("app 0").map(String::as_str),
+            Some("guidance")
+        );
+        assert!(!cfg.learned_notes.contains_key("orphan"));
     }
 }

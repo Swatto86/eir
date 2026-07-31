@@ -1,6 +1,6 @@
 [package]
 name = "eir-ui"
-version = "0.34.5"
+version = "0.34.6"
 edition = "2021"
 authors = ["Swatto <claude.ai@swatto.co.uk>"]
 description = "Eir system monitor — tray UI"
@@ -27,8 +27,16 @@ tauri-plugin-single-instance = "2"
 # Native file/folder picker for Ask Eir attachments.
 tauri-plugin-dialog = "2"
 base64 = "0.22"
-# Fullscreen-game detection for Game Mode: SHQueryUserNotificationState (shell32).
-windows = { version = "0.58", features = ["Win32_UI_Shell", "Win32_Foundation"] }
+# Fullscreen-game detection plus named-pipe service identity verification.
+windows = { version = "0.58", features = [
+    "Win32_UI_Shell",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 # Query/install the Windows service from the About view.
 windows-service = "0.7"
 

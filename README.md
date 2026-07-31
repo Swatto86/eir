@@ -71,16 +71,17 @@ Each decision cycle (default every 10 minutes):
    anything disruptive or irreversible is queued for approval in the tray UI — each
    item explains, in plain English, exactly what it will do (and, for a file delete,
    the file's real size, age, and what kind of file it is). The queue is persistent:
-   it never times out and survives a service restart, so an approval is always
-   waiting for you, not gone if you missed a pop-up.
+   it never times out and survives a service restart. If the service stops after a
+   click but before recording completion, the item returns for fresh approval rather
+   than replaying a possibly completed action.
 6. **Learn conservatively** — Eir mines its own audit history for repeated local
    patterns, such as package-manager methods that always fail for a specific app or
    fixes that never improve a recurring issue. Learned facts can only reduce or
    reorder actions, never make Eir more aggressive, and every fact is visible in the
    UI with Pin / Disable / Forget controls.
 
-> **Architecture & design:** see [ARCHITECTURE.md](ARCHITECTURE.md). Current burn-in
-> guidance and the next release priorities are in [PLAN.md](PLAN.md).
+> **Architecture & design:** see [ARCHITECTURE.md](ARCHITECTURE.md). Release
+> gates and the next priorities are in [PLAN.md](PLAN.md).
 
 ## AI providers
 
@@ -120,8 +121,8 @@ are reported instead of being silently treated as queued.
   pending action shows a plain-English summary of what it does, whether it can be
   undone, and — for a file delete — the target's real size, last-modified date, and
   likely kind (regenerable cache vs. irreplaceable data). The approval queue is
-  persistent: it never expires and survives restarts, so nothing slips away while
-  you're not looking.
+  persistent: pending items survive restarts, while an interrupted accepted item
+  requires a fresh click instead of being executed again automatically.
 - **Never-uninstall guarantee** — software removal is a hard-blocked action.
 - **Machine-pattern learning** — repeated local evidence teaches Eir which app-update
   paths, signals, or fixes are not useful on this machine. Learning is conservative,
@@ -148,6 +149,10 @@ are reported instead of being silently treated as queued.
 - **Usage transparency** — shows AI calls, tokens, and estimated cost in **GBP**.
   Free models are clearly marked as no-cost.
 - **Self-updating** — signed auto-updates via the GitHub releases feed.
+- **Bounded at every ingress** — AI responses, Ask attachments/history, pipe frames,
+  status projections, configuration collections, command output, and updater evidence
+  all have explicit limits, so a bad provider or local client cannot grow service
+  memory without bound.
 - **Stays out of the way** — closing the window hides to the tray; the service keeps
   running. The tray app can start with Windows and launch hidden.
 
@@ -156,7 +161,8 @@ are reported instead of being silently treated as queued.
 1. Download **`Eir_<version>_x64-setup.exe`** from the
    [latest release](https://github.com/Swatto86/eir/releases/latest).
 2. Run it **as Administrator**. The installer registers and starts the `EirSvc`
-   service and seeds the default config.
+   service in a protected Program Files directory and seeds the default config. It
+   includes a pinned WebView2 runtime, so Windows does not need one preinstalled.
 3. Launch **Eir** from the Start Menu — the tray icon appears once the service
    connects.
 4. The default provider is **OpenRouter**. Open **Settings**, paste your
@@ -167,6 +173,16 @@ are reported instead of being silently treated as queued.
    model, or your logged-in **Kilo CLI** session.
 
 Already installed? Eir updates itself automatically.
+
+The release also provides a single-file portable tray executable with the same pinned
+WebView2 runtime embedded and extracted to a temporary directory while it runs. It needs
+no installer, administrator rights, preinstalled WebView2, or Visual C++ runtime: it runs
+EirSvc under the launching user's token for that session. One portable instance may run
+per Windows session and can coexist with an installed Eir. Its config, policy, audit
+database, and logs persist under `%LOCALAPPDATA%\EirPortable`; closing the portable UI
+also stops its foreground service. Portable mode never changes Start-with-Windows and
+never launches the NSIS self-updater—download a newer portable release to update it.
+LocalSystem repairs and continuous background monitoring still require the full installer.
 
 After an upgrade, open **About** and confirm the UI and service show the same version.
 Then use **Settings → Test provider** to exercise the saved provider through the installed
@@ -179,9 +195,11 @@ that every configured package manager was available.
 All settings live in the in-app **Settings** panel: start-with-Windows, AI provider
 and models, API keys, advisor escalation, polling intervals, watched event-log
 channels and directories, and app-updater settings. Provider/monitoring settings are
-persisted to `config.toml` next to the service executable. Provider/model changes
-apply live; only collector channel, interval, or directory changes restart the
-service. Updater/advisor settings also apply live.
+persisted to `config.toml` next to the installed service executable, or under
+`%LOCALAPPDATA%\EirPortable` in portable mode. Provider/model changes apply live; only
+collector channel, interval, or directory changes restart the installed service.
+Portable mode saves those collector changes and asks you to restart portable Eir.
+Updater/advisor settings also apply live.
 
 `config.toml.example` documents every field for reference, but you should never need
 to edit it by hand.
@@ -198,17 +216,21 @@ cargo install tauri-cli --version "^2"
 powershell -NoProfile -File icons\gen-icon.ps1
 
 # 3. Build the installer. This runs build-svc.ps1 first (which compiles EirSvc
-#    and stages bin\eir-svc.exe), then bundles the tray app + service into NSIS.
-cargo tauri build --config eir-ui/tauri.conf.json
+#    and stages bin\eir-svc.exe), verifies a fresh extraction of the pinned
+#    WebView2 CAB, then bundles the tray app + service + runtime into NSIS.
+cargo tauri build --config eir-ui/tauri.conf.json -- --locked
 ```
 
-Run the core local checks:
+Run the repository gate (including manifest/Cargo.lock version agreement and locked
+Rust builds):
 
 ```powershell
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify.ps1
 ```
+
+For v0.34.6 and later, the tag workflow also requires the exact tag
+`v<manifest-version>`, reruns its gates from that tag SHA, and keeps the release draft
+until the exact installer `.sig` and `latest.json` version, URL, and signature agree.
 
 ## Project layout
 
@@ -222,16 +244,31 @@ cargo test --workspace --all-targets
 
 - The service runs as **LocalSystem**; the UI runs at **Medium** integrity (normal
   user). They communicate only over the local named pipe `\\.\pipe\EirSvc`.
+- Service installation fails closed unless `eir-svc.exe` is an ordinary, single-link
+  file directly under a protected Program Files directory. Install and upgrade reject
+  redirected paths, copy legacy state from a held source stream into a fresh protected
+  file, reset ownership/ACLs on Eir-owned files, and restore the previous service after
+  an interrupted in-place upgrade. Uninstall removes only validated Eir state without
+  following reparse points.
 - The pipe is created with an explicit security descriptor —
-  `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;NW;;;ME)` — granting Interactive
-  Users read/write while a Medium mandatory-label SACL lets the Medium-integrity UI
-  write to it (no-write-up). The service also requires the pipe client to belong to
-  the active interactive session and rechecks that session during I/O, so switching
-  users invalidates the old client. No network listener is opened.
+  granting Interactive Users only the access needed to exchange data while a Medium
+  mandatory label blocks Low-integrity clients. The service accepts only the installed
+  sibling UI (or an elevated administrator) in the sole active interactive session,
+  and rechecks that session during I/O; the UI independently verifies that the pipe
+  server is the registered LocalSystem `EirSvc`. Portable clients deliberately cannot
+  control the privileged service. No network listener is opened.
+- Portable mode uses a random private pipe and mutually verifies that the UI and
+  foreground service are same-user, same-session sibling processes. The service rejects
+  LocalSystem and split-token/full-elevation portable launches, and a delete-on-close
+  runner lease shuts it down if the runner exits.
 - Destructive actions are blocked at the policy layer and require explicit approval;
   software uninstalls are never permitted.
-- Claude, Codex, and Kilo CLI providers run under the active desktop user's
-  Windows token. A user-owned CLI binary is never executed with LocalSystem authority.
+- User-owned files, Winget, and Claude/Codex/Kilo sessions are scoped to the sole active
+  desktop user and accessed with that user's Windows token. Multiple active sessions
+  fail closed; user-controlled reparse paths are rejected.
+- Updater and executor boundaries reject ambiguous installed identities, unsafe
+  installer paths/arguments, protected process targets, and unverifiable/no-effect
+  operations instead of reporting them as successful.
 - API keys are stored in the local `config.toml` and never logged.
 
 ## License

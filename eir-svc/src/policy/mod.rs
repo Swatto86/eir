@@ -65,6 +65,14 @@ impl ExecutionPolicy {
 
         // Below the configured confidence threshold — don't run or prompt.
         let threshold = self.execution.confidence_threshold;
+        if !(0.0..=1.0).contains(&confidence) {
+            return Verdict::Block(format!("Invalid confidence value: {confidence:?}"));
+        }
+        if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
+            return Verdict::Block(format!(
+                "Invalid policy confidence threshold: {threshold:?}"
+            ));
+        }
         if confidence < threshold {
             return Verdict::Block(format!(
                 "Confidence {:.0}% below threshold {:.0}%",
@@ -180,7 +188,9 @@ pub(crate) fn normalize_path_lexical(path: &str) -> Vec<String> {
         ("HKEY_LOCAL_MACHINE", "HKLM:"),
         ("HKEY_CURRENT_USER", "HKCU:"),
     ] {
-        if p.len() >= from.len() && p[..from.len()].eq_ignore_ascii_case(from) {
+        if p.get(..from.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(from))
+        {
             p = format!("{to}{}", &p[from.len()..]);
             break;
         }
@@ -301,6 +311,28 @@ mod tests {
             pol.evaluate(&FixAction::DefenderRealtimeEnable, 0.99),
             Verdict::RequireApproval(_)
         ));
+    }
+
+    #[test]
+    fn invalid_confidence_values_fail_closed() {
+        let mut pol = policy_with(&["firewall_enable"]);
+        let action = FixAction::FirewallEnable {
+            profile: "all".into(),
+        };
+        for confidence in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
+            assert!(
+                matches!(pol.evaluate(&action, confidence), Verdict::Block(_)),
+                "invalid confidence {confidence:?} must not auto-approve"
+            );
+        }
+
+        for threshold in [f32::NAN, f32::INFINITY, -0.1, 0.0, 1.1] {
+            pol.execution.confidence_threshold = threshold;
+            assert!(
+                matches!(pol.evaluate(&action, 0.9), Verdict::Block(_)),
+                "invalid threshold {threshold:?} must fail closed"
+            );
+        }
     }
 
     /// SFC/DISM are long-running system-file repairs and must NEVER auto-execute, even
@@ -480,5 +512,11 @@ mod tests {
             value_data: "4".into(),
         };
         assert!(matches!(pol.evaluate(&action, 0.99), Verdict::Block(_)));
+    }
+
+    #[test]
+    fn lexical_normalisation_does_not_slice_inside_utf8() {
+        let path = format!("{}é", "a".repeat(17));
+        assert_eq!(normalize_path_lexical(&path), vec![path.to_lowercase()]);
     }
 }

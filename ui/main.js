@@ -1,16 +1,5 @@
 const invoke = window.__TAURI__.core.invoke;
 
-// ── Native feel ───────────────────────────────────────────────────────────────
-// Suppress the webview's browser context menu everywhere — the biggest "this is
-// a webpage" tell in a desktop app. Inputs keep normal keyboard editing.
-window.addEventListener('contextmenu', (e) => e.preventDefault());
-
-// Hide on close (tray remains active)
-window.__TAURI__.window.getCurrentWindow().onCloseRequested((e) => {
-  e.preventDefault();
-  window.__TAURI__.window.getCurrentWindow().hide();
-});
-
 // Escape hides the window (tray-app convention). Inside a field it just blurs,
 // so a stray Escape while typing doesn't yank the window away.
 window.addEventListener('keydown', (e) => {
@@ -41,6 +30,38 @@ function commandMessage(result, fallback) {
   return (typeof result === 'string' && result.trim()) ? result : fallback;
 }
 
+const SERVICE_ACTION_SELECTOR = [
+  '#ask-send', '#clear-ask',
+  '#disk-scan', '.disk-clean',
+  '#startup-scan', '.startup-toggle',
+  '.btn-approve', '.btn-reject',
+  '.act-undo', '#clear-activity', '#refresh-status',
+  '#upd-now', '#clear-updates', '.upd-retry', '.upd-ignore', '.upd-note-save',
+  '.learned-act', '#set-save', '#test-provider', '#set-adv-save', '#set-upd-save',
+  '#pause-btn', '#game-btn',
+].join(',');
+
+function setServiceActionsDisconnected(disconnected) {
+  document.querySelectorAll(SERVICE_ACTION_SELECTOR).forEach((button) => {
+    if (disconnected) {
+      button.dataset.serviceUnavailable = '1';
+      button.setAttribute('aria-disabled', 'true');
+    } else if (button.dataset.serviceUnavailable) {
+      delete button.dataset.serviceUnavailable;
+      button.removeAttribute('aria-disabled');
+    }
+  });
+}
+
+// `pointer-events` never blocks keyboard activation. Enforce aria-disabled at the
+// event boundary too; Rust remains the trust-boundary backstop.
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('[data-service-unavailable]')) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+}, true);
+setServiceActionsDisconnected(true);
+
 // Copy to clipboard with a plain-DOM fallback for webviews where navigator.clipboard
 // is unavailable. Confirms on the button when given one, else via a toast.
 async function copyText(text, btn) {
@@ -49,21 +70,28 @@ async function copyText(text, btn) {
     await navigator.clipboard.writeText(text);
     ok = true;
   } catch {
+    let ta;
     try {
-      const ta = document.createElement('textarea');
+      ta = document.createElement('textarea');
       ta.value = text;
       ta.style.position = 'fixed';
       ta.style.opacity = '0';
       document.body.appendChild(ta);
       ta.select();
       ok = document.execCommand('copy');
-      ta.remove();
     } catch { ok = false; }
+    finally { if (ta) ta.remove(); }
   }
   if (btn) {
-    const old = btn.textContent;
+    clearTimeout(btn._copyTimer);
+    const old = btn.dataset.copyLabel || btn.textContent;
+    btn.dataset.copyLabel = old;
     btn.textContent = ok ? '✓ Copied' : 'Copy failed';
-    setTimeout(() => { btn.textContent = old; }, 1500);
+    btn._copyTimer = setTimeout(() => {
+      btn.textContent = old;
+      delete btn.dataset.copyLabel;
+      delete btn._copyTimer;
+    }, 1500);
   } else {
     toast(ok ? 'Copied to clipboard' : 'Copy failed', ok ? 'ok' : 'err');
   }
@@ -111,16 +139,26 @@ const VIEW_TITLES = {
   settings: 'Settings',
   about: 'About',
 };
+let runtimePortable = null;
 
 function showView(name) {
   document.querySelectorAll('.view').forEach((v) =>
     v.classList.toggle('active', v.id === `view-${name}`));
-  document.querySelectorAll('.nav-btn').forEach((b) =>
-    b.classList.toggle('active', b.dataset.view === name));
+  document.querySelectorAll('.nav-btn').forEach((b) => {
+    const active = b.dataset.view === name;
+    b.classList.toggle('active', active);
+    if (active) b.setAttribute('aria-current', 'page');
+    else b.removeAttribute('aria-current');
+  });
   document.getElementById('view-title').textContent = VIEW_TITLES[name] || name;
-  // Re-entering Settings only refills from the service when no card holds unsaved
-  // edits — otherwise a Dashboard detour would silently wipe in-progress changes.
-  if (name === 'settings' && dirtyCards.size === 0) fillSettings();
+  if (name === 'settings') {
+    if (runtimePortable === false && !dirtyCards.has('card-autostart')) {
+      fillAutostartSetting();
+    }
+    // Hydrate only from real service snapshots. Dirty cards are preserved, while
+    // dependent cards retry until their updater/advisor snapshots arrive.
+    if (!settingsHydrated) fillSettings();
+  }
 }
 
 document.getElementById('nav').addEventListener('click', (e) => {
@@ -358,8 +396,10 @@ async function refreshInner() {
   document.getElementById('pause-label').textContent = status.paused ? 'Resume' : 'Pause';
   document.getElementById('pause-ico').textContent = status.paused ? '▶' : '⏸';
   document.getElementById('pause-btn').classList.toggle('paused', !!status.paused);
+  document.getElementById('pause-btn').setAttribute('aria-pressed', String(!!status.paused));
   const gaming = !!status.gaming;
   document.getElementById('game-btn').classList.toggle('active', gaming);
+  document.getElementById('game-btn').setAttribute('aria-pressed', String(gaming));
   // Explicit ON/Off both ways so the state is never ambiguous.
   document.getElementById('game-label').textContent = gaming ? 'Game Mode: ON' : 'Game Mode: Off';
   document.getElementById('game-btn').title = gaming
@@ -403,8 +443,8 @@ async function refreshInner() {
   const settingsView = document.getElementById('view-settings');
   if (!status.settings) {
     settingsHydrated = false;
-  } else if (settingsView.classList.contains('active')
-      && !settingsHydrated && dirtyCards.size === 0) {
+    setServiceSettingsLoading(true);
+  } else if (settingsView.classList.contains('active') && !settingsHydrated) {
     fillSettings();
   }
   renderLearned(status.learned_facts);
@@ -429,6 +469,7 @@ async function refreshInner() {
     const ss = document.getElementById('set-status');
     if (ss) ss.textContent = status.error;
   }
+  setServiceActionsDisconnected(svcDown);
 }
 
 // ── Weekly health digest ───────────────────────────────────────────────────────
@@ -510,8 +551,9 @@ function renderAsk(ask) {
   const running = !!(ask && ask.running);
   if (askWasRunning && !running) askLastDoneAt = Date.now();
   askWasRunning = running;
-  sendBtn.disabled = running;
+  sendBtn.disabled = running || askSending || askAttachmentBusy;
   sendBtn.textContent = running ? 'Thinking…' : 'Ask Eir';
+  updateAskControls();
   // Reconcile the status line with the service each poll. After a submit, hold a
   // neutral "Sending…" instead of flashing the *previous* answer's error for the
   // up-to-2s gap before the service flips `running`; a new rejection (different
@@ -544,14 +586,26 @@ function renderAsk(ask) {
 }
 
 let askSending = false;
+let askAttachmentBusy = false;
+function updateAskControls() {
+  const disabled = askSending || askAttachmentBusy || askWasRunning;
+  document.getElementById('ask-send').disabled = disabled;
+  document.getElementById('ask-attach-files').disabled = disabled;
+  document.getElementById('ask-attach-folder').disabled = disabled;
+  document.getElementById('clear-ask').disabled = askSending || askWasRunning;
+  document.querySelectorAll('#ask-attach-chips .rm').forEach((button) => {
+    button.disabled = disabled;
+  });
+}
 async function submitAsk() {
+  if (document.getElementById('ask-send').dataset.serviceUnavailable) return;
   const input = document.getElementById('ask-input');
   const q = input.value.trim();
   if (!q) return;
   // Synchronous in-flight guard: the Send button only disables via the next 2s poll's
   // ask.running, so without this a fast second Enter/click could queue a duplicate ask
   // before the service flips running. Re-enabled in finally.
-  if (askSending) return;
+  if (askSending || askAttachmentBusy || askWasRunning) return;
   const statusEl = document.getElementById('ask-status');
   // Mirror the service's 15s between-questions guard for an older service that cannot
   // return a rejection before the tray consumes pending attachments.
@@ -563,6 +617,9 @@ async function submitAsk() {
   }
   askSending = true;
   const sendBtn = document.getElementById('ask-send');
+  const sentChips = askChips;
+  askChips = [];
+  renderAskChips();
   sendBtn.disabled = true;
   statusEl.textContent = 'Sending…';
   try {
@@ -572,15 +629,16 @@ async function submitAsk() {
     askBaselineErr = (lastStatus && lastStatus.ask && lastStatus.ask.error) || '';
     askBaselineAt = Date.now();
     input.value = '';
-    // The service consumed the pending attachments on a successful queue.
-    askChips = [];
-    renderAskChips();
     statusEl.textContent = commandMessage(result, 'Question accepted');
   } catch (e) {
+    // The backend restores only the failed batch ahead of any attachments picked
+    // while this request was in flight; mirror that order in the visible chips.
+    askChips = sentChips.concat(askChips);
+    renderAskChips();
     statusEl.textContent = 'Failed: ' + e;
   } finally {
     askSending = false;
-    sendBtn.disabled = false;
+    updateAskControls();
   }
   refresh();
 }
@@ -610,23 +668,47 @@ function renderAskChips() {
     <span class="ask-chip" title="${escAttr(a.name)}">
       <span>${a.kind === 'image' ? '🖼' : '📄'}</span>
       <span class="nm">${esc(a.name)}</span>
-      <span class="rm" data-i="${i}" title="Remove">✕</span>
+      <button type="button" class="rm" data-i="${i}" aria-label="Remove ${escAttr(a.name)}">✕</button>
     </span>`).join('');
+  updateAskControls();
 }
 async function pickAttachments(kind) {
+  if (askAttachmentBusy || askSending || askWasRunning) return;
+  askAttachmentBusy = true;
+  updateAskControls();
   try {
     askChips = await invoke('add_ask_attachments', { kind }) || [];
     renderAskChips();
     if (askChips.length >= 12) toast('Attachment limit reached (12)', 'ok');
   } catch (e) { console.error('add_ask_attachments failed', e); toast('Could not attach', 'err'); }
+  finally { askAttachmentBusy = false; updateAskControls(); }
 }
 document.getElementById('ask-attach-files').addEventListener('click', () => pickAttachments('files'));
 document.getElementById('ask-attach-folder').addEventListener('click', () => pickAttachments('folder'));
 document.getElementById('ask-attach-chips').addEventListener('click', async (e) => {
   const rm = e.target.closest('.rm');
-  if (!rm) return;
-  try { askChips = await invoke('remove_ask_attachment', { index: parseInt(rm.dataset.i, 10) }) || []; renderAskChips(); }
-  catch (err) { console.error('remove_ask_attachment failed', err); }
+  if (!rm || askAttachmentBusy || askSending || askWasRunning) return;
+  const removedIndex = parseInt(rm.dataset.i, 10);
+  if (!Number.isFinite(removedIndex)) return;
+  let removed = false;
+  askAttachmentBusy = true;
+  updateAskControls();
+  try {
+    askChips = await invoke('remove_ask_attachment', { index: removedIndex }) || [];
+    renderAskChips();
+    removed = true;
+  }
+  catch (err) { console.error('remove_ask_attachment failed', err); toast('Could not remove attachment: ' + err, 'err'); }
+  finally {
+    askAttachmentBusy = false;
+    updateAskControls();
+    if (removed) {
+      const removeButtons = document.querySelectorAll('#ask-attach-chips .rm');
+      const next = removeButtons[Math.min(removedIndex, removeButtons.length - 1)]
+        || document.getElementById('ask-attach-files');
+      next.focus();
+    }
+  }
 });
 
 // ── Disk space ───────────────────────────────────────────────────────────────
@@ -659,7 +741,7 @@ function renderDisk(di, paused) {
   if (cleanable > 0) bits.push(humanBytes(cleanable) + ' cleanable');
   stateEl.textContent = bits.length ? '· ' + bits.join(' · ') : '';
   errEl.style.display = (di && di.error) ? 'block' : 'none';
-  errEl.textContent = (di && di.error) || '';
+  setText(errEl, (di && di.error) || '');
   const sig = JSON.stringify({ r: running, e: entries, at: di && di.scanned_at });
   if (sig === lastDiskSig) return;
   lastDiskSig = sig;
@@ -768,7 +850,7 @@ function renderStartup(sv, paused) {
   }
   stateEl.textContent = bits.length ? '· ' + bits.join(' · ') : '';
   errEl.style.display = (sv && sv.error) ? 'block' : 'none';
-  errEl.textContent = (sv && sv.error) || '';
+  setText(errEl, (sv && sv.error) || '');
   const sig = JSON.stringify({ r: running, e: entries, at: sv && sv.scanned_at, h: startupHideMs });
   if (sig === lastStartupSig) return;
   lastStartupSig = sig;
@@ -1097,8 +1179,11 @@ document.getElementById('activity-filter').addEventListener('click', (e) => {
   const chip = e.target.closest('.chip');
   if (!chip || chip.dataset.filter === activityFilter) return;
   activityFilter = chip.dataset.filter;
-  document.querySelectorAll('#activity-filter .chip').forEach((c) =>
-    c.classList.toggle('active', c === chip));
+  document.querySelectorAll('#activity-filter .chip').forEach((c) => {
+    const active = c === chip;
+    c.classList.toggle('active', active);
+    c.setAttribute('aria-pressed', String(active));
+  });
   if (lastStatus) renderActivity(lastStatus);
 });
 
@@ -1454,20 +1539,54 @@ document.getElementById('learned-list').addEventListener('click', (e) => {
 
 // Per-card dirty tracking: the Settings view is four independently-saved cards, so
 // a save in one card must not clear unsaved edits in another. Any input marks its
-// enclosing card dirty; a successful save clears only that card; (re)filling from
-// the service clears all. Re-entering the view refills only when nothing is dirty.
+// enclosing card dirty; a successful save clears only that card; reconnect hydration
+// refreshes clean cards while retaining edits in dirty ones.
 const dirtyCards = new Set();
 let settingsHydrated = false;
+const SERVICE_SETTINGS_CARD_IDS = ['card-provider', 'card-advisor', 'card-updater'];
+function serviceSettingsCardAvailable(id) {
+  if (!lastStatus || !lastStatus.settings
+      || ['ServiceDisconnected', 'Connecting', 'Restarting'].includes(lastStatus.status)) {
+    return false;
+  }
+  if (id === 'card-advisor') return !!(lastStatus.advisor && lastStatus.advisor.settings);
+  if (id === 'card-updater') return !!(lastStatus.updater && lastStatus.updater.settings);
+  return true;
+}
+function setServiceSettingsCardLoading(id, loading) {
+  document.getElementById(id)
+    .querySelectorAll('input, select, textarea, button')
+    .forEach((control) => {
+      if (loading || !['test-provider', 'm-scoop'].includes(control.id)) {
+        control.disabled = loading;
+      }
+    });
+}
+function setServiceSettingsLoading(loading) {
+  SERVICE_SETTINGS_CARD_IDS.forEach((id) => {
+    setServiceSettingsCardLoading(id, loading || !serviceSettingsCardAvailable(id));
+  });
+  console.assert(loading || document.getElementById('m-scoop').disabled,
+    'Scoop must remain unavailable after settings load');
+}
+setServiceSettingsLoading(true);
+document.getElementById('set-autostart').disabled = true;
+document.getElementById('set-autostart-save').disabled = true;
 document.getElementById('view-settings').addEventListener('input', (e) => {
   const card = e.target.closest('.card');
+  if (card && SERVICE_SETTINGS_CARD_IDS.includes(card.id)
+      && !serviceSettingsCardAvailable(card.id)) return;
   if (card && card.id) dirtyCards.add(card.id);
 });
 
 // Read an integer input clamped to [min, max] (blank/garbage → def) so a typed
 // out-of-range value saves as what the service will actually honour.
 function numVal(id, def, min, max) {
-  const v = parseInt(document.getElementById(id).value, 10);
-  return Math.min(max, Math.max(min, Number.isFinite(v) ? v : def));
+  const input = document.getElementById(id);
+  const v = parseInt(input.value, 10);
+  const bounded = Math.min(max, Math.max(min, Number.isFinite(v) ? v : def));
+  input.value = bounded;
+  return bounded;
 }
 
 const PROVIDER_HINTS = {
@@ -1568,18 +1687,27 @@ function switchProvider() {
 }
 document.getElementById('set-provider').addEventListener('change', switchProvider);
 
+let autostartRequest = 0;
 async function fillAutostartSetting() {
   const box = document.getElementById('set-autostart');
+  const save = document.getElementById('set-autostart-save');
   const st = document.getElementById('set-autostart-status');
+  const request = ++autostartRequest;
   box.disabled = true;
+  save.disabled = true;
   st.textContent = 'Checking…';
   try {
-    box.checked = await invoke('get_autostart_enabled');
+    const enabled = await invoke('get_autostart_enabled');
+    if (request !== autostartRequest) return;
+    box.checked = enabled;
     st.textContent = '';
   } catch (e) {
-    st.textContent = 'Unavailable: ' + e;
+    if (request === autostartRequest) st.textContent = 'Unavailable: ' + e;
   } finally {
-    box.disabled = false;
+    if (request === autostartRequest) {
+      box.disabled = false;
+      save.disabled = false;
+    }
   }
 }
 
@@ -1601,38 +1729,49 @@ async function saveAutostartSetting() {
 }
 
 function fillSettings() {
-  fillAutostartSetting();
   const s = lastStatus && lastStatus.settings;
   if (!s) return;
-  settingsHydrated = true;
-  const provider = s.provider || 'openrouter';
-  document.getElementById('set-provider').value = provider;
-  activeModelProvider = provider;
-  savedProvider = provider;
-  updateProviderHint();
-  document.getElementById('set-model').value = s.model || '';
-  document.getElementById('set-effort').value = s.effort || '';
-  document.getElementById('set-upd-model').value = s.update_check_model || '';
-  document.getElementById('set-conf').value = Math.round((s.confidence_threshold || 0.80) * 100);
-  document.getElementById('set-decint').value = s.decision_interval_secs || 600;
-  document.getElementById('set-elpoll').value = s.event_log_poll_interval_secs || 30;
-  document.getElementById('set-wmipoll').value = s.wmi_poll_interval_secs || 300;
-  document.getElementById('set-channels').value = (s.event_log_channels || []).join(', ');
-  document.getElementById('set-dirs').value = (s.log_directories || []).join(', ');
-  document.getElementById('set-game-auto').checked = s.game_mode_auto !== false;
-  document.getElementById('set-game-power').checked = !!s.game_mode_power_boost;
-  document.getElementById('set-or-key').placeholder =
-    s.openrouter_key_set ? '•••••• set — blank keeps it' : 'not set';
-  document.getElementById('set-an-key').placeholder =
-    s.anthropic_key_set ? '•••••• set — blank keeps it' : 'not set';
-  document.getElementById('set-kilo-profile').placeholder =
-    s.kilo_cli_user_profile_set ? '•••••• set — blank keeps it' : 'C:\\Users\\You  (blank = auto-detect)';
-  document.getElementById('set-kilo-path').placeholder =
-    s.kilo_cli_path_set ? '•••••• set — blank keeps it' : 'kilo  (blank = on PATH)';
-  fillUpdaterSettings(lastStatus.updater && lastStatus.updater.settings);
-  fillAdvisorSettings(lastStatus.advisor && lastStatus.advisor.settings);
-  rememberModelValues(provider);
-  dirtyCards.clear();
+  document.getElementById('set-save').disabled = false;
+  // A service restart invalidates the old snapshot, but must not erase edits the
+  // user was typing when the pipe dropped. Rehydrate each clean card independently.
+  if (!dirtyCards.has('card-provider')) {
+    const provider = s.provider || 'openrouter';
+    document.getElementById('set-provider').value = provider;
+    activeModelProvider = provider;
+    savedProvider = provider;
+    updateProviderHint();
+    document.getElementById('set-model').value = s.model || '';
+    document.getElementById('set-effort').value = s.effort || '';
+    document.getElementById('set-upd-model').value = s.update_check_model || '';
+    document.getElementById('set-conf').value = Math.round((s.confidence_threshold || 0.80) * 100);
+    document.getElementById('set-decint').value = s.decision_interval_secs || 600;
+    document.getElementById('set-elpoll').value = s.event_log_poll_interval_secs || 30;
+    document.getElementById('set-wmipoll').value = s.wmi_poll_interval_secs || 300;
+    document.getElementById('set-channels').value = (s.event_log_channels || []).join(', ');
+    document.getElementById('set-dirs').value = (s.log_directories || []).join(', ');
+    document.getElementById('set-game-auto').checked = s.game_mode_auto !== false;
+    document.getElementById('set-game-power').checked = !!s.game_mode_power_boost;
+    document.getElementById('set-or-key').placeholder =
+      s.openrouter_key_set ? '•••••• set — blank keeps it' : 'not set';
+    document.getElementById('set-an-key').placeholder =
+      s.anthropic_key_set ? '•••••• set — blank keeps it' : 'not set';
+    document.getElementById('set-kilo-profile').placeholder =
+      s.kilo_cli_user_profile_set ? '•••••• set — blank keeps it' : 'C:\\Users\\You  (blank = auto-detect)';
+    document.getElementById('set-kilo-path').placeholder =
+      s.kilo_cli_path_set ? '•••••• set — blank keeps it' : 'kilo  (blank = on PATH)';
+    rememberModelValues(provider);
+  }
+  if (!dirtyCards.has('card-updater')) {
+    fillUpdaterSettings(lastStatus.updater && lastStatus.updater.settings);
+  }
+  if (!dirtyCards.has('card-advisor')) {
+    fillAdvisorSettings(lastStatus.advisor && lastStatus.advisor.settings);
+  }
+  // A nested snapshot can arrive a poll later than the main service settings.
+  // Keep retrying clean-card hydration until both dependent cards have data.
+  settingsHydrated = !!(lastStatus.updater && lastStatus.updater.settings
+    && lastStatus.advisor && lastStatus.advisor.settings);
+  setServiceSettingsLoading(false);
 }
 
 async function saveSettings() {
@@ -1651,9 +1790,9 @@ async function saveSettings() {
     kilo_cli_user_profile: kiloProfile || null,
     kilo_cli_path: kiloPath || null,
     confidence_threshold: numVal('set-conf', 80, 50, 95) / 100,
-    decision_interval_secs: numVal('set-decint', 600, 10, Infinity),
-    event_log_poll_interval_secs: numVal('set-elpoll', 30, 5, Infinity),
-    wmi_poll_interval_secs: numVal('set-wmipoll', 300, 30, Infinity),
+    decision_interval_secs: numVal('set-decint', 600, 10, 604800),
+    event_log_poll_interval_secs: numVal('set-elpoll', 30, 5, 604800),
+    wmi_poll_interval_secs: numVal('set-wmipoll', 300, 30, 604800),
     event_log_channels: splitList(document.getElementById('set-channels').value),
     log_directories: splitList(document.getElementById('set-dirs').value),
     game_mode_auto: document.getElementById('set-game-auto').checked,
@@ -1710,6 +1849,7 @@ async function saveSettings() {
 
 function fillAdvisorSettings(s) {
   if (!s) return;
+  document.getElementById('set-adv-save').disabled = false;
   document.getElementById('set-adv-enabled').checked = !!s.enabled;
   document.getElementById('set-adv-model').value = s.escalation_model || '';
   document.getElementById('set-adv-effort').value = s.escalation_effort || '';
@@ -1724,15 +1864,11 @@ async function saveAdvisorSettings() {
     st.textContent = 'Save the AI provider first, then save Advisor.';
     return;
   }
-  // A blank confidence field defaults to 60; an explicit 0 is "never escalate on low
-  // confidence". Use trim + parse so 0 is preserved.
-  const confRaw = document.getElementById('set-adv-conf').value.trim();
-  const confPct = confRaw === '' ? 60 : parseInt(confRaw, 10);
   const settings = {
     enabled: document.getElementById('set-adv-enabled').checked,
     escalation_model: document.getElementById('set-adv-model').value.trim(),
     escalation_effort: document.getElementById('set-adv-effort').value,
-    low_confidence_threshold: Math.min(95, Math.max(0, Number.isFinite(confPct) ? confPct : 60)) / 100,
+    low_confidence_threshold: numVal('set-adv-conf', 60, 0, 95) / 100,
   };
   st.textContent = 'Saving…';
   try {
@@ -1750,6 +1886,7 @@ const METHOD_BOXES = [['m-winget', 'winget'], ['m-choco', 'choco'], ['m-msstore'
 
 function fillUpdaterSettings(s) {
   if (!s) return;
+  document.getElementById('set-upd-save').disabled = false;
   document.getElementById('set-upd-enabled').checked = !!s.enabled;
   document.getElementById('set-upd-interval').value =
     Math.max(1, Math.round((s.schedule_interval_secs || 86400) / 3600));
@@ -1786,14 +1923,18 @@ document.getElementById('set-upd-ignored').addEventListener('click', async (e) =
 
 async function saveUpdaterSettings() {
   const methods = METHOD_BOXES.filter(([id]) => document.getElementById(id).checked).map(([, n]) => n);
+  const st = document.getElementById('set-upd-status');
+  if (!methods.length) {
+    st.textContent = 'Choose at least one update method.';
+    return;
+  }
   const settings = {
     enabled: document.getElementById('set-upd-enabled').checked,
-    schedule_interval_secs: numVal('set-upd-interval', 24, 1, Infinity) * 3600,
+    schedule_interval_secs: numVal('set-upd-interval', 24, 1, 8760) * 3600,
     methods,
     native_enabled: document.getElementById('set-native-enabled').checked,
     native_signature_policy: document.getElementById('set-sigpol').value,
   };
-  const st = document.getElementById('set-upd-status');
   st.textContent = 'Saving…';
   try {
     const result = await invoke('set_updater_settings', { settings });
@@ -1809,8 +1950,19 @@ async function saveUpdaterSettings() {
 // live, but the guard still prevents duplicate invocations.
 function saveGuarded(btnId, fn) {
   const btn = document.getElementById(btnId);
+  const card = btn.closest('.card');
+  const fields = [...card.querySelectorAll('input:not(:disabled), select:not(:disabled), textarea:not(:disabled)')];
   btn.disabled = true;
-  Promise.resolve(fn()).finally(() => { btn.disabled = false; });
+  card.setAttribute('aria-busy', 'true');
+  fields.forEach((field) => { field.disabled = true; });
+  Promise.resolve().then(fn).finally(() => {
+    fields.forEach((field) => { field.disabled = false; });
+    card.removeAttribute('aria-busy');
+    btn.disabled = false;
+    if (SERVICE_SETTINGS_CARD_IDS.includes(card.id)) {
+      setServiceSettingsCardLoading(card.id, !serviceSettingsCardAvailable(card.id));
+    }
+  });
 }
 document.getElementById('set-save').addEventListener('click', () => saveGuarded('set-save', saveSettings));
 document.getElementById('test-provider').addEventListener('click', async (e) => {
@@ -1841,12 +1993,15 @@ document.getElementById('set-autostart-save').addEventListener('click', () => sa
 
 // ── Pause ─────────────────────────────────────────────────────────────────────
 
-document.getElementById('pause-btn').addEventListener('click', async () => {
+document.getElementById('pause-btn').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
   try {
     const result = await invoke('toggle_pause');
     toast(commandMessage(result, 'Pause state changed'), 'ok');
   }
   catch (e) { console.error('toggle_pause failed', e); toast('Could not change pause state: ' + e, 'err'); }
+  finally { btn.disabled = false; }
   refresh();
 });
 
@@ -1866,17 +2021,25 @@ document.getElementById('game-btn').addEventListener('click', async () => {
 
 const aboutSvcEl = document.getElementById('about-service-version');
 const aboutInstallBtn = document.getElementById('about-install-svc');
+const aboutUpdatesBtn = document.getElementById('about-updates');
 const aboutWarnEl = document.getElementById('about-version-warning');
+const aboutDescription = document.getElementById('about-description');
+const navUpdates = document.getElementById('nav-updates');
+const updaterCard = document.getElementById('card-updater');
+let aboutRequest = 0;
 
 async function refreshAbout() {
-  const [appVer, svcVer, svcState] = await Promise.all([
+  const request = ++aboutRequest;
+  const [appVer, svcVer, svcState, portable] = await Promise.all([
     invoke('get_app_version').catch(() => null),
     invoke('get_service_version').catch(() => null),
     invoke('get_service_state').catch(() => 'unknown'),
+    invoke('is_portable').catch(() => true),
   ]);
+  if (request !== aboutRequest) return;
   document.getElementById('about-version').textContent = `Version ${appVer || '—'}`;
 
-  let svcText = 'Service: ';
+  let svcText = portable ? 'Portable service: ' : 'Service: ';
   if (svcState === 'not_installed') {
     svcText += 'not installed';
   } else if (svcVer) {
@@ -1889,8 +2052,28 @@ async function refreshAbout() {
   }
   aboutSvcEl.textContent = svcText;
 
-  const installable = svcState === 'not_installed' || svcState === 'unknown';
+  const installable = !portable && (svcState === 'not_installed' || svcState === 'unknown');
+  runtimePortable = portable;
+  const autostartCard = document.getElementById('card-autostart');
+  autostartCard.hidden = portable;
+  navUpdates.hidden = portable;
+  updaterCard.hidden = portable;
+  aboutDescription.textContent = portable
+    ? 'Portable Eir monitors while this app is open and runs its service under your Windows account. Administrator-only repairs, continuous background monitoring, Start with Windows, and unattended app updates require the full installer.'
+    : 'Eir is an autonomous Windows system guardian. A LocalSystem service watches the event log, application logs, services and security posture; an AI model diagnoses problems the moment they appear; reversible whitelisted fixes run automatically and anything disruptive waits here for your approval. It also keeps your installed apps up to date unattended, and learns this machine’s quirks as it goes.';
+  console.assert(autostartCard.hidden === portable,
+    'Portable mode must not expose installed-app startup controls');
+  console.assert(navUpdates.hidden === portable && updaterCard.hidden === portable,
+    'Portable mode must not expose privileged app-update controls');
+  if (portable && document.getElementById('view-updates').classList.contains('active')) {
+    showView('dashboard');
+  }
+  if (!portable && document.getElementById('view-settings').classList.contains('active')
+      && !dirtyCards.has('card-autostart')) {
+    fillAutostartSetting();
+  }
   aboutInstallBtn.style.display = installable ? 'inline-block' : 'none';
+  aboutUpdatesBtn.style.display = portable ? 'none' : 'inline-block';
 
   if (appVer && svcVer && appVer !== svcVer) {
     aboutWarnEl.textContent = `Warning: UI (${appVer}) and service (${svcVer}) versions differ — restart the service or reinstall Eir.`;
@@ -1915,16 +2098,21 @@ aboutInstallBtn.addEventListener('click', async () => {
 });
 
 document.getElementById('about-github').addEventListener('click', () => {
-  invoke('open_url', { url: 'https://github.com/Swatto86/eir' }).catch(() => {});
+  invoke('open_url', { url: 'https://github.com/Swatto86/eir' })
+    .catch((e) => toast('Could not open GitHub: ' + e, 'err'));
 });
 
-document.getElementById('about-updates').addEventListener('click', async () => {
+aboutUpdatesBtn.addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
   const st = document.getElementById('about-status');
+  btn.disabled = true;
   st.textContent = 'Checking… if an update is found it will download and restart automatically (this can take a few minutes).';
   try {
     st.textContent = await invoke('check_updates_now');
   } catch (e) {
     st.textContent = 'Check failed: ' + e;
+  } finally {
+    btn.disabled = false;
   }
 });
 

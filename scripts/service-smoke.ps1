@@ -14,11 +14,15 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
 }
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
-$runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
-$smokeRoot = Join-Path $runnerTemp ("eir-service-smoke-" + [guid]::NewGuid().ToString('N'))
+$programFilesFolder = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
+if ([string]::IsNullOrWhiteSpace($programFilesFolder)) {
+    throw 'Windows did not return a Program Files directory.'
+}
+$programFiles = [IO.Path]::GetFullPath($programFilesFolder).TrimEnd('\')
+$smokeRoot = Join-Path $programFiles ("EirServiceSmoke-" + [guid]::NewGuid().ToString('N'))
 $resolvedSmoke = [IO.Path]::GetFullPath($smokeRoot)
-if (-not $resolvedSmoke.StartsWith($runnerTemp + '\', [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Smoke directory escaped RUNNER_TEMP: $resolvedSmoke"
+if (-not $resolvedSmoke.StartsWith($programFiles + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Smoke directory escaped Program Files: $resolvedSmoke"
 }
 
 New-Item -ItemType Directory -Path $resolvedSmoke | Out-Null
@@ -114,6 +118,20 @@ finally {
         }
         $service.Dispose()
         & $smokeExe uninstall
+        if ($LASTEXITCODE -ne 0) {
+            throw "Service uninstaller exited with code $LASTEXITCODE"
+        }
+        $deleteDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        $remainingService = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        while ($remainingService -and [DateTime]::UtcNow -lt $deleteDeadline) {
+            $remainingService.Dispose()
+            Start-Sleep -Milliseconds 250
+            $remainingService = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        }
+        if ($remainingService) {
+            $remainingService.Dispose()
+            throw "Service registration remained after uninstall: $serviceName"
+        }
     }
     if (Test-Path -LiteralPath $resolvedSmoke) {
         Remove-Item -LiteralPath $resolvedSmoke -Recurse -Force

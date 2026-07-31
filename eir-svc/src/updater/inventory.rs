@@ -132,7 +132,7 @@ try {
 
 /// Enumerate installed applications from the registry Uninstall keys. Returns a list of
 /// `(display_name, display_version)` pairs, filtered for noise and deduplicated by
-/// name (lowercase). Per-user hives only appear if loaded. The script reads only
+/// stable app identity. Per-user hives only appear if loaded. The script reads only
 /// immediate registry children under fixed roots; it never expands install paths.
 pub async fn list_installed() -> Result<InventoryResult, String> {
     let mut cmd = std::process::Command::new("powershell");
@@ -147,7 +147,7 @@ pub async fn list_installed() -> Result<InventoryResult, String> {
 }
 
 /// Pure: parse the JSON emitted by the inventory script, drop noise and empty versions,
-/// and deduplicate by lowercase name (first wins).
+/// and deduplicate by stable app identity, keeping the newest registered version.
 fn parse_inventory(text: &str) -> Result<InventoryResult, String> {
     let inventory: RawInventory =
         serde_json::from_str(text).map_err(|e| format!("invalid registry inventory JSON: {e}"))?;
@@ -156,8 +156,9 @@ fn parse_inventory(text: &str) -> Result<InventoryResult, String> {
             "registry inventory exceeded the {MAX_INVENTORY_APPS}-app limit"
         ));
     }
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
+    let mut indexes: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut ambiguous = std::collections::HashSet::new();
+    let mut out: Vec<(String, String)> = Vec::new();
     let mut warnings = inventory.warnings;
     for e in inventory.apps {
         let name = e.name.trim();
@@ -167,14 +168,31 @@ fn parse_inventory(text: &str) -> Result<InventoryResult, String> {
             warnings.push("registry product entry exceeded field limits".to_string());
             continue;
         }
-        if name.is_empty() || version.is_empty() || is_noise(name) || !valid_app_id(&app_id(name)) {
+        let key = app_id(name);
+        if name.is_empty() || version.is_empty() || is_noise(name) || !valid_app_id(&key) {
             continue;
         }
-        let key = name.to_lowercase();
-        if !seen.insert(key) {
+        if ambiguous.contains(&key) {
             continue;
         }
+        if let Some(&index) = indexes.get(&key) {
+            let same = version.eq_ignore_ascii_case(&out[index].1)
+                || crate::updater::version::version_cmp(version, &out[index].1)
+                    == Some(std::cmp::Ordering::Equal);
+            if !same {
+                ambiguous.insert(key);
+            }
+            continue;
+        }
+        indexes.insert(key, out.len());
         out.push((name.to_string(), version.to_string()));
+    }
+    if !ambiguous.is_empty() {
+        out.retain(|(name, _)| !ambiguous.contains(&app_id(name)));
+        warnings.push(format!(
+            "{} ambiguous registry product registration(s) skipped",
+            ambiguous.len()
+        ));
     }
     Ok(InventoryResult {
         apps: out,
@@ -195,10 +213,22 @@ mod tests {
 {"name":"Eir","version":"0.27.5"}
 ],"warnings":["one hive was inaccessible"]}"#;
         let inventory = parse_inventory(json).expect("parse");
-        assert_eq!(inventory.apps.len(), 1);
-        assert_eq!(inventory.apps[0].0, "7-Zip");
-        assert_eq!(inventory.apps[0].1, "25.01");
-        assert_eq!(inventory.warnings, ["one hive was inaccessible"]);
+        assert!(inventory.apps.is_empty());
+        assert!(inventory
+            .warnings
+            .iter()
+            .any(|warning| warning == "one hive was inaccessible"));
+    }
+
+    #[test]
+    fn differing_duplicate_product_registrations_are_excluded_as_ambiguous() {
+        let json = r#"{"apps":[
+{"name":"Example Tool version 2.0","version":"2.0"},
+{"name":"Example Tool version 1.0","version":"1.0"},
+{"name":"Example Tool 1.5 (x64)","version":"1.5"}
+],"warnings":[]}"#;
+        let inventory = parse_inventory(json).expect("parse");
+        assert!(inventory.apps.is_empty());
     }
 
     #[test]

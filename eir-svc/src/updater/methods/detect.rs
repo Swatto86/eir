@@ -28,8 +28,17 @@ pub fn choco_path() -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
-pub fn choco_available() -> bool {
-    choco_path().is_some()
+pub async fn choco_path_async() -> Option<PathBuf> {
+    tokio::task::spawn_blocking(choco_path)
+        .await
+        .unwrap_or_else(|error| {
+            warn!("Chocolatey path lookup task failed: {error}");
+            None
+        })
+}
+
+pub async fn choco_available_async() -> bool {
+    choco_path_async().await.is_some()
 }
 
 /// Scoop shims live under user-writable profiles. Selecting one from the SYSTEM
@@ -49,8 +58,8 @@ static WINGET_RESOLUTION: OnceLock<WingetResolution> = OnceLock::new();
 /// winget is present on modern Windows. Checks the interactive PATH alias first,
 /// then resolves the real MSIX exe under `C:\Program Files\WindowsApps` — the latter
 /// is needed when EirSvc runs as LocalSystem, whose profile has no winget alias.
-pub fn winget_available() -> bool {
-    winget_path().is_some()
+pub async fn winget_available_async() -> bool {
+    winget_path_async().await.is_some()
 }
 
 /// Absolute path to `winget.exe`, or `None` if it cannot be found. Prefer the PATH
@@ -61,12 +70,30 @@ pub(crate) fn winget_path() -> Option<PathBuf> {
     WINGET_RESOLUTION.get_or_init(resolve_winget).path.clone()
 }
 
+pub(crate) async fn winget_path_async() -> Option<PathBuf> {
+    tokio::task::spawn_blocking(winget_path)
+        .await
+        .unwrap_or_else(|error| {
+            warn!("winget path lookup task failed: {error}");
+            None
+        })
+}
+
 /// Human-readable reason winget could not be resolved, or `None` if it is available.
 /// Surfaced in the updater note so a "winget not available" message is provably
 /// either a stale service binary (pre-resolution code) or a genuine SYSTEM-level
 /// failure.
 pub fn winget_unavailability_reason() -> Option<String> {
     WINGET_RESOLUTION.get_or_init(resolve_winget).reason.clone()
+}
+
+pub async fn winget_unavailability_reason_async() -> Option<String> {
+    tokio::task::spawn_blocking(winget_unavailability_reason)
+        .await
+        .unwrap_or_else(|error| {
+            warn!("winget availability lookup task failed: {error}");
+            Some("winget availability lookup failed".to_string())
+        })
 }
 
 fn resolve_winget() -> WingetResolution {
@@ -243,7 +270,7 @@ pub async fn bootstrap_choco() -> bool {
     ]);
     let (code, _out) =
         crate::updater::proc::run_capped_cmd(cmd, crate::updater::proc::INSTALL).await;
-    let ok = code == 0 && choco_available();
+    let ok = code == 0 && choco_available_async().await;
     if !ok {
         warn!("Chocolatey bootstrap did not complete (exit {code})");
     }
@@ -283,12 +310,15 @@ mod tests {
         assert!(!scoop_available());
     }
 
-    #[test]
-    fn winget_availability_and_reason_are_consistent() {
+    #[tokio::test]
+    async fn async_manager_resolution_matches_the_cached_sync_result() {
         // If winget resolves, there must be no unavailability reason; if it does not,
         // the reason must explain why. This guards the cache staying internally
         // consistent regardless of the machine state.
-        if winget_available() {
+        let winget = winget_path_async().await;
+        assert_eq!(winget, winget_path());
+        assert_eq!(choco_path_async().await, choco_path());
+        if winget.is_some() {
             assert!(
                 winget_unavailability_reason().is_none(),
                 "winget resolved but a reason was also recorded"

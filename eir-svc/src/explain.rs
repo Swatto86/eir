@@ -261,9 +261,16 @@ fn explain_network(command: &str) -> ActionExplanation {
 /// the system — currently the on-disk facts for `file_delete` and the full script
 /// for `powershell_diagnostic`. Returns an empty string when there is nothing
 /// inspectable. Does file I/O; call off the hot path.
-pub fn target_details(action: &FixAction) -> String {
+pub async fn target_details(action: &FixAction) -> String {
     match action {
-        FixAction::FileDelete { path } => file_facts(path),
+        FixAction::FileDelete { path } => {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || file_facts(&path))
+                .await
+                .unwrap_or_else(|_| {
+                    "Eir could not inspect this file. Nothing is previewed or deleted.".to_string()
+                })
+        }
         FixAction::PowerShellDiagnostic { script } => format!("Script to run:\n{script}"),
         _ => String::new(),
     }

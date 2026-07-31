@@ -1,4 +1,6 @@
 /target
 eir.db
 config.toml
+!.cargo/config.toml
 eir-ui/bin/
+eir-ui/Microsoft.WebView2.FixedVersionRuntime.*.x64/

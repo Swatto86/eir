@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-27 · **Release:** v0.33.0
+**Last updated:** 2026-07-31 · **Code:** v0.34.6
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -78,7 +78,7 @@ Eir is a single Cargo workspace (`resolver = "2"`) with three crates, plus a sta
 | `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service: signal collection, AI client, policy, execution, autonomous updater, SQLite audit DB. Heavy `windows` 0.58 feature set. |
 | `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), `windows-service` 0.7 (SCM queries + install from About), tracing. `build-dependencies`: `tauri-build` 2. |
 
-All three crates are versioned in lockstep — currently `0.33.0` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json`. `scripts/check-versions.ps1` gates CI on all four agreeing.
+All three crates are versioned in lockstep — currently `0.34.6` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json` and the three corresponding `Cargo.lock` package entries. `scripts/check-versions.ps1` gates all seven values.
 
 The dependency graph is acyclic and points inward: `eir-proto` depends on nothing internal; `eir-svc` and `eir-ui` each depend only on `eir-proto`. The UI and service never link against each other — they are separate processes coupled solely through the `eir-proto` wire contract over `\\.\pipe\EirSvc`.
 
@@ -94,10 +94,16 @@ The dependency graph is acyclic and points inward: `eir-proto` depends on nothin
 - `beforeBuildCommand`: `powershell -NoProfile -ExecutionPolicy Bypass -File eir-ui\build-svc.ps1`
 - `beforeDevCommand`: `""` (empty)
 
-`eir-ui/build-svc.ps1` is the single generated-artifact step. It:
-1. `cargo build -p eir-svc --release` (exits 1 on failure).
-2. Resolves the workspace target dir via `cargo metadata --no-deps` → `.target_directory`.
-3. Copies `<target>/release/eir-svc.exe` → `eir-ui/bin/eir-svc.exe`, creating `bin/` if absent.
+`eir-ui/build-svc.ps1` prepares the two generated bundle inputs. It:
+1. Runs `scripts/prepare-webview2.ps1`, which caches only the pinned fixed WebView2 CAB,
+   verifies its SHA-256, always expands it into a fresh staging directory, verifies the
+   extracted runtime executable's Authenticode signature, and only then replaces the
+   generated runtime directory.
+2. Runs `cargo build --locked -p eir-svc --release` (exits 1 on failure).
+3. Resolves the workspace target dir via `cargo metadata --locked --no-deps` →
+   `.target_directory`.
+4. Copies `<target>/release/eir-svc.exe` → `eir-ui/bin/eir-svc.exe`, creating `bin/`
+   if absent.
 
 `eir-ui/bin/` is **gitignored** (`.gitignore:4` `eir-ui/bin/`; `git check-ignore` confirms `eir-ui/bin/eir-svc.exe` is ignored). So the staged service binary is a build-time artifact, never committed. `tauri.conf.json` `bundle.resources` then pulls it into the installer:
 ```
@@ -107,7 +113,13 @@ The dependency graph is acyclic and points inward: `eir-proto` depends on nothin
 ```
 This means `eir-svc.exe` ends up at the install root (renamed from `bin/`), alongside the config template and policy file. This is the project-specific application of the user's Tauri rule "wire `beforeBuildCommand` to every generated-frontend-asset step" — here the only generated artifact is the service binary, so that's what the hook builds.
 
-**Build data flow:** `cargo tauri build` (in `eir-ui`) → runs `build-svc.ps1` (compiles + stages `eir-svc.exe` into `eir-ui/bin/`) → `tauri_build`/`tauri-codegen` embeds `ui/` HTML+JS into the `eir` binary → NSIS bundler packages `eir.exe` + `eir-svc.exe` + `config.toml.example` + `policy.toml` + installer hooks into `Eir_<version>_x64-setup.exe`, plus signed updater artifacts (`createUpdaterArtifacts: true`).
+**Build data flow:** `cargo tauri build -- --locked` (in `eir-ui`) → runs `build-svc.ps1`
+(verifies/expands the fixed WebView2 runtime and stages `eir-svc.exe`) →
+`tauri_build`/`tauri-codegen` embeds `ui/` HTML+JS into `eir.exe` → NSIS packages the
+UI, service, config/policy, installer hooks, and fixed runtime into
+`Eir_<version>_x64-setup.exe`, plus signed updater artifacts
+(`createUpdaterArtifacts: true`). `webviewInstallMode.type = "fixedRuntime"` removes
+the runtime-install prerequisite from both fresh and offline installs.
 
 ### Toolchain pinning
 
@@ -115,25 +127,41 @@ This means `eir-svc.exe` ends up at the install root (renamed from `bin/`), alon
 
 ### CI gate (`.github/workflows/ci.yml`)
 
-Triggers: `push` to `master`, and all `pull_request`. `permissions: contents: read`. Single job `verify` on `windows-latest`:
-1. `actions/checkout@v6`, then `scripts/check-versions.ps1`.
-2. `dtolnay/rust-toolchain@1.95.0` with `rustfmt, clippy`, then `swatinem/rust-cache@v2`.
-3. **Format**: `cargo fmt --all --check`.
-4. **Stage service binary**: runs `build-svc.ps1` — required because `eir-ui`'s `tauri_build` validates bundle resources during clippy/tests.
-5. **Clippy/test**: `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace --all-targets`.
-6. **Full Tauri build**: `tauri-apps/tauri-action@v0` builds and signs the real bundle without publishing.
-7. **Installed-service smoke**: installs the staged binary as `EirSvc`, verifies it is running as LocalSystem, negotiates protocol capabilities, and requires a successful correlated pause command over the real pipe.
-8. **Standalone smoke**: launches `target/release/eir.exe` and requires it to remain running.
+Triggers: `push` to `master`, and all `pull_request`. `permissions: contents: read`.
+The workflow has a Windows verification job plus an Ubuntu job that audits the Windows
+Rust dependency graph:
+1. `actions/checkout@v6`, manifest/Cargo.lock version sync, the compiled NSIS-hook
+   harness, release-workflow regressions, and the portable-runner regression.
+2. `dtolnay/rust-toolchain@1.95.0` with `rustfmt, clippy`, Rust caching, and fixed
+   WebView2-CAB-only caching; every build re-derives the expanded runtime.
+3. JavaScript syntax and Rust formatting checks.
+4. **Stage service binary**: runs `build-svc.ps1` — required because `eir-ui`'s
+    `tauri_build` validates bundle resources during clippy/tests.
+5. **Clippy/test**: locked `cargo clippy --workspace --all-targets -- -D warnings` and
+   `cargo test --workspace --all-targets`.
+6. **Full Tauri build**: `tauri-apps/tauri-action@v0` builds and signs the real bundle
+   with the lockfile enforced, without publishing.
+7. **Portable boundary/import check**: verifies the release executables' imports before
+   packaging.
+8. **Installed-service smoke**: installs the staged binary as `EirSvc`, verifies it is
+    running as LocalSystem, negotiates protocol capabilities, and requires a successful
+    correlated pause command over the real pipe.
+9. **Standalone and portable smoke**: launches the release executable and builds/runs
+   the self-contained portable package.
 
 The early staging and the bundle build's `beforeBuildCommand` both build the service; this is intentional because clippy/tests need the resource before the bundle step.
 
-The green CI gate is the only pre-release bar (matches the user's "no manual/live-test gate" policy).
+The exact release commit must pass this workflow before it is tagged.
 
 ### Local gate scripts and lint policy
 
-`scripts/fastcheck.ps1` (fmt + clippy) is the per-edit check; `scripts/verify.ps1` runs
-`check-versions.ps1` → fmt → clippy → tests, mirroring steps 1–5 of CI so a commit arrives
-already green. Neither builds the bundle — that stays a CI/`cargo tauri build` step.
+`scripts/fastcheck.ps1` runs JavaScript syntax, formatting, conditional service staging,
+and locked clippy. `scripts/verify.ps1` runs manifest/Cargo.lock version sync, the
+compiled installer-hook harness, release/portable regressions, JavaScript syntax,
+formatting, unconditional service/runtime staging, locked clippy and all-target tests, a
+locked workspace release build, portable import checks, and `cargo deny` for the Windows
+target. It does not build the NSIS bundle — that stays a separate locked
+`cargo tauri build`/CI step.
 
 `[workspace.lints.clippy]` (root `Cargo.toml`) sets `unwrap_used` and `expect_used` to
 `warn`, which the `-D warnings` gate turns into build failures; all three crates take
@@ -148,12 +176,21 @@ which both call Win32 directly.
 
 ### Tag-driven signed release (`.github/workflows/release.yml`)
 
-Triggers: `push` of tags matching `v*`. `permissions: contents: write`. Single job `release` on `windows-latest`:
-1. `actions/checkout@v6`
-2. `dtolnay/rust-toolchain@1.95.0` (no components — release doesn't lint)
-3. `swatinem/rust-cache@v2`
-4. `tauri-apps/tauri-action@v0` with `projectPath: eir-ui`, `tagName: ${{ github.ref_name }}`, `releaseName: Eir ${{ github.ref_name }}`, a templated `releaseBody`, `releaseDraft: true`, `prerelease: false`. Env: `GITHUB_TOKEN` + the two `TAURI_SIGNING_*` secrets.
-5. A PowerShell step uploads the portable executable and checksums, verifies the installer, updater metadata/signature, portable binary, and checksum assets, then publishes the draft.
+Triggers: `push` of tags matching `v*`. An Ubuntu dependency-audit job must pass before
+the Windows release job, whose write permission is scoped to release contents:
+1. Both jobs explicitly check out `${{ github.sha }}`. The release job verifies HEAD is
+   that SHA and requires the tag to equal exactly `v<manifest-version>`.
+2. The release job reruns the packaging regressions, JavaScript syntax, formatting,
+   locked clippy/tests, and locked service staging from that checkout.
+3. `tauri-apps/tauri-action@v0` performs a locked build and creates a draft release with
+   the signed installer and updater artifacts.
+4. The workflow verifies portable imports, the installed LocalSystem service, the
+   standalone UI, and the smoke-tested self-contained portable executable.
+5. It uploads the portable executable and checksums, then requires exactly one
+   version-matching installer, its exact `<installer>.sig`, `latest.json`, the portable,
+   and checksums. The downloaded metadata must contain the manifest version, the exact
+   tag-scoped installer URL, and the exact signature asset contents before the draft is
+   published.
 
 Because `tagName` is set, `tauri-action` builds, signs, and creates a **draft** GitHub release with the NSIS installer (`Eir_<version>_x64-setup.exe`), `latest.json`, and the `.sig`. The release is not public until every required asset has been verified. The signing keypair is minisign; the public key is embedded in `tauri.conf.json` `plugins.updater.pubkey` (base64 minisign public key).
 
@@ -162,26 +199,73 @@ Because `tagName` is set, `tauri-action` builds, signs, and creates a **draft** 
 `tauri.conf.json` `plugins.updater.endpoints` is a single URL:
 `https://github.com/Swatto86/eir/releases/latest/download/latest.json`. It points at the **`/latest/`** redirect, so the installed app always fetches whichever release is newest — the single-rolling-release model. `createUpdaterArtifacts: true` ensures `latest.json` + `.sig` ship beside the installer. The unauthenticated `/latest/download/` fetch requires the release repo to be public.
 
-The NSIS install hooks (`eir-ui/installer-hooks.nsh`, wired via `bundle.windows.nsis.installerHooks`, `installMode: perMachine`) make self-update actually work over a running service:
-- **PREINSTALL**: `sc stop EirSvc`, poll for STOPPED for up to ~40 s, then `sc delete EirSvc` before files are replaced.
-- **POSTINSTALL**: seed `config.toml` from `config.toml.example` on first install, delete the template, then run `eir-svc.exe install`; the install verb registers and starts the service.
-- **PREUNINSTALL**: stop/unregister the service, then remove the current user's Eir autostart values and Tauri config directory.
+The NSIS install hooks (`eir-ui/installer-hooks.nsh`, wired via
+`bundle.windows.nsis.installerHooks`, `installMode: perMachine`) make service upgrades
+transactional at the boundary:
+- **PREINSTALL**: let the user cancel before mutation; force the canonical Program Files
+   directory; reject a redirected install root; inspect and stop the retained service;
+   preserve its protected binary for rollback; migrate only ordinary, local, single-link
+   config/database/log files while each source is held open with write/delete sharing
+   denied, copying into fresh protected paths; and remove every known bundle output
+   before elevated copying.
+- **POSTINSTALL**: reset owner/ACLs on the root and every Eir-owned file; seed config on
+  first install; run the service's fail-closed install/update verb; remove validated
+  legacy state only after the protected service starts; and preserve an existing
+  per-user autostart choice. Failure/abort callbacks restore and restart the prior
+  in-place service when safe.
+- **PREUNINSTALL**: stop and delete the registered service with absolute System32 tools,
+  then remove only validated current-user Eir autostart/configuration paths without
+  following reparse points.
 - **POSTUNINSTALL**: empty.
 
 `bundle.windows.allowDowngrades: false`; targets `["nsis"]` only; main window `visible: false`. Manual launches show/focus it during Tauri setup; Windows-login autostart passes `--hidden` so it stays in the tray.
 
+### Portable runtime boundary
+
+The portable artifact self-extracts the UI, EirSvc, default config/policy, and pinned
+WebView2 runtime, then `portable-run.ps1` owns their lifecycle. A native
+`Local\EirPortable` mutex permits one portable instance per Windows session without
+colliding with the installed app. The runner opens a delete-on-close sibling sentinel;
+EirSvc polls that lease and exits when the runner closes or dies. It starts EirSvc only
+with a default or limited user token—never LocalSystem or a split full-elevation token.
+
+Each launch uses a random `\\.\pipe\EirSvcPortable-<nonce>` pipe. The service accepts
+only the same-user sibling `eir.exe`; the UI accepts only the same-user, same-session
+sibling `eir-svc.exe`. This portable path is separate from the installed LocalSystem
+pipe and cannot control the installed service.
+
+Extraction is ephemeral, but state is not. The runner atomically seeds missing
+`config.toml` and `policy.toml` into `%LOCALAPPDATA%\EirPortable`; the service accepts
+only that exact existing local, non-reparse directory and resolves relative config,
+audit database, policy, and log paths beneath it. Portable mode does not register
+Start-with-Windows, run the NSIS updater, or invoke the installed-service restart helper.
+Collector-setting changes are saved and take effect after the user restarts portable Eir.
+
+The Windows MSVC target uses static CRT linkage. The portable import gate rejects UI or
+service binaries that still import `VCRUNTIME*.dll`, `MSVCP*.dll`, or
+`WebView2Loader.dll`, keeping the published executable free of unshipped runtime DLL
+prerequisites. The v0.34.6 portable package passed the real extraction, fixed-WebView,
+private-pipe, persistence, shutdown, and cleanup smoke locally.
+
 ### Version-bump locations
 
-A release version lives in **four** places that must move together:
+A release version has **four authoritative manifest declarations** that must move
+together, plus three derived lockfile entries:
 - `eir-ui/tauri.conf.json` → `"version"` (drives installer filename, About, updater compare).
 - `eir-proto/Cargo.toml`, `eir-svc/Cargo.toml`, `eir-ui/Cargo.toml` → `[package] version`.
-- `Cargo.lock` must be re-synced (it is present and tracked, 152 KB).
+- `Cargo.lock` must contain exactly one matching package entry for each crate.
 
 There is **no `package.json`**, so the WattMail blueprint's "bump `package.json`" step does not apply here. The release-commit `[release]` marker convention is visible in git history (e.g. `0752c08 ... (v0.10.2) [release]`).
 
 ### Build/release control flow (summary)
 
-Developer bumps the 3 `Cargo.toml` versions + `tauri.conf.json` + `Cargo.lock`, commits with `[release]`, pushes to `master`, waits for CI on that exact SHA, then pushes tag `vX.Y.Z` → `release.yml` builds the signed bundle as a draft, verifies every asset, and publishes the rolling GitHub release → installed clients poll `releases/latest/download/latest.json`, verify the minisign `.sig` against the embedded pubkey, and self-update (NSIS hooks stop/replace/restart `EirSvc`).
+Developer bumps the 3 `Cargo.toml` versions + `tauri.conf.json`, refreshes `Cargo.lock`,
+commits with `[release]`, pushes to `master`, waits for CI on that exact SHA, then pushes
+the exact tag `vX.Y.Z` → `release.yml` checks out and gates that tag SHA, builds the
+signed bundle as a draft, verifies the exact installer/signature and updater metadata,
+and publishes the rolling GitHub release → installed clients poll
+`releases/latest/download/latest.json`, verify the minisign `.sig` against the embedded
+pubkey, and self-update (NSIS hooks stop/replace/restart `EirSvc`).
 
 ## Pipe protocol & tray UI
 
@@ -221,11 +305,21 @@ Supporting types:
 A pipe created by a LocalSystem service defaults to granting only SYSTEM + Administrators, so a non-elevated, medium-integrity UI would get "Access is denied." `build_pipe_security_descriptor()` builds an explicit descriptor from the SDDL string:
 
 ```
-D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;NW;;;ME)
+D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x0012008b;;;IU)S:(ML;;NWNR;;;ME)
 ```
 
-- **DACL**: SYSTEM (`SY`) and Administrators (`BA`) get full control; Interactive Users (`IU`) get read/write. Every accepted connection is resolved to its client process/session and its own WTS state must be `WTSActive` (covering active console or RDP desktops); the state is rechecked during reads and writes, so disconnecting or switching users invalidates the old client.
-- **SACL mandatory label**: `S:(ML;;NW;;;ME)` sets a **Medium** integrity label with the no-write-up (`NW`) policy. Without this the pipe inherits the creator's System integrity and Windows' no-write-up rule would silently let the medium-integrity UI *read* but block its *writes* (Approve/Reject/Pause). Labelling the pipe Medium permits the UI's writes while still blocking Low-integrity (sandboxed) processes.
+- **DACL**: SYSTEM (`SY`), Administrators (`BA`), and the object owner (`OW`) get
+  full control. Owner Rights lets the unelevated portable creator open subsequent
+  server instances after a disconnect; installed mode's owner is already privileged.
+  Interactive Users (`IU`) get the read/write/synchronise rights needed for a client
+  but not `FILE_CREATE_PIPE_INSTANCE`.
+- **SACL mandatory label**: `S:(ML;;NWNR;;;ME)` labels the pipe **Medium** and blocks
+  Low-integrity processes from both writing and reading. Every connection must also
+  be the installed sibling `eir.exe` (or an elevated administrator) in the sole active
+  console/RDP session. The service holds the process handle across identity checks and
+  rechecks the session during reads, writes, and a full command-queue wait; disconnecting
+  or switching users releases the only listener. Portable same-path hashes are not
+  accepted as process identity because the file could be replaced after launch.
 
 Implementation details: the descriptor is **intentionally leaked** and returned as a `usize` (not a raw pointer) so it can cross the listener's `.await` points (a raw pointer is not `Send`); `pipe_server.rs:32,47`. The `SECURITY_ATTRIBUTES` is constructed inside a block that ends before the first `.await`, so the non-`Send` pointer is never held across an await (`pipe_server.rs:83-104`), and the pipe is created via `create_with_security_attributes_raw`. If descriptor construction fails the server falls back to a default-ACL pipe and warns (`pipe_server.rs:77-79, 102`).
 
@@ -233,9 +327,17 @@ Implementation details: the descriptor is **intentionally leaked** and returned 
 
 - `spawn()` creates a `watch::channel<StatusPayload>` (status fan-out) and an `mpsc::channel<UiMsg>` (size 8, command intake), returns a `PipeServer { status_tx }` plus the `UiMsg` receiver, and spawns `listener_task` (`pipe_server.rs:54-69`).
 - `PipeServer::broadcast_status()` just does `status_tx.send()` — the rest of the service pushes a fresh snapshot here whenever state changes (`pipe_server.rs:187-191`).
-- **Listener loop**: connects one client, enforces the active-session identity, then splits it. The writer sends a protocol-v2 starting snapshot immediately and broadcasts status/command results; the bounded reader rejects oversized lines, deserializes `UiRequest`, and forwards commands plus correlation ids to the decision loop. Bad messages are logged and skipped.
+- **Listener loop**: connects one client, enforces process and active-session identity,
+  then splits it. The writer sends a protocol-v2 starting snapshot and broadcasts
+  status/command results; both directions cap a JSON line at 12 MiB. Status projection
+  also bounds approval/learned-fact collections and non-finite numbers, with a smaller
+  recovery projection if a snapshot still cannot fit. Oversized inbound frames drop the
+  connection; malformed bounded messages are logged and skipped.
 - **Single-consumer design**: the listener handles one connection at a time; on disconnect (`read_line` returns `Ok(0)` EOF) it aborts the writer task and loops back to accept the next client (`pipe_server.rs:182-184`). There is no concurrent multi-client support.
-- **Critical invariant**: Approve/Reject are resolved only by the decision loop against the persistent queue. Claiming is atomic in SQLite; approved-but-not-completed rows reload after a service restart, while rejected rows cannot resurrect.
+- **Critical invariant**: Approve/Reject are resolved only by the decision loop against
+  the persistent queue. Claiming is atomic in SQLite; rejected rows cannot resurrect,
+  and an approved-but-not-durably-completed row returns to pending at startup for a
+  fresh click instead of being replayed.
 
 ### UI side: pipe client (`eir-ui/src/pipe_client.rs`)
 
@@ -243,6 +345,10 @@ Implementation details: the descriptor is **intentionally leaked** and returned 
 - **Connected flag (v0.24.1)**: `connect_and_run` stores `true` into the shared `connected` flag the moment the pipe opens and `run_on` stores `false` the moment the connection ends. Command handlers gate on it via `ensure_connected` (below), so a click made while the service is down or mid-restart fails loudly instead of being queued and then silently dropped by the stale-command drain. The flag flip is covered by a `pipe_client` unit test.
 - On disconnect it overwrites the cached status to `"ServiceDisconnected"` with an actionable error string telling the user to install/start the service. A clean EOF (settings-save restart) instead shows `"Connecting"`; both are among the frontend's `svc-down` states.
 - `connect_and_run` opens the client with retry handling: `ERROR_FILE_NOT_FOUND` (os err 2) → bubble up (pipe not created yet, triggers reconnect); `ERROR_PIPE_BUSY` (231) → 50ms retry; other errors → propagate (`pipe_client.rs:45-59`).
+- Before marking the connection live, the UI resolves the named-pipe server PID and
+  verifies that SCM registers that exact process as the running LocalSystem `EirSvc`,
+  with an ordinary local non-reparse `eir-svc.exe` image. An arbitrary same-user pipe
+  server therefore cannot impersonate the service.
 - **Read and write are separate loops joined by `select!`** (`pipe_client.rs:71-112`). The read loop deserializes `ServiceMsg::Status` and replaces `*status.lock()` wholesale. The write loop drains `cmd_rx` and writes each command as a JSON line + flush. A documented design note explains *why* they're separate: a previous single-`select!` design cancelled the in-flight `read_line` on every command send, and `read_line` is not cancellation-safe, corrupting the status stream and starving writes (`pipe_client.rs:66-70`).
 
 ### Tauri command surface (`eir-ui/src/main.rs`)
@@ -294,7 +400,7 @@ The frontend was fully rebuilt in v0.17 (still hand-written vanilla HTML/CSS/JS,
 - **Activity feed** merges `recent_problems` + `recent_executions` into one list sorted by `at` descending, with emoji/tag per kind (`activityItems`).
 - **v0.24.3 UX pass**: Escape hides the window (blurs first when a field has focus); Ask Eir sends on plain Enter (Shift+Enter = newline, IME composition guarded); every `data-ts` relative age gets an absolute local-time tooltip (set once per element); the sidebar Pause button turns amber with a ▶ icon while paused; a config-shaped `status.error` (provider/key/model/config) surfaces an "Open Settings" quick link in the hero; the Disk/Startup card headers summarise the last scan ("2.1 GB cleanable" / "12 entries, 3 disabled"); the "What the agent is thinking" meta line shows "analysed Xm ago" from the new `last_analysis_at` wire field; and numeric settings inputs are clamped to their declared min/max on save (`numVal`).
 - **v0.25.1 UX pass** (frontend-only, no wire/service change): **toasts** (`toast(msg, kind)` → `#toast-wrap`, `textContent` only, auto-dismiss 2.6 s / 5 s for errors, click-to-dismiss, stack capped at 4) originally gave the then-fire-and-forget commands a neutral acknowledgement. Protocol v2 supersedes that constraint: current toasts use the returned command outcome, while neutral “queued” wording remains only for an older service during version skew. **Copy-to-clipboard** (`copyText`, `navigator.clipboard` with a textarea/`execCommand` fallback) on the hero error and per-approval target+details supports pasting a diagnosis elsewhere. **Activity filter chips** (All / Fixes / Diagnoses / Failures): `activityItems` tags each row `type` (`fix`/`diag`) + `fail`; `renderActivity` filters via `matchesActivityFilter`, folds `activityFilter` into the signature so a chip switch forces one rebuild, and keeps undo bookkeeping keyed on the *unfiltered* list so a hidden row cannot drop its in-flight Undo.
-- **Settings** is a full view (no modal) populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. The App Updates card shows the persisted ignored IDs only when the list is non-empty and restores one through the existing `set_app_ignore` command, so refresh cannot strand an ignored app. Since v0.24.3 the view guards unsaved edits; v0.24.4 made the tracking **per-card** (`dirtyCards` set keyed on the four card ids `card-autostart`/`card-provider`/`card-advisor`/`card-updater`): any input marks its enclosing card dirty, a successful save clears only that card, a fill clears all, and re-entering the view refills only when no card is dirty — so saving the advisor card no longer discards unsaved edits still sitting in the provider card. The grouped provider select offers OpenRouter / Anthropic API / Claude CLI / Codex CLI / Kilo CLI and hides fields irrelevant to the selected provider. All three model controls use one native filterable `datalist`; `list_provider_models` reads OpenRouter's live catalogue, `codex debug models`, or `kilo models`, with static Claude and offline fallbacks. A request sequence rejects stale provider-A results after a switch to B, while per-provider in-memory selections and persisted-but-vanished ids remain visible. Changing provider clears incompatible model controls; the service also clears the old advisor escalation model at the authoritative config boundary. JS pre-validates key/model requirements before sending (`AiClient::new` remains authoritative). Provider/model settings apply live; only collector channels/poll intervals/log directories trigger the restart helper.
+- **Settings** is a full view (no modal) populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. The App Updates card shows the persisted ignored IDs only when the list is non-empty and restores one through the existing `set_app_ignore` command, so refresh cannot strand an ignored app. Since v0.24.3 the view guards unsaved edits; v0.24.4 made the tracking **per-card** (`dirtyCards` set keyed on the four card ids `card-autostart`/`card-provider`/`card-advisor`/`card-updater`): any input marks its enclosing card dirty and a successful save clears only that card. A disconnect invalidates the cached service settings and disables those controls; the next complete snapshot rehydrates each clean card independently while retaining dirty edits, and updater/advisor cards stay disabled and retry hydration until their nested snapshots exist. The grouped provider select offers OpenRouter / Anthropic API / Claude CLI / Codex CLI / Kilo CLI and hides fields irrelevant to the selected provider. All three model controls use one native filterable `datalist`; `list_provider_models` reads OpenRouter's live catalogue, `codex debug models`, or `kilo models`, with static Claude and offline fallbacks. A request sequence rejects stale provider-A results after a switch to B, while per-provider in-memory selections and persisted-but-vanished ids remain visible. Changing provider clears incompatible model controls; the service also clears the old advisor escalation model at the authoritative config boundary. JS pre-validates key/model requirements before sending (`AiClient::new` remains authoritative). Provider/model settings apply live; only collector channels/poll intervals/log directories trigger the restart helper.
 
 ### Clear / Approve / Ignore / Update-now flows
 
@@ -315,7 +421,15 @@ The heart of `eir-svc` is a single async supervisory loop in `eir-svc/src/main.r
 
 - `define_windows_service!(ffi_service_main, svc_main)` (line 42) wires the SCM entry point.
 - `run_service()` (lines 50-102) registers an event handler that, on `Stop`/`Shutdown`, sets a shared `AtomicBool`; reports `ServiceState::Running` (accepting STOP|SHUTDOWN); builds the runtime; and `block_on(eir_main(...))` where the shutdown future polls the atomic every 500 ms (lines 81-89). After the loop returns it reports `ServiceState::Stopped`. `Interrogate` returns `NoError`; other controls return `NotImplemented`.
-- `install_service()` (104-128) creates the service as `OWN_PROCESS`, `AutoStart`, `account_name: None` (i.e. **LocalSystem**). `uninstall_service()` (130-139) stops then deletes it.
+- The `install` verb delegates to `service_install::install_or_update`. It accepts only
+  an ordinary, single-hardlink `eir-svc.exe` inside one application-directory level
+  beneath a Windows known Program Files root; rejects UNC, traversal, and any reparse
+  component before and after canonicalisation; resets the install-directory/binary
+  owner and inherited ACL through absolute System32 `icacls.exe`; then creates or
+  updates an `OWN_PROCESS`, `AutoStart`, **LocalSystem** registration with least SCM
+  access. Existing registration must already be LocalSystem and fully stopped. The
+  verb reads configuration/status back and fails unless the protected path and running
+  state were retained. `uninstall_service()` stops then deletes it.
 
 ### `SvcState` — the single owned state struct (lines 164-224)
 
@@ -339,7 +453,11 @@ Not shared/locked — it lives on the loop task and is mutated inline; the UI se
 5. Inits SQLite (`audit::init_db`), cleans stale updater staging, seeds `updater`/`advisor` status from config + history, sets `advisor_spend_date` to today.
 6. **AI client init is non-fatal** (646-656): a bad AI config sets `status="Error"` + an actionable error and leaves `ai = None`, but the service keeps running so Settings stays usable. The post-warmup settle (and its `resting_status` re-settle) is gated on `ai.is_some()` (v0.24.4) — it previously cleared this error before the first broadcast, leaving a mis-configured provider looking healthy forever.
 7. Spawns signal collectors: `event_log`, `file_watch` (after `discover_watch_dirs`), `wmi`. Sleeps 5 s to let them warm up.
-8. Restores `usage_summary` plus pending approvals from the DB. Durably claimed (`approved`) rows are replayed into the executor after its channel starts, so a service crash cannot lose an accepted action. Legacy active rows have their semantic action keys backfilled and duplicates removed before either queue is loaded.
+8. Restores `usage_summary` and approvals from the DB. A durably claimed (`approved`)
+   row proves only that the click was recorded—not whether an external effect happened
+   before a crash—so startup atomically returns it to `pending` for fresh approval.
+   Legacy active rows have semantic keys backfilled and duplicates removed before the
+   bounded pending page is loaded.
 9. Sets up the decision `ticker` (`cfg.monitoring.decision_interval_secs`), channels, and the executor worker (below).
 
 ### The `tokio::select!` decision loop (lines 729-1378)
@@ -373,7 +491,12 @@ The outer `tokio::select!` races the main loop future against the `shutdown` fut
 - `ClearProblems` / `ClearExecutions` / `ClearAsk` → clear the respective deque / Ask history.
 - `RefreshStatus` → force a fast services-only rescan (`wmi::rescan_failed_services`, no PowerShell), overwrite `failed_services`, re-settle `resting_status`, and broadcast — clears a recovered service on demand. Deliberately does **not** touch `st.error` (that is a live AI/config error, not stale status).
 - `UpdateSettings` → `apply_update`, compute `settings_update_needs_restart` **before** mutating config, **validate by constructing a fresh `AiClient`**; on failure reject and reload config from disk (never apply a bricked provider); on success save config. If the update changed collector spawn parameters (event-log channels, event-log/WMI poll intervals, log directories), `restart_self()` then `return`; otherwise the new AI client, policy confidence threshold, and decision ticker are swapped live without a restart. If the restart helper fails to spawn, the service stays alive on the old settings and surfaces an error instead of stopping with nothing to start it again.
-- `Approve { id, approved }` atomically claims a still-pending database row. An accepted row remains durable as `approved` until the executor transaction either completes it or requeues it; startup replays claimed rows after a crash. Current policy and target preflight are rechecked before execution. A rejection is recorded for learning and then retired. Always resettle status + broadcast.
+- `Approve { id, approved }` atomically claims a still-pending database row. An
+  accepted row remains durable as `approved` until the executor transaction completes
+  or requeues it; startup requeues an interrupted claim for a fresh click rather than
+  replaying an uncertain external action. Current policy and target preflight are
+  rechecked before execution. A rejection is recorded for learning and then retired.
+  Always resettle status + broadcast.
 - `RunUpdatesNow` → requires monitoring to be resumed and no cycle already running, but deliberately bypasses the updater's enabled/schedule gate so the user can request a one-off check.
 - `ClearUpdateHistory`, `UpdateUpdaterSettings`, `SetAppIgnore`, `SetAdvisorSettings` → applied **live, no restart** (unlike provider settings), each persisting via `config::save`.
 
@@ -433,8 +556,8 @@ Eir's signal layer is three independent background collectors that each maintain
 
 ### Source 2 — File / log watcher (`signals/file_watch.rs` + `signals/log_parser.rs`)
 
-- **Discovery (`discover_watch_dirs`):** scans fixed roots (`C:\Windows\Logs`, `C:\Windows\Temp`, `C:\Temp`, `C:\Logs`) plus active-user roots (`LOCALAPPDATA`, `APPDATA`, `TEMP`, `TMP`) and `PROGRAMDATA`. A root/subdir is watched only if it contains a recognised recent text file; configured extras are always included when present. Discovery and all subsequent watcher/file reads run while impersonating the active desktop user, so LocalSystem never traverses user-controlled reparse points with SYSTEM authority. Re-discovery feeds new dirs to the live watcher.
-- **Watching:** `notify` `RecommendedWatcher`, `RecursiveMode::Recursive`, on a dedicated OS thread. It reacts to `Create`/`Modify` only, re-arms known directories after recreation, and stays alive when startup discovery is empty so a later login can add roots.
+- **Discovery (`discover_watch_dirs`):** scans fixed roots (`C:\Windows\Logs`, `C:\Windows\Temp`, `C:\Temp`, `C:\Logs`) plus active-user roots (`LOCALAPPDATA`, `APPDATA`, `TEMP`, `TMP`) and `PROGRAMDATA`. A root/subdir is watched only if it contains a recognised recent text file; configured extras are always included when present. Discovery and all subsequent watcher/file reads run while impersonating the active desktop user, so LocalSystem never traverses user-controlled reparse points with SYSTEM authority. The active SID is checked before and after discovery; a user switch discards the previous complete root set before retrying discovery for the new session.
+- **Watching:** `notify` `RecommendedWatcher`, `RecursiveMode::Recursive`, on a dedicated OS thread. It reacts to `Create`/`Modify` only and stays alive when startup discovery is empty. Re-discovery sends an authoritative complete directory set: the watcher is rebuilt, prior OS handles are dropped, and parsed/queued events from the old roots are cleared. This both re-arms recreated directories and prevents roots from a switched-away user accumulating indefinitely.
 - **Per-event parse:** for each changed path it reads `size_bytes` and calls `try_parse_log` (lines 200–209). `try_parse_log` (27–42) skips empty files, requires one of `TEXT_EXTENSIONS` (log/txt/csv/json/xml/ini/cfg/conf/err/out/trace/debug/warn/error/info, lines 14–17), reads at most the **last** `MAX_READ_BYTES = 65_536` of the file (`read_tail`, dropping the partial first line) so a rolling log that has grown past 64 KB still has its newest lines parsed, and runs `log_parser::parse`. A result that is INFO with no error snippets is dropped to `None` (line 37) — only "interesting" log events attach to the `FileChange`.
 - **`log_parser::parse`** (`log_parser.rs:38–48): infers `program` from path shape (Program Files / ProgramData / Windows\Logs\<Subsystem> / AppData\(Local|Roaming|LocalLow), lines 64–125, falling back to parent dir name); `extract_errors` (129–171) walks lines, classifies against `ERROR_KEYWORDS`/`WARN_KEYWORDS` (lines 4–30), raises a severity ceiling (FATAL > ERROR > WARN > INFO), and collects up to 5 non-overlapping snippets (1 line before + 2 after, lines 161–167); `excerpt` caps raw content at `MAX_EXCERPT_CHARS = 2500` with a truncation marker (lines 35, 52–60).
 - **Bounding:** `RING_SIZE = 50`, a true rolling ring buffer (`pop_front` when full). File changes are **drained**, so each `FileChange` is delivered to the AI at most once.
@@ -474,12 +597,33 @@ The AI layer lives in `eir-svc/src/ai/` (`mod.rs` re-exports `client` and `promp
 All three subscription CLIs share one privilege boundary: when EirSvc is LocalSystem, it obtains the active console user's primary token with `WTSQueryUserToken` and starts a hidden process with `CreateProcessAsUserW`. Scratch-file redirection replaces standard-handle inheritance, which Windows forbids across sessions. User-owned CLI binaries therefore never execute as SYSTEM.
 
 - **`Anthropic`** — native `/v1/messages`, streaming SSE, `x-api-key` + `anthropic-version: 2023-06-01`. Requires `anthropic_api_key` and a non-empty model or `new()` bails. Sends `output_config.effort` when an effort is configured — except for Haiku models, which do not support the dial. Parses per-call usage from the stream (`message_start` input/cache tokens, `message_delta` output tokens) and **estimates** cost from a small list-price table (`anthropic_price_per_mtok` / `estimate_anthropic_cost` — prices drift) for the usage card and advisor spend visibility.
-- **`OpenRouter`** — OpenAI-compatible streaming against `https://openrouter.ai/api/v1`. Key comes from config or is auto-detected from `~/.openrouter/config.json` under any `C:\Users` profile (`resolve_openrouter_key`); blank model defaults to `"openrouter/free"`. Adds `HTTP-Referer`/`X-Title` attribution and requests a final usage chunk (tokens + provider-reported cost). Effort maps to `reasoning.effort` (`xhigh`/`max` collapse to `high`).
-- **`ClaudeCli`** — Claude on the user's **subscription**: spawns the local `claude` binary (`--print --output-format json`, optional `--model`, `--effort`), **no API key**. `resolve_user_profile` uses the configured profile or scans `C:\Users\*\.claude\.credentials.json`; `resolve_claude_binary` tries the configured path, then `<profile>\.local\bin\claude.exe` (native installer), then npm's install layout under the profile — `AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe` (the exe the `claude.cmd` shim dispatches to), then the `claude.cmd` shim itself (npm's stable entry point, covering package-layout drift) — then PATH. Usage comes from the CLI's JSON envelope (`result`, `total_cost_usd`, cache-token fields — the cost is the *equivalent* API cost; the call itself is covered by the subscription, and the UI shows "—"/no-charge). Blank model = the CLI's configured default.
+- **`OpenRouter`** — OpenAI-compatible streaming against
+  `https://openrouter.ai/api/v1`. The key comes from config or the sole active desktop
+  user's `~/.openrouter/config.json`, read while impersonating that user; Eir never
+  searches other profiles. Blank model defaults to `"openrouter/free"`. Adds
+  `HTTP-Referer`/`X-Title` attribution and requests a final usage chunk. Effort maps to
+  `reasoning.effort` (`xhigh`/`max` collapse to `high`).
+- **`ClaudeCli`** — Claude on the active user's **subscription**: spawns the local
+  `claude` binary (`--print --output-format json`, optional `--model`, `--effort`),
+  **no API key**. Under LocalSystem, the sole active session's token supplies both the
+  real profile and process identity; configured profile hints cannot redirect it to
+  another user. Binary resolution tries the configured path, then the active profile's
+  native and npm layouts/shim. Usage comes from the CLI JSON envelope; reported cost is
+  equivalent API value, not a subscription charge. Blank model uses the CLI default.
 - **`CodexCli`** — Codex on the active desktop user's **ChatGPT subscription**, **no API key**. `resolve_codex_binary` tries the configured override, OpenAI desktop install, Codex standalone package, npm native layouts/shim, then PATH. Each call gets a fresh empty scratch cwd and runs `codex [--search] --ask-for-approval never exec --json --sandbox read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules --color never`, with the prompt on stdin. `-m` selects a model; reasoning uses `-c model_reasoning_effort=…` (`max` clamps to `xhigh` before GPT-5.6). `parse_codex_ndjson` takes final `agent_message` text and `turn.completed` usage, subtracting cached input from the base input bucket to avoid double-counting; subscription cost is unknown/zero. Only the update-check path adds global `--search`.
-- **`KiloCli`** — Kilo Code on the user's **subscription** (Kilo Pass / Token-Plan addons / BYOK): spawns the local `kilo` binary (`run --auto --format json --agent ask`, optional `-m`/`--variant`), **no API key**. `resolve_kilo_cli_profile` scans `C:\Users\*\.local\share\kilo\auth.json` — the CLI's actual session file, a JSON object keyed by provider name (`"kilo"` for the Pass/Token-Plan login, plus any BYOK provider entries). `resolve_kilo_cli_binary` mirrors `resolve_claude_binary`'s structure but for npm's install layout: it tries the configured path, then the platform-specific exe under the resolved profile's `AppData\Roaming\npm\node_modules\@kilocode\cli\node_modules\@kilocode\{cli-windows-x64,cli-windows-x64-baseline}\bin\kilo.exe` (Windows npm installs resolve to either variant depending on CPU feature detection at install time), then the npm shim `kilo.cmd`, then falls back to bare `"kilo"` on PATH. Output is NDJSON (`parse_kilo_ndjson`): each event nests its real payload under a `part` object (e.g. `{"type":"text","part":{"text":"..."}}`) — `text` events concatenate into the reply and the last `step_finish` event's `part.tokens`/`part.cost` become usage, with a fallback to the equivalent top-level fields for older/alternate event shapes. **Models routed through the subscription/Token-Plan/BYOK require a `kilo/` prefix** (e.g. `kilo/minimax/minimax-m3`); a bare `provider/model` id (e.g. `minimax/minimax-m3`) instead routes to that provider directly and fails without the user's own credentials there — Eir does not auto-prefix, a wrong model string surfaces the CLI's own error.
+- **`KiloCli`** — Kilo Code on the active user's **subscription** (Kilo Pass,
+  Token-Plan addons, or BYOK): spawns `kilo run --auto --format json --agent ask`,
+  **no API key**. Like Claude, LocalSystem derives the sole active user's profile/token
+  and resolves only that profile's platform-specific npm binary or shim. Output is
+  NDJSON; text parts form the reply and the last `step_finish` supplies usage.
+  Subscription/BYOK routing still requires a `kilo/` model prefix.
 
-Both SSE readers share `SseLineBuf`, a byte-based line accumulator (unit-tested), so a multi-byte UTF-8 character split across network chunks can never drop data. CLI envelope/NDJSON decoding is unit-tested for Claude, Codex, and Kilo.
+Both SSE readers share a UTF-8-safe byte accumulator. Streaming and non-streaming HTTP
+bodies have a 4 MiB aggregate cap; CLI stdout/stderr are drained concurrently with fixed
+per-stream memory caps; provider-reported numeric usage/cost is normalised before storage.
+Ask validates attachment metadata/content again in the service, bounds prompt history and
+stored answers, and digest/status projections are bounded before crossing the pipe. CLI
+envelope/NDJSON decoding and these limits have regression checks.
 
 `AiClient::new` is the construction seam; it's rebuilt per update cycle from the live `ApiConfig` (`spawn_update_cycle`).
 
@@ -507,7 +651,11 @@ Each streaming path surfaces mid-stream provider errors instead of returning emp
 
 ### Decision types & fix parsing (`models.rs`)
 
-- `ClaudeDecision` (`models.rs:232-242`): `analysis: String`, `problems: Vec<Problem>`, `needs_deeper_analysis: bool` (`#[serde(default)]` so terse/old responses still parse).
+- `ClaudeDecision` carries `analysis`, `problems`, and `needs_deeper_analysis`.
+  `bound_model_output` runs before logging/display/policy: it keeps at most five valid
+  actions, caps prose/action strings at 16 KiB, caps proposed-action JSON at 64 KiB,
+  and drops an invalid/oversized action whole rather than truncating a privileged path
+  or command into a different operation.
 - `Problem` (`models.rs:115-124`): diagnosis, root_cause, `confidence: f32`, `proposed_fix: serde_json::Value` (kept as raw JSON), reasoning, side_effects, undo_instructions. `parse_fix_action` (`models.rs:127-129`) deserializes `proposed_fix` into `FixAction`, returning `None` on mismatch — so a malformed/unknown action is dropped rather than executed.
 - `FixAction` (`models.rs:133-207`): `#[serde(tag = "action", rename_all = "snake_case")]` enum across ~20 actions (service/log/disk/task/registry/network/driver/bcd/process/file plus Phase-5 security actions). `PowerShellDiagnostic` pins `#[serde(rename = "powershell_diagnostic")]` because snake_case would otherwise yield `power_shell_diagnostic` (`models.rs:153-156`). `SoftwareUninstall` still exists as a variant though the prompt explicitly forbids uninstalling.
 - `CallUsage` (`models.rs:245-252`): input/output tokens, cache_creation, cache_read, `cost_usd`.
@@ -576,9 +724,9 @@ AI-proposed):
 | `NetworkDiagnostic{command}` | inline PS (`mod.rs:68`) | only `flush_dns/release_renew/reset_tcp/reset_winsock`; else early-return failure | hardcoded command switch |
 | `DriverDisable{name}` | `driver.rs` | `sc.exe config … start= disabled`, then registry start-mode readback | critical-driver blocklist + bounded service-name charset |
 | `DriverEnable{name}` | `driver.rs` | `sc.exe config … start= demand`, then readback | bounded service-name charset (auto-whitelisted) |
-| `SoftwareUninstall{pkg}` | `software.rs` | Get-Package → registry uninstall string / msiexec | **also hard-blocked in policy** — never runs |
+| `SoftwareUninstall{pkg}` | `software.rs` | exact package resolution → registry uninstall command / `msiexec`, with exit and disappearance checks | **hard-blocked in policy** — defence-in-depth refuses missing/no-op commands and never reports a failed/non-effectful uninstall as success |
 | `BcdEdit{element,value}` | `boot.rs` | `bcdedit /set {current}` | **`SAFE_ELEMENTS` allowlist** + shell-metachar rejection on value |
-| `ProcessKill{name}` | `process.rs` | exact process lookup → forced stop → bounded wait for exit | protected-process blocklist (including `.exe` spelling) + glob refusal |
+| `ProcessKill{name}` | `process.rs` | exact process lookup → forced stop → bounded wait for exit | one shared validator rejects protected service/security/system processes, `.exe` aliases, paths, and globs; updater AI remedies route through the same gate |
 | `FileDelete{path}` | `logs.rs` | active-user-impersonated native single-file deletion with existence postcheck | approval-gated; local absolute non-reparse path; directory/protected/UNC refusal; preview uses the same user token, so a mutable user path never becomes a privileged SYSTEM deletion |
 | `FirewallEnable{profile}` | `security.rs` | `netsh advfirewall set … on`, then profile-state query | profile allowlist + observed postcondition |
 | `DefenderSignatureUpdate` | `security.rs` | `Update-MpSignature`, then signature-age query | observed postcondition |
@@ -590,7 +738,12 @@ Adapter-level guards are **defence in depth**: they enforce regardless of policy
 
 ### PowerShell timeout helper
 
-`executor/powershell.rs`. `run_diagnostic(script)` calls `run_diagnostic_with_timeout` with `DEFAULT_TIMEOUT = 120s` (`powershell.rs:7`). Spawns `powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -Command <script>`, stdin nulled, `kill_on_drop(true)`. Wraps `child.wait_with_output()` in `tokio::time::timeout`; on timeout returns an error and the dropped future kills the process. Non-zero exit ⇒ error carrying stdout+stderr+code. The 120s ceiling bounds the executor worker (`security.rs:36` notes even the Defender pull uses the default cap deliberately).
+`executor/powershell.rs`. `run_diagnostic(script)` calls
+`run_diagnostic_with_timeout` with `DEFAULT_TIMEOUT = 120s`. It spawns
+`powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -Command <script>`,
+nulls stdin, and drains stdout/stderr concurrently into fixed-size buffers so a child
+cannot deadlock on a full pipe or exhaust memory. Timeout kills and waits for the child;
+non-zero exit returns bounded stdout/stderr plus the code.
 
 All PowerShell-based adapters — including `registry.rs` and `tasks.rs` — route through `run_diagnostic`, so every one is bounded by the 120s timeout with `kill_on_drop`; none spawns an untimed `std::process::Command`.
 
@@ -685,7 +838,13 @@ For an app no manager can update, `update_native` (`native.rs:122`): asks the mo
 - **`validate_plan`** (`plan.rs:222`, pure, unit-tested): https-only; no credentials/non-default-port/raw-IP/punycode host; host must be a TRUSTED multi-tenant release host (`github.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com` — deliberately NOT `*.github.io` or `raw/gist.githubusercontent.com`, which serve arbitrary user files) OR the app's own vendor domain by **exact brand-label equality** (`host_matches_name`, rejecting lookalikes like `obsidian-download.com`, `notionx.io`, `krita.evil.com`); URL must end `.exe`/`.msi` or a supported archive (`.zip`/`.7z`/`.tar`/`.tar.gz`/`.tgz`); an optional archive member must be a safe relative `.exe`/`.msi` path; silent args allow-listed by installer kind via `sanitise_args` (shell metacharacters dropped); optional 64-hex SHA-256. An `.exe` with no known silent switch is refused (`plan_runnable`) → manual fallback; an MSI defaults to `/qn /norestart`.
 - **`download_and_check`** (`download.rs:345`): streams to a SYSTEM/Administrators-only staging dir under `%ProgramData%\Eir\staging` (ACL applied **fail-closed** — no install if lockdown fails; `ensure_root`). The full URL gate is re-applied on every redirect hop and the final URL; HTML bodies and over-cap sizes are rejected (header and streamed-byte counter); a vendor SHA-256, if given, must match the downloaded asset (terminal `HashMismatch`). For ZIP/7z/TAR/TAR.GZ assets, only the model-named member—or the sole unambiguous `.exe`/`.msi`—is extracted to a fixed staging filename; invalid paths, more than 10,000 entries, ambiguous installers, and over-cap expanded contents are refused. The extracted installer then passes the same Authenticode gate and pre-launch rehash as a direct asset.
 - **Signature gate** (`signature_gate`, `download.rs:167`) is a HARD gate decided in Rust before launch, per `SignaturePolicy` (`config.rs:14`): `RequireValid` (default — any trusted valid Authenticode signature), `RequirePublisherMatch` (valid AND signer CN equals the expected publisher — note: `expected_publisher` is currently AI-sourced, so this is a tripwire, not a true vendor pin), `AllowUnsigned` (explicit opt-in). A rejection message starts "signature rejected" so it classifies as terminal `SignatureRejected`. A timed-out signature read yields non-"Valid" text → fails closed.
-- **`run_installer`** (`native.rs:243`): re-hashes the staged file immediately before launch (TOCTOU; sentinel `-4` = changed → reported as tampering/`HashMismatch`), runs the exe directly or via `msiexec /i`, with a 10-minute watchdog. Success = exit 0 or 3010 (reboot). Verification is by name (winget ARP read) with an exe-ProductVersion fallback, softened to `Unverified` on an exe-fallback mismatch since a 4-part FILEVERSION can trail the marketing version.
+- **`run_installer`** (`native.rs`): re-hashes the staged file immediately before
+  launch, runs it directly or through `msiexec /i` with a 10-minute watchdog, and
+  accepts only exit 0 or 3010. Post-install verification re-reads the registered
+  Winget/ARP version and treats conflicting duplicate registrations as ambiguous.
+  The former arbitrary executable-path ProductVersion fallback was removed: under
+  LocalSystem it could follow a user-controlled path to a network share and disclose
+  machine credentials, while its four-part file version was not authoritative anyway.
 
 ### Self-updater skip (should_skip / base_id / SELF_UPDATING) and the ignore list
 
@@ -694,7 +853,17 @@ Two distinct skip mechanisms:
 1. **`SELF_UPDATING` / `should_skip` / `base_id`** (`check.rs:35`–`60`) — the just-added skip for apps that update themselves and reliably fight package managers. `SELF_UPDATING = &["discord"]` (Discord's Squirrel installer hangs `choco upgrade` for the full INSTALL timeout, then choco's stale version DB makes it retry every cycle). `base_id` strips a Chocolatey package suffix (`.install`/`.portable`/`.app`/`.commandline`) so `discord.install` and `discord` share one identity. **`should_skip` unifies the self-updater set and the user ignore list against the same base id**: an id is skipped if its base is in `SELF_UPDATING`, OR if the user's `ignored` list matches the exact id or its base (case-insensitive) — so ignoring `discord` also covers the `discord.install` choco package, and vice versa. `should_skip` is enforced at three points: when pushing manager candidates (`push_candidate`, `check.rs:78`), when filtering the unmanaged set before the AI check (`check.rs:232`), and on the AI's returned native candidates (`native_candidates_from`, `check.rs:310`).
 2. **System-component skip** — the `is_noise` SKIP list in `winget_parse.rs:130` excludes `"eir"` and Windows-managed components including Windows Subsystem for Linux (alongside drivers/runtimes/redistributables/OS components). `push_candidate` applies the same filter to every package-manager result before a native fallback is appended, while unmanaged AI inventory applies it during parsing, so these components cannot reach either updater path. Eir's own self-update is handled by the separate Tauri updater plugin, not this engine.
 
-Native candidate identity is anchored to the machine (`native_candidates_from`, `check.rs`): an AI-reported update whose name doesn't resolve unambiguously to an actually-installed app (`match_installed_entry` against the merged winget + registry inventory set) is dropped, and only strictly-newer versions (`version::is_newer`, with the marketing-truncation guard) survive — preventing a poisoned AI from naming a fabricated app to pick an arbitrary vendor domain.
+Native candidate identity is anchored to the machine (`native_candidates_from`,
+`check.rs`): registry/Winget rows are count/string bounded and grouped by stable
+identity; duplicate registrations with differing versions are excluded as ambiguous
+rather than choosing the newest. An AI-reported name must resolve uniquely to that
+inventory, and only strictly newer versions survive—preventing fabricated identities
+or ambiguous evidence from selecting a vendor domain.
+
+Retry remedies remain data, not shell authority. The domain validator constrains each
+remedy to its failure/method and routes `KillProcess` through the executor's shared
+protected-process validator; the orchestrator records a refused remedy as a failed
+attempt instead of invoking `taskkill` directly.
 
 Per-app AI guidance uses `[updater.notes]`; guidance proven by a successful targeted retry is mirrored in `[updater.learned_notes]`. The App Updates view shows and edits guidance only on a product row with an available update; the persistent library remains service-owned and is not permanently rendered. The stable, version-stripped installed identity—not an AI-returned alias—is the key. Exact guidance is preferred; learned guidance may be reused only when compact product ids contain one another (for example `tool` and `tool x64`). It is included in targeted version checks, retry diagnosis, and native-installer prompts. Native planning receives the detected target version and rejects an AI proposal below it. GitHub repository/release URLs are canonicalised to `/owner/repo/releases/latest`; a failed initial GitHub plan gets one corrective search against that page, explicitly excluding the installed tag. After success, the provider rewrites guidance as concise, precise, grammatically correct English. Rust accepts that rewrite only within a small bounded length increase and when every explicit original URL remains present; otherwise the whitespace-normalised original becomes the proven note. A user edit/delete removes proven status. After a guided retry still fails, the provider receives the recorded attempt evidence and adds one factual explanation sentence after the unchanged mechanical failure reason; an unavailable provider leaves the real reason intact. None of this can relax Rust's URL, hash, Authenticode, archive-size, or silent-install gates. Service-side limits cap ids at 200 characters and guidance maps at 500 entries.
 
@@ -759,8 +928,11 @@ unit-tested** list of targets with deterministic, hand-written categories and no
 `explain.rs` philosophy — never AI-authored). **Cleanup maps only to pre-existing safe actions:**
 `DiskCleanup{temp|prefetch}` (whitelisted → auto-runs) and a stray `MEMORY.DMP` → `FileDelete`
 (approval-gated, with the existing `file_facts` risk classification). Everything else
-(`Windows.old`, browser/app caches, Recycle Bin, hiberfil/pagefile, per-user temp, largest
-`AppData\Local` folders) is **report-only** in v1. A "Clean" click sends the entry id;
+(`Windows.old`, browser/app caches, Recycle Bin, hiberfil/pagefile, the active user's
+temp, and that user's largest `AppData\Local` folders) is **report-only** in v1. The
+entire user-profile scan runs while impersonating the sole active user and rejects
+reparse roots/descendants before traversal, so SYSTEM cannot be induced to follow a
+junction or authenticate to a remote share. A "Clean" click sends the entry id;
 `CleanDiskEntry` maps it via `st.disk_targets` and routes through `route_user_action`. No AI call.
 
 ### F13 — Startup advisor (`startup_scan.rs` + `executor/startup.rs` + `executor/tasks.rs`)
@@ -862,7 +1034,14 @@ Written by `audit::log_decision`; `executed` is flipped inside the same `persist
 - `action_json TEXT` — serialized `FixAction`, executed verbatim on approval
 - `info_json TEXT` — serialized `ApprovalInfo` for the UI (its `id` field overwritten from the row id on load)
 - `baseline_json TEXT` — `SystemState` at proposal time, the "before" baseline for feedback once executed
-- `action_key`, `status` (`pending|approved|rejected`), and `claimed_at` make a click an atomic database transition. A unique active-action index prevents duplicate cards. On load, legacy NULL keys are derived from `action_json` after semantic duplicates are removed. Approved rows reload and retry after a crash until the execution transaction removes them; synthetic failures atomically return them to pending. Rejected tombstones are never re-presented.
+- `action_key`, `status` (`pending|approved|rejected`), and `claimed_at` make a click
+  an atomic database transition. A unique active-action index prevents duplicates.
+  Inserts and recovery are count/byte bounded; oversized legacy rows are removed rather
+  than projected. On load, legacy NULL keys are derived after semantic duplicates are
+  removed. Startup atomically returns every interrupted `approved` row to `pending` for
+  a fresh click because SQLite cannot prove whether an external side effect occurred.
+  Synthetic failures also return atomically to pending. Rejected tombstones are never
+  re-presented.
 
 **`registry_undo`** (`0002`, extended by `0018_registry_undo_type.sql` and `0019_registry_undo_applied_value.sql`) stores both the exact prior scalar kind/data and the exact kind/data Eir applied. Legacy or incomplete rows fail closed. Undo runs its applied-value comparison and restore in one PowerShell invocation, refusing if the live value no longer matches Eir's write.
 
@@ -889,10 +1068,18 @@ The closed loop is: execute → record before/target → wait for settlement →
 
 `config.rs` defines `Config { api, monitoring, persistence, updater (#[serde(default)]), advisor (#[serde(default)]) }`. The two `#[serde(default)]` sections let an older `config.toml` (written before those features) still parse — covered by round-trip tests (`config.rs:267`–331).
 
-- **`load(path)`** resolves relative to the executable directory, parses TOML, sanitises legacy unsafe log roots, and recovers from the last parseable `.bak` if the live file is corrupt.
+- **`load(path)`** resolves relative to the executable directory, parses TOML,
+  sanitises legacy unsafe/oversized log roots and event-log channels, clamps every
+  runtime interval/updater count/size, replaces non-finite thresholds, and recovers
+  from the last parseable `.bak` if the live file is corrupt.
 - **`save(config, path)`** serialises the fully validated candidate, preserves only a parseable live file as `.bak`, writes a sibling temp, then atomically renames it over the live config. Callers clone/apply/validate/save before swapping in-memory state, so a rejected change cannot partially mutate the running service.
 - **`to_ui_settings`** projects `Config` into `eir_proto::UiSettings` for the tray app. Crucially it **never sends secrets** — API keys are reduced to `*_key_set: bool` flags via the local `set` closure (true iff present and non-empty). It surfaces provider, model, update-check model, effort, the three poll/decision intervals, channels/dirs, and `confidence_threshold` (plus the deprecated always-empty `base_url`/`api_key_set` wire-compat fields).
-- **`apply_update(SettingsUpdate)`** applies a UI edit: blank/None secret fields **keep the stored value** (the `keep` closure), so the UI never needs to re-send keys it can't read back. Intervals are floored (`decision ≥10`, event-log `≥5`, wmi `≥30`); `confidence_threshold` is clamped to `0.50–0.95`; `effort` is `normalize_effort`'d to one of low|medium|high|xhigh|max or empty. `ApiProvider::parse` maps `claude_cli`/`openrouter`/`kilo_cli` (plus legacy aliases, including the removed gateway provider's `kilocode`/`kilo` tokens now folding into `kilo_cli`) and defaults anything else to Anthropic; the serde attributes on `ApiProvider` alias the removed `openai_compatible` token to Anthropic so a pre-0.17 config.toml still loads (its now-unknown extra keys are ignored by the toml loader — covered by `removed_provider_aliases_to_anthropic`; the `claude_cli` provider is first-class again as of v0.18, round-trip covered by `claude_cli_provider_round_trips_with_no_key_or_model`; the `kilocode` → `kilo_cli` alias is covered by `kilocode_provider_alias_loads_as_kilo_cli`).
+- **`apply_update(SettingsUpdate)`** applies a UI edit: blank/None secret fields
+  **keep the stored value**, so the UI never re-sends keys it cannot read back.
+  Intervals are clamped at both ends; thresholds must be finite and stay within their
+  policy ranges; event-log channels/log roots are count/length bounded, deduplicated,
+  and reject control characters or unsafe paths. Effort normalises to the closed
+  `low|medium|high|xhigh|max` set or empty. Provider aliases preserve older configs.
 - **Settings save hot-applies or restarts as needed.** In the loop (`main.rs:802`), an `UpdateSettings` message is validated by constructing an `AiClient` first (rejecting e.g. a keyless provider, reloading the prior config on failure so the service isn't bricked). A pure `settings_update_needs_restart` diff decides whether the changed fields require a process restart (only collector spawn parameters: event-log channels, event-log/WMI poll intervals, log directories). If so, `config::save` + `restart_self()`; if the helper fails to spawn the service stays alive on the old settings. Otherwise the new AI client, policy confidence threshold, and decision ticker are applied live without restart.
 
 `AdvisorConfig` (`config.rs:26`) has its own `to_view`/`apply_view` with the same clamping discipline (threshold clamped `0.0–0.95`). It is config-only and not stored in the DB.
@@ -1090,24 +1277,25 @@ one app already known to behave this way.
 
 ## Current limitations and roadmap
 
-This section is authoritative for v0.33.0. [PLAN.md](PLAN.md) holds the operational
-burn-in checklist and ordered v0.34 work; [CONTEXT.md](CONTEXT.md) records release history.
+This section records the v0.34.6 baseline. [PLAN.md](PLAN.md) holds the release gate and
+next work; [CONTEXT.md](CONTEXT.md) records durable decisions and releases.
 
 ### Verification baseline
 
-- The v0.33 local gate passed formatting, clippy, 299 tests, JavaScript/version checks,
-  release compilation, and the NSIS build.
-- Release CI gates the exact commit with a fresh LocalSystem service install, a real
-  protocol-v2 correlated command, signed Tauri/NSIS artifacts, and a standalone-app smoke.
-- The packaged v0.33 WebView was exercised against the installed v0.32 service: version
-  skew and the unsupported provider-test capability rendered correctly, and a live Codex
-  Ask round-trip completed. The installed v0.33 LocalSystem provider test remains a burn-in
-  check, not a claimed live result.
+- The full local gate, real NSIS build, and packaged portable WebView/service workflow
+  passed for v0.34.6. The elevated v0.34.5→v0.34.6 Program Files/LocalSystem upgrade,
+  configured-provider/effect workflow, exact-SHA CI, and signed assets remain CI/live
+  environment gates rather than locally fabricated evidence.
+- CI is configured to gate manifest/Cargo.lock version sync, installer/release/portable
+  regressions, JavaScript, locked Rust formatting/clippy/tests, Windows-target dependency
+  advisories, a signed locked Tauri/NSIS build, portable imports, a fresh LocalSystem
+  service/protocol smoke, and standalone/portable launches. A configured gate is not
+  evidence that a future release passed it.
 
 ### Delivery and persistence
 
-- CI proves a fresh install, not an upgrade from the previous release with representative
-  config and database state. An exact-SHA upgrade gate is the first v0.34 priority.
+- The hardened installer has explicit state-migration and rollback paths, but the real
+  previous-release upgrade remains a required v0.34.6 acceptance check.
 - Config has no explicit schema version. Serde defaults load older files, but saving
   serialises known fields and can discard unknown keys from a newer config.
 - A corrupt audit database fails closed instead of being deleted automatically; recovery is
@@ -1158,8 +1346,8 @@ burn-in checklist and ordered v0.34 work; [CONTEXT.md](CONTEXT.md) records relea
 ### App updater
 
 - A native install's expected publisher is currently AI-sourced, so publisher matching is a
-  tripwire against mismatch, not a durable vendor pin. v0.34 should anchor it in signed
-  installed software or a curated local mapping.
+  tripwire against mismatch, not a durable vendor pin. Future work should anchor it in
+  signed installed software or a curated local mapping.
 - Scoop stays disabled under LocalSystem; Microsoft Store updates remain best-effort because
   entitlement and installs are user-scoped.
 - Unmanaged AI checks rotate the stalest 20 apps per cycle. Recorded failures or deferred
@@ -1167,7 +1355,7 @@ burn-in checklist and ordered v0.34 work; [CONTEXT.md](CONTEXT.md) records relea
   can be omitted when another source is usable; “clean” is not proof that every configured
   manager was available.
 - Version normalisation still has edge cases around prereleases and vendor-specific version
-  shapes. Native installer execution under the released LocalSystem service remains part of
-  normal-use burn-in.
+  shapes. Native installer execution under the packaged LocalSystem service remains part
+  of the candidate acceptance workflow.
 
 No new repair authority is planned until these trust-loop gaps are closed.
