@@ -153,11 +153,7 @@ fn status_line(status: StatusPayload) -> Option<Vec<u8>> {
     let status = status_for_wire(status);
     let projection = |pending_approvals| StatusPayload {
         protocol_version: status.protocol_version,
-        capabilities: vec![
-            CAP_COMMAND_RESULTS.to_string(),
-            CAP_PROVIDER_TEST.to_string(),
-            eir_proto::CAP_TARGETED_UPDATE_RETRY.to_string(),
-        ],
+        capabilities: eir_proto::service_capabilities(),
         status: "Error".to_string(),
         paused: status.paused,
         cpu: status.cpu,
@@ -281,10 +277,7 @@ fn spawn_named_with_verifier(
 ) -> (PipeServer, mpsc::Receiver<UiRequest>) {
     let (status_tx, _) = watch::channel(StatusPayload {
         protocol_version: PROTOCOL_VERSION,
-        capabilities: vec![
-            CAP_COMMAND_RESULTS.to_string(),
-            CAP_PROVIDER_TEST.to_string(),
-        ],
+        capabilities: eir_proto::service_capabilities(),
         status: "Starting".to_string(),
         ..Default::default()
     });
@@ -1396,6 +1389,14 @@ mod tests {
             ServiceMsg::Status(status) => {
                 assert_eq!(status.protocol_version, PROTOCOL_VERSION);
                 assert!(status.capabilities.iter().any(|x| x == CAP_COMMAND_RESULTS));
+                // The startup snapshot a client receives on connect must advertise
+                // everything this build supports: a UI that connects during startup
+                // caches these and would otherwise refuse a supported retry.
+                assert_eq!(status.capabilities, eir_proto::service_capabilities());
+                assert!(status
+                    .capabilities
+                    .iter()
+                    .any(|x| x == eir_proto::CAP_TARGETED_UPDATE_RETRY));
             }
             other => panic!("expected status, got {other:?}"),
         }

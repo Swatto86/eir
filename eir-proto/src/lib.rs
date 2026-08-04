@@ -6,6 +6,18 @@ pub const CAP_COMMAND_RESULTS: &str = "command_results";
 pub const CAP_PROVIDER_TEST: &str = "provider_test";
 pub const CAP_TARGETED_UPDATE_RETRY: &str = "targeted_update_retry";
 
+/// Everything this service build supports, for every StatusPayload it sends —
+/// the startup seed, the degraded projection, and the decision loop's snapshot.
+/// One list: three hand-maintained copies is how the startup seed came to omit
+/// CAP_TARGETED_UPDATE_RETRY and tell the UI a supported feature was missing.
+pub fn service_capabilities() -> Vec<String> {
+    vec![
+        CAP_COMMAND_RESULTS.to_string(),
+        CAP_PROVIDER_TEST.to_string(),
+        CAP_TARGETED_UPDATE_RETRY.to_string(),
+    ]
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct StatusPayload {
     /// Wire contract version and optional features supported by the service.

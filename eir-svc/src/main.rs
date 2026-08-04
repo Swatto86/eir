@@ -698,11 +698,7 @@ fn build_status(st: &SvcState) -> StatusPayload {
         .flatten();
     StatusPayload {
         protocol_version: eir_proto::PROTOCOL_VERSION,
-        capabilities: vec![
-            eir_proto::CAP_COMMAND_RESULTS.to_string(),
-            eir_proto::CAP_PROVIDER_TEST.to_string(),
-            eir_proto::CAP_TARGETED_UPDATE_RETRY.to_string(),
-        ],
+        capabilities: eir_proto::service_capabilities(),
         status: st.status.clone(),
         paused: st.paused,
         cpu: st.cpu,
