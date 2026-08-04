@@ -7,7 +7,10 @@ const PROTECTED_PROCESSES: &[&str] = &[
 
 pub async fn kill(process_name: &str) -> Result<String> {
     validate_kill_target(process_name)?;
-    let safe_name = process_name.replace('\'', "''");
+    // A Windows process's Name has no extension, so Get-Process -Name never matches a
+    // ".exe"-suffixed string. Strip it (validate_kill_target strips it for the blocklist)
+    // before building the query.
+    let safe_name = process_query_name(process_name).replace('\'', "''");
     // Report success only if a process actually existed and was stopped. The old script
     // used `-ErrorAction SilentlyContinue` and unconditionally wrote success, so a typo'd/
     // absent/hallucinated name or an access-denied kill was logged as a fabricated success
@@ -23,6 +26,16 @@ pub async fn kill(process_name: &str) -> Result<String> {
          Write-Output 'Stopped process(es) named: {safe_name}'"
     );
     super::powershell::run_diagnostic(&script).await
+}
+
+/// The name to pass to `Get-Process -Name`: a Windows process Name carries no
+/// extension, so a trailing ".exe" (any case) is removed. UTF-8 safe (splits on '.').
+pub(crate) fn process_query_name(process_name: &str) -> &str {
+    process_name
+        .rsplit_once('.')
+        .filter(|(_, ext)| ext.eq_ignore_ascii_case("exe"))
+        .map(|(stem, _)| stem)
+        .unwrap_or(process_name)
 }
 
 pub(crate) fn validate_kill_target(process_name: &str) -> Result<()> {
@@ -70,6 +83,14 @@ mod tests {
             let err = kill(name).await.unwrap_err();
             assert!(err.to_string().contains("protected"), "{err}");
         }
+    }
+
+    #[test]
+    fn process_query_name_strips_exe_so_get_process_matches() {
+        assert_eq!(process_query_name("chrome.exe"), "chrome");
+        assert_eq!(process_query_name("Chrome.EXE"), "Chrome");
+        assert_eq!(process_query_name("chrome"), "chrome");
+        assert_eq!(process_query_name("my.app.exe"), "my.app");
     }
 
     #[test]
