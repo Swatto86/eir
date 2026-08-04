@@ -1034,6 +1034,10 @@ document.getElementById('approvals').addEventListener('click', (e) => {
   if (approve && btn.dataset.irreversible && !btn.classList.contains('confirm')) {
     btn.classList.add('confirm');
     btn.textContent = 'Click again to confirm — cannot be undone';
+    // A label swap on the already-focused button is not reliably re-announced, so
+    // the warning reached sighted users only. #toast-wrap is aria-live="polite";
+    // the 'err' variant lasts 5s, covering the 6s arm window.
+    toast('This action cannot be undone — activate Approve again to confirm.', 'err');
     btn._confirmTimer = setTimeout(() => {
       btn.classList.remove('confirm');
       btn.textContent = 'Approve & run';

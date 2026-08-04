@@ -1363,6 +1363,27 @@ mod tests {
     }
 
     #[test]
+    fn arming_an_irreversible_approval_is_announced() {
+        // The two-click safeguard communicated only by swapping the focused button's
+        // label, which assistive tech does not reliably re-announce. It must also go
+        // through the aria-live toast region.
+        let html = include_str!("../../ui/index.html");
+        let javascript = include_str!("../../ui/main.js");
+        assert!(
+            html.contains("id=\"toast-wrap\" aria-live=\"polite\""),
+            "toasts are the announced channel"
+        );
+        let (_, after) = javascript
+            .split_once("btn.textContent = 'Click again to confirm — cannot be undone';")
+            .expect("the arming branch is still here");
+        let arming = &after[..after.find("btn._confirmTimer").expect("the 6s disarm timer")];
+        assert!(
+            arming.contains("toast(") && arming.contains("cannot be undone"),
+            "arming an irreversible approval must be announced"
+        );
+    }
+
+    #[test]
     fn rejected_command_result_is_an_error() {
         assert_eq!(
             command_result(CommandResult {
