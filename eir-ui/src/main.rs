@@ -1376,7 +1376,9 @@ mod tests {
         let (_, after) = javascript
             .split_once("btn.textContent = 'Click again to confirm — cannot be undone';")
             .expect("the arming branch is still here");
-        let arming = &after[..after.find("btn._confirmTimer").expect("the 6s disarm timer")];
+        let arming = &after[..after
+            .find("btn._confirmTimer")
+            .expect("the 6s disarm timer")];
         assert!(
             arming.contains("toast(") && arming.contains("cannot be undone"),
             "arming an irreversible approval must be announced"

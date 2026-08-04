@@ -396,8 +396,8 @@ mod tests {
         assert!(super::read_channel_since("", 0, true).is_none());
         // A channel that DOES open still primes to a real high-water mark, so the
         // assertion above cannot pass by everything returning None.
-        let (entries, cursor) = super::read_channel_since("Application", 0, true)
-            .expect("Application channel opens");
+        let (entries, cursor) =
+            super::read_channel_since("Application", 0, true).expect("Application channel opens");
         assert!(entries.is_empty(), "a prime delivers nothing");
         assert!(cursor > 0, "a prime seeds the high-water mark");
     }
