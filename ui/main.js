@@ -1001,9 +1001,13 @@ function renderApprovals(list) {
   const sig = list.map((i) => `${i.id}:${i.created_at}`).join('|');
   if (sig === lastApprovalsSig) return;
   lastApprovalsSig = sig;
+  // The rebuild destroys whatever inside the list had focus; move it somewhere
+  // stable rather than letting it fall to <body>.
+  const hadFocus = el.contains(document.activeElement);
   el.innerHTML = list.length
     ? list.map(approvalCard).join('')
     : '<div class="empty">Nothing needs your approval right now.</div>';
+  if (hadFocus) document.querySelector('.nav-btn[data-view="approvals"]').focus();
   // Re-disable buttons for any decision still resolving.
   for (const id of decidingIds) {
     const card = el.querySelector(`.approval-card[data-approval-id="${id}"]`);
@@ -1013,7 +1017,16 @@ function renderApprovals(list) {
 
 async function decide(id, approved, card) {
   decidingIds.add(id);
-  if (card) card.querySelectorAll('button').forEach((b) => (b.disabled = true));
+  if (card) {
+    // Disabling the focused button blurs it to <body>, and the 2s poll then rebuilds
+    // the whole list — a keyboard user would restart from the top of the document
+    // after every decision. Park focus on the stable Approvals nav button first; a
+    // stray second Enter there merely re-shows the view.
+    if (card.contains(document.activeElement)) {
+      document.querySelector('.nav-btn[data-view="approvals"]').focus();
+    }
+    card.querySelectorAll('button').forEach((b) => (b.disabled = true));
+  }
   try {
     const result = await invoke('decide_approval', { id, approved });
     toast(commandMessage(result, approved ? 'Approval applied' : 'Rejection applied'), 'ok');

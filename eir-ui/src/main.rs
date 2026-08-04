@@ -1555,6 +1555,23 @@ mod tests {
     }
 
     #[test]
+    fn deciding_an_approval_keeps_keyboard_focus() {
+        // Disabling the focused Approve/Reject button blurred it to <body>, losing
+        // the keyboard user's place; focus must be parked first.
+        let javascript = include_str!("../../ui/main.js");
+        let (_, decide) = javascript
+            .split_once("async function decide(")
+            .expect("decide is still here");
+        let before_disable = &decide[..decide
+            .find("b.disabled = true")
+            .expect("the disable loop is still here")];
+        assert!(
+            before_disable.contains(".focus()"),
+            "decide must park focus before disabling the focused button"
+        );
+    }
+
+    #[test]
     fn rejected_command_result_is_an_error() {
         assert_eq!(
             command_result(CommandResult {
