@@ -395,9 +395,12 @@ fn select_candidate(
 ) -> Result<ArchiveCandidate, String> {
     let selected = match requested_path {
         Some(requested) => {
+            // Candidate names are normalized to forward slashes; the requested path
+            // comes from the AI plan and may use backslashes. Compare in one space.
+            let requested = requested.replace('\\', "/");
             let mut matches = candidates
                 .into_iter()
-                .filter(|entry| entry.name.eq_ignore_ascii_case(requested));
+                .filter(|entry| entry.name.eq_ignore_ascii_case(&requested));
             let selected = matches.next().ok_or_else(|| {
                 format!("installer not found in {archive}: no entry named '{requested}'")
             })?;
@@ -608,7 +611,10 @@ fn extract_7z_installer(
         archive_path,
         dir,
         |entry, reader, _unused_path| {
-            if entry.name.eq_ignore_ascii_case(&selected.name) {
+            // 7z is the only format matched by name (zip/tar re-locate by index), and
+            // a Windows-authored archive stores `setup\tool.exe` while selected.name
+            // is normalized — compare normalized or nothing ever matches.
+            if entry.name.replace('\\', "/").eq_ignore_ascii_case(&selected.name) {
                 extracted = Some(write_installer(reader, dir, selected.kind, max_bytes)?);
                 return Ok(false);
             }
@@ -852,6 +858,35 @@ mod tests {
         assert_eq!(kind, InstallerKind::Exe);
         assert_eq!(std::fs::read(file).unwrap(), b"installer");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extracts_7z_with_backslash_entry_names() {
+        // 7-Zip on Windows stores backslash-separated paths. Candidates are built
+        // from normalized names, so every later name comparison must normalize too.
+        use std::io::Cursor;
+        let dir = std::env::temp_dir().join(format!("eir-7z-backslash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sevenz_path = dir.join("release.7z");
+        let mut writer = sevenz_rust2::ArchiveWriter::create(&sevenz_path).unwrap();
+        writer
+            .push_archive_entry(
+                sevenz_rust2::ArchiveEntry::new_file(r"setup\tool.exe"),
+                Some(Cursor::new(b"installer".to_vec())),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        // Both the normalized and the raw backslash form of the requested path must
+        // resolve to the same entry.
+        for requested in ["setup/tool.exe", r"setup\tool.exe"] {
+            let (file, kind, _) = extract_7z_installer(&sevenz_path, &dir, Some(requested), 100)
+                .unwrap_or_else(|e| panic!("{requested}: {e}"));
+            assert_eq!(kind, InstallerKind::Exe);
+            assert_eq!(std::fs::read(file).unwrap(), b"installer");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
