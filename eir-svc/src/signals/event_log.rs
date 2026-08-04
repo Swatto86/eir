@@ -88,13 +88,20 @@ fn source_name(record: &[u8]) -> String {
 /// rollover / u32 wrap — the newest record is now *below* the stored cursor) is
 /// detected and treated like a re-prime, so post-clear events aren't silently
 /// dropped forever by the "already delivered" guard.
-fn read_channel_since(channel: &str, last_record: u32, prime: bool) -> (Vec<EventLogEntry>, u32) {
+/// Returns None when the channel could not be opened, so the caller can leave the
+/// cursor untouched: recording a failed prime as cursor 0 would disable every
+/// `last_record > 0` stale guard below and dump the backlog on the next poll.
+fn read_channel_since(
+    channel: &str,
+    last_record: u32,
+    prime: bool,
+) -> Option<(Vec<EventLogEntry>, u32)> {
     let channel_w = wide(channel);
     let handle = match unsafe { OpenEventLogW(PCWSTR::null(), PCWSTR(channel_w.as_ptr())) } {
         Ok(h) => h,
         Err(e) => {
             warn!("Failed to open event log channel {channel}: {e}");
-            return (vec![], last_record);
+            return None;
         }
     };
 
@@ -217,7 +224,7 @@ fn read_channel_since(channel: &str, last_record: u32, prime: bool) -> (Vec<Even
     unsafe {
         let _ = CloseEventLog(handle);
     }
-    (entries, new_max_record)
+    Some((entries, new_max_record))
 }
 
 pub fn spawn(
@@ -250,17 +257,23 @@ pub fn spawn(
                             let known = c.get(channel.as_str()).copied();
                             let last = known.unwrap_or(0);
                             let prime = known.is_none();
-                            let (entries, new_last) = read_channel_since(channel, last, prime);
-                            // Always record the cursor on a prime (even if it didn't
-                            // advance) so the channel isn't re-primed every poll.
-                            if prime || new_last != last {
-                                c.insert(channel.clone(), new_last);
+                            // A failed OPEN returns None: leave the cursor untouched so a
+                            // failed prime re-primes next poll instead of being recorded as
+                            // cursor 0 (which disables every `last_record > 0` stale guard).
+                            if let Some((entries, new_last)) =
+                                read_channel_since(channel, last, prime)
+                            {
+                                // Always record the cursor on a prime (even if it didn't
+                                // advance) so the channel isn't re-primed every poll.
+                                if prime || new_last != last {
+                                    c.insert(channel.clone(), new_last);
+                                }
+                                // Keep every record read_channel_since returned — BUFFER_CAP
+                                // downstream is the only bound. The old RING_SIZE cap here
+                                // silently dropped a later channel's events entirely (and any
+                                // error past the 20th) once an earlier channel filled the budget.
+                                all.extend(entries);
                             }
-                            // Keep every record read_channel_since returned — BUFFER_CAP
-                            // downstream is the only bound. The old RING_SIZE cap here
-                            // silently dropped a later channel's events entirely (and any
-                            // error past the 20th) once an earlier channel filled the budget.
-                            all.extend(entries);
                         }
                         (all, c)
                     })
@@ -372,6 +385,22 @@ pub fn drain(shared: &SharedEntries) -> Vec<EventLogEntry> {
 #[cfg(test)]
 mod tests {
     use super::{insertion_strings, parse_record, EVENTLOGRECORD};
+
+    #[test]
+    fn failed_open_yields_no_cursor_so_a_failed_prime_reprimes() {
+        // An empty channel name is the one input OpenEventLogW rejects outright
+        // (a merely unknown name silently falls back to the Application log).
+        // A failed open must NOT look like a completed prime: returning a cursor
+        // of 0 would disable every `last_record > 0` stale guard, dumping the
+        // backlog on the next successful poll.
+        assert!(super::read_channel_since("", 0, true).is_none());
+        // A channel that DOES open still primes to a real high-water mark, so the
+        // assertion above cannot pass by everything returning None.
+        let (entries, cursor) = super::read_channel_since("Application", 0, true)
+            .expect("Application channel opens");
+        assert!(entries.is_empty(), "a prime delivers nothing");
+        assert!(cursor > 0, "a prime seeds the high-water mark");
+    }
 
     #[test]
     fn insertion_strings_recover_event_details_with_bounds() {
