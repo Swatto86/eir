@@ -1,6 +1,6 @@
 [package]
 name = "eir-proto"
-version = "0.34.10"
+version = "0.34.11"
 edition = "2021"
 
 [dependencies]
