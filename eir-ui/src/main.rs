@@ -1595,6 +1595,23 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_a_learned_fact_requires_confirmation() {
+        // "forget" is a hard row delete on the service side; like the Clear buttons,
+        // it must confirm before the invoke.
+        let javascript = include_str!("../../ui/main.js");
+        let (_, handler) = javascript
+            .split_once("document.getElementById('learned-list').addEventListener('click'")
+            .expect("learned-list handler is still here");
+        let body = &handler[..handler
+            .find("invoke('set_learned_fact'")
+            .expect("handler still invokes set_learned_fact")];
+        assert!(
+            body.contains("window.confirm("),
+            "forget deletes a learned fact without confirming first"
+        );
+    }
+
+    #[test]
     fn rejected_command_result_is_an_error() {
         assert_eq!(
             command_result(CommandResult {

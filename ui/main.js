@@ -1598,12 +1598,23 @@ document.getElementById('learned-list').addEventListener('click', (e) => {
   if (!btn) return;
   const id = parseInt(btn.dataset.id, 10);
   if (!Number.isFinite(id)) return;
+  // "Forget" is a hard row delete on the service side, and it sits right next to the
+  // reversible Disable — confirm it like the Clear buttons do. Pin/Disable stay
+  // one-click.
+  const forget = btn.dataset.op === 'forget';
+  if (forget
+      && !window.confirm('Forget this learned fact? It is deleted permanently and only re-learned if the pattern happens again.')) {
+    return;
+  }
   // Disable the row's buttons to prevent a double-submit before the next repaint,
   // mirroring the approve / undo / disk-clean controls.
   const row = btn.parentElement;
   row.querySelectorAll('.learned-act').forEach((b) => { b.disabled = true; });
   invoke('set_learned_fact', { id, op: btn.dataset.op })
-    .then((result) => { toast(commandMessage(result, 'Learned fact updated'), 'ok'); refresh(); })
+    .then((result) => {
+      toast(commandMessage(result, forget ? 'Learned fact forgotten' : 'Learned fact updated'), 'ok');
+      refresh();
+    })
     .catch((err) => {
       console.error('set_learned_fact failed', err);
       toast('Could not update learned fact: ' + err, 'err');
