@@ -1505,6 +1505,15 @@ document.getElementById('updater-apps').addEventListener('click', (e) => {
     .finally(() => { ig.disabled = false; });
 });
 
+// Return focus to the row's guidance toggle when its editor closes — only when the
+// focus is actually inside the editor being hidden, so a mouse user who clicked
+// elsewhere isn't yanked back.
+function focusGuidanceToggle(editor) {
+  if (!editor.contains(document.activeElement)) return;
+  const toggle = editor.closest('.upd-row')?.querySelector('.upd-guide');
+  if (toggle) toggle.focus();
+}
+
 // Per-app AI guidance is shown and editable only while that product has an update row.
 document.getElementById('view-updates').addEventListener('input', (e) => {
   if (e.target.classList.contains('upd-note-input')) e.target.dataset.dirty = '1';
@@ -1519,7 +1528,11 @@ document.getElementById('view-updates').addEventListener('click', (e) => {
   }
   const cancel = e.target.closest('.upd-note-cancel');
   if (cancel) {
-    cancel.closest('.upd-note-editor').hidden = true;
+    const editor = cancel.closest('.upd-note-editor');
+    editor.hidden = true;
+    // Hiding the editor blurs whatever inside it had focus; hand it back to the
+    // button that opened it, as a disclosure should.
+    focusGuidanceToggle(editor);
     lastAppsSig = null;
     refresh();
     return;
@@ -1533,7 +1546,10 @@ document.getElementById('view-updates').addEventListener('click', (e) => {
   btn.disabled = true;
   invoke('set_app_note', { id, note })
     .then((result) => {
-      if (editor) editor.hidden = true;
+      if (editor) {
+        editor.hidden = true;
+        focusGuidanceToggle(editor);
+      }
       toast(commandMessage(result, note ? 'AI guidance saved' : 'AI guidance deleted'), 'ok');
     })
     .catch((err) => { console.error('set_app_note failed', err); toast('Could not update AI guidance: ' + err, 'err'); })

@@ -1572,6 +1572,29 @@ mod tests {
     }
 
     #[test]
+    fn closing_the_guidance_editor_restores_focus() {
+        // Save/Cancel hid the editor while focus was inside it — the same blur-to-body
+        // defect as the approvals buttons.
+        let javascript = include_str!("../../ui/main.js");
+        let (_, helper) = javascript
+            .split_once("function focusGuidanceToggle(editor) {")
+            .expect("the focus-restore helper is still here");
+        assert!(helper[..200].contains(".upd-guide"), "focus goes to the toggle");
+        for (label, marker) in [
+            ("cancel", "const editor = cancel.closest('.upd-note-editor');"),
+            ("save", "if (editor) {"),
+        ] {
+            let (_, rest) = javascript
+                .split_once(marker)
+                .unwrap_or_else(|| panic!("the guidance {label} path is still here"));
+            assert!(
+                rest[..200].contains("focusGuidanceToggle(editor)"),
+                "the guidance {label} path must restore focus"
+            );
+        }
+    }
+
+    #[test]
     fn rejected_command_result_is_an_error() {
         assert_eq!(
             command_result(CommandResult {
