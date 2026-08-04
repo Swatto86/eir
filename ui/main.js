@@ -341,7 +341,19 @@ async function refresh() {
 async function refreshInner() {
   let status;
   try { status = await invoke('get_status'); }
-  catch (e) { console.error('get_status failed', e); return; }
+  catch (e) {
+    // Say so on screen: the status line is role="status", so the failure is both
+    // seen and announced. Silently returning left "Initializing…" up forever with
+    // the actions disabled and no stated reason. No toast — polling retries every
+    // 2s and would flood. A later successful poll restores everything below.
+    console.error('get_status failed', e);
+    document.body.classList.add('svc-down');
+    document.getElementById('status-dot').style.background = 'var(--red)';
+    setText(document.getElementById('status-text'), 'Service unavailable');
+    setText(document.getElementById('hero-status'), 'Service unavailable');
+    setServiceActionsDisconnected(true);
+    return;
+  }
   lastStatus = status;
 
   // While the service is down/restarting the last snapshot stays on screen; mark

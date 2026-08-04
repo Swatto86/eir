@@ -1339,6 +1339,30 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_status_poll_is_shown_and_announced() {
+        // A swallowed get_status failure left "Initializing…" on screen forever with
+        // every action disabled and no announced reason. The catch must state it in
+        // the role="status" line and keep the actions marked unavailable.
+        let javascript = include_str!("../../ui/main.js");
+        let (_, after) = javascript
+            .split_once("status = await invoke('get_status');")
+            .expect("the status poll is still here");
+        let catch_block = &after[..after
+            .find("lastStatus = status;")
+            .expect("the poll's success path is still here")];
+        assert!(catch_block.contains("get_status failed"), "wrong block");
+        for marker in [
+            "'Service unavailable'",
+            "setServiceActionsDisconnected(true)",
+        ] {
+            assert!(
+                catch_block.contains(marker),
+                "a failed status poll must surface {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn rejected_command_result_is_an_error() {
         assert_eq!(
             command_result(CommandResult {
