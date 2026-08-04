@@ -661,6 +661,7 @@ document.getElementById('ask-list').addEventListener('click', (e) => {
   if (btn) copyText(btn.closest('.ask-entry').querySelector('.ask-a').textContent, btn);
 });
 document.getElementById('clear-ask').addEventListener('click', async () => {
+  if (!window.confirm('Clear this chat? This cannot be undone.')) return;
   try {
     const result = await invoke('clear_ask');
     toast(commandMessage(result, 'Chat cleared'), 'ok');
@@ -1169,6 +1170,7 @@ document.getElementById('activity-list').addEventListener('click', (e) => {
 });
 
 document.getElementById('clear-activity').addEventListener('click', async () => {
+  if (!window.confirm('Clear all activity history? This cannot be undone.')) return;
   try {
     await invoke('clear_problems');
     const result = await invoke('clear_executions');
@@ -1424,6 +1426,7 @@ document.getElementById('upd-now').addEventListener('click', async () => {
   catch (e) { console.error('run_updates_now failed', e); toast('Could not start updates: ' + e, 'err'); }
 });
 document.getElementById('clear-updates').addEventListener('click', async () => {
+  if (!window.confirm('Clear all update history? This cannot be undone.')) return;
   try {
     const result = await invoke('clear_update_history');
     toast(commandMessage(result, 'Update history cleared'), 'ok');

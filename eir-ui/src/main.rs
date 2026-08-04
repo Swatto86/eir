@@ -1405,6 +1405,32 @@ mod tests {
     }
 
     #[test]
+    fn destructive_clear_actions_require_confirmation() {
+        // Each Clear button permanently deletes history; one stray activation used to
+        // do it with no chance to cancel. Confirmation must come BEFORE the invoke.
+        let javascript = include_str!("../../ui/main.js");
+        for (id, command) in [
+            ("clear-ask", "invoke('clear_ask')"),
+            ("clear-activity", "invoke('clear_problems')"),
+            ("clear-updates", "invoke('clear_update_history')"),
+        ] {
+            let handler = javascript
+                .split_once(&format!(
+                    "document.getElementById('{id}').addEventListener('click'"
+                ))
+                .map(|(_, rest)| rest)
+                .unwrap_or_else(|| panic!("{id} handler is still here"));
+            let body = &handler[..handler
+                .find(command)
+                .unwrap_or_else(|| panic!("{id} still calls {command}"))];
+            assert!(
+                body.contains("window.confirm("),
+                "{id} deletes history without confirming first"
+            );
+        }
+    }
+
+    #[test]
     fn rejected_command_result_is_an_error() {
         assert_eq!(
             command_result(CommandResult {
