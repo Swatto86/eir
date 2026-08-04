@@ -333,12 +333,23 @@ fn restore_ask_attachments(
     Ok(())
 }
 
+/// What a pick produced. `skipped` counts explicitly picked files that did not
+/// become attachments (binary/unreadable, or over a cap) so the user is told
+/// instead of silently getting nothing; `full` means the pending list was already
+/// at its cap, so no dialog was opened at all.
+#[derive(Serialize)]
+struct AttachOutcome {
+    attachments: Vec<ask_attach::AttachmentMeta>,
+    skipped: usize,
+    full: bool,
+}
+
 #[tauri::command]
 async fn add_ask_attachments(
     kind: String,
     app: AppHandle,
     atts: State<'_, AskAttachments>,
-) -> Result<Vec<ask_attach::AttachmentMeta>, String> {
+) -> Result<AttachOutcome, String> {
     let (remaining_count, remaining_bytes) = {
         let guard = atts.0.lock().map_err(|e| e.to_string())?;
         let used_bytes: usize = guard.iter().map(|a| a.content.len()).sum();
@@ -348,28 +359,39 @@ async fn add_ask_attachments(
         )
     };
     if remaining_count == 0 || remaining_bytes == 0 {
+        // No dialog is opened at all — say so, or clicking "📎 Files" does nothing.
         let guard = atts.0.lock().map_err(|e| e.to_string())?;
-        return Ok(guard
-            .iter()
-            .map(|a| ask_attach::AttachmentMeta {
-                name: a.name.clone(),
-                kind: a.kind.clone(),
-            })
-            .collect());
+        return Ok(AttachOutcome {
+            attachments: guard
+                .iter()
+                .map(|a| ask_attach::AttachmentMeta {
+                    name: a.name.clone(),
+                    kind: a.kind.clone(),
+                })
+                .collect(),
+            skipped: 0,
+            full: true,
+        });
     }
     let app2 = app.clone();
-    // Dialog + file reads + image transcode all off the async runtime.
-    let processed: Vec<eir_proto::AskAttachment> =
+    // Dialog + file reads + image transcode all off the async runtime. The second
+    // element is how many files the user explicitly picked (folder mode reports 0 —
+    // its secrets/binary filtering is by design, not a surprise to report).
+    let (processed, picked): (Vec<eir_proto::AskAttachment>, usize) =
         tauri::async_runtime::spawn_blocking(move || {
             use tauri_plugin_dialog::DialogExt;
             if kind == "folder" {
                 match app2.dialog().file().blocking_pick_folder() {
-                    Some(fp) => fp
-                        .into_path()
-                        .ok()
-                        .map(|p| ask_attach::process_folder(&p, remaining_count, remaining_bytes))
-                        .unwrap_or_default(),
-                    None => vec![],
+                    Some(fp) => (
+                        fp.into_path()
+                            .ok()
+                            .map(|p| {
+                                ask_attach::process_folder(&p, remaining_count, remaining_bytes)
+                            })
+                            .unwrap_or_default(),
+                        0,
+                    ),
+                    None => (vec![], 0),
                 }
             } else {
                 match app2.dialog().file().blocking_pick_files() {
@@ -378,9 +400,13 @@ async fn add_ask_attachments(
                             .into_iter()
                             .filter_map(|fp| fp.into_path().ok())
                             .collect();
-                        ask_attach::process_files(&paths, remaining_count, remaining_bytes)
+                        let picked = paths.len();
+                        (
+                            ask_attach::process_files(&paths, remaining_count, remaining_bytes),
+                            picked,
+                        )
                     }
-                    None => vec![],
+                    None => (vec![], 0),
                 }
             }
         })
@@ -389,6 +415,7 @@ async fn add_ask_attachments(
 
     let mut guard = atts.0.lock().map_err(|e| e.to_string())?;
     let mut total: usize = guard.iter().map(|a| a.content.len()).sum();
+    let mut appended = 0usize;
     for a in processed {
         // Bound both the count and the TOTAL payload (across picks) so the eventual
         // AskEir line can't exceed the pipe cap and get silently dropped.
@@ -399,14 +426,19 @@ async fn add_ask_attachments(
         }
         total += a.content.len();
         guard.push(a);
+        appended += 1;
     }
-    Ok(guard
-        .iter()
-        .map(|a| ask_attach::AttachmentMeta {
-            name: a.name.clone(),
-            kind: a.kind.clone(),
-        })
-        .collect())
+    Ok(AttachOutcome {
+        attachments: guard
+            .iter()
+            .map(|a| ask_attach::AttachmentMeta {
+                name: a.name.clone(),
+                kind: a.kind.clone(),
+            })
+            .collect(),
+        skipped: picked.saturating_sub(appended),
+        full: false,
+    })
 }
 
 #[tauri::command]
@@ -1504,6 +1536,22 @@ mod tests {
             block.contains("toast(") && block.contains("has answered"),
             "a finished answer must be announced"
         );
+    }
+
+    #[test]
+    fn skipped_attachment_picks_are_reported() {
+        // Picking a PDF/DOCX attached nothing with zero feedback, and at the byte cap
+        // the picker never opened. Both must reach the user.
+        let javascript = include_str!("../../ui/main.js");
+        let (_, pick) = javascript
+            .split_once("async function pickAttachments(")
+            .expect("pickAttachments is still here");
+        let body = &pick[..pick
+            .find("catch (e) { console.error('add_ask_attachments failed'")
+            .expect("the pick still invokes add_ask_attachments")];
+        assert!(body.contains("res.skipped"), "skipped picks are not reported");
+        assert!(body.contains("res.full"), "an unopened picker is not reported");
+        assert!(body.contains("could not be attached"));
     }
 
     #[test]

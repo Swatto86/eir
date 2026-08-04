@@ -702,9 +702,18 @@ async function pickAttachments(kind) {
   askAttachmentBusy = true;
   updateAskControls();
   try {
-    askChips = await invoke('add_ask_attachments', { kind }) || [];
+    const res = await invoke('add_ask_attachments', { kind }) || {};
+    askChips = res.attachments || [];
     renderAskChips();
-    if (askChips.length >= 12) toast('Attachment limit reached (12)', 'ok');
+    // A picked file that cannot be attached (PDF/DOCX and other binaries, or over a
+    // cap) used to vanish silently, so the question was asked without it.
+    if (res.full) {
+      toast('Attachment limit reached — remove an attachment first', 'err');
+    } else if (res.skipped) {
+      toast(`${res.skipped} file${res.skipped === 1 ? '' : 's'} could not be attached (binary, unreadable, or over the size limit)`, 'err');
+    } else if (askChips.length >= 12) {
+      toast('Attachment limit reached (12)', 'ok');
+    }
   } catch (e) { console.error('add_ask_attachments failed', e); toast('Could not attach', 'err'); }
   finally { askAttachmentBusy = false; updateAskControls(); }
 }
