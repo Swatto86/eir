@@ -162,10 +162,35 @@ fn extract_errors(content: &str) -> (Vec<String>, String) {
         if snippets.len() < 5 && i >= next_allowed {
             let start = i.saturating_sub(1);
             let end = (i + 3).min(lines.len());
-            next_allowed = end;
+            // The next snippet starts one line BEFORE its match, so the next match
+            // must be at `end + 1` for its window to clear this one; `end` alone let
+            // line `end - 1` appear in both snippets.
+            next_allowed = end + 1;
             snippets.push(lines[start..end].join("\n"));
         }
     }
 
     (snippets, severity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_errors;
+
+    #[test]
+    fn error_snippets_do_not_share_a_line() {
+        // Matches three lines apart: each window reaches one line back, so the
+        // previous window's last line used to be duplicated into the next snippet.
+        let (snippets, severity) = extract_errors("a\nb\nERROR one\nc\nd\nERROR two\ne\nf\n");
+        assert_eq!(severity, "ERROR");
+        assert!(
+            snippets.iter().any(|s| s.contains("ERROR one")),
+            "the first match must still be captured"
+        );
+        let mut seen: Vec<&str> = Vec::new();
+        for line in snippets.iter().flat_map(|s| s.lines()) {
+            assert!(!seen.contains(&line), "line {line:?} is in two snippets");
+            seen.push(line);
+        }
+    }
 }
