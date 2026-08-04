@@ -1,6 +1,6 @@
 [package]
 name = "eir-svc"
-version = "0.34.8"
+version = "0.34.9"
 edition = "2021"
 authors = ["Swatto <claude.ai@swatto.co.uk>"]
 description = "Eir system monitor service — runs as LocalSystem"
@@ -50,6 +50,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 toml = "0.8"
 tokio-stream = "0.1"
+# Ask attachments arrive base64-encoded; CLI providers need the raw image bytes on disk.
+base64 = "0.22"
 futures-util = "0.3"
 # Update subsystem: hash staged installers, validate URLs, and safely read release archives.
 sha2 = "0.10"

@@ -209,14 +209,44 @@ async fn response_text_capped(resp: reqwest::Response) -> Result<String> {
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-/// A base64-encoded image attachment for a multimodal completion. Only the HTTP
-/// providers (Anthropic API, OpenRouter vision models) consume these; the CLI providers
-/// ignore them (see `AiClient::supports_images`).
+/// A base64-encoded image attachment for a multimodal completion. The HTTP providers
+/// (Anthropic API, OpenRouter vision models) inline them; the Codex CLI takes them as
+/// files in its scratch workspace. Providers that can't read images at all are reported
+/// by `AiClient::supports_images`.
 #[derive(Clone, Debug)]
 pub struct ImageInput {
     pub base64: String,
     /// e.g. `image/jpeg` or `image/png`.
     pub media_type: String,
+}
+
+impl ImageInput {
+    /// Scratch filename for a CLI provider that attaches image *files*. Generated
+    /// here — never derived from the attachment name — so it can't traverse.
+    fn file_name(&self, index: usize) -> String {
+        let ext = match self.media_type.as_str() {
+            "image/png" => "png",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => "jpg",
+        };
+        format!("eir-image-{index}.{ext}")
+    }
+}
+
+/// Decode image attachments into (scratch filename, bytes) pairs for CLI providers.
+fn image_files(images: &[ImageInput]) -> Result<Vec<(String, Vec<u8>)>> {
+    use base64::Engine;
+    images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(image.base64.as_bytes())
+                .context("Decode attached image")?;
+            Ok((image.file_name(index), bytes))
+        })
+        .collect()
 }
 
 // ── Client ────────────────────────────────────────────────────────────────────
@@ -437,8 +467,15 @@ impl AiClient {
                     model,
                 } => {
                     let m = model_ov.unwrap_or(model);
-                    self.call_codex_cli(configured_binary.as_deref(), m, effort, &prompt, false)
-                        .await
+                    self.call_codex_cli(
+                        configured_binary.as_deref(),
+                        m,
+                        effort,
+                        &prompt,
+                        false,
+                        &[],
+                    )
+                    .await
                 }
                 AiClientConfig::OpenRouter { api_key, model } => {
                     let m = model_ov.unwrap_or(model);
@@ -861,6 +898,7 @@ impl AiClient {
                     },
                     &args,
                     &prompt,
+                    &[],
                     seq,
                 )
             })
@@ -957,11 +995,14 @@ impl AiClient {
         effort: &str,
         prompt: &str,
         web_search: bool,
+        images: &[ImageInput],
     ) -> Result<(String, Option<CallUsage>)> {
         static CODEX_CALL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = CODEX_CALL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let args = codex_cli_args(model, effort, web_search)?;
-        let output = run_codex_cli(configured_binary, &args, prompt, seq).await?;
+        let files = image_files(images)?;
+        let names: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
+        let args = codex_cli_args(model, effort, web_search, &names)?;
+        let output = run_codex_cli(configured_binary, &args, prompt, &files, seq).await?;
 
         if output.code != 0 {
             if let Some(err) = codex_event_error(&output.stdout) {
@@ -1024,6 +1065,7 @@ impl AiClient {
                     },
                     &args,
                     &prompt,
+                    &[],
                     seq,
                 )
             })
@@ -1203,8 +1245,15 @@ impl AiClient {
                 model,
             } => {
                 let m = if ov.is_empty() { model.as_str() } else { ov };
-                self.call_codex_cli(configured_binary.as_deref(), m, &self.effort, prompt, true)
-                    .await
+                self.call_codex_cli(
+                    configured_binary.as_deref(),
+                    m,
+                    &self.effort,
+                    prompt,
+                    true,
+                    &[],
+                )
+                .await
             }
             AiClientConfig::KiloCli {
                 configured_binary,
@@ -1263,7 +1312,7 @@ impl AiClient {
                 model,
             } => {
                 let m = if ov.is_empty() { model.as_str() } else { ov };
-                self.call_codex_cli(configured_binary.as_deref(), m, "", prompt, false)
+                self.call_codex_cli(configured_binary.as_deref(), m, "", prompt, false, &[])
                     .await
             }
             AiClientConfig::OpenRouter { api_key, model } => {
@@ -1290,14 +1339,16 @@ impl AiClient {
         }
     }
 
-    /// Whether this provider can accept image attachments. Only the HTTP providers do
-    /// (and OpenRouter only with a vision-capable model — a non-vision model surfaces a
-    /// per-call API error). The CLI providers don't, so the Ask handler warns and answers
-    /// text-only for them.
+    /// Whether this provider can accept image attachments: the HTTP providers inline them
+    /// (OpenRouter only with a vision-capable model — a non-vision model surfaces a
+    /// per-call API error), and the Codex CLI takes them as `--image` files. The Claude
+    /// and Kilo CLIs don't, so the Ask handler warns and answers text-only for them.
     pub fn supports_images(&self) -> bool {
         matches!(
             self.config,
-            AiClientConfig::Anthropic { .. } | AiClientConfig::OpenRouter { .. }
+            AiClientConfig::Anthropic { .. }
+                | AiClientConfig::OpenRouter { .. }
+                | AiClientConfig::CodexCli { .. }
         )
     }
 
@@ -1326,7 +1377,16 @@ impl AiClient {
                 self.call_openai_style(OPENROUTER_BASE, &api_key, m, "", prompt, images)
                     .await
             }
-            // CLI providers can't take images — answer text-only (the handler warns).
+            AiClientConfig::CodexCli {
+                configured_binary,
+                model,
+            } => {
+                let m = if ov.is_empty() { model.as_str() } else { ov };
+                self.call_codex_cli(configured_binary.as_deref(), m, "", prompt, false, images)
+                    .await
+            }
+            // The remaining CLI providers can't take images — answer text-only (the
+            // handler warns).
             _ => self.complete_text(prompt, model_override).await,
         }
     }
@@ -1513,7 +1573,12 @@ pub(crate) fn claude_cli_model(model: &str) -> String {
 /// Build the fixed, non-interactive Codex argv. The model is the only
 /// user-configurable argument that may pass through an npm `cmd /C` shim, so
 /// keep it to the model-id character set before it reaches a shell.
-fn codex_cli_args(model: &str, effort: &str, web_search: bool) -> Result<Vec<String>> {
+fn codex_cli_args(
+    model: &str,
+    effort: &str,
+    web_search: bool,
+    image_files: &[String],
+) -> Result<Vec<String>> {
     let model = model.trim();
     validate_cli_model_id(model, "Codex")?;
 
@@ -1544,6 +1609,13 @@ fn codex_cli_args(model: &str, effort: &str, web_search: bool) -> Result<Vec<Str
     }
     if let Some(level) = codex_cli_effort(model, effort) {
         args.extend(["-c".into(), format!("model_reasoning_effort={level}")]);
+    }
+    // `--image=<file>` (attached form, one value) rather than `-i <file>`: `--image`
+    // is multi-value, so a space-separated form immediately before the trailing `-`
+    // stdin sentinel could swallow it as a second filename. Names are relative to the
+    // scratch workspace, which is the CLI's working directory.
+    for name in image_files {
+        args.push(format!("--image={name}"));
     }
     args.push("-".into());
     Ok(args)
@@ -1716,12 +1788,14 @@ async fn run_codex_cli(
     configured_binary: Option<&str>,
     args: &[String],
     prompt: &str,
+    files: &[(String, Vec<u8>)],
     seq: u64,
 ) -> Result<CliProcessOutput> {
     if running_as_local_system() {
         let binary = configured_binary.map(str::to_owned);
         let args = args.to_vec();
         let prompt = prompt.to_owned();
+        let files = files.to_vec();
         return tokio::task::spawn_blocking(move || {
             run_cli_as_active_user(
                 UserCliSpec {
@@ -1734,6 +1808,7 @@ async fn run_codex_cli(
                 },
                 &args,
                 &prompt,
+                &files,
                 seq,
             )
         })
@@ -1752,6 +1827,11 @@ async fn run_codex_cli(
     tokio::fs::create_dir_all(&workspace)
         .await
         .context("Create Codex CLI scratch workspace")?;
+    for (name, bytes) in files {
+        tokio::fs::write(workspace.join(name), bytes)
+            .await
+            .context("Write Codex image attachment")?;
+    }
     let mut command = cli_process(&binary);
     command
         .args(args)
@@ -1996,6 +2076,9 @@ fn run_cli_as_active_user(
     spec: UserCliSpec<'_>,
     args: &[String],
     prompt: &str,
+    // Extra scratch files (generated names, e.g. image attachments) written into the
+    // workspace under the user's token alongside the stdin/stdout/stderr redirections.
+    files: &[(String, Vec<u8>)],
     seq: u64,
 ) -> Result<CliProcessOutput> {
     let UserCliSpec {
@@ -2040,6 +2123,9 @@ fn run_cli_as_active_user(
             std::fs::write(&stdin, prompt)?;
             std::fs::File::create(&stdout)?;
             std::fs::File::create(&stderr)?;
+            for (name, bytes) in files {
+                std::fs::write(workspace.join(name), bytes)?;
+            }
         }
 
         let application = format!(
@@ -2195,6 +2281,7 @@ pub(crate) async fn run_winget_as_active_user(
             },
             &args,
             "",
+            &[],
             seq,
         )
     })
@@ -2774,20 +2861,39 @@ mod tests {
 
     #[test]
     fn codex_cli_args_are_safe_and_provider_appropriate() {
-        let args = codex_cli_args("gpt-5.6-sol", "max", true).unwrap();
+        let args = codex_cli_args("gpt-5.6-sol", "max", true, &[]).unwrap();
         assert_eq!(args.first().map(String::as_str), Some("--search"));
         assert!(args.windows(2).any(|w| w == ["-m", "gpt-5.6-sol"]));
         assert!(args
             .windows(2)
             .any(|w| w == ["-c", "model_reasoning_effort=max"]));
         assert_eq!(args.last().map(String::as_str), Some("-"));
+        assert!(!args.iter().any(|a| a.starts_with("--image")));
 
-        let older = codex_cli_args("gpt-5.4", "max", false).unwrap();
+        // Attached images: one `--image=<file>` each, and the stdin sentinel stays last
+        // so the prompt is still read from stdin.
+        let with_images = codex_cli_args(
+            "gpt-5.6-sol",
+            "high",
+            false,
+            &["eir-image-0.jpg".to_string(), "eir-image-1.png".to_string()],
+        )
+        .unwrap();
+        assert_eq!(with_images.last().map(String::as_str), Some("-"));
+        assert_eq!(
+            with_images
+                .iter()
+                .filter(|a| a.starts_with("--image="))
+                .collect::<Vec<_>>(),
+            vec!["--image=eir-image-0.jpg", "--image=eir-image-1.png"]
+        );
+
+        let older = codex_cli_args("gpt-5.4", "max", false, &[]).unwrap();
         assert!(older
             .windows(2)
             .any(|w| w == ["-c", "model_reasoning_effort=xhigh"]));
-        assert!(codex_cli_args("gpt-5.4 & whoami", "high", false).is_err());
-        assert!(codex_cli_args(&"a".repeat(257), "high", false).is_err());
+        assert!(codex_cli_args("gpt-5.4 & whoami", "high", false, &[]).is_err());
+        assert!(codex_cli_args(&"a".repeat(257), "high", false, &[]).is_err());
     }
 
     #[cfg(windows)]
@@ -2818,6 +2924,29 @@ mod tests {
                 stderr: std::path::Path::new(r"C:\err"),
             },
         )
+        .is_err());
+    }
+
+    #[test]
+    fn image_files_decode_to_generated_names() {
+        let images = [
+            ImageInput {
+                base64: "aGk=".to_string(),
+                media_type: "image/jpeg".to_string(),
+            },
+            ImageInput {
+                base64: "aGk=".to_string(),
+                media_type: "image/png".to_string(),
+            },
+        ];
+        let files = image_files(&images).unwrap();
+        assert_eq!(files[0].0, "eir-image-0.jpg");
+        assert_eq!(files[1].0, "eir-image-1.png");
+        assert_eq!(files[0].1, b"hi");
+        assert!(image_files(&[ImageInput {
+            base64: "not base64!!".to_string(),
+            media_type: "image/png".to_string(),
+        }])
         .is_err());
     }
 
