@@ -1629,6 +1629,25 @@ mod tests {
     }
 
     #[test]
+    fn manual_game_mode_off_warns_that_auto_detect_can_revert_it() {
+        // A manual OFF only withdraws the lease; the tray's detector re-asserts it
+        // within ~30s while a fullscreen game runs. The toast used to just confirm
+        // "Game Mode off".
+        let javascript = include_str!("../../ui/main.js");
+        let (_, handler) = javascript
+            .split_once("document.getElementById('game-btn').addEventListener('click'")
+            .expect("the game-btn handler is still here");
+        let body = &handler[..handler
+            .find("catch (e) { console.error('set_gaming failed'")
+            .expect("the handler still calls set_gaming")];
+        assert!(body.contains("game_mode_auto"), "the caveat must be conditional");
+        assert!(
+            body.contains("auto-detect can turn it back on"),
+            "a manual off that will not hold must say so"
+        );
+    }
+
+    #[test]
     fn rejected_command_result_is_an_error() {
         assert_eq!(
             command_result(CommandResult {

@@ -2107,7 +2107,15 @@ document.getElementById('game-btn').addEventListener('click', async () => {
   const on = !(lastStatus && lastStatus.gaming);
   try {
     const result = await invoke('set_gaming', { on, manual: true });
-    toast(commandMessage(result, on ? 'Game Mode on' : 'Game Mode off'), 'ok');
+    let msg = commandMessage(result, on ? 'Game Mode on' : 'Game Mode off');
+    // A manual OFF only withdraws the current lease: while a fullscreen game is
+    // running the detector re-asserts it within ~30s. Say so, and name the setting
+    // that makes the choice stick, instead of confirming an off that won't hold.
+    const autoOn = !!(lastStatus && lastStatus.settings && lastStatus.settings.game_mode_auto);
+    if (!on && autoOn) {
+      msg += ' — auto-detect can turn it back on while a fullscreen game runs. Disable Auto Game Mode in Settings for full manual control.';
+    }
+    toast(msg, 'ok');
   }
   catch (e) { console.error('set_gaming failed', e); toast('Could not change Game Mode: ' + e, 'err'); }
   refresh();
