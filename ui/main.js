@@ -525,6 +525,7 @@ function sparkCell(label, key, color, points, markers, latest) {
   </div>`;
 }
 
+let lastHistorySig = null;
 function renderHistory(status) {
   const card = document.getElementById('history-card');
   const pts = status.history || [];
@@ -537,6 +538,11 @@ function renderHistory(status) {
   for (const e of (status.recent_executions || [])) {
     if (e.at) markers.push({ at: e.at, color: e.success ? 'var(--green)' : 'var(--red)', label: e.action });
   }
+  // Skip the rebuild when nothing changed, so the 2s poll doesn't recreate the SVGs
+  // and dismiss a marker <title> tooltip mid-hover (same guard as the list renders).
+  const sig = JSON.stringify({ pts, markers });
+  if (sig === lastHistorySig) return;
+  lastHistorySig = sig;
   const last = pts[pts.length - 1];
   document.getElementById('spark-grid').innerHTML =
     sparkCell('CPU', 'cpu', 'var(--blue)', pts, markers, last.cpu) +

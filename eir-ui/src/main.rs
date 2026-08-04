@@ -1612,6 +1612,23 @@ mod tests {
     }
 
     #[test]
+    fn history_sparklines_only_rebuild_on_change() {
+        // An unguarded innerHTML on the 2s poll recreated the SVGs and killed marker
+        // tooltips mid-hover; the paint must sit behind a change signature.
+        let javascript = include_str!("../../ui/main.js");
+        let (_, render) = javascript
+            .split_once("function renderHistory(")
+            .expect("renderHistory is still here");
+        let before_paint = &render[..render
+            .find("spark-grid")
+            .expect("renderHistory still paints the spark grid")];
+        assert!(
+            before_paint.contains("lastHistorySig"),
+            "renderHistory must skip identical repaints"
+        );
+    }
+
+    #[test]
     fn rejected_command_result_is_an_error() {
         assert_eq!(
             command_result(CommandResult {
