@@ -561,7 +561,19 @@ function renderAsk(ask) {
   const sendBtn = document.getElementById('ask-send');
   const statusEl = document.getElementById('ask-status');
   const running = !!(ask && ask.running);
-  if (askWasRunning && !running) askLastDoneAt = Date.now();
+  if (askWasRunning && !running) {
+    askLastDoneAt = Date.now();
+    // Announce completion: the answer lands in #ask-list (not a live region) and the
+    // disabled send button's label change is not reliably re-announced, so a screen
+    // reader heard "Question accepted" and then silence. Errors are announced by the
+    // role="status" line below; announce success through the aria-live toast region,
+    // which also reaches a user who has navigated to another view. Guarded to a
+    // genuinely fresh answer so a service-restart blip cannot fake one.
+    const newestAt = ((ask && ask.entries) || []).reduce((m, x) => Math.max(m, x.at || 0), 0);
+    if (!(ask && ask.error) && newestAt && Date.now() / 1000 - newestAt < 30) {
+      toast('Eir has answered — see Ask Eir.', 'ok');
+    }
+  }
   askWasRunning = running;
   sendBtn.disabled = running || askSending || askAttachmentBusy;
   sendBtn.textContent = running ? 'Thinking…' : 'Ask Eir';

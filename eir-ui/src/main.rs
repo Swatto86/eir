@@ -1489,6 +1489,24 @@ mod tests {
     }
 
     #[test]
+    fn ask_completion_is_announced() {
+        // The answer appears only in the non-live #ask-list, so screen readers heard
+        // "Question accepted" and then silence. The running→idle transition must
+        // announce through the aria-live toast region.
+        let javascript = include_str!("../../ui/main.js");
+        let (_, transition) = javascript
+            .split_once("if (askWasRunning && !running) {")
+            .expect("the ask running→idle transition is still here");
+        let block = &transition[..transition
+            .find("askWasRunning = running;")
+            .expect("the transition still stores the new state")];
+        assert!(
+            block.contains("toast(") && block.contains("has answered"),
+            "a finished answer must be announced"
+        );
+    }
+
+    #[test]
     fn rejected_command_result_is_an_error() {
         assert_eq!(
             command_result(CommandResult {
