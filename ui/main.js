@@ -1418,12 +1418,19 @@ function renderUpdater(u, paused, protocolVersion, capabilities) {
   }
 }
 
-document.getElementById('upd-now').addEventListener('click', async () => {
+document.getElementById('upd-now').addEventListener('click', async (e) => {
+  // Same synchronous in-progress state as the scan buttons: without it the button
+  // stayed live for up to a poll (2s), inviting a second run. renderUpdater
+  // reconciles the real label/disabled state on the refresh below.
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  btn.textContent = 'Starting…';
   try {
     const result = await invoke('run_updates_now');
     toast(commandMessage(result, 'Update run started'), 'ok');
   }
   catch (e) { console.error('run_updates_now failed', e); toast('Could not start updates: ' + e, 'err'); }
+  refresh();
 });
 document.getElementById('clear-updates').addEventListener('click', async () => {
   if (!window.confirm('Clear all update history? This cannot be undone.')) return;

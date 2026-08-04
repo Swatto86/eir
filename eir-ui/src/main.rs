@@ -1431,6 +1431,32 @@ mod tests {
     }
 
     #[test]
+    fn service_trigger_buttons_show_progress_synchronously() {
+        // "Update now" left the button live and unchanged until the next 2s poll, so a
+        // second activation issued a duplicate run. It must arm itself on click like
+        // the scan buttons, and refresh so the poll reconciles the real state.
+        let javascript = include_str!("../../ui/main.js");
+        for (id, command) in [
+            ("upd-now", "invoke('run_updates_now')"),
+            ("disk-scan", "invoke('scan_disk')"),
+        ] {
+            let handler = javascript
+                .split_once(&format!(
+                    "document.getElementById('{id}').addEventListener('click'"
+                ))
+                .map(|(_, rest)| rest)
+                .unwrap_or_else(|| panic!("{id} handler is still here"));
+            let before_invoke = &handler[..handler
+                .find(command)
+                .unwrap_or_else(|| panic!("{id} still calls {command}"))];
+            assert!(
+                before_invoke.contains("btn.disabled = true"),
+                "{id} must disable itself before invoking"
+            );
+        }
+    }
+
+    #[test]
     fn rejected_command_result_is_an_error() {
         assert_eq!(
             command_result(CommandResult {
