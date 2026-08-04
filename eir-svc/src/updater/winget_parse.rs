@@ -167,9 +167,11 @@ pub fn is_noise(name: &str) -> bool {
         "visual studio installer",
         "onedrive",
         "teams machine-wide",
-        "eir",
     ];
-    SKIP.iter().any(|s| n.contains(s))
+    // "eir" is only ever the product literally named Eir (PRODUCTNAME in the
+    // installer). Match it as a whole token — as a substring it silently drops any
+    // app whose name merely contains those letters ("Weird West", "Their Notes").
+    SKIP.iter().any(|s| n.contains(s)) || n.split_whitespace().any(|t| t == "eir")
 }
 
 /// A winget *catalog* id looks like `Publisher.App` — a dot, no path separators
@@ -234,6 +236,17 @@ pub fn parse_unmanaged(text: &str, already_managed: &HashSet<String>) -> Vec<(St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_noise_skips_eir_itself_but_not_names_that_merely_contain_eir() {
+        assert!(is_noise("Eir"));
+        assert!(is_noise("Eir Guardian"));
+        // These were silently dropped from update management by the substring match.
+        assert!(!is_noise("Weird West"));
+        assert!(!is_noise("Their Notes"));
+        // The long entries still match as substrings.
+        assert!(is_noise("Realtek Audio Driver"));
+    }
 
     /// Render a winget-style fixed-width table from explicit column widths, a
     /// header, and data rows. Mirrors winget exactly: columns are left-aligned and
