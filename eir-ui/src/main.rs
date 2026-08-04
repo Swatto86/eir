@@ -1384,6 +1384,27 @@ mod tests {
     }
 
     #[test]
+    fn updater_interval_frontend_matches_service_seconds_contract() {
+        // The service clamps schedule_interval_secs to 300 … 365 days. The frontend
+        // showed whole hours with a 1-hour floor, so a valid 5-minute schedule was
+        // displayed as 1 and written back as 3600 by any unrelated updater save.
+        const MIN: u64 = 300;
+        const MAX: u64 = 365 * 24 * 3600;
+        let html = include_str!("../../ui/index.html");
+        let javascript = include_str!("../../ui/main.js");
+        assert!(html.contains("Check interval (seconds)"));
+        assert!(html.contains(&format!(
+            "id=\"set-upd-interval\" type=\"number\" min=\"{MIN}\" max=\"{MAX}\""
+        )));
+        assert!(javascript.contains(&format!(
+            "Math.min({MAX}, Math.max({MIN}, s.schedule_interval_secs || 86400))"
+        )));
+        assert!(javascript.contains(&format!(
+            "schedule_interval_secs: numVal('set-upd-interval', 86400, {MIN}, {MAX})"
+        )));
+    }
+
+    #[test]
     fn rejected_command_result_is_an_error() {
         assert_eq!(
             command_result(CommandResult {

@@ -668,8 +668,8 @@
         <div class="set-grid">
           <label for="set-upd-enabled">Auto-update apps</label>
           <input id="set-upd-enabled" type="checkbox">
-          <label for="set-upd-interval">Check interval (hours)</label>
-          <input id="set-upd-interval" type="number" min="1" max="8760" placeholder="24">
+          <label for="set-upd-interval">Check interval (seconds)</label>
+          <input id="set-upd-interval" type="number" min="300" max="31536000" placeholder="86400">
           <label id="set-methods-label">Update via</label>
           <div class="methods-row" id="set-methods" role="group" aria-labelledby="set-methods-label">
             <label><input type="checkbox" id="m-winget"> winget</label>

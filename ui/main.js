@@ -1904,8 +1904,11 @@ function fillUpdaterSettings(s) {
   if (!s) return;
   document.getElementById('set-upd-save').disabled = false;
   document.getElementById('set-upd-enabled').checked = !!s.enabled;
+  // Seconds, matching the service's own range (it clamps to 300 … 365d). Showing
+  // whole hours rounded a valid 5–59 minute schedule up to 1, and saving any other
+  // updater option then wrote that back as 3600, silently changing the schedule.
   document.getElementById('set-upd-interval').value =
-    Math.max(1, Math.round((s.schedule_interval_secs || 86400) / 3600));
+    Math.min(31536000, Math.max(300, s.schedule_interval_secs || 86400));
   const methods = s.methods || [];
   for (const [id, name] of METHOD_BOXES) document.getElementById(id).checked = methods.includes(name);
   document.getElementById('m-scoop').checked = false;
@@ -1946,7 +1949,7 @@ async function saveUpdaterSettings() {
   }
   const settings = {
     enabled: document.getElementById('set-upd-enabled').checked,
-    schedule_interval_secs: numVal('set-upd-interval', 24, 1, 8760) * 3600,
+    schedule_interval_secs: numVal('set-upd-interval', 86400, 300, 31536000),
     methods,
     native_enabled: document.getElementById('set-native-enabled').checked,
     native_signature_policy: document.getElementById('set-sigpol').value,
