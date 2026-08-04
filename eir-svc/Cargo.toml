@@ -56,6 +56,8 @@ futures-util = "0.3"
 # Update subsystem: hash staged installers, validate URLs, and safely read release archives.
 sha2 = "0.10"
 url = "2"
+# Version comparison: SemVer precedence so a prerelease ranks below its stable release.
+semver = "1"
 zip = { version = "4", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 tar = { version = "0.4", default-features = false }

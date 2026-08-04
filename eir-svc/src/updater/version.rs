@@ -36,7 +36,15 @@ pub fn numeric_components(s: &str) -> Option<Vec<u64>> {
 /// Compare two version strings numerically, component by component. Returns None
 /// when neither side begins with a parseable dotted-numeric version.
 pub fn version_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
-    let (mut x, mut y) = (numeric_components(a)?, numeric_components(b)?);
+    let (a, b) = (normalize_version(a), normalize_version(b));
+    // Real SemVer first, so a prerelease ranks BELOW its stable release instead of
+    // comparing equal (the numeric head alone drops the "-beta"). Windows/vendor
+    // schemes ("2.43.0.windows.1", "1.7.12227.37421622") aren't valid SemVer and
+    // fall through to the dotted-numeric comparison unchanged.
+    if let (Ok(x), Ok(y)) = (semver::Version::parse(&a), semver::Version::parse(&b)) {
+        return Some(x.cmp(&y));
+    }
+    let (mut x, mut y) = (numeric_components(&a)?, numeric_components(&b)?);
     let n = x.len().max(y.len());
     x.resize(n, 0);
     y.resize(n, 0);
@@ -152,6 +160,18 @@ mod tests {
             classify_version("Unknown", "2.0.0"),
             Verification::Unverified
         );
+        // A prerelease is NOT the stable release: verifying an attempted 2.0.0 against
+        // an installed 2.0.0-beta must be a mismatch, and the stable must still be
+        // offered as an update over it.
+        assert_eq!(
+            version_cmp("2.0.0-beta", "2.0.0"),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            classify_version("2.0.0-beta", "2.0.0"),
+            Verification::Mismatch
+        );
+        assert!(is_newer("2.0.0", "2.0.0-beta"));
     }
 
     #[test]
