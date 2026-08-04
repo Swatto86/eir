@@ -1,7 +1,4 @@
-use eir_proto::{
-    CommandResult, ServiceMsg, StatusPayload, UiRequest, CAP_COMMAND_RESULTS, CAP_PROVIDER_TEST,
-    PIPE_NAME, PROTOCOL_VERSION,
-};
+use eir_proto::{CommandResult, ServiceMsg, StatusPayload, UiRequest, PIPE_NAME, PROTOCOL_VERSION};
 use std::{
     ffi::{c_void, OsString},
     os::windows::{ffi::OsStringExt, io::AsRawHandle},
@@ -1388,7 +1385,10 @@ mod tests {
         match serde_json::from_str::<ServiceMsg>(line.trim()).expect("initial status message") {
             ServiceMsg::Status(status) => {
                 assert_eq!(status.protocol_version, PROTOCOL_VERSION);
-                assert!(status.capabilities.iter().any(|x| x == CAP_COMMAND_RESULTS));
+                assert!(status
+                    .capabilities
+                    .iter()
+                    .any(|x| x == eir_proto::CAP_COMMAND_RESULTS));
                 // The startup snapshot a client receives on connect must advertise
                 // everything this build supports: a UI that connects during startup
                 // caches these and would otherwise refuse a supported retry.

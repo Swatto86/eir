@@ -614,7 +614,11 @@ fn extract_7z_installer(
             // 7z is the only format matched by name (zip/tar re-locate by index), and
             // a Windows-authored archive stores `setup\tool.exe` while selected.name
             // is normalized — compare normalized or nothing ever matches.
-            if entry.name.replace('\\', "/").eq_ignore_ascii_case(&selected.name) {
+            if entry
+                .name
+                .replace('\\', "/")
+                .eq_ignore_ascii_case(&selected.name)
+            {
                 extracted = Some(write_installer(reader, dir, selected.kind, max_bytes)?);
                 return Ok(false);
             }

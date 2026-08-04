@@ -1549,8 +1549,14 @@ mod tests {
         let body = &pick[..pick
             .find("catch (e) { console.error('add_ask_attachments failed'")
             .expect("the pick still invokes add_ask_attachments")];
-        assert!(body.contains("res.skipped"), "skipped picks are not reported");
-        assert!(body.contains("res.full"), "an unopened picker is not reported");
+        assert!(
+            body.contains("res.skipped"),
+            "skipped picks are not reported"
+        );
+        assert!(
+            body.contains("res.full"),
+            "an unopened picker is not reported"
+        );
         assert!(body.contains("could not be attached"));
     }
 
@@ -1579,9 +1585,15 @@ mod tests {
         let (_, helper) = javascript
             .split_once("function focusGuidanceToggle(editor) {")
             .expect("the focus-restore helper is still here");
-        assert!(helper[..200].contains(".upd-guide"), "focus goes to the toggle");
+        assert!(
+            helper[..200].contains(".upd-guide"),
+            "focus goes to the toggle"
+        );
         for (label, marker) in [
-            ("cancel", "const editor = cancel.closest('.upd-note-editor');"),
+            (
+                "cancel",
+                "const editor = cancel.closest('.upd-note-editor');",
+            ),
             ("save", "if (editor) {"),
         ] {
             let (_, rest) = javascript
@@ -1640,7 +1652,10 @@ mod tests {
         let body = &handler[..handler
             .find("catch (e) { console.error('set_gaming failed'")
             .expect("the handler still calls set_gaming")];
-        assert!(body.contains("game_mode_auto"), "the caveat must be conditional");
+        assert!(
+            body.contains("game_mode_auto"),
+            "the caveat must be conditional"
+        );
         assert!(
             body.contains("auto-detect can turn it back on"),
             "a manual off that will not hold must say so"
