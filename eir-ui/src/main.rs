@@ -970,26 +970,37 @@ static UPDATE_IN_PROGRESS: std::sync::atomic::AtomicBool =
 /// Check for updates shortly after startup and every 6 hours thereafter. When a
 /// newer signed release is published, download, install (runs the NSIS installer,
 /// which prompts for elevation and updates the service too), and relaunch.
-fn spawn_update_checker(handle: tauri::AppHandle) {
+fn spawn_update_checker(handle: tauri::AppHandle, status: pipe_client::SharedStatus) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         loop {
-            check_for_update(&handle).await;
-            tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+            let ran = check_for_update(&handle, &status).await;
+            // Deferred for Game Mode → retry sooner, so the update lands shortly
+            // after the game ends instead of up to 6 hours later.
+            let next_secs = if ran { 6 * 3600 } else { 30 * 60 };
+            tokio::time::sleep(std::time::Duration::from_secs(next_secs)).await;
         }
     });
 }
 
-async fn check_for_update(handle: &tauri::AppHandle) {
+/// True when the check ran; false when it was deferred for Game Mode.
+async fn check_for_update(handle: &tauri::AppHandle, status: &pipe_client::SharedStatus) -> bool {
+    // Game Mode promises "updates & housekeeping paused while you play". The
+    // service-side app updater honours it (updater_due); Eir's own updater must too
+    // — a UAC prompt plus an app restart mid-game is exactly the interruption Game
+    // Mode exists to prevent. The manual About-view check stays ungated.
+    if self_update_deferred(status) {
+        return false;
+    }
     if UPDATE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-        return; // a manual check is already installing
+        return true; // a manual check is already installing
     }
     let updater = match handle.updater() {
         Ok(u) => u,
         Err(e) => {
             error!("Updater unavailable: {e}");
             UPDATE_IN_PROGRESS.store(false, Ordering::SeqCst);
-            return;
+            return true;
         }
     };
     // Timeouts guarantee completion so UPDATE_IN_PROGRESS is reset even if the check
@@ -1012,6 +1023,12 @@ async fn check_for_update(handle: &tauri::AppHandle) {
         Err(_) => error!("Update check timed out"),
     }
     UPDATE_IN_PROGRESS.store(false, Ordering::SeqCst);
+    true
+}
+
+/// Whether Eir's own update must wait — the user is playing a fullscreen game.
+fn self_update_deferred(status: &pipe_client::SharedStatus) -> bool {
+    pipe_client::lock_status(status).gaming
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1110,7 +1127,7 @@ fn main() {
                 });
 
                 // The updater installs NSIS and therefore belongs only to installed Eir.
-                spawn_update_checker(app.handle().clone());
+                spawn_update_checker(app.handle().clone(), status_for_loop.clone());
             }
 
             let open_item = MenuItem::with_id(app, "open", "Open Status", true, None::<&str>)?;
@@ -1456,6 +1473,19 @@ mod tests {
                 "{id} must disable itself before invoking"
             );
         }
+    }
+
+    #[test]
+    fn self_update_is_deferred_while_gaming() {
+        // The background self-update runs the per-machine NSIS installer (UAC
+        // secure-desktop prompt) and restarts the app — never mid-game.
+        let status: pipe_client::SharedStatus = Arc::new(Mutex::new(StatusPayload {
+            gaming: true,
+            ..Default::default()
+        }));
+        assert!(self_update_deferred(&status));
+        pipe_client::lock_status(&status).gaming = false;
+        assert!(!self_update_deferred(&status));
     }
 
     #[test]
