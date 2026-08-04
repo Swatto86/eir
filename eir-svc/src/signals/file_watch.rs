@@ -184,6 +184,13 @@ fn replacement_watch_dirs(directories: &[PathBuf]) -> HashSet<PathBuf> {
     directories.iter().cloned().collect()
 }
 
+/// Whether the watched directory set actually changed (a fast-user-switch), as
+/// opposed to a routine re-arm of the same roots. Only a real change justifies
+/// dropping buffered, un-drained events.
+fn watched_set_changed(previous: &HashSet<PathBuf>, next: &HashSet<PathBuf>) -> bool {
+    previous != next
+}
+
 fn parse_path(path: &Path, as_active_user: bool) -> Option<(u64, crate::models::LogEvent)> {
     let _user = if as_active_user {
         Some(ActiveUserImpersonation::new()?)
@@ -449,13 +456,19 @@ pub fn spawn(
                 }
                 let removed = watched_dirs.difference(&armed).count();
                 let added = armed.difference(&watched_dirs).count();
+                let roots_changed = watched_set_changed(&watched_dirs, &armed);
                 drop(std::mem::replace(&mut watcher, replacement));
                 watched_dirs = armed;
-                // Drop already-parsed and queued events from the old user's roots.
-                if let Ok(mut changes) = shared_clone.lock() {
-                    changes.clear();
+                // Only drop accumulated events when the watched set ACTUALLY changed (a
+                // fast-user-switch). main.rs re-sends the full set every 20 cycles even
+                // when it is unchanged; clearing then wipes fresh, un-drained evidence
+                // and races the decision loop's same-cycle drain.
+                if roots_changed {
+                    if let Ok(mut changes) = shared_clone.lock() {
+                        changes.clear();
+                    }
+                    while event_rx.try_recv().is_ok() {}
                 }
-                while event_rx.try_recv().is_ok() {}
                 info!(
                     dirs = watched_dirs.len(),
                     added, removed, "File watcher roots replaced"
@@ -571,6 +584,24 @@ mod tests {
             Instant::now() + Duration::from_secs(5)
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_real_root_change_drops_buffered_events() {
+        // main.rs re-sends the discovered directory set every 20 cycles whether or not
+        // it changed, and discovery order is not stable. A re-send of the same roots
+        // (any order, duplicates included) must not count as a change — clearing then
+        // wipes un-drained evidence. Only a fast-user-switch does.
+        let a = PathBuf::from(r"C:\A");
+        let b = PathBuf::from(r"C:\B");
+        let sent = replacement_watch_dirs(&[a.clone(), b.clone()]);
+        let resent = replacement_watch_dirs(&[b.clone(), a.clone(), a.clone()]);
+        let switched = replacement_watch_dirs(&[PathBuf::from(r"C:\Other")]);
+
+        assert!(!watched_set_changed(&sent, &resent));
+        assert!(watched_set_changed(&sent, &switched));
+        // A failed rebuild arms nothing — that IS a change, and still clears.
+        assert!(watched_set_changed(&sent, &HashSet::new()));
     }
 
     #[test]
