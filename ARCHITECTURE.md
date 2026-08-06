@@ -634,7 +634,7 @@ envelope/NDJSON decoding and these limits have regression checks.
 1. Builds the prompt via `prompt::build`.
 2. Applies a `model_override` and an `effort_override` to **every** provider (both trimmed and ignored if empty). This is the advisor escalation lever.
 3. Dispatches to the per-provider call, returning raw text + `Option<CallUsage>` (every provider now reports usage where available; Anthropic's cost is estimated, OpenRouter's is provider-reported, the Kilo CLI's step_finish cost is provider-reported where present).
-4. Parses: `strip_fences` removes ```` ```json ````/`~~~` fences, then `serde_json::from_str::<ClaudeDecision>`; on failure it falls back to `extract_json_object` (first `{` … last `}`) to handle reasoning models that wrap JSON in prose. A hard parse failure propagates an error with the raw text attached.
+4. Parses: `strip_fences` removes ```` ```json ````/`~~~` fences, then `serde_json::from_str::<ClaudeDecision>`; on failure it falls back to `extract_json_object`, a string-/escape-aware brace scan that returns the **first complete** object, to handle models that wrap JSON in prose or (common on cheaper free models) emit the object more than once. A truncated object is passed through whole so serde reports the real EOF error rather than a silently narrowed fragment. A hard parse failure propagates an error with the raw text attached. The same helper backs `extract_json`, used by the updater's check/diagnose/native-installer parsers.
 
 Each streaming path surfaces mid-stream provider errors instead of returning empty: OpenAI-style bails on a streamed `error` object and on an empty final body (`client.rs:445-448`, `469-471`); Anthropic only accumulates `content_block_delta`/`text_delta` events.
 

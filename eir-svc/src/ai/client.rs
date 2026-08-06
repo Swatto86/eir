@@ -2376,11 +2376,7 @@ fn estimate_anthropic_cost(
 /// Pull the JSON object out of a model response that may wrap it in prose or code
 /// fences (reasoning models often add commentary around the JSON).
 pub(crate) fn extract_json(s: &str) -> &str {
-    let t = strip_fences(s);
-    match (t.find('{'), t.rfind('}')) {
-        (Some(a), Some(b)) if b > a => &t[a..=b],
-        _ => t,
-    }
+    extract_json_object(strip_fences(s))
 }
 
 async fn openrouter_api_key(configured: Option<&str>) -> Result<String> {
@@ -2430,12 +2426,41 @@ fn read_openrouter_key(profile: &std::path::Path) -> Option<String> {
         .map(|key| key.trim().to_string())
 }
 
-/// Extract the outermost JSON object (first `{` to last `}`) — a fallback for
-/// models that surround the JSON with prose.
+/// Extract the FIRST complete JSON object — a fallback for models that surround the
+/// JSON with prose. Brace-matched (string- and escape-aware) rather than first-`{`
+/// to last-`}`: cheaper free models routinely emit the object twice, or restate it
+/// after the answer, and the naive span covered `{obj}{obj}`, which parses as nothing.
+/// Falls back to the widest span so a *truncated* object still reaches serde for a
+/// real "EOF while parsing" error rather than being silently reduced to a fragment.
 fn extract_json_object(s: &str) -> &str {
-    match (s.find('{'), s.rfind('}')) {
-        (Some(a), Some(b)) if b > a => &s[a..=b],
-        _ => s,
+    let Some(start) = s.find('{') else { return s };
+    let (mut depth, mut in_str, mut escaped) = (0usize, false, false);
+    for (i, c) in s[start..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if in_str {
+            match c {
+                '\\' => escaped = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                '"' => in_str = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &s[start..=start + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    match s.rfind('}') {
+        Some(b) if b > start => &s[start..=b],
+        _ => &s[start..],
     }
 }
 
@@ -3098,6 +3123,30 @@ mod tests {
         // And the raw-based fallback recovers the object even if a real fence wraps prose.
         let wrapped = "Here is the answer:\n```\n{\"diagnosis\":\"x\"}\n```";
         assert_eq!(extract_json_object(wrapped), "{\"diagnosis\":\"x\"}");
+    }
+
+    #[test]
+    fn extract_json_takes_the_first_complete_object() {
+        // Observed with a cheap free model: it emitted the verdict, then began repeating
+        // it, so the response was `{obj}{partial`. First-`{`..last-`}` spanned both and
+        // parsed as nothing; the first complete object must be recovered instead.
+        let doubled = "{\"analysis\":\"healthy\",\"problems\":[]}{\"analysis\":\"heal";
+        assert_eq!(
+            extract_json(doubled),
+            "{\"analysis\":\"healthy\",\"problems\":[]}"
+        );
+        serde_json::from_str::<serde_json::Value>(extract_json(doubled)).unwrap();
+
+        // Nested objects, and a brace inside a string, must not end the scan early.
+        let nested = "prose {\"a\":{\"b\":\"}\"},\"c\":\"\\\\\"} tail {\"x\":1}";
+        assert_eq!(extract_json(nested), "{\"a\":{\"b\":\"}\"},\"c\":\"\\\\\"}");
+        serde_json::from_str::<serde_json::Value>(extract_json(nested)).unwrap();
+
+        // A genuinely truncated object still reaches serde as a parse error, not a
+        // silently-narrowed fragment that would mis-decode.
+        let truncated = "{\"analysis\":\"heal";
+        assert_eq!(extract_json(truncated), truncated);
+        assert!(serde_json::from_str::<serde_json::Value>(extract_json(truncated)).is_err());
     }
 
     #[test]
