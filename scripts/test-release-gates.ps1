@@ -116,7 +116,11 @@ Assert-Contains $publish 'upload_url' 'Publish does not use the draft release up
 Assert-Contains $publish 'uploads\.github\.com' 'Publish does not require the GitHub uploads host for release assets.'
 Assert-Contains $publish 'for \(\$attempt = 1; \$attempt -le \$maxAttempts' 'Publish does not retry transient GitHub API failures.'
 Assert-Contains $publish 'Start-Sleep -Seconds \$delaySeconds' 'Publish retry does not back off between GitHub API attempts.'
-Assert-Contains $publish 'HTTP 40\[0-4\]' 'Publish retries client 404s instead of failing closed.'
+if ($publish -match '(?m)\s--output(\s|$)') {
+    throw 'gh api has no --output flag; download release assets from redirected stdout.'
+}
+Assert-Contains $publish 'StandardOutput' 'Publish does not stream gh api stdout when downloading assets for validation.'
+Assert-Contains $publish 'unknown flag' 'Publish retries gh usage errors instead of failing closed.'
 
 [void][scriptblock]::Create($publish)
 

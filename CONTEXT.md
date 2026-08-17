@@ -10,6 +10,8 @@ Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.j
 
 ## Architectural decisions
 
+2026-08-17 | Eir | v0.34.13 verification downloads gh api stdout | The uploads.github.com fix landed: all five v0.34.13 assets reached the draft, then validation 404'd locally because `gh api --output` is not a flag (Windows gh printed usage and we retried it six times). Asset GET now copies process stdout into the validation file; usage errors fail closed.
+
 2026-08-17 | Eir | v0.34.13 asset POST uses uploads.github.com | The retried publish script built, signed, and smoked green, then 404'd six times posting `Eir_0.34.13_x64-setup.exe` to `api.github.com /releases/{id}/assets`. Release asset creation is `POST https://uploads.github.com/...` from the draft's `upload_url`; api.github.com only lists/deletes assets. Publish now posts to that upload host, fails closed on 4xx, and still retries 5xx.
 
 2026-08-17 | Eir | v0.34.13 publish retries GitHub uploads outside tauri-action | Tag `v0.34.13` built and signed twice at HEAD `e896a40`; both runs died in `tauri-action` with GitHub `No server is currently available` while deleting the existing draft installer, so portable/checksum upload never ran and `/releases/latest` stayed on v0.34.12. The tag workflow now builds/signs without `tagName`, and `scripts/publish-release.ps1` creates or reuses the draft by id, generates `latest.json` from the local `.sig`, uploads all five assets, verifies version/URL/signature, then PATCHes `draft=false`. Every GitHub API call retries six times with 4s–32s backoff.

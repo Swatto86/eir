@@ -110,22 +110,48 @@ function Invoke-GitHubApi {
         $errorFile = Join-Path $runnerTemp "eir-gh-$([guid]::NewGuid().ToString('N')).err"
         try {
             $output = $null
+            $exitCode = 0
+            $errorText = ''
             if ($InputPath) {
                 $output = & gh @ghArguments --input $InputPath 2>$errorFile
+                $exitCode = $LASTEXITCODE
+                if (Test-Path -LiteralPath $errorFile) {
+                    $errorText = [string](Get-Content -LiteralPath $errorFile -Raw)
+                }
             } elseif ($OutputPath) {
-                & gh @ghArguments --output $OutputPath 2>$errorFile
+                # gh api cannot write a response body to a file path. Stream stdout
+                # so binary .sig downloads stay intact.
+                $ghExe = (Get-Command gh -CommandType Application).Source
+                $psi = [System.Diagnostics.ProcessStartInfo]::new($ghExe)
+                $psi.UseShellExecute = $false
+                $psi.RedirectStandardOutput = $true
+                $psi.RedirectStandardError = $true
+                $psi.CreateNoWindow = $true
+                foreach ($argument in $ghArguments) {
+                    [void]$psi.ArgumentList.Add($argument)
+                }
+                $proc = [System.Diagnostics.Process]::Start($psi)
+                $outStream = [System.IO.File]::Create($OutputPath)
+                try {
+                    $proc.StandardOutput.BaseStream.CopyTo($outStream)
+                } finally {
+                    $outStream.Dispose()
+                }
+                $errorText = [string]$proc.StandardError.ReadToEnd()
+                $proc.WaitForExit()
+                $exitCode = $proc.ExitCode
             } else {
                 $output = & gh @ghArguments 2>$errorFile
+                $exitCode = $LASTEXITCODE
+                if (Test-Path -LiteralPath $errorFile) {
+                    $errorText = [string](Get-Content -LiteralPath $errorFile -Raw)
+                }
             }
-            $errorText = ''
-            if (Test-Path -LiteralPath $errorFile) {
-                $errorText = [string](Get-Content -LiteralPath $errorFile -Raw)
-            }
-            if ($LASTEXITCODE -eq 0) {
+            if ($exitCode -eq 0) {
                 return $output
             }
             $detail = $errorText.Trim()
-            $fatal = $detail -match 'HTTP 40[0-4]|HTTP 409|HTTP 422'
+            $fatal = $detail -match 'HTTP 40[0-4]|HTTP 409|HTTP 422|unknown flag'
             if ($fatal -or $attempt -eq $maxAttempts) {
                 throw "GitHub API failed after $attempt attempts ($($ApiArguments -join ' ')): $detail"
             }
