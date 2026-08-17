@@ -60,7 +60,7 @@ $inPlaceMigration = $migration.Substring($inPlaceStart, $legacyStart - $inPlaceS
 if ($inPlaceMigration -match 'WindowsPowerShell\\v1\.0\\powershell\.exe') {
     throw 'Protected in-place state migration must not depend on child PowerShell file access.'
 }
-Assert-Contains $inPlaceMigration '(?s)CreateFileW\(w "\$2", i 0x80000000, i 1,.*?CopyFileW\(w "\$2", w "\$3", i 1\).*?CloseHandle\(p r5\)' 'Protected in-place migration does not hold the source against writes/deletes through the native copy.'
+Assert-Contains $inPlaceMigration '(?s)CreateFileW\(w "\$2", i 0x80000000, i 1,.*?CopyFileW\(w "\$2", w "\$3", i 1\).*?StrCmp \$4 "0" state_file_copy_in_place_failed.*?CloseHandle\(p r5\)' 'Protected in-place migration does not hold the source against writes/deletes through the native copy.'
 Assert-Contains $inPlaceMigration 'FlushFileBuffers\(p r5\)' 'Protected in-place migration does not flush the fresh destination.'
 $cloneCommand = [regex]::Match(
     $migration,
