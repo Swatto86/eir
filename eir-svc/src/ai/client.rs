@@ -59,43 +59,25 @@ fn provider_cost(cost: f64) -> f64 {
     }
 }
 
+fn merge_usage(a: Option<CallUsage>, b: Option<CallUsage>) -> Option<CallUsage> {
+    match (a, b) {
+        (None, other) | (other, None) => other,
+        (Some(a), Some(b)) => Some(CallUsage {
+            input_tokens: a.input_tokens.saturating_add(b.input_tokens),
+            output_tokens: a.output_tokens.saturating_add(b.output_tokens),
+            cache_creation: a.cache_creation.saturating_add(b.cache_creation),
+            cache_read: a.cache_read.saturating_add(b.cache_read),
+            cost_usd: provider_cost(a.cost_usd + b.cost_usd),
+        }),
+    }
+}
+
 // ── OpenAI-compatible request/response (OpenRouter) ────────────────────────────
 
 #[derive(Serialize)]
 struct ChatMessage<'a> {
     role: &'a str,
     content: &'a str,
-}
-
-#[derive(Serialize)]
-struct OpenAiRequest<'a> {
-    model: &'a str,
-    max_tokens: u32,
-    stream: bool,
-    messages: Vec<ChatMessage<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream_options: Option<StreamOptions>,
-    /// OpenRouter-specific: request a final usage chunk with cost.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    usage: Option<UsageInclude>,
-    /// Reasoning effort (OpenRouter reasoning models).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<Reasoning<'a>>,
-}
-
-#[derive(Serialize)]
-struct StreamOptions {
-    include_usage: bool,
-}
-
-#[derive(Serialize)]
-struct UsageInclude {
-    include: bool,
-}
-
-#[derive(Serialize)]
-struct Reasoning<'a> {
-    effort: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -122,12 +104,140 @@ struct OpenAiStreamError {
 
 #[derive(Deserialize)]
 struct OpenAiChoice {
-    delta: OpenAiDelta,
+    #[serde(default)]
+    delta: Option<OpenAiDelta>,
+    #[serde(default)]
+    message: Option<OpenAiDelta>,
 }
 
 #[derive(Deserialize)]
 struct OpenAiDelta {
-    content: Option<String>,
+    /// Some free models stream `content` as a string; others as an array of
+    /// `{type,text}` parts. `Value` accepts both so a typed miss doesn't drop
+    /// the chunk silently.
+    #[serde(default)]
+    content: Option<Value>,
+    #[serde(default)]
+    text: Option<Value>,
+    #[serde(default)]
+    reasoning: Option<Value>,
+    #[serde(default, rename = "reasoning_content")]
+    reasoning_content: Option<Value>,
+}
+
+fn value_as_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(s) if s.is_empty() => None,
+        Value::String(s) => Some(s.clone()),
+        Value::Array(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(s) = part.as_str() {
+                    out.push_str(s);
+                } else if let Some(s) = part.get("text").and_then(Value::as_str) {
+                    out.push_str(s);
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn delta_content(delta: &OpenAiDelta) -> Option<String> {
+    delta
+        .content
+        .as_ref()
+        .and_then(value_as_text)
+        .or_else(|| delta.text.as_ref().and_then(value_as_text))
+}
+
+fn delta_reasoning(delta: &OpenAiDelta) -> Option<String> {
+    delta
+        .reasoning
+        .as_ref()
+        .and_then(value_as_text)
+        .or_else(|| delta.reasoning_content.as_ref().and_then(value_as_text))
+}
+
+fn append_capped(out: &mut String, text: &str) -> Result<()> {
+    if out.len().saturating_add(text.len()) > MAX_AI_RESPONSE_BYTES {
+        bail!(
+            "model response exceeded the {}-byte limit",
+            MAX_AI_RESPONSE_BYTES
+        );
+    }
+    out.push_str(text);
+    Ok(())
+}
+
+fn ingest_openai_sse_data(
+    data: &str,
+    out: &mut String,
+    reasoning: &mut String,
+    usage: &mut Option<CallUsage>,
+) -> Result<()> {
+    if let Ok(chunk) = serde_json::from_str::<OpenAiChunk>(data) {
+        if let Some(err) = chunk.error {
+            let msg = err.message.unwrap_or_else(|| "unknown error".into());
+            bail!("model API error: {msg}");
+        }
+        if let Some(u) = chunk.usage {
+            *usage = Some(CallUsage {
+                input_tokens: u.prompt_tokens.unwrap_or(0),
+                output_tokens: u.completion_tokens.unwrap_or(0),
+                cache_creation: 0,
+                cache_read: 0,
+                cost_usd: provider_cost(u.cost.unwrap_or(0.0)),
+            });
+        }
+        if let Some(choices) = chunk.choices {
+            if let Some(choice) = choices.into_iter().next() {
+                let delta = choice.delta.as_ref().or(choice.message.as_ref());
+                if let Some(delta) = delta {
+                    if let Some(text) = delta_content(delta) {
+                        append_capped(out, &text)?;
+                    }
+                    if let Some(text) = delta_reasoning(delta) {
+                        append_capped(reasoning, &text)?;
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+    // Typed parse failed — still pull content/error out of a loosely-shaped chunk
+    // rather than dropping it. Some free models send content as an unexpected type.
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return Ok(());
+    };
+    if let Some(msg) = value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        bail!("model API error: {msg}");
+    }
+    if let Some(text) = value
+        .pointer("/choices/0/delta/content")
+        .or_else(|| value.pointer("/choices/0/message/content"))
+        .and_then(value_as_text)
+    {
+        append_capped(out, &text)?;
+    }
+    if let Some(text) = value
+        .pointer("/choices/0/delta/reasoning")
+        .or_else(|| value.pointer("/choices/0/delta/reasoning_content"))
+        .and_then(value_as_text)
+    {
+        append_capped(reasoning, &text)?;
+    }
+    Ok(())
 }
 
 // ── Claude CLI JSON envelope (claude --print --output-format json) ────────────
@@ -423,118 +533,47 @@ impl AiClient {
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.effort);
         // The per-cycle context is the changing half; the static SYSTEM_PROMPT is
-        // prepended for the single-blob providers, or sent as a cached system prompt on
-        // the Anthropic path.
+        // prepended for the single-blob providers, sent as a cached system prompt on
+        // the Anthropic path, and as a `system` role on OpenRouter so weaker models
+        // do not bury the schema inside one giant user blob.
         let context =
             crate::ai::prompt::build_context(snapshot, history, feedback_summary, learned);
-        let prompt = format!("{}\n\n{}", crate::ai::prompt::SYSTEM_PROMPT, context);
-        // Bounded retry on TRANSIENT failures only. Each call returns Err before
-        // yielding any text, so retrying the whole call is safe (no partial output to
-        // corrupt). This runs off the decision loop, so the backoff doesn't stall the
-        // UI; a permanent error (bad key, 400) is returned immediately without retry.
-        let mut attempt: u32 = 0;
-        let (raw, usage) = loop {
-            let result = match &self.config {
-                AiClientConfig::Anthropic { api_key, model } => {
-                    let m = model_ov.unwrap_or(model);
-                    self.call_anthropic(
-                        api_key,
-                        m,
-                        effort,
-                        Some(crate::ai::prompt::SYSTEM_PROMPT),
-                        &context,
-                        &[],
-                    )
-                    .await
-                }
-                AiClientConfig::ClaudeCli {
-                    configured_binary,
-                    model,
-                    user_profile,
-                } => {
-                    let m = model_ov.unwrap_or(model);
-                    self.call_claude_cli(
-                        configured_binary.as_deref(),
-                        m,
-                        effort,
-                        user_profile.as_deref(),
-                        &prompt,
-                    )
-                    .await
-                }
-                AiClientConfig::CodexCli {
-                    configured_binary,
-                    model,
-                } => {
-                    let m = model_ov.unwrap_or(model);
-                    self.call_codex_cli(
-                        configured_binary.as_deref(),
-                        m,
-                        effort,
-                        &prompt,
-                        false,
-                        &[],
-                    )
-                    .await
-                }
-                AiClientConfig::OpenRouter { api_key, model } => {
-                    let m = model_ov.unwrap_or(model);
-                    let api_key = openrouter_api_key(api_key.as_deref()).await?;
-                    self.call_openai_style(OPENROUTER_BASE, &api_key, m, effort, &prompt, &[])
-                        .await
-                }
-                AiClientConfig::KiloCli {
-                    configured_binary,
-                    model,
-                    user_profile,
-                } => {
-                    let m = model_ov.unwrap_or(model);
-                    self.call_kilo_cli(
-                        configured_binary.as_deref(),
-                        m,
-                        effort,
-                        user_profile.as_deref(),
-                        &prompt,
-                    )
-                    .await
-                }
-            };
-            match result {
-                Ok(v) => break v,
-                Err(e) if attempt < MAX_AI_RETRIES && is_transient_ai_error(&e) => {
-                    attempt += 1;
-                    let backoff = std::time::Duration::from_secs(2u64.pow(attempt));
-                    warn!(
-                        "AI call failed (transient, attempt {attempt}/{MAX_AI_RETRIES}), \
-                         retrying in {}s: {e}",
-                        backoff.as_secs()
-                    );
-                    tokio::time::sleep(backoff).await;
-                }
-                Err(e) => return Err(e),
-            }
-        };
+        let (raw, mut usage) = self
+            .invoke_analysis_retried(&context, model_ov, effort)
+            .await?;
+        debug!(text = %char_preview(&raw, 500), "Raw model response");
 
-        let json_text = strip_fences(&raw);
-        debug!(text = %char_preview(json_text, 500), "Raw model response");
-
-        // Models occasionally wrap the JSON in prose; fall back to the first
-        // {...last} object if a direct parse fails. Run the fallback over the ORIGINAL
-        // `raw`, not `json_text` — if `strip_fences` picked the wrong block, the real
-        // JSON only survives in `raw`.
-        let mut decision: ClaudeDecision = match serde_json::from_str(json_text) {
+        let mut decision: ClaudeDecision = match crate::ai::json::parse_decision(&raw) {
             Ok(d) => d,
-            Err(_) => {
-                let extracted = extract_json_object(&raw);
-                serde_json::from_str(extracted).with_context(|| {
-                    // Truncate: the raw blob can be ~30 KB and would otherwise be cloned
-                    // into st.error and rebroadcast on every 2 s UI poll until the next
-                    // successful cycle.
-                    format!(
-                        "Failed to parse model response as JSON:\n{}",
-                        char_preview(&raw, 2000)
-                    )
-                })?
+            Err(first) => {
+                // Cheap/free models occasionally emit unrecoverable JSON. One repair
+                // turn with a short schema reminder is cheaper than failing the cycle
+                // and latching st.error with the raw blob.
+                warn!(
+                    error = %first,
+                    "Model response was not valid JSON; retrying once with a repair hint"
+                );
+                let repaired = format!("{context}\n\n{}", crate::ai::prompt::JSON_REPAIR_HINT);
+                match self
+                    .invoke_analysis_retried(&repaired, model_ov, effort)
+                    .await
+                {
+                    Ok((raw2, usage2)) => {
+                        usage = merge_usage(usage, usage2);
+                        crate::ai::json::parse_decision(&raw2).with_context(|| {
+                            format!(
+                                "Failed to parse model response as JSON:\n{}",
+                                char_preview(&raw2, 2000)
+                            )
+                        })?
+                    }
+                    Err(_) => {
+                        return Err(anyhow::Error::from(first).context(format!(
+                            "Failed to parse model response as JSON:\n{}",
+                            char_preview(&raw, 2000)
+                        )));
+                    }
+                }
             }
         };
 
@@ -567,6 +606,112 @@ impl AiClient {
         );
 
         Ok((decision, usage))
+    }
+
+    /// Dispatch one analysis call. Anthropic and OpenRouter get a real system
+    /// prompt; CLI providers still receive a concatenated blob.
+    async fn invoke_analysis(
+        &self,
+        context: &str,
+        model_ov: Option<&str>,
+        effort: &str,
+    ) -> Result<(String, Option<CallUsage>)> {
+        let blob = format!("{}\n\n{}", crate::ai::prompt::SYSTEM_PROMPT, context);
+        match &self.config {
+            AiClientConfig::Anthropic { api_key, model } => {
+                let m = model_ov.unwrap_or(model);
+                self.call_anthropic(
+                    api_key,
+                    m,
+                    effort,
+                    Some(crate::ai::prompt::SYSTEM_PROMPT),
+                    context,
+                    &[],
+                )
+                .await
+            }
+            AiClientConfig::ClaudeCli {
+                configured_binary,
+                model,
+                user_profile,
+            } => {
+                let m = model_ov.unwrap_or(model);
+                self.call_claude_cli(
+                    configured_binary.as_deref(),
+                    m,
+                    effort,
+                    user_profile.as_deref(),
+                    &blob,
+                )
+                .await
+            }
+            AiClientConfig::CodexCli {
+                configured_binary,
+                model,
+            } => {
+                let m = model_ov.unwrap_or(model);
+                self.call_codex_cli(configured_binary.as_deref(), m, effort, &blob, false, &[])
+                    .await
+            }
+            AiClientConfig::OpenRouter { api_key, model } => {
+                let m = model_ov.unwrap_or(model);
+                let api_key = openrouter_api_key(api_key.as_deref()).await?;
+                self.call_openai_style(
+                    OPENROUTER_BASE,
+                    &api_key,
+                    m,
+                    effort,
+                    Some(crate::ai::prompt::SYSTEM_PROMPT),
+                    context,
+                    &[],
+                )
+                .await
+            }
+            AiClientConfig::KiloCli {
+                configured_binary,
+                model,
+                user_profile,
+            } => {
+                let m = model_ov.unwrap_or(model);
+                self.call_kilo_cli(
+                    configured_binary.as_deref(),
+                    m,
+                    effort,
+                    user_profile.as_deref(),
+                    &blob,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn invoke_analysis_retried(
+        &self,
+        context: &str,
+        model_ov: Option<&str>,
+        effort: &str,
+    ) -> Result<(String, Option<CallUsage>)> {
+        // Bounded retry on TRANSIENT failures only. Each call returns Err before
+        // yielding any text, so retrying the whole call is safe (no partial output to
+        // corrupt). This runs off the decision loop, so the backoff doesn't stall the
+        // UI; a permanent error (bad key, 400) is returned immediately without retry.
+        let mut attempt: u32 = 0;
+        loop {
+            match self.invoke_analysis(context, model_ov, effort).await {
+                Ok(v) => return Ok(v),
+                Err(e) if attempt < MAX_AI_RETRIES && is_transient_ai_error(&e) => {
+                    attempt += 1;
+                    let backoff = std::time::Duration::from_secs(2u64.pow(attempt));
+                    warn!(
+                        "AI call failed (transient, attempt {attempt}/{MAX_AI_RETRIES}), \
+                         retrying in {}s: {e}",
+                        backoff.as_secs()
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     // ── Anthropic native (/v1/messages, streaming SSE) ────────────────────────
@@ -729,29 +874,17 @@ impl AiClient {
         api_key: &str,
         model: &str,
         effort: &str,
+        system: Option<&str>,
         prompt: &str,
         images: &[ImageInput],
     ) -> Result<(String, Option<CallUsage>)> {
         let url = format!("{base_url}/chat/completions");
-        // Text-only uses the typed request; with images the user content becomes an
-        // OpenAI-style parts array ({type:text} + {type:image_url, data-uri}). Both
-        // serialise to a Value so `.json()` takes either.
-        let body: serde_json::Value = if images.is_empty() {
-            serde_json::to_value(OpenAiRequest {
-                model,
-                max_tokens: MAX_TOKENS,
-                stream: true,
-                messages: vec![ChatMessage {
-                    role: "user",
-                    content: prompt,
-                }],
-                stream_options: Some(StreamOptions {
-                    include_usage: true,
-                }),
-                usage: Some(UsageInclude { include: true }),
-                reasoning: openai_effort(effort).map(|e| Reasoning { effort: e }),
-            })
-            .unwrap_or_default()
+        let mut messages: Vec<Value> = Vec::new();
+        if let Some(sys) = system.map(str::trim).filter(|s| !s.is_empty()) {
+            messages.push(json!({ "role": "system", "content": sys }));
+        }
+        if images.is_empty() {
+            messages.push(json!({ "role": "user", "content": prompt }));
         } else {
             let mut parts = vec![json!({ "type": "text", "text": prompt })];
             for img in images {
@@ -760,19 +893,19 @@ impl AiClient {
                     "image_url": { "url": format!("data:{};base64,{}", img.media_type, img.base64) },
                 }));
             }
-            let mut b = json!({
-                "model": model,
-                "max_tokens": MAX_TOKENS,
-                "stream": true,
-                "messages": [{ "role": "user", "content": parts }],
-                "stream_options": { "include_usage": true },
-                "usage": { "include": true },
-            });
-            if let Some(e) = openai_effort(effort) {
-                b["reasoning"] = json!({ "effort": e });
-            }
-            b
-        };
+            messages.push(json!({ "role": "user", "content": parts }));
+        }
+        let mut body = json!({
+            "model": model,
+            "max_tokens": MAX_TOKENS,
+            "stream": true,
+            "messages": messages,
+            "stream_options": { "include_usage": true },
+            "usage": { "include": true },
+        });
+        if let Some(e) = openai_effort(effort) {
+            body["reasoning"] = json!({ "effort": e });
+        }
 
         let resp = self
             .http
@@ -796,6 +929,7 @@ impl AiClient {
         }
 
         let mut out = String::new();
+        let mut reasoning = String::new();
         let mut usage: Option<CallUsage> = None;
         let mut lines = SseLineBuf::new();
         let mut done = false;
@@ -817,40 +951,12 @@ impl AiClient {
                         done = true;
                         break;
                     }
-                    if let Ok(chunk) = serde_json::from_str::<OpenAiChunk>(data) {
-                        // Surface a streamed error (e.g. free-tier rate limit)
-                        // instead of returning an opaque empty response.
-                        if let Some(err) = chunk.error {
-                            let msg = err.message.unwrap_or_else(|| "unknown error".into());
-                            bail!("model API error: {msg}");
-                        }
-                        if let Some(u) = chunk.usage {
-                            usage = Some(CallUsage {
-                                input_tokens: u.prompt_tokens.unwrap_or(0),
-                                output_tokens: u.completion_tokens.unwrap_or(0),
-                                cache_creation: 0,
-                                cache_read: 0,
-                                cost_usd: provider_cost(u.cost.unwrap_or(0.0)),
-                            });
-                        }
-                        if let Some(choices) = chunk.choices {
-                            if let Some(choice) = choices.into_iter().next() {
-                                if let Some(content) = choice.delta.content {
-                                    if out.len().saturating_add(content.len())
-                                        > MAX_AI_RESPONSE_BYTES
-                                    {
-                                        bail!(
-                                            "model response exceeded the {}-byte limit",
-                                            MAX_AI_RESPONSE_BYTES
-                                        );
-                                    }
-                                    out.push_str(&content);
-                                }
-                            }
-                        }
-                    }
+                    ingest_openai_sse_data(data, &mut out, &mut reasoning, &mut usage)?;
                 }
             }
+        }
+        if out.trim().is_empty() {
+            out = reasoning;
         }
         if out.trim().is_empty() {
             bail!("model returned an empty response (it may be rate-limited or unavailable)");
@@ -1318,7 +1424,7 @@ impl AiClient {
             AiClientConfig::OpenRouter { api_key, model } => {
                 let m = if ov.is_empty() { model.as_str() } else { ov };
                 let api_key = openrouter_api_key(api_key.as_deref()).await?;
-                self.call_openai_style(OPENROUTER_BASE, &api_key, m, "", prompt, &[])
+                self.call_openai_style(OPENROUTER_BASE, &api_key, m, "", None, prompt, &[])
                     .await
             }
             AiClientConfig::KiloCli {
@@ -1374,7 +1480,7 @@ impl AiClient {
             AiClientConfig::OpenRouter { api_key, model } => {
                 let m = if ov.is_empty() { model.as_str() } else { ov };
                 let api_key = openrouter_api_key(api_key.as_deref()).await?;
-                self.call_openai_style(OPENROUTER_BASE, &api_key, m, "", prompt, images)
+                self.call_openai_style(OPENROUTER_BASE, &api_key, m, "", None, prompt, images)
                     .await
             }
             AiClientConfig::CodexCli {
@@ -2373,12 +2479,6 @@ fn estimate_anthropic_cost(
         + web_searches as f64 * 0.01
 }
 
-/// Pull the JSON object out of a model response that may wrap it in prose or code
-/// fences (reasoning models often add commentary around the JSON).
-pub(crate) fn extract_json(s: &str) -> &str {
-    extract_json_object(strip_fences(s))
-}
-
 async fn openrouter_api_key(configured: Option<&str>) -> Result<String> {
     if let Some(key) = configured.filter(|key| !key.trim().is_empty()) {
         return Ok(key.trim().to_string());
@@ -2424,44 +2524,6 @@ fn read_openrouter_key(profile: &std::path::Path) -> Option<String> {
         .and_then(|v| v.get("apiKey").and_then(|k| k.as_str()).map(str::to_string))
         .filter(|key| !key.trim().is_empty())
         .map(|key| key.trim().to_string())
-}
-
-/// Extract the FIRST complete JSON object — a fallback for models that surround the
-/// JSON with prose. Brace-matched (string- and escape-aware) rather than first-`{`
-/// to last-`}`: cheaper free models routinely emit the object twice, or restate it
-/// after the answer, and the naive span covered `{obj}{obj}`, which parses as nothing.
-/// Falls back to the widest span so a *truncated* object still reaches serde for a
-/// real "EOF while parsing" error rather than being silently reduced to a fragment.
-fn extract_json_object(s: &str) -> &str {
-    let Some(start) = s.find('{') else { return s };
-    let (mut depth, mut in_str, mut escaped) = (0usize, false, false);
-    for (i, c) in s[start..].char_indices() {
-        if escaped {
-            escaped = false;
-        } else if in_str {
-            match c {
-                '\\' => escaped = true,
-                '"' => in_str = false,
-                _ => {}
-            }
-        } else {
-            match c {
-                '"' => in_str = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return &s[start..=start + i];
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    match s.rfind('}') {
-        Some(b) if b > start => &s[start..=b],
-        _ => &s[start..],
-    }
 }
 
 /// Pull the concise failure message out of Codex's JSONL stream.
@@ -2714,30 +2776,6 @@ async fn wait_capped(
             bail!("{what} timed out after 300s")
         }
     }
-}
-
-fn strip_fences(s: &str) -> &str {
-    let t = s.trim();
-    // Only a fence at the very START of the (trimmed) response is a real code fence.
-    // The old `s.find(open)` scanned the whole string, so a triple-backtick run inside
-    // a log excerpt the model echoed back in "diagnosis"/"reasoning" was mistaken for
-    // the opening fence and the real JSON was sliced away. `strip_prefix` matches only
-    // at the start. Check the tagged fence (```json) before its bare form (```).
-    for (open, close) in [
-        ("```json", "```"),
-        ("```", "```"),
-        ("~~~json", "~~~"),
-        ("~~~", "~~~"),
-    ] {
-        if let Some(after) = t.strip_prefix(open) {
-            return after
-                .find(close)
-                .map(|e| &after[..e])
-                .unwrap_or(after)
-                .trim();
-        }
-    }
-    t
 }
 
 #[cfg(test)]
@@ -3107,46 +3145,37 @@ mod tests {
     }
 
     #[test]
-    fn strip_fences_and_extract_json() {
-        assert_eq!(strip_fences("```json\n{\"a\":1}\n```"), "{\"a\":1}");
-        assert_eq!(extract_json("noise {\"a\":1} trailing"), "{\"a\":1}");
-    }
+    fn openai_sse_accepts_content_parts_and_reasoning_fallback() {
+        let mut out = String::new();
+        let mut reasoning = String::new();
+        let mut usage = None;
+        ingest_openai_sse_data(
+            r#"{"choices":[{"delta":{"content":[{"type":"text","text":"{\"a\":"}]}}]}"#,
+            &mut out,
+            &mut reasoning,
+            &mut usage,
+        )
+        .unwrap();
+        ingest_openai_sse_data(
+            r#"{"choices":[{"delta":{"content":[{"type":"text","text":"1}"}]}}]}"#,
+            &mut out,
+            &mut reasoning,
+            &mut usage,
+        )
+        .unwrap();
+        assert_eq!(out, "{\"a\":1}");
 
-    #[test]
-    fn strip_fences_ignores_backticks_inside_the_payload() {
-        // A model that quotes a log excerpt containing a triple-backtick block inside its
-        // JSON must NOT have that inner fence mistaken for the opening one. Only a fence at
-        // the trimmed start counts; here there is none, so the whole string is returned and
-        // the JSON survives for `serde_json::from_str`.
-        let raw = "{\"diagnosis\":\"saw ```\\nboom\\n``` in the log\",\"confidence\":0.9}";
-        assert_eq!(strip_fences(raw), raw);
-        // And the raw-based fallback recovers the object even if a real fence wraps prose.
-        let wrapped = "Here is the answer:\n```\n{\"diagnosis\":\"x\"}\n```";
-        assert_eq!(extract_json_object(wrapped), "{\"diagnosis\":\"x\"}");
-    }
-
-    #[test]
-    fn extract_json_takes_the_first_complete_object() {
-        // Observed with a cheap free model: it emitted the verdict, then began repeating
-        // it, so the response was `{obj}{partial`. First-`{`..last-`}` spanned both and
-        // parsed as nothing; the first complete object must be recovered instead.
-        let doubled = "{\"analysis\":\"healthy\",\"problems\":[]}{\"analysis\":\"heal";
-        assert_eq!(
-            extract_json(doubled),
-            "{\"analysis\":\"healthy\",\"problems\":[]}"
-        );
-        serde_json::from_str::<serde_json::Value>(extract_json(doubled)).unwrap();
-
-        // Nested objects, and a brace inside a string, must not end the scan early.
-        let nested = "prose {\"a\":{\"b\":\"}\"},\"c\":\"\\\\\"} tail {\"x\":1}";
-        assert_eq!(extract_json(nested), "{\"a\":{\"b\":\"}\"},\"c\":\"\\\\\"}");
-        serde_json::from_str::<serde_json::Value>(extract_json(nested)).unwrap();
-
-        // A genuinely truncated object still reaches serde as a parse error, not a
-        // silently-narrowed fragment that would mis-decode.
-        let truncated = "{\"analysis\":\"heal";
-        assert_eq!(extract_json(truncated), truncated);
-        assert!(serde_json::from_str::<serde_json::Value>(extract_json(truncated)).is_err());
+        let mut out = String::new();
+        let mut reasoning = String::new();
+        ingest_openai_sse_data(
+            r#"{"choices":[{"delta":{"reasoning":"scratch","content":null}}]}"#,
+            &mut out,
+            &mut reasoning,
+            &mut usage,
+        )
+        .unwrap();
+        assert!(out.is_empty());
+        assert_eq!(reasoning, "scratch");
     }
 
     #[test]

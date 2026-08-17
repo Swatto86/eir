@@ -6,7 +6,8 @@
 //! method or an allow-listed remedy whose target it justified from the error text.
 //! When the AI is unavailable or proposes nonsense, the deterministic ladder runs.
 
-use crate::ai::client::{extract_json, AiClient};
+use crate::ai::client::AiClient;
+use crate::ai::json::parse_model_json_matching;
 use crate::updater::domain::{
     deterministic_next, validate_next_step, AttemptOutcome, ErrorCategory, Method, NextStep,
     ProposedStep, Remedy, StepContext, UpdateCandidate,
@@ -75,7 +76,9 @@ fn to_proposed(raw: RawStep) -> ProposedStep {
 /// Parse a model response into a proposal. Pure — unit-tested against recorded
 /// replies (fenced, prose-wrapped, malformed).
 fn parse_step(content: &str) -> ProposedStep {
-    match serde_json::from_str::<RawStep>(extract_json(content)) {
+    match parse_model_json_matching::<RawStep, _>(content, |v| {
+        v.get("action").is_some() || v.get("method").is_some()
+    }) {
         Ok(raw) => to_proposed(raw),
         Err(_) => ProposedStep::GiveUp {
             reason: "could not parse the AI's next-step reply".to_string(),
@@ -126,7 +129,8 @@ Rules:\n\
 a package-manager lock is held; \"retry_after_reboot\" if a reboot is required.\n\
 - \"give_up\": if no available method can plausibly succeed.\n\
 Follow saved guidance when it applies, but never bypass integrity checks. Only choose a method \
-from the available list. Set remedy to null when switching.",
+from the available list. Set remedy to null when switching.\n\
+Respond with ONLY the JSON object. No markdown, no commentary.",
         name = candidate.name,
         current = candidate.current,
         available_ver = candidate.available,
@@ -189,6 +193,17 @@ mod tests {
             ProposedStep::Retry {
                 method: Method::Winget,
                 remedy: Remedy::Force
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_switch_with_trailing_comma_and_think_tags() {
+        let c = "<think>try scoop</think>\n{\"action\":\"switch\",\"method\":\"scoop\",}";
+        assert_eq!(
+            parse_step(c),
+            ProposedStep::Switch {
+                method: Method::Scoop
             }
         );
     }

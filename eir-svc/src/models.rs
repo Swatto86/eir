@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -180,12 +181,19 @@ pub struct PastDecision {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Problem {
+    #[serde(default, deserialize_with = "de_null_string")]
     pub diagnosis: String,
+    #[serde(default, deserialize_with = "de_null_string")]
     pub root_cause: String,
+    #[serde(default = "default_confidence", deserialize_with = "de_confidence")]
     pub confidence: f32,
+    #[serde(default)]
     pub proposed_fix: serde_json::Value,
+    #[serde(default, deserialize_with = "de_null_string")]
     pub reasoning: String,
+    #[serde(default, deserialize_with = "de_null_string")]
     pub side_effects: String,
+    #[serde(default, deserialize_with = "de_null_string")]
     pub undo_instructions: String,
 }
 
@@ -196,7 +204,136 @@ const MAX_MODEL_ACTION_BYTES: usize = 64 * 1024;
 
 impl Problem {
     pub fn parse_fix_action(&self) -> Option<FixAction> {
-        serde_json::from_value(self.proposed_fix.clone()).ok()
+        coerce_fix_value(&self.proposed_fix)
+    }
+}
+
+fn coerce_fix_value(value: &Value) -> Option<FixAction> {
+    match value {
+        Value::Object(_) => serde_json::from_value(value.clone()).ok(),
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.starts_with('{') {
+                let parsed: Value = serde_json::from_str(trimmed).ok()?;
+                return serde_json::from_value(parsed).ok();
+            }
+            parse_fix_shorthand(trimmed)
+        }
+        _ => None,
+    }
+}
+
+/// Cheap-model shorthand: `"sfc_scan"` or `"process_kill: notepad.exe"`.
+/// Multi-field actions (registry_reset, etc.) still require a JSON object.
+fn parse_fix_shorthand(s: &str) -> Option<FixAction> {
+    match s {
+        "defender_signature_update" => return Some(FixAction::DefenderSignatureUpdate),
+        "defender_realtime_enable" => return Some(FixAction::DefenderRealtimeEnable),
+        "sfc_scan" => return Some(FixAction::SfcScan),
+        "dism_restore_health" => return Some(FixAction::DismRestoreHealth),
+        _ => {}
+    }
+    let (action, rest) = s
+        .split_once(':')
+        .or_else(|| s.find(' ').map(|i| (&s[..i], &s[i + 1..])))?;
+    let action = action.trim();
+    let rest = rest.trim().trim_matches('"');
+    if rest.is_empty() {
+        return None;
+    }
+    match action {
+        "process_kill" => Some(FixAction::ProcessKill {
+            process_name: rest.into(),
+        }),
+        "service_restart" => Some(FixAction::ServiceRestart {
+            service_name: rest.into(),
+        }),
+        "service_start" => Some(FixAction::ServiceStart {
+            service_name: rest.into(),
+        }),
+        "service_stop" => Some(FixAction::ServiceStop {
+            service_name: rest.into(),
+        }),
+        "file_delete" => Some(FixAction::FileDelete { path: rest.into() }),
+        "disk_cleanup" => Some(FixAction::DiskCleanup {
+            target: rest.into(),
+        }),
+        "firewall_enable" => Some(FixAction::FirewallEnable {
+            profile: rest.into(),
+        }),
+        "task_disable" => Some(FixAction::TaskDisable {
+            task_name: rest.into(),
+        }),
+        "task_enable" => Some(FixAction::TaskEnable {
+            task_name: rest.into(),
+        }),
+        "driver_disable" => Some(FixAction::DriverDisable {
+            driver_name: rest.into(),
+        }),
+        "driver_enable" => Some(FixAction::DriverEnable {
+            driver_name: rest.into(),
+        }),
+        "network_diagnostic" => Some(FixAction::NetworkDiagnostic {
+            command: rest.into(),
+        }),
+        _ => None,
+    }
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_confidence() -> f32 {
+    0.0
+}
+
+fn de_null_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn de_null_vec<'de, T, D>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn de_confidence<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    Ok(confidence_from_value(Value::deserialize(deserializer)?))
+}
+
+fn confidence_from_value(value: Value) -> f32 {
+    let n = match value {
+        Value::Null => 0.0,
+        Value::Number(n) => n.as_f64().unwrap_or(0.0) as f32,
+        Value::String(s) => {
+            let s = s.trim().trim_end_matches('%');
+            s.parse::<f32>().unwrap_or(0.0)
+        }
+        _ => 0.0,
+    };
+    if n > 1.0 && n <= 100.0 {
+        n / 100.0
+    } else {
+        n
+    }
+}
+
+fn de_boolish<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    Ok(boolish_from_value(Value::deserialize(deserializer)?))
+}
+
+fn boolish_from_value(value: Value) -> bool {
+    match value {
+        Value::Bool(b) => b,
+        Value::Number(n) => n.as_i64().unwrap_or(0) != 0,
+        Value::String(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "true" | "yes" | "1" | "on"
+        ),
+        _ => false,
     }
 }
 
@@ -461,13 +598,20 @@ pub struct PendingApproval {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClaudeDecision {
+    #[serde(default, deserialize_with = "de_null_string")]
     pub analysis: String,
+    #[serde(default, deserialize_with = "de_null_vec")]
     pub problems: Vec<Problem>,
     /// The model sets this when the signals look concerning but it can't confidently
     /// diagnose/fix them at the current reasoning level — the advisor-mode trigger to
     /// re-analyze at higher effort / a stronger model. `#[serde(default)]` so an older
-    /// or terse response (without the field) still parses.
-    #[serde(default)]
+    /// or terse response (without the field) still parses. String/number forms are
+    /// accepted because cheaper models often emit `"true"` instead of `true`.
+    #[serde(
+        default = "default_false",
+        alias = "needsDeeperAnalysis",
+        deserialize_with = "de_boolish"
+    )]
     pub needs_deeper_analysis: bool,
 }
 
@@ -577,6 +721,37 @@ mod tests {
             .problems
             .iter()
             .all(|problem| { problem.proposed_fix["service_name"].as_str() == Some("Spooler") }));
+    }
+
+    #[test]
+    fn parse_fix_action_accepts_a_string_object_or_shorthand() {
+        let object = model_problem(serde_json::json!({
+            "action": "sfc_scan"
+        }));
+        assert!(matches!(
+            object.parse_fix_action(),
+            Some(FixAction::SfcScan)
+        ));
+
+        let as_string = model_problem(serde_json::Value::String(
+            r#"{"action":"process_kill","process_name":"notepad"}"#.into(),
+        ));
+        match as_string.parse_fix_action() {
+            Some(FixAction::ProcessKill { process_name }) => {
+                assert_eq!(process_name, "notepad");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let shorthand = model_problem(serde_json::Value::String(
+            "process_kill: notepad.exe".into(),
+        ));
+        match shorthand.parse_fix_action() {
+            Some(FixAction::ProcessKill { process_name }) => {
+                assert_eq!(process_name, "notepad.exe");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     fn state_with_disk_health(dh: &str) -> SystemState {

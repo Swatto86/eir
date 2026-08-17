@@ -13,6 +13,7 @@
 //! everything else is listed report-only.
 
 use crate::ai::client::AiClient;
+use crate::ai::json::parse_model_json;
 use crate::models::CallUsage;
 use anyhow::{Context, Result};
 use eir_proto::StartupEntryView;
@@ -465,26 +466,13 @@ async fn classify(
         ));
     }
     let (text, usage) = ai.complete_text(&prompt, model).await?;
-    let arr = extract_json_array(&text).unwrap_or("[]");
-    let verdicts: Vec<Verdict> = serde_json::from_str(arr).unwrap_or_default();
+    let verdicts: Vec<Verdict> = parse_model_json(&text).unwrap_or_default();
     let map = verdicts
         .into_iter()
         .filter(|v| v.i < entries.len())
         .map(|v| (v.i, (valid_verdict(&v.verdict), v.note)))
         .collect();
     Ok((map, usage))
-}
-
-/// Extract the first `[` … last `]` span so stray prose around the JSON doesn't break
-/// parsing.
-fn extract_json_array(s: &str) -> Option<&str> {
-    let start = s.find('[')?;
-    let end = s.rfind(']')?;
-    if end > start {
-        Some(&s[start..=end])
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]
@@ -621,8 +609,11 @@ mod tests {
 
     #[test]
     fn extract_json_array_strips_prose() {
-        assert_eq!(extract_json_array("noise [1,2] tail"), Some("[1,2]"));
-        assert_eq!(extract_json_array("no array here"), None);
+        assert_eq!(
+            crate::ai::json::extract_json_array("noise [1,2] tail"),
+            Some("[1,2]")
+        );
+        assert_eq!(crate::ai::json::extract_json_array("no array here"), None);
     }
 
     #[test]

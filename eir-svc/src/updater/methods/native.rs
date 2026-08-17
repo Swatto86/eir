@@ -4,7 +4,8 @@
 //! moved. The AI only ever proposes a URL/version/args; nothing it returns reaches
 //! the shell unchecked.
 
-use crate::ai::client::{extract_json, AiClient};
+use crate::ai::client::AiClient;
+use crate::ai::json::parse_model_json;
 use crate::updater::config::SignaturePolicy;
 use crate::updater::domain::{
     classify_error, AttemptOutcome, ErrorCategory, Method, UpdateCandidate, Verification,
@@ -103,8 +104,11 @@ fn plan_from_response(
     name: &str,
     current: &str,
 ) -> (Option<InstallPlan>, Option<String>, Option<String>) {
-    let json = extract_json(content);
-    let mut raw: InstallPlanRaw = match serde_json::from_str(json) {
+    let mut raw: InstallPlanRaw = match crate::ai::json::parse_model_json_matching(content, |v| {
+        v.get("installer_url").is_some() || v.get("releases_url").is_some()
+    })
+    .or_else(|_| parse_model_json(content))
+    {
         Ok(r) => r,
         Err(e) => {
             return (

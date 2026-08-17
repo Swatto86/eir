@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-07-31 · **Code:** v0.34.8
+**Last updated:** 2026-08-17 · **Code:** v0.34.13
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -603,7 +603,12 @@ All three subscription CLIs share one privilege boundary: when EirSvc is LocalSy
   user's `~/.openrouter/config.json`, read while impersonating that user; Eir never
   searches other profiles. Blank model defaults to `"openrouter/free"`. Adds
   `HTTP-Referer`/`X-Title` attribution and requests a final usage chunk. Effort maps to
-  `reasoning.effort` (`xhigh`/`max` collapse to `high`).
+  `reasoning.effort` (`xhigh`/`max` collapse to `high`). Analysis calls send
+  `SYSTEM_PROMPT` as a `system` role and the per-cycle snapshot as `user`, so weaker
+  models do not bury the schema in one concatenated blob. SSE `delta.content` accepts a
+  string or `{type,text}` parts array; if content is empty, accumulated
+  `reasoning`/`reasoning_content` is used. A chunk that fails the typed parse is still
+  scraped as a `Value` rather than dropped.
 - **`ClaudeCli`** — Claude on the active user's **subscription**: spawns the local
   `claude` binary (`--print --output-format json`, optional `--model`, `--effort`),
   **no API key**. Under LocalSystem, the sole active session's token supplies both the
@@ -631,33 +636,35 @@ envelope/NDJSON decoding and these limits have regression checks.
 ### Analysis entry points & response parsing
 
 `analyze` delegates to `analyze_with` with no overrides. `analyze_with` is the single dispatch point:
-1. Builds the prompt via `prompt::build`.
+1. Builds the per-cycle context via `prompt::build_context` (the static `SYSTEM_PROMPT` is sent separately on Anthropic/OpenRouter).
 2. Applies a `model_override` and an `effort_override` to **every** provider (both trimmed and ignored if empty). This is the advisor escalation lever.
 3. Dispatches to the per-provider call, returning raw text + `Option<CallUsage>` (every provider now reports usage where available; Anthropic's cost is estimated, OpenRouter's is provider-reported, the Kilo CLI's step_finish cost is provider-reported where present).
-4. Parses: `strip_fences` removes ```` ```json ````/`~~~` fences, then `serde_json::from_str::<ClaudeDecision>`; on failure it falls back to `extract_json_object`, a string-/escape-aware brace scan that returns the **first complete** object, to handle models that wrap JSON in prose or (common on cheaper free models) emit the object more than once. A truncated object is passed through whole so serde reports the real EOF error rather than a silently narrowed fragment. A hard parse failure propagates an error with the raw text attached. The same helper backs `extract_json`, used by the updater's check/diagnose/native-installer parsers.
+4. Parses via `ai::json::parse_decision`: strip `<think>`/`<thinking>`/`<reasoning>` tags and opening code fences, walk every complete top-level object/array (so a prose `{error}` token is not taken over a later payload), sanitise trailing commas / `//` `/* */` comments / raw newlines in strings / smart quotes, then deserialize. `ClaudeDecision`/`Problem` accept missing fields, string/percent confidence, and string/number booleans. A flattened `action` (+ fields) on a problem is lifted into `proposed_fix`; a bare problem or problems array is wrapped. `proposed_fix` as a JSON string or `"process_kill: name"` shorthand is coerced only into known single-field/`unit` actions — unknown shapes still fail `parse_fix_action` and are dropped by `bound_model_output`. A truncated object is passed through so serde reports EOF rather than a silently narrowed fragment. If nothing recoverable remains, one repair turn appends `JSON_REPAIR_HINT` and retries; a hard failure still attaches a truncated raw preview. The same sanitise/extract path backs `parse_model_json`, used by the updater's check/diagnose/native-installer parsers and the startup classifier.
+
+Each streaming path surfaces mid-stream provider errors instead of returning empty: OpenAI-style bails on a streamed `error` object and on an empty final body; Anthropic only accumulates `content_block_delta`/`text_delta` events.
 
 Each streaming path surfaces mid-stream provider errors instead of returning empty: OpenAI-style bails on a streamed `error` object and on an empty final body (`client.rs:445-448`, `469-471`); Anthropic only accumulates `content_block_delta`/`text_delta` events.
 
 ### The monitoring prompt (`ai/prompt.rs`)
 
-`prompt::build` (`prompt.rs:3`) assembles one large user-message string. Injected context, in order:
-- **LOG EVENTS section** (`format_log_events`, `prompt.rs:194-233`): for every `FileChange` whose `log_event` has non-empty `error_snippets`, it emits program / file path / severity / error snippets / a raw `content_excerpt` ("judge the finding in context"). Flagged "highest priority for diagnosis".
-- **CURRENT SYSTEM STATE**: the full `SignalSnapshot` serialized to pretty JSON, **with `decision_history` stripped out** (`prompt.rs:9-12`) since history is rendered separately.
-- **RECENT DECISION HISTORY (last 5)**: the `history: &[PastDecision]` arg (loaded via `audit::get_recent_decisions(&db, 5)`, `main.rs:1022-1023`), pretty JSON.
-- **RECENT EXECUTION FEEDBACK** (`prompt.rs:17-26`): only when `feedback_summary` is `Some`, non-empty, and not the sentinel `"No execution history yet."`. Built by `feedback::recent_summary(&db, 10)` (`feedback/mod.rs:112`), which joins `execution_feedback` to `execution_log`. Each line is `- <ts>: <action> -> SUCCESS|FAILURE<delta><[reason: ...]>`; FAILUREs carry the condensed error text so the model can avoid re-proposing a broken fix. The prompt explicitly instructs: read the `[reason: ...]`, do not re-propose an action whose error shows it can't work, lower/raise confidence based on past outcomes.
-- **AVAILABLE FIX ACTIONS** (`prompt.rs:38-54`): an enumerated catalogue with exact JSON shapes — must match `FixAction` variant tags.
-- A long body of **policy/guardrail prose** (`prompt.rs:56-166`): investigate-before-acting evidence rules; `file_delete` two-condition gate; least-destructive/never-uninstall; a NORMAL-behaviour denylist (DCOM 10016, update chatter, VPN toasts, GPU telemetry); a hard rule that high CPU/RAM/disk *usage* is not a fault absent OOM/exhaustion; never-disrupt-the-user for `process_kill`/`service_stop`; a SECURITY POSTURE section mapping firewall/Defender state to the safe security actions, with third-party-AV/firewall and null-means-unknown caveats; a ≥0.80 confidence + ≤5-problems rule.
-- **`needs_deeper_analysis` instruction** (`prompt.rs:162-166`): the model sets it true when evidence is ambiguous/conflicting and it can't confidently act at this reasoning level — the advisor escalation trigger.
-- A strict **JSON-only output schema** (`prompt.rs:168-186`).
+`prompt::build_context` assembles the per-cycle user turn. Injected context, in order:
+- **LOG EVENTS section** (`format_log_events`): for every `FileChange` whose `log_event` has non-empty `error_snippets`, it emits program / file path / severity / error snippets / a raw `content_excerpt` ("judge the finding in context"). Flagged "highest priority for diagnosis".
+- **CURRENT SYSTEM STATE**: the full `SignalSnapshot` serialized to pretty JSON, **with `decision_history` stripped out** since history is rendered separately.
+- **RECENT DECISION HISTORY (last 5)**: the `history: &[PastDecision]` arg (loaded via `audit::get_recent_decisions(&db, 5)`), pretty JSON.
+- **RECENT EXECUTION FEEDBACK**: only when `feedback_summary` is `Some`, non-empty, and not the sentinel `"No execution history yet."`. Built by `feedback::recent_summary(&db, 10)`, which joins `execution_feedback` to `execution_log`. Each line is `- <ts>: <action> -> SUCCESS|FAILURE<delta><[reason: ...]>`; FAILUREs carry the condensed error text so the model can avoid re-proposing a broken fix. The prompt explicitly instructs: read the `[reason: ...]`, do not re-propose an action whose error shows it can't work, lower/raise confidence based on past outcomes.
+- **AVAILABLE FIX ACTIONS** (`SYSTEM_PROMPT`): an enumerated catalogue with exact JSON shapes — must match `FixAction` variant tags.
+- A long body of **policy/guardrail prose** in `SYSTEM_PROMPT`: investigate-before-acting evidence rules; `file_delete` two-condition gate; least-destructive/never-uninstall; a NORMAL-behaviour denylist (DCOM 10016, update chatter, VPN toasts, GPU telemetry); a hard rule that high CPU/RAM/disk *usage* is not a fault absent OOM/exhaustion; never-disrupt-the-user for `process_kill`/`service_stop`; a SECURITY POSTURE section mapping firewall/Defender state to the safe security actions, with third-party-AV/firewall and null-means-unknown caveats; a ≥0.80 confidence + ≤5-problems rule.
+- **`needs_deeper_analysis` instruction**: the model sets it true when evidence is ambiguous/conflicting and it can't confidently act at this reasoning level — the advisor escalation trigger.
+- A strict **JSON-only output schema** in `SYSTEM_PROMPT`, repeated as `OUTPUT_REMINDER` at the **end** of the per-cycle context so weaker models that lose the schema after a long snapshot still see the contract last.
 
 ### Decision types & fix parsing (`models.rs`)
 
-- `ClaudeDecision` carries `analysis`, `problems`, and `needs_deeper_analysis`.
+- `ClaudeDecision` carries `analysis`, `problems`, and `needs_deeper_analysis`. All three default when omitted; `needs_deeper_analysis` also accepts `"true"`/`"false"` and `needsDeeperAnalysis`. `Problem` fields default the same way, and `confidence` accepts `0.9`, `90`, `"90%"`, or `"0.9"`.
   `bound_model_output` runs before logging/display/policy: it keeps at most five valid
   actions, caps prose/action strings at 16 KiB, caps proposed-action JSON at 64 KiB,
   and drops an invalid/oversized action whole rather than truncating a privileged path
   or command into a different operation.
-- `Problem` (`models.rs:115-124`): diagnosis, root_cause, `confidence: f32`, `proposed_fix: serde_json::Value` (kept as raw JSON), reasoning, side_effects, undo_instructions. `parse_fix_action` (`models.rs:127-129`) deserializes `proposed_fix` into `FixAction`, returning `None` on mismatch — so a malformed/unknown action is dropped rather than executed.
+- `Problem`: diagnosis, root_cause, confidence, `proposed_fix: serde_json::Value` (kept as raw JSON), reasoning, side_effects, undo_instructions. `parse_fix_action` deserializes `proposed_fix` into `FixAction`, also accepting a JSON string or a known `"action: target"` shorthand, returning `None` on mismatch — so a malformed/unknown action is dropped rather than executed.
 - `FixAction` (`models.rs:133-207`): `#[serde(tag = "action", rename_all = "snake_case")]` enum across ~20 actions (service/log/disk/task/registry/network/driver/bcd/process/file plus Phase-5 security actions). `PowerShellDiagnostic` pins `#[serde(rename = "powershell_diagnostic")]` because snake_case would otherwise yield `power_shell_diagnostic` (`models.rs:153-156`). `SoftwareUninstall` still exists as a variant though the prompt explicitly forbids uninstalling.
 - `CallUsage` (`models.rs:245-252`): input/output tokens, cache_creation, cache_read, `cost_usd`.
 

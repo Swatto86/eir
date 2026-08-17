@@ -4,7 +4,8 @@
 //! ARP/unmanaged), which become native candidates. Results are de-duplicated and
 //! filtered against the user's ignore list and notes.
 
-use crate::ai::client::{extract_json, AiClient};
+use crate::ai::client::AiClient;
+use crate::ai::json::{parse_model_json, parse_model_json_matching};
 use crate::updater::config::{valid_app_id, UpdaterConfig};
 use crate::updater::domain::{Method, UpdateCandidate};
 use crate::updater::methods::{choco, detect, msstore, scoop, winget};
@@ -281,7 +282,14 @@ pub async fn collect(
 
 #[derive(Deserialize)]
 struct AiResp {
+    #[serde(default, deserialize_with = "de_null_updates")]
     updates: Vec<AiUpdateRaw>,
+}
+
+fn de_null_updates<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<AiUpdateRaw>, D::Error> {
+    Ok(Option::<Vec<AiUpdateRaw>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
@@ -323,13 +331,20 @@ fn merge_registry_app(
     }
 }
 
+fn parse_ai_resp(content: &str) -> Result<AiResp, String> {
+    parse_model_json_matching::<AiResp, _>(content, |v| v.get("updates").is_some())
+        .or_else(|_| {
+            parse_model_json::<Vec<AiUpdateRaw>>(content).map(|updates| AiResp { updates })
+        })
+        .map_err(|e| format!("could not parse update list: {e}"))
+}
+
 async fn parse_and_record_checks(
     pool: &SqlitePool,
     checked: &[(String, String)],
     content: &str,
 ) -> Result<AiResp, String> {
-    let response: AiResp = serde_json::from_str(extract_json(content))
-        .map_err(|e| format!("could not parse update list: {e}"))?;
+    let response: AiResp = parse_ai_resp(content)?;
     let ids: Vec<String> = checked.iter().map(|(name, _)| app_id(name)).collect();
     crate::updater::history::record_checks(pool, &ids)
         .await
@@ -475,7 +490,8 @@ async fn check_unmanaged(
  Respond ONLY with JSON, no markdown:\n\
  {{\"updates\":[{{\"name\":\"<app>\",\"current\":\"<installed>\",\"latest\":\"<newer version>\",\"url\":\"<official download or releases page URL>\"}}]}}\n\
  Omit apps that are already current or that you cannot verify. Only include real, verified versions.\n\n\
- INSTALLED APPS:\n{app_lines}"
+ INSTALLED APPS:\n{app_lines}\n\n\
+ Reply with ONLY the JSON object. No markdown, no commentary."
     );
 
     let (content, usage) = match ai.complete(&prompt, model_override).await {

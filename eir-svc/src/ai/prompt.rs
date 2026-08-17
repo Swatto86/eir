@@ -190,6 +190,21 @@ Respond ONLY with valid JSON (no markdown, no preamble):
   ]
 }"#;
 
+/// Repeated at the END of the per-cycle context so weaker models that lose the
+/// schema after a long snapshot still see the output contract last.
+pub const OUTPUT_REMINDER: &str = "\
+Respond with ONLY the JSON object specified in the instructions \
+(analysis, needs_deeper_analysis, problems). No markdown fences, no preamble, \
+no trailing commentary.";
+
+/// Second-turn hint after a reply that could not be parsed as JSON.
+pub const JSON_REPAIR_HINT: &str = "\
+IMPORTANT: Your previous reply was not valid JSON. Reply with ONLY this JSON object, \
+no markdown, no code fences, no commentary:\n\
+{\"analysis\":\"...\",\"needs_deeper_analysis\":false,\"problems\":[]}\n\
+If there are problems, put at most five in the problems array. Each problem MUST include \
+proposed_fix as a JSON object (not a string), e.g. {\"action\":\"sfc_scan\"}.";
+
 /// The per-cycle context: the log events, the full system-state snapshot, recent
 /// decision history, execution feedback, and learned facts. This changes every cycle,
 /// so on the Anthropic path it is the (uncached) user turn that follows the cached
@@ -230,7 +245,9 @@ CURRENT SYSTEM STATE (full snapshot):
 
 RECENT DECISION HISTORY (last 5):
 {history_json}
-{feedback_section}{learned_section}"#
+{feedback_section}{learned_section}
+
+{OUTPUT_REMINDER}"#
     )
 }
 
@@ -319,6 +336,8 @@ mod tests {
         // Dynamic half: the live state, none of the static rules.
         let ctx = build_context(&snap, &[], None, None);
         assert!(ctx.contains("CURRENT SYSTEM STATE"));
+        assert!(ctx.contains(OUTPUT_REMINDER));
+        assert!(ctx.ends_with(OUTPUT_REMINDER) || ctx.trim_end().ends_with(OUTPUT_REMINDER));
         assert!(!ctx.contains("AVAILABLE FIX ACTIONS"));
     }
 }
