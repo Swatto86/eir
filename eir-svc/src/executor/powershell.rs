@@ -116,11 +116,14 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostic_output_is_retained_with_a_fixed_cap() {
+        // StringBuilder.Append(char, count) is much faster than ('x' * n) on a
+        // loaded CI runner; the 15s budget was enough on a warm CI job and too
+        // tight on the tag workflow after clippy.
         let script = format!(
-            "[Console]::Out.Write(('x' * {}))",
+            "$n = {}; $b = [System.Text.StringBuilder]::new($n); [void]$b.Append([char]'x', $n); [Console]::Out.Write($b.ToString())",
             MAX_DIAGNOSTIC_STREAM_BYTES + 4096
         );
-        let output = run_diagnostic_with_timeout(&script, Duration::from_secs(15))
+        let output = run_diagnostic_with_timeout(&script, Duration::from_secs(60))
             .await
             .expect("diagnostic");
         assert!(output.len() <= MAX_DIAGNOSTIC_STREAM_BYTES + 128);
