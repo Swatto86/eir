@@ -112,8 +112,11 @@ Assert-Contains $publish '\[string\]::Equals\(\$metadataSignature,\s*\$installer
 Assert-Contains $publish 'repos/\$repo/releases\?per_page=100' 'Release does not list drafts by id; get-by-tag 404s unpublished releases.'
 Assert-Contains $publish "'--method', 'PATCH'" 'Release does not publish the verified draft through the Releases API.'
 Assert-Contains $publish "'-F', 'draft=false'" 'Release does not publish only after verification.'
+Assert-Contains $publish 'upload_url' 'Publish does not use the draft release upload_url for assets.'
+Assert-Contains $publish 'uploads\.github\.com' 'Publish does not require the GitHub uploads host for release assets.'
 Assert-Contains $publish 'for \(\$attempt = 1; \$attempt -le \$maxAttempts' 'Publish does not retry transient GitHub API failures.'
 Assert-Contains $publish 'Start-Sleep -Seconds \$delaySeconds' 'Publish retry does not back off between GitHub API attempts.'
+Assert-Contains $publish 'HTTP 40\[0-4\]' 'Publish retries client 404s instead of failing closed.'
 
 [void][scriptblock]::Create($publish)
 

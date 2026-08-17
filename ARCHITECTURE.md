@@ -187,12 +187,14 @@ the Windows release job, whose write permission is scoped to release contents:
 4. The workflow verifies portable imports, the installed LocalSystem service, the
    standalone UI, and the smoke-tested self-contained portable executable.
 5. `scripts/publish-release.ps1` locates or creates the draft by listing releases (GET
-   `/releases/tags/{tag}` 404s drafts), retries GitHub API calls, uploads the installer,
-   its exact `<installer>.sig`, generated `latest.json`, the portable, and checksums by
-   release id, then requires exactly those five assets. The downloaded metadata must
-   contain the manifest version, the exact tag-scoped installer URL, and the exact
-   signature asset contents before the draft is published (`PATCH` `draft=false` on that
-   release id, re-asserting `tag_name`).
+   `/releases/tags/{tag}` 404s drafts), retries transient GitHub API calls, uploads the
+   installer, its exact `<installer>.sig`, generated `latest.json`, the portable, and
+   checksums to the draft's `upload_url` on `uploads.github.com` (api.github.com
+   `/releases/{id}/assets` 404s POSTs), then requires exactly those five assets. The
+   downloaded metadata must contain the manifest version, the exact tag-scoped installer
+   URL, and the exact signature asset contents before the draft is published (`PATCH`
+   `draft=false` on that release id, re-asserting `tag_name`). Client 4xx fails closed;
+   5xx is retried.
 
 `tauri-action` builds and signs only. The NSIS installer (`Eir_<version>_x64-setup.exe`),
 `.sig`, `latest.json`, portable, and checksums are attached by the retried publish

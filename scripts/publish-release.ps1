@@ -107,19 +107,32 @@ function Invoke-GitHubApi {
         foreach ($argument in $ApiArguments) {
             [void]$ghArguments.Add($argument)
         }
-        $output = $null
-        if ($InputPath) {
-            $output = & gh @ghArguments --input $InputPath
-        } elseif ($OutputPath) {
-            & gh @ghArguments --output $OutputPath
-        } else {
-            $output = & gh @ghArguments
-        }
-        if ($LASTEXITCODE -eq 0) {
-            return $output
-        }
-        if ($attempt -eq $maxAttempts) {
-            throw "GitHub API failed after $maxAttempts attempts ($($ApiArguments -join ' '))"
+        $errorFile = Join-Path $runnerTemp "eir-gh-$([guid]::NewGuid().ToString('N')).err"
+        try {
+            $output = $null
+            if ($InputPath) {
+                $output = & gh @ghArguments --input $InputPath 2>$errorFile
+            } elseif ($OutputPath) {
+                & gh @ghArguments --output $OutputPath 2>$errorFile
+            } else {
+                $output = & gh @ghArguments 2>$errorFile
+            }
+            $errorText = ''
+            if (Test-Path -LiteralPath $errorFile) {
+                $errorText = [string](Get-Content -LiteralPath $errorFile -Raw)
+            }
+            if ($LASTEXITCODE -eq 0) {
+                return $output
+            }
+            $detail = $errorText.Trim()
+            $fatal = $detail -match 'HTTP 40[0-4]|HTTP 409|HTTP 422'
+            if ($fatal -or $attempt -eq $maxAttempts) {
+                throw "GitHub API failed after $attempt attempts ($($ApiArguments -join ' ')): $detail"
+            }
+        } finally {
+            if (Test-Path -LiteralPath $errorFile) {
+                Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
+            }
         }
         Start-Sleep -Seconds $delaySeconds
         $delaySeconds = [Math]::Min($delaySeconds * 2, 32)
@@ -158,6 +171,10 @@ if (-not $release.draft) {
     throw "Release $tag was published before all assets were uploaded"
 }
 $releaseId = $release.id
+$uploadUrlTemplate = [string]$release.upload_url
+if ($uploadUrlTemplate -notmatch '^https://uploads\.github\.com/') {
+    throw "Release $tag upload_url '$uploadUrlTemplate' is not the GitHub uploads host"
+}
 
 function Publish-ReleaseAsset {
     param([long]$ReleaseId, [string]$Path)
@@ -166,10 +183,15 @@ function Publish-ReleaseAsset {
     foreach ($asset in @($assetsJson | ConvertFrom-Json | Where-Object { $_.name -eq $name })) {
         Invoke-GitHubApi -ApiArguments @('--method', 'DELETE', "repos/$repo/releases/assets/$($asset.id)") | Out-Null
     }
+    # Asset POST must use uploads.github.com. api.github.com /releases/{id}/assets 404s.
+    $uploadUrl = $uploadUrlTemplate -replace '\{\?name,label\}', [string]::Empty
+    $separator = if ($uploadUrl.Contains('?')) { '&' } else { '?' }
+    $uploadUrl = "$uploadUrl$separator" + "name=$([uri]::EscapeDataString($name))"
     Invoke-GitHubApi -ApiArguments @(
         '--method', 'POST',
-        "repos/$repo/releases/$ReleaseId/assets?name=$([uri]::EscapeDataString($name))",
-        '-H', 'Content-Type: application/octet-stream'
+        $uploadUrl,
+        '-H', 'Content-Type: application/octet-stream',
+        '-H', 'Accept: application/vnd.github+json'
     ) -InputPath $Path | Out-Null
 }
 
