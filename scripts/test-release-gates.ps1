@@ -24,6 +24,7 @@ function Assert-Contains {
 
 $ci = Read-RepoFile '.github\workflows\ci.yml'
 $release = Read-RepoFile '.github\workflows\release.yml'
+$publish = Read-RepoFile 'scripts\publish-release.ps1'
 $versions = Read-RepoFile 'scripts\check-versions.ps1'
 $prepare = Read-RepoFile 'scripts\prepare-webview2.ps1'
 $buildService = Read-RepoFile 'eir-ui\build-svc.ps1'
@@ -98,24 +99,22 @@ if ($prepare -match '(?s)if\s*\(-not\s*\(Test-Path[^\r\n]*\$runtimeExe.*?expand\
     throw 'WebView2 runtime can bypass verified CAB extraction through local reuse.'
 }
 
-Assert-Contains $release '\$installerName\s*=\s*"Eir_\$\{version\}_x64-setup\.exe"' 'Release does not require the exact versioned installer filename.'
-Assert-Contains $release 'Get-Item -LiteralPath \$installerPath' 'Release does not select the exact installer path.'
-Assert-Contains $release '\$installerSignatureName\s*=\s*"\$\(\$installer\.Name\)\.sig"' 'Release does not require the exact installer signature asset.'
-Assert-Contains $release '\$latest\.version\s+-ne\s+\$version' 'Release does not validate latest.json version.'
-Assert-Contains $release 'releases/download/\$tag/\$\(\$installer\.Name\)' 'Release does not require latest.json to target the exact tagged installer.'
-Assert-Contains $release '\[string\]::Equals\(\$metadataSignature,\s*\$installerSignature' 'Release does not match latest.json signature to the exact installer signature asset.'
-Assert-Contains $release 'repos/\$repo/releases\?per_page=100' 'Release does not list drafts by id; get-by-tag 404s unpublished releases.'
-Assert-Contains $release 'gh api --method PATCH' 'Release does not publish the verified draft through the Releases API.'
-Assert-Contains $release '-F draft=false' 'Release does not publish only after verification.'
-
-$publishBlock = [regex]::Match(
-    $release,
-    '(?ms)^[ ]{6}- name: Upload, verify, and publish release.*?^[ ]{8}run: \|\r?\n(?<Script>(?:^[ ]{10}.*(?:\r?\n|$))*)'
-)
-if (-not $publishBlock.Success) {
-    throw 'Release publishing PowerShell block could not be inspected.'
+if ($release -match '(?m)^\s+tagName:') {
+    throw 'Release Tauri build must not upload to GitHub; draft asset replacement is retried in publish-release.ps1.'
 }
-$publishScript = $publishBlock.Groups['Script'].Value -replace '(?m)^\s{10}', ''
-[void][scriptblock]::Create($publishScript)
+Assert-Contains $release 'scripts/publish-release\.ps1' 'Release does not invoke the retried publish script.'
+Assert-Contains $publish '\$installerName\s*=\s*"Eir_\$\{version\}_x64-setup\.exe"' 'Release does not require the exact versioned installer filename.'
+Assert-Contains $publish 'Get-Item -LiteralPath \$installerPath' 'Release does not select the exact installer path.'
+Assert-Contains $publish '\$installerSignatureName\s*=\s*"\$\(\$installer\.Name\)\.sig"' 'Release does not require the exact installer signature asset.'
+Assert-Contains $publish '\$latest\.version\s+-ne\s+\$version' 'Release does not validate latest.json version.'
+Assert-Contains $publish 'releases/download/\$tag/\$\(\$installer\.Name\)' 'Release does not require latest.json to target the exact tagged installer.'
+Assert-Contains $publish '\[string\]::Equals\(\$metadataSignature,\s*\$installerSignature' 'Release does not match latest.json signature to the exact installer signature asset.'
+Assert-Contains $publish 'repos/\$repo/releases\?per_page=100' 'Release does not list drafts by id; get-by-tag 404s unpublished releases.'
+Assert-Contains $publish "'--method', 'PATCH'" 'Release does not publish the verified draft through the Releases API.'
+Assert-Contains $publish "'-F', 'draft=false'" 'Release does not publish only after verification.'
+Assert-Contains $publish 'for \(\$attempt = 1; \$attempt -le \$maxAttempts' 'Publish does not retry transient GitHub API failures.'
+Assert-Contains $publish 'Start-Sleep -Seconds \$delaySeconds' 'Publish retry does not back off between GitHub API attempts.'
+
+[void][scriptblock]::Create($publish)
 
 Write-Host 'release-gate checks OK' -ForegroundColor Green

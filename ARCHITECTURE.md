@@ -182,18 +182,23 @@ the Windows release job, whose write permission is scoped to release contents:
    that SHA and requires the tag to equal exactly `v<manifest-version>`.
 2. The release job reruns the packaging regressions, JavaScript syntax, formatting,
    locked clippy/tests, and locked service staging from that checkout.
-3. `tauri-apps/tauri-action@v0` performs a locked build and creates a draft release with
-   the signed installer and updater artifacts.
+3. `tauri-apps/tauri-action@v0` performs a locked build and signs the installer. It does
+   not create or mutate a GitHub release (`tagName` is unset, matching CI).
 4. The workflow verifies portable imports, the installed LocalSystem service, the
    standalone UI, and the smoke-tested self-contained portable executable.
-5. It locates the draft by listing releases (GET `/releases/tags/{tag}` 404s drafts),
-   uploads the portable executable and checksums by release id, then requires exactly one
-   version-matching installer, its exact `<installer>.sig`, `latest.json`, the portable,
-   and checksums. The downloaded metadata must contain the manifest version, the exact
-   tag-scoped installer URL, and the exact signature asset contents before the draft is
-   published (`PATCH` `draft=false` on that release id, re-asserting `tag_name`).
+5. `scripts/publish-release.ps1` locates or creates the draft by listing releases (GET
+   `/releases/tags/{tag}` 404s drafts), retries GitHub API calls, uploads the installer,
+   its exact `<installer>.sig`, generated `latest.json`, the portable, and checksums by
+   release id, then requires exactly those five assets. The downloaded metadata must
+   contain the manifest version, the exact tag-scoped installer URL, and the exact
+   signature asset contents before the draft is published (`PATCH` `draft=false` on that
+   release id, re-asserting `tag_name`).
 
-Because `tagName` is set, `tauri-action` builds, signs, and creates a **draft** GitHub release with the NSIS installer (`Eir_<version>_x64-setup.exe`), `latest.json`, and the `.sig`. The release is not public until every required asset has been verified. The signing keypair is minisign; the public key is embedded in `tauri.conf.json` `plugins.updater.pubkey` (base64 minisign public key).
+`tauri-action` builds and signs only. The NSIS installer (`Eir_<version>_x64-setup.exe`),
+`.sig`, `latest.json`, portable, and checksums are attached by the retried publish
+script. The release stays draft until those assets verify. The signing keypair is
+minisign; the public key is embedded in `tauri.conf.json` `plugins.updater.pubkey`
+(base64 minisign public key).
 
 ### Self-update wiring (single rolling release)
 
