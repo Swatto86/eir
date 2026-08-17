@@ -145,18 +145,26 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+            $PSNativeCommandUseErrorActionPreference = $false
+          }
           Set-StrictMode -Version Latest
           $tag = $env:GITHUB_REF_NAME
           $version = $tag -replace '^v', ''
+          $repo = $env:GITHUB_REPOSITORY
           $portable = "target/release/Eir_${tag}_windows-x64.exe"
           if (-not (Test-Path -LiteralPath $portable -PathType Leaf)) {
             throw "Smoke-tested portable package is missing: $portable"
           }
           $installerName = "Eir_${version}_x64-setup.exe"
-          $installerPath = Join-Path 'target/release/bundle/nsis' $installerName
-          if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
+          $installerPath = @(
+            Join-Path 'target/release/bundle/nsis' $installerName
+            Join-Path 'eir-ui/target/release/bundle/nsis' $installerName
+          ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $installerPath) {
             throw "Expected NSIS installer is missing: $installerName"
           }
           $installer = Get-Item -LiteralPath $installerPath
@@ -167,20 +175,39 @@ jobs:
             "$hash  $(Split-Path $_ -Leaf)"
           } | Set-Content $checksums -Encoding ascii
 
-          $releaseJson = gh release view $tag --json isDraft
+          # GET /releases/tags/{tag} 404s drafts. List releases so the draft tauri-action
+          # just created is visible to GITHUB_TOKEN, then operate by numeric id.
+          $releasesJson = & gh api --paginate "repos/$repo/releases?per_page=100"
           if ($LASTEXITCODE -ne 0) { throw "Failed to inspect release $tag" }
-          $release = $releaseJson | ConvertFrom-Json
-          if (-not $release.isDraft) {
+          $release = @($releasesJson | ConvertFrom-Json) |
+            Where-Object { $_.tag_name -eq $tag } |
+            Select-Object -First 1
+          if (-not $release) { throw "Failed to inspect release $tag" }
+          if (-not $release.draft) {
             throw "Release $tag was published before all assets were uploaded"
           }
+          $releaseId = $release.id
 
-          gh release upload $tag $portable $checksums --clobber
-          if ($LASTEXITCODE -ne 0) { throw "Failed to upload portable assets for $tag" }
+          function Publish-ReleaseAsset {
+            param([long]$ReleaseId, [string]$Path)
+            $name = Split-Path $Path -Leaf
+            $assetsJson = & gh api "repos/$repo/releases/$ReleaseId/assets?per_page=100"
+            if ($LASTEXITCODE -ne 0) { throw "Failed to upload portable assets for $tag" }
+            foreach ($asset in @($assetsJson | ConvertFrom-Json | Where-Object { $_.name -eq $name })) {
+              & gh api --method DELETE "repos/$repo/releases/assets/$($asset.id)" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "Failed to upload portable assets for $tag" }
+            }
+            & gh api --method POST "repos/$repo/releases/$ReleaseId/assets?name=$([uri]::EscapeDataString($name))" -H 'Content-Type: application/octet-stream' --input $Path | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Failed to upload portable assets for $tag" }
+          }
 
-          $releaseJson = gh release view $tag --json assets,isDraft
+          Publish-ReleaseAsset -ReleaseId $releaseId -Path $portable
+          Publish-ReleaseAsset -ReleaseId $releaseId -Path $checksums
+
+          $releaseJson = & gh api "repos/$repo/releases/$releaseId"
           if ($LASTEXITCODE -ne 0) { throw "Failed to inspect assets for $tag" }
           $release = $releaseJson | ConvertFrom-Json
-          if (-not $release.isDraft) {
+          if (-not $release.draft) {
             throw "Release $tag was published before asset verification completed"
           }
 
@@ -199,10 +226,17 @@ jobs:
 
           $validationDir = Join-Path $env:RUNNER_TEMP "eir-release-$([guid]::NewGuid().ToString('N'))"
           New-Item -ItemType Directory -Path $validationDir | Out-Null
-          gh release download $tag --pattern latest.json --dir $validationDir
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to download latest.json for validation' }
-          gh release download $tag --pattern $installerSignatureName --dir $validationDir
-          if ($LASTEXITCODE -ne 0) { throw "Failed to download $installerSignatureName for validation" }
+
+          function Save-ReleaseAsset {
+            param([string]$Name)
+            $asset = @($release.assets | Where-Object { $_.name -eq $Name } | Select-Object -First 1)
+            if (-not $asset) { throw "Failed to download $Name for validation" }
+            $out = Join-Path $validationDir $Name
+            & gh api -H 'Accept: application/octet-stream' "repos/$repo/releases/assets/$($asset.id)" --output $out
+            if ($LASTEXITCODE -ne 0) { throw "Failed to download $Name for validation" }
+          }
+          Save-ReleaseAsset -Name 'latest.json'
+          Save-ReleaseAsset -Name $installerSignatureName
 
           $latest = Get-Content (Join-Path $validationDir 'latest.json') -Raw | ConvertFrom-Json
           if ($latest.version -ne $version) {
@@ -224,5 +258,5 @@ jobs:
             throw 'latest.json signature does not match the exact installer signature asset'
           }
 
-          gh release edit $tag --draft=false
+          & gh api --method PATCH "repos/$repo/releases/$releaseId" -f tag_name="$tag" -F draft=false
           if ($LASTEXITCODE -ne 0) { throw "Failed to publish release $tag" }

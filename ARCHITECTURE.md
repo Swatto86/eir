@@ -186,11 +186,12 @@ the Windows release job, whose write permission is scoped to release contents:
    the signed installer and updater artifacts.
 4. The workflow verifies portable imports, the installed LocalSystem service, the
    standalone UI, and the smoke-tested self-contained portable executable.
-5. It uploads the portable executable and checksums, then requires exactly one
+5. It locates the draft by listing releases (GET `/releases/tags/{tag}` 404s drafts),
+   uploads the portable executable and checksums by release id, then requires exactly one
    version-matching installer, its exact `<installer>.sig`, `latest.json`, the portable,
    and checksums. The downloaded metadata must contain the manifest version, the exact
    tag-scoped installer URL, and the exact signature asset contents before the draft is
-   published.
+   published (`PATCH` `draft=false` on that release id, re-asserting `tag_name`).
 
 Because `tagName` is set, `tauri-action` builds, signs, and creates a **draft** GitHub release with the NSIS installer (`Eir_<version>_x64-setup.exe`), `latest.json`, and the `.sig`. The release is not public until every required asset has been verified. The signing keypair is minisign; the public key is embedded in `tauri.conf.json` `plugins.updater.pubkey` (base64 minisign public key).
 

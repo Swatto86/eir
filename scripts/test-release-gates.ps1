@@ -104,7 +104,9 @@ Assert-Contains $release '\$installerSignatureName\s*=\s*"\$\(\$installer\.Name\
 Assert-Contains $release '\$latest\.version\s+-ne\s+\$version' 'Release does not validate latest.json version.'
 Assert-Contains $release 'releases/download/\$tag/\$\(\$installer\.Name\)' 'Release does not require latest.json to target the exact tagged installer.'
 Assert-Contains $release '\[string\]::Equals\(\$metadataSignature,\s*\$installerSignature' 'Release does not match latest.json signature to the exact installer signature asset.'
-Assert-Contains $release 'gh release edit \$tag --draft=false' 'Release does not publish only after verification.'
+Assert-Contains $release 'repos/\$repo/releases\?per_page=100' 'Release does not list drafts by id; get-by-tag 404s unpublished releases.'
+Assert-Contains $release 'gh api --method PATCH' 'Release does not publish the verified draft through the Releases API.'
+Assert-Contains $release '-F draft=false' 'Release does not publish only after verification.'
 
 $publishBlock = [regex]::Match(
     $release,
