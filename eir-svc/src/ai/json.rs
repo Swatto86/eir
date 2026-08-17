@@ -42,11 +42,15 @@ const ACTION_FIELDS: &[&str] = &[
 /// Pull the first complete JSON object out of a reply that may wrap it in prose
 /// or code fences. Brace-matched (string- and escape-aware) rather than
 /// first-`{` to last-`}`: cheaper free models routinely emit the object twice.
+/// Production parsers use [`parse_model_json`]; these extractors remain as the
+/// unit-test contract for the first-complete-value scan.
+#[cfg(test)]
 pub(crate) fn extract_json(s: &str) -> &str {
     extract_delimited(strip_fences(s), '{', '}').unwrap_or(strip_fences(s))
 }
 
 /// First complete `[`…`]` array, or `None` when the reply has no array.
+#[cfg(test)]
 pub(crate) fn extract_json_array(s: &str) -> Option<&str> {
     extract_delimited(s, '[', ']')
 }
@@ -219,16 +223,12 @@ fn find_ci_ascii(hay: &str, needle: &str) -> Option<usize> {
     if needle_bytes.is_empty() || hay_bytes.len() < needle_bytes.len() {
         return None;
     }
-    for i in 0..=hay_bytes.len() - needle_bytes.len() {
-        if needle_bytes
+    (0..=hay_bytes.len() - needle_bytes.len()).find(|&i| {
+        needle_bytes
             .iter()
             .enumerate()
             .all(|(j, b)| hay_bytes[i + j].eq_ignore_ascii_case(b))
-        {
-            return Some(i);
-        }
-    }
-    None
+    })
 }
 
 /// Only a fence at the very START of the (trimmed) response is a real code fence.
@@ -287,6 +287,7 @@ fn json_candidates(s: &str) -> Vec<&str> {
     out
 }
 
+#[cfg(test)]
 fn extract_delimited(s: &str, open: char, close: char) -> Option<&str> {
     let start = s.find(open)?;
     match close_delimited_at(s, start) {

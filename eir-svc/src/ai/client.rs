@@ -868,6 +868,7 @@ impl AiClient {
 
     // ── OpenAI-compatible streaming (/chat/completions) — OpenRouter & Kilo ───
 
+    #[allow(clippy::too_many_arguments)]
     async fn call_openai_style(
         &self,
         base_url: &str,
