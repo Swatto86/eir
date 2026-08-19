@@ -10,6 +10,8 @@ Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.j
 
 ## Architectural decisions
 
+2026-08-19 | Eir | Ollama lists only pulled models; web search via cloud API key | Settings model list queries live `/api/tags` only — no static fallback. Failures surface as explicit errors (server down, nothing pulled). App-update `complete()` calls Ollama's `ollama.com/api/web_search` when `ollama_api_key` (or `OLLAMA_API_KEY`) is set, then runs local chat with results inlined; without a key it falls back to plain local chat.
+
 2026-08-19 | Eir | v0.34.14 Ollama local provider release | Ships the sixth AI provider (`ollama`): OpenAI-compatible localhost API, no key, Settings model list from `/api/tags`, vision when the model supports it, no web search on app-update checks.
 
 2026-08-19 | Eir | Ollama local provider | Sixth AI provider `ollama` uses Ollama's OpenAI-compatible API at `http://127.0.0.1:11434/v1` (configurable `ollama_base_url`). No API key; model required. Service path reuses `call_openai_style` with empty auth headers. LocalSystem can reach localhost without user impersonation. Vision enabled via `supports_images()` (model-dependent at runtime). App-update checks have no web search. Settings UI lists models from `GET …/api/tags` with static fallbacks. Wire: `UiSettings`/`SettingsUpdate.ollama_base_url`.

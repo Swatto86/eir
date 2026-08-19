@@ -76,6 +76,7 @@ effort = ""
 # provider = "ollama"
 # model = "llama3.2"   # required — e.g. llama3.2, qwen2.5:7b, mistral
 # ollama_base_url = "http://127.0.0.1:11434/v1"  # optional — default shown
+# ollama_api_key = ""  # optional — from ollama.com/settings/keys; enables web search on app-update checks
 
 [monitoring]
 # Windows Event Log channels to tail

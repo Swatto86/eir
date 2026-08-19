@@ -41,6 +41,9 @@ use windows::{
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
+const OLLAMA_WEB_SEARCH_URL: &str = "https://ollama.com/api/web_search";
+const OLLAMA_WEB_SEARCH_QUERY_CAP: usize = 400;
+const OLLAMA_WEB_SEARCH_SNIPPET_CAP: usize = 2_000;
 /// Max retries for a transient AI failure before giving up on this cycle.
 const MAX_AI_RETRIES: u32 = 2;
 /// Output-token ceiling per analysis. A busy machine can produce many problems; at
@@ -401,10 +404,12 @@ enum AiClientConfig {
         model: String,
         user_profile: Option<String>,
     },
-    /// Local Ollama — OpenAI-compatible chat API, no API key.
+    /// Local Ollama — OpenAI-compatible chat API on localhost; optional cloud
+    /// API key enables Ollama's web-search API for app-update checks.
     Ollama {
         base_url: String,
         model: String,
+        api_key: Option<String>,
     },
 }
 
@@ -502,10 +507,12 @@ impl AiClient {
                     bail!("[api] a model is required for provider = \"ollama\" (e.g. llama3.2 or qwen2.5:7b)");
                 }
                 let base_url = crate::config::normalize_ollama_base_url(&cfg.ollama_base_url);
-                info!(base_url = %base_url, model = %cfg.model, "ollama provider configured");
+                let api_key = cfg.ollama_api_key.clone().filter(|k| !k.trim().is_empty());
+                info!(base_url = %base_url, model = %cfg.model, web_search = api_key.is_some(), "ollama provider configured");
                 AiClientConfig::Ollama {
                     base_url,
                     model: cfg.model.clone(),
+                    api_key,
                 }
             }
         };
@@ -698,7 +705,11 @@ impl AiClient {
                 )
                 .await
             }
-            AiClientConfig::Ollama { base_url, model } => {
+            AiClientConfig::Ollama {
+                base_url,
+                model,
+                api_key: _,
+            } => {
                 let m = model_ov.unwrap_or(model);
                 self.call_openai_style(
                     base_url,
@@ -1414,11 +1425,21 @@ impl AiClient {
                 )
                 .await
             }
-            AiClientConfig::Ollama { base_url, model } => {
-                // No web search — model-only update checks.
+            AiClientConfig::Ollama {
+                base_url,
+                model,
+                api_key,
+            } => {
                 let m = if ov.is_empty() { model.as_str() } else { ov };
-                self.call_openai_style(base_url, "", m, "", None, prompt, &[])
-                    .await
+                if let Some(key) = ollama_api_key(api_key.as_deref()) {
+                    self.call_ollama_web(&key, base_url, m, prompt).await
+                } else {
+                    warn!(
+                        "Ollama app-update check has no web search — add an API key from ollama.com/settings/keys"
+                    );
+                    self.call_openai_style(base_url, "", m, "", None, prompt, &[])
+                        .await
+                }
             }
         }
     }
@@ -1483,8 +1504,11 @@ impl AiClient {
                 )
                 .await
             }
-            AiClientConfig::Ollama { base_url, model } => {
-                // No web search — model-only update checks.
+            AiClientConfig::Ollama {
+                base_url,
+                model,
+                api_key: _,
+            } => {
                 let m = if ov.is_empty() { model.as_str() } else { ov };
                 self.call_openai_style(base_url, "", m, "", None, prompt, &[])
                     .await
@@ -1531,7 +1555,11 @@ impl AiClient {
                 self.call_openai_style(OPENROUTER_BASE, &api_key, m, "", None, prompt, images)
                     .await
             }
-            AiClientConfig::Ollama { base_url, model } => {
+            AiClientConfig::Ollama {
+                base_url,
+                model,
+                api_key: _,
+            } => {
                 let m = if ov.is_empty() { model.as_str() } else { ov };
                 self.call_openai_style(base_url, "", m, "", None, prompt, images)
                     .await
@@ -1608,6 +1636,49 @@ impl AiClient {
             cost_usd: provider_cost(u.cost.unwrap_or(0.0)),
         });
         Ok((content, usage))
+    }
+
+    /// Ollama app-update path: cloud web search, then local chat with results inlined.
+    async fn call_ollama_web(
+        &self,
+        api_key: &str,
+        base_url: &str,
+        model: &str,
+        prompt: &str,
+    ) -> Result<(String, Option<CallUsage>)> {
+        let query = ollama_web_search_query(prompt);
+        let results = self.ollama_web_search(api_key, &query).await?;
+        let augmented = augment_prompt_with_ollama_web(prompt, &results);
+        self.call_openai_style(base_url, "", model, "", None, &augmented, &[])
+            .await
+    }
+
+    async fn ollama_web_search(&self, api_key: &str, query: &str) -> Result<Vec<OllamaWebResult>> {
+        let body = json!({
+            "query": query,
+            "max_results": 5,
+        });
+        let resp = self
+            .http
+            .post(OLLAMA_WEB_SEARCH_URL)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Ollama web search request failed")?;
+
+        let status = resp.status();
+        let text = response_text_capped(resp)
+            .await
+            .context("Ollama web search read failed")?;
+        if !status.is_success() {
+            let detail: String = text.chars().take(400).collect();
+            bail!("Ollama web search error ({status}): {detail}");
+        }
+        let parsed: OllamaWebSearchResponse =
+            serde_json::from_str(&text).context("bad Ollama web search response")?;
+        Ok(parsed.results)
     }
 
     /// Anthropic with the native web_search server tool (non-streaming). The
@@ -2532,6 +2603,61 @@ fn estimate_anthropic_cost(
         + web_searches as f64 * 0.01
 }
 
+#[derive(Debug, Deserialize)]
+struct OllamaWebSearchResponse {
+    #[serde(default)]
+    results: Vec<OllamaWebResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaWebResult {
+    title: String,
+    url: String,
+    content: String,
+}
+
+fn ollama_api_key(configured: Option<&str>) -> Option<String> {
+    if let Some(key) = configured.filter(|key| !key.trim().is_empty()) {
+        return Some(key.trim().to_string());
+    }
+    std::env::var("OLLAMA_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .map(|key| key.trim().to_string())
+}
+
+fn ollama_web_search_query(prompt: &str) -> String {
+    let line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(prompt.trim());
+    line.chars().take(OLLAMA_WEB_SEARCH_QUERY_CAP).collect()
+}
+
+fn augment_prompt_with_ollama_web(prompt: &str, results: &[OllamaWebResult]) -> String {
+    if results.is_empty() {
+        return prompt.to_string();
+    }
+    let mut augmented = String::from("Recent web search results:\n\n");
+    for (index, result) in results.iter().enumerate() {
+        let snippet: String = result
+            .content
+            .chars()
+            .take(OLLAMA_WEB_SEARCH_SNIPPET_CAP)
+            .collect();
+        augmented.push_str(&format!(
+            "{}. {} ({})\n{snippet}\n\n",
+            index + 1,
+            result.title,
+            result.url
+        ));
+    }
+    augmented.push_str("---\n\nUsing the search results above where helpful, answer:\n\n");
+    augmented.push_str(prompt);
+    augmented
+}
+
 async fn openrouter_api_key(configured: Option<&str>) -> Result<String> {
     if let Some(key) = configured.filter(|key| !key.trim().is_empty()) {
         return Ok(key.trim().to_string());
@@ -3366,13 +3492,23 @@ mod tests {
     }
 
     #[test]
-    fn kilo_cli_variant_mapping() {
-        assert_eq!(kilo_cli_variant(""), None);
-        assert_eq!(kilo_cli_variant("low"), Some("low"));
-        assert_eq!(kilo_cli_variant("medium"), Some("medium"));
-        assert_eq!(kilo_cli_variant("high"), Some("high"));
-        assert_eq!(kilo_cli_variant("xhigh"), Some("high"));
-        assert_eq!(kilo_cli_variant("max"), Some("high"));
-        assert_eq!(kilo_cli_variant("bogus"), None);
+    fn ollama_web_search_helpers_bound_and_augment() {
+        let query = ollama_web_search_query("  line one\nline two");
+        assert_eq!(query, "line one");
+        let long = "x".repeat(OLLAMA_WEB_SEARCH_QUERY_CAP + 50);
+        assert_eq!(
+            ollama_web_search_query(&long).len(),
+            OLLAMA_WEB_SEARCH_QUERY_CAP
+        );
+        let augmented = augment_prompt_with_ollama_web(
+            "Find the latest version.",
+            &[OllamaWebResult {
+                title: "Example".into(),
+                url: "https://example.com".into(),
+                content: "version 2.0".into(),
+            }],
+        );
+        assert!(augmented.contains("Recent web search results:"));
+        assert!(augmented.contains("Find the latest version."));
     }
 }

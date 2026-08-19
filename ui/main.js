@@ -279,7 +279,8 @@ function updateCheckLabel(s) {
     return `Kilo CLI · ${m || 'main model'} + web`;
   }
   if (s.provider === 'ollama') {
-    return `Ollama · ${m || 'main model'} (no web search)`;
+    const web = s.ollama_key_set ? ' + web' : ' (no web search key)';
+    return `Ollama · ${m || 'main model'}${web}`;
   }
   const main = (s.model || '').trim() || (s.provider === 'openrouter' ? 'openrouter/free' : '');
   const web = s.provider === 'openrouter' ? ' + web' : '';
@@ -1695,7 +1696,7 @@ const PROVIDER_HINTS = {
   codex_cli: 'Uses your ChatGPT subscription via the logged-in Codex CLI — no API key. Install Codex and run `codex login` once; Eir auto-detects your profile and codex.exe.',
   anthropic: 'Claude direct from Anthropic. A model is required (e.g. claude-opus-4-8, claude-haiku-4-5). Key: console.anthropic.com',
   kilo_cli: 'Uses your Kilo subscription via the logged-in Kilo CLI — no API key. Install with `npm install -g @kilocode/cli`, then run `kilo` once to sign in. Subscription models use the kilo/ prefix.',
-  ollama: 'Uses a local Ollama server — no API key. Install Ollama, pull a model (`ollama pull llama3.2`), then pick it here. App-update checks have no web search.',
+  ollama: 'Uses a local Ollama server for chat — no key needed for that. For app-update web search, add a free key from ollama.com/settings/keys. Only pulled models appear in the list.',
 };
 
 const PROVIDER_MODEL_PLACEHOLDERS = {
@@ -1713,7 +1714,7 @@ const PROVIDER_UPDATE_PLACEHOLDERS = {
   codex_cli: 'blank = main model, with web search',
   anthropic: 'blank = Claude Haiku, with web search',
   kilo_cli: 'blank = main model, with web search',
-  ollama: 'blank = main model (no web search)',
+  ollama: 'blank = main model, with web search when key set',
 };
 
 const MODEL_INPUT_IDS = ['set-model', 'set-upd-model', 'set-adv-model'];
@@ -1760,11 +1761,17 @@ async function loadProviderModels(provider) {
       fragment.appendChild(option);
     });
     list.replaceChildren(fragment);
-    hint.textContent = `${values.length} models available — open the list or type to filter.`;
+    const countLabel = provider === 'ollama'
+      ? `${values.length} pulled model${values.length === 1 ? '' : 's'}`
+      : `${values.length} model${values.length === 1 ? '' : 's'}`;
+    hint.textContent = `${countLabel} — open the list or type to filter.`;
   } catch (e) {
     if (request === modelListRequest) {
-      hint.textContent = 'Model list unavailable — the current model is still preserved.';
-      console.error('list_provider_models failed', e);
+      const msg = typeof e === 'string' ? e : String(e);
+      hint.textContent = provider === 'ollama'
+        ? msg
+        : 'Model list unavailable — the current model is still preserved.';
+      if (provider !== 'ollama') console.error('list_provider_models failed', e);
     }
   } finally {
     if (request === modelListRequest) {
@@ -1872,6 +1879,8 @@ function fillSettings() {
     document.getElementById('set-kilo-path').placeholder =
       s.kilo_cli_path_set ? '•••••• set — blank keeps it' : 'kilo  (blank = on PATH)';
     document.getElementById('set-ollama-url').value = s.ollama_base_url || 'http://127.0.0.1:11434/v1';
+    document.getElementById('set-ollama-key').placeholder =
+      s.ollama_key_set ? '•••••• set — blank keeps it' : 'ollama.com/settings/keys (for web search)';
     rememberModelValues(provider);
   }
   if (!dirtyCards.has('card-updater')) {
@@ -1894,6 +1903,7 @@ async function saveSettings() {
   const kiloProfile = document.getElementById('set-kilo-profile').value.trim();
   const kiloPath = document.getElementById('set-kilo-path').value.trim();
   const ollamaUrl = document.getElementById('set-ollama-url').value.trim();
+  const ollamaKey = document.getElementById('set-ollama-key').value.trim();
   const settings = {
     provider: document.getElementById('set-provider').value,
     model: document.getElementById('set-model').value.trim(),
@@ -1904,6 +1914,7 @@ async function saveSettings() {
     kilo_cli_user_profile: kiloProfile || null,
     kilo_cli_path: kiloPath || null,
     ollama_base_url: ollamaUrl,
+    ollama_api_key: ollamaKey || null,
     confidence_threshold: numVal('set-conf', 80, 50, 95) / 100,
     decision_interval_secs: numVal('set-decint', 600, 10, 604800),
     event_log_poll_interval_secs: numVal('set-elpoll', 30, 5, 604800),
@@ -1949,6 +1960,7 @@ async function saveSettings() {
     st.textContent = commandMessage(result, 'Settings applied.');
     document.getElementById('set-or-key').value = '';
     document.getElementById('set-an-key').value = '';
+    document.getElementById('set-ollama-key').value = '';
     document.getElementById('set-kilo-profile').value = '';
     document.getElementById('set-kilo-path').value = '';
     dirtyCards.delete('card-provider');

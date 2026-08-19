@@ -175,6 +175,8 @@ pub struct ApiConfig {
     /// ollama: OpenAI-compatible API root (default `http://127.0.0.1:11434/v1`).
     #[serde(default = "default_ollama_base_url")]
     pub ollama_base_url: String,
+    /// ollama: API key from ollama.com/settings/keys for cloud web search.
+    pub ollama_api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -401,6 +403,7 @@ impl Config {
                 .is_some_and(is_real),
             kilo_cli_path_set: self.api.kilo_cli_path.as_deref().is_some_and(is_real),
             ollama_base_url: self.api.ollama_base_url.clone(),
+            ollama_key_set: set(&self.api.ollama_api_key),
             // Deprecated wire fields (see eir_proto::UiSettings).
             base_url: String::new(),
             api_key_set: false,
@@ -445,6 +448,7 @@ impl Config {
         };
         keep(&mut self.api.openrouter_api_key, u.openrouter_api_key);
         keep(&mut self.api.anthropic_api_key, u.anthropic_api_key);
+        keep(&mut self.api.ollama_api_key, u.ollama_api_key);
         // Same "blank = unchanged" rule for the kilo_cli hint overrides: the field
         // is always blank on load, so treating blank as "clear" wiped a configured
         // override on every unrelated settings save.
@@ -640,6 +644,7 @@ audit_db = "./eir.db"
             effort: "High".into(),
             openrouter_api_key: Some("sk-or-test".into()),
             anthropic_api_key: None,
+            ollama_api_key: None,
             kilo_cli_user_profile: None,
             kilo_cli_path: None,
             ollama_base_url: String::new(),
@@ -683,6 +688,7 @@ audit_db = "./eir.db"
             effort: "high".into(),
             openrouter_api_key: Some("sk-xxx".into()),
             anthropic_api_key: None,
+            ollama_api_key: None,
             kilo_cli_user_profile: None,
             kilo_cli_path: None,
             ollama_base_url: String::new(),

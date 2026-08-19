@@ -47,15 +47,6 @@ const OPENROUTER_MODELS: &[&str] = &[
     "deepseek/deepseek-v4-pro",
     "minimax/minimax-m3",
 ];
-const OLLAMA_MODELS: &[&str] = &[
-    "llama3.2",
-    "llama3.1",
-    "mistral",
-    "qwen2.5",
-    "gemma2",
-    "phi3",
-    "codellama",
-];
 
 #[tauri::command]
 pub async fn list_provider_models(
@@ -75,9 +66,7 @@ pub async fn list_provider_models(
         "openrouter" => Ok(openrouter_models()
             .await
             .unwrap_or_else(|| strings(OPENROUTER_MODELS))),
-        "ollama" => Ok(ollama_models(ollama_base_url.as_deref())
-            .await
-            .unwrap_or_else(|| strings(OLLAMA_MODELS))),
+        "ollama" => ollama_models(ollama_base_url.as_deref()).await,
         _ => Err("Unknown AI provider".into()),
     }
 }
@@ -102,38 +91,60 @@ fn ollama_tags_url(base_v1: &str) -> String {
     format!("{root}/api/tags")
 }
 
-async fn ollama_models(base_url: Option<&str>) -> Option<Vec<String>> {
+async fn ollama_models(base_url: Option<&str>) -> Result<Vec<String>, String> {
     let base = normalize_ollama_base_url(base_url);
     let tags_url = ollama_tags_url(&base);
     let ps_url = tags_url.replace('\'', "''");
+    // Comma-prefix forces JSON array output even for a single pulled model (PS 5.1).
     let script = format!(
-        "try {{ @((Invoke-RestMethod -Uri '{ps_url}' -TimeoutSec 5).models.name) | ConvertTo-Json -Compress }} catch {{ '' }}"
+        "try {{ $names = @((Invoke-RestMethod -Uri '{ps_url}' -TimeoutSec 5).models.name); if (-not $names -or $names.Count -eq 0) {{ '[]' }} else {{ ,$names | ConvertTo-Json -Compress }} }} catch {{ throw $_ }}"
     );
     let mut command = tokio::process::Command::new("powershell.exe");
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
-    let (status, stdout, _) = run_command_capped(
+    let (status, stdout, stderr) = run_command_capped(
         command
             .args(["-NoProfile", "-Command", &script])
             .stdin(Stdio::null()),
         Duration::from_secs(10),
         MODEL_OUTPUT_CAP,
     )
-    .await?;
+    .await
+    .ok_or_else(|| format!("Could not query Ollama at {base} — is the server running?"))?;
     if !status.success() {
-        return None;
+        let detail = String::from_utf8_lossy(&stderr);
+        let detail = detail.trim();
+        let msg = if detail.is_empty() {
+            format!("Ollama at {base} returned a non-zero exit status")
+        } else {
+            format!("Ollama at {base}: {detail}")
+        };
+        return Err(msg);
     }
-    parse_ollama_models(&String::from_utf8_lossy(&stdout))
+    let models = parse_ollama_models(&String::from_utf8_lossy(&stdout))
+        .ok_or_else(|| format!("Could not parse the model list from Ollama at {base}"))?;
+    if models.is_empty() {
+        return Err(
+            "No models pulled on this Ollama server — run `ollama pull <model>` first".into(),
+        );
+    }
+    Ok(models)
 }
 
 fn parse_ollama_models(output: &str) -> Option<Vec<String>> {
     let trimmed = output.trim();
-    if trimmed.is_empty() {
-        return None;
+    if trimmed.is_empty() || trimmed == "[]" {
+        return Some(Vec::new());
     }
     if let Ok(models) = serde_json::from_str::<Vec<String>>(trimmed) {
         let models: Vec<String> = models.into_iter().filter(|id| valid_model_id(id)).collect();
-        return (!models.is_empty()).then_some(models);
+        return Some(models);
+    }
+    if let Ok(model) = serde_json::from_str::<String>(trimmed) {
+        if valid_model_id(&model) {
+            return Some(vec![model]);
+        }
+        return Some(Vec::new());
     }
     let root: Value = serde_json::from_str(trimmed).ok()?;
     let models: Vec<String> = root["models"]
@@ -143,7 +154,7 @@ fn parse_ollama_models(output: &str) -> Option<Vec<String>> {
         .filter(|id| valid_model_id(id))
         .map(str::to_string)
         .collect();
-    (!models.is_empty()).then_some(models)
+    Some(models)
 }
 
 async fn openrouter_models() -> Option<Vec<String>> {
@@ -307,5 +318,16 @@ mod tests {
     fn ollama_models_parse_json_array() {
         let models = parse_ollama_models(r#"["llama3.2:latest","mistral"]"#).unwrap();
         assert_eq!(models, ["llama3.2:latest", "mistral"]);
+    }
+
+    #[test]
+    fn ollama_models_parse_single_json_string() {
+        let models = parse_ollama_models(r#""llama3.2:latest""#).unwrap();
+        assert_eq!(models, ["llama3.2:latest"]);
+    }
+
+    #[test]
+    fn ollama_models_empty_array_means_none_pulled() {
+        assert_eq!(parse_ollama_models("[]").unwrap(), Vec::<String>::new());
     }
 }

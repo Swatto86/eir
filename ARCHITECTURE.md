@@ -632,10 +632,11 @@ All three subscription CLIs share one privilege boundary: when EirSvc is LocalSy
   NDJSON; text parts form the reply and the last `step_finish` supplies usage.
   Subscription/BYOK routing still requires a `kilo/` model prefix.
 - **`Ollama`** — local OpenAI-compatible streaming against `api.ollama_base_url`
-  (default `http://127.0.0.1:11434/v1`), **no API key**. Model is required.
-  LocalSystem reaches localhost directly. `call_openai_style` omits auth headers when
-  the key is empty. Vision is enabled via `supports_images()` (model-dependent).
-  App-update `complete()` has no web search on this path.
+  (default `http://127.0.0.1:11434/v1`). Model is required; local chat needs no key.
+  Optional `ollama_api_key` (or `OLLAMA_API_KEY`) calls Ollama's cloud
+  `https://ollama.com/api/web_search` before app-update checks, then inlines results
+  into a local chat completion. `supports_images()` is true (model-dependent).
+  Settings lists only models returned by live `GET …/api/tags` (no static catalogue).
 
 Both SSE readers share a UTF-8-safe byte accumulator. Streaming and non-streaming HTTP
 bodies have a 4 MiB aggregate cap; CLI stdout/stderr are drained concurrently with fixed
