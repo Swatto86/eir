@@ -1,0 +1,29 @@
+{
+  "models": [
+    {
+      "name": "huihui_ai/qwen3.8-abliterated:latest",
+      "model": "huihui_ai/qwen3.8-abliterated:latest",
+      "capabilities": ["completion", "tools", "thinking", "vision"]
+    },
+    {
+      "name": "qwen2.5-coder:14b",
+      "model": "qwen2.5-coder:14b",
+      "capabilities": ["completion", "tools", "insert"]
+    },
+    {
+      "name": "nomic-embed-text:latest",
+      "model": "nomic-embed-text:latest",
+      "capabilities": ["embedding"]
+    },
+    {
+      "name": "huihui_ai/qwen3-coder-abliterated:30b-a3b-instruct-q4_K_M",
+      "model": "huihui_ai/qwen3-coder-abliterated:30b-a3b-instruct-q4_K_M",
+      "capabilities": ["completion"]
+    },
+    {
+      "name": "qwen3.6:27b",
+      "model": "qwen3.6:27b",
+      "capabilities": ["vision", "completion", "tools", "thinking"]
+    }
+  ]
+}

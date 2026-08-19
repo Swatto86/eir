@@ -200,10 +200,20 @@ fn parse_ollama_models(output: &str) -> Option<Vec<String>> {
 fn extract_ollama_model_ids(models: &[Value]) -> Vec<String> {
     models
         .iter()
+        .filter(|entry| ollama_model_usable_for_chat(entry))
         .filter_map(|entry| entry["name"].as_str().or_else(|| entry["model"].as_str()))
         .filter(|id| valid_model_id(id))
         .map(str::to_string)
         .collect()
+}
+
+/// Chat/analysis needs a completion model — skip embedding-only entries when
+/// Ollama advertises capabilities (older servers without the field are kept).
+fn ollama_model_usable_for_chat(entry: &Value) -> bool {
+    match entry.get("capabilities").and_then(|caps| caps.as_array()) {
+        Some(caps) => caps.iter().any(|cap| cap.as_str() == Some("completion")),
+        None => true,
+    }
 }
 
 fn filter_ollama_model_ids(models: Vec<String>) -> Vec<String> {
@@ -404,6 +414,27 @@ mod tests {
     fn ollama_models_allow_underscores_in_tags() {
         let models = parse_ollama_models(r#"{"models":[{"name":"deepseek-r1:8b_q4"}]}"#).unwrap();
         assert_eq!(models, ["deepseek-r1:8b_q4"]);
+    }
+
+    #[test]
+    fn ollama_models_skip_embedding_only_entries() {
+        let models = parse_ollama_models(
+            r#"{"models":[
+                {"name":"qwen2.5-coder:14b","capabilities":["completion","tools"]},
+                {"name":"nomic-embed-text:latest","capabilities":["embedding"]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(models, ["qwen2.5-coder:14b"]);
+    }
+
+    #[test]
+    fn ollama_models_parse_user_tags_payload() {
+        let models =
+            parse_ollama_models(include_str!("../test/fixtures/ollama-tags-sample.json")).unwrap();
+        assert_eq!(models.len(), 4);
+        assert!(!models.iter().any(|m| m.contains("nomic-embed-text")));
+        assert!(models.iter().any(|m| m.contains("qwen3.8-abliterated")));
     }
 
     #[test]
