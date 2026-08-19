@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.14. It has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.15. It has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.1
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-08-19 | Eir | v0.34.15 Ollama pulled-models list and web search | Settings lists only live `/api/tags` (no static fallback). Optional `ollama_api_key` enables Ollama cloud web search on app-update checks before local chat completion.
 
 2026-08-19 | Eir | Ollama lists only pulled models; web search via cloud API key | Settings model list queries live `/api/tags` only — no static fallback. Failures surface as explicit errors (server down, nothing pulled). App-update `complete()` calls Ollama's `ollama.com/api/web_search` when `ollama_api_key` (or `OLLAMA_API_KEY`) is set, then runs local chat with results inlined; without a key it falls back to plain local chat.
 

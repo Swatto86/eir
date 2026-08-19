@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-08-19 · **Code:** v0.34.14
+**Last updated:** 2026-08-19 · **Code:** v0.34.15
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -307,7 +307,7 @@ Supporting types:
 
 **Backward-compat invariant**: additive status fields use `#[serde(default)]`, and `UiRequest.request_id` is optional + flattened. This keeps the original top-level command JSON valid across the installer’s UI/service skew window; capabilities tell the tray when it may rely on command results or provider testing.
 
-**Secret-handling invariant**: `UiSettings` never carries secret values, only booleans (`openrouter_key_set`, `anthropic_key_set`) so the UI shows "configured" without exposing keys. OpenRouter and native Anthropic take pasted API keys; `claude_cli`, `codex_cli`, and `kilo_cli` borrow a locally logged-in subscription session instead; `ollama` needs no key and talks to a local server. Inbound `SettingsUpdate` uses `Option<String>` for secrets where `None` = "unchanged" and a non-empty value replaces the stored secret; the JS sends `null` to preserve.
+**Secret-handling invariant**: `UiSettings` never carries secret values, only booleans (`openrouter_key_set`, `anthropic_key_set`, `ollama_key_set`) so the UI shows "configured" without exposing keys. OpenRouter and native Anthropic take pasted API keys; `ollama` uses a separate cloud key only for web search; `claude_cli`, `codex_cli`, and `kilo_cli` borrow a locally logged-in subscription session instead. Inbound `SettingsUpdate` uses `Option<String>` for secrets where `None` = "unchanged" and a non-empty value replaces the stored secret; the JS sends `null` to preserve.
 
 ### Named-pipe security / ACL model (`pipe_server.rs:16-48`)
 
