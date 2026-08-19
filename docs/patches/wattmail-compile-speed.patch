@@ -1,0 +1,167 @@
+From 7aba3674531692e1537dc606c57add54f06330a5 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 19 Aug 2026 21:02:23 +0000
+Subject: [PATCH] Speed up Rust dev builds and CI with dev opt-level, sccache,
+ fastcheck
+
+- Add [profile.dev.package."*"] opt-level = 1 at workspace root
+- Add .cargo/config.toml with parallel build jobs
+- Wire mozilla-actions/sccache-action into CI, cross-check, and release
+- Add scripts/fastcheck.sh with -p for scoped cargo check
+- Log decision in CONTEXT.md
+---
+ .cargo/config.toml            |  4 ++++
+ .github/workflows/ci.yml      | 10 ++++++++++
+ .github/workflows/release.yml |  5 +++++
+ CONTEXT.md                    |  8 +++++++-
+ Cargo.toml                    |  3 +++
+ scripts/fastcheck.sh          | 28 ++++++++++++++++++++++++++++
+ 6 files changed, 57 insertions(+), 1 deletion(-)
+ create mode 100644 .cargo/config.toml
+ create mode 100755 scripts/fastcheck.sh
+
+diff --git a/.cargo/config.toml b/.cargo/config.toml
+new file mode 100644
+index 0000000..b6e5348
+--- /dev/null
++++ b/.cargo/config.toml
+@@ -0,0 +1,4 @@
++[build]
++jobs = 0
++
++# sccache: set RUSTC_WRAPPER=sccache in the environment (CI does this automatically).
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index ba2cf14..9b5cb70 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -13,6 +13,9 @@ concurrency:
+ jobs:
+   verify:
+     runs-on: windows-latest
++    env:
++      RUSTC_WRAPPER: sccache
++      SCCACHE_GHA_ENABLED: "true"
+     steps:
+       - uses: actions/checkout@v5
+ 
+@@ -26,6 +29,8 @@ jobs:
+         with:
+           components: rustfmt, clippy
+ 
++      - uses: mozilla-actions/sccache-action@v0.0.10
++
+       - uses: Swatinem/rust-cache@v2
+ 
+       - name: Install frontend dependencies
+@@ -67,6 +72,9 @@ jobs:
+       matrix:
+         os: [macos-latest, ubuntu-22.04]
+     runs-on: ${{ matrix.os }}
++    env:
++      RUSTC_WRAPPER: sccache
++      SCCACHE_GHA_ENABLED: "true"
+     steps:
+       - uses: actions/checkout@v5
+ 
+@@ -79,6 +87,8 @@ jobs:
+         with:
+           components: rustfmt, clippy
+ 
++      - uses: mozilla-actions/sccache-action@v0.0.10
++
+       - uses: Swatinem/rust-cache@v2
+ 
+       # Tauri's Linux build needs the system webkit/gtk/appindicator libraries to
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index 2228a7c..6c47960 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -7,6 +7,9 @@ on:
+ jobs:
+   release:
+     runs-on: windows-latest
++    env:
++      RUSTC_WRAPPER: sccache
++      SCCACHE_GHA_ENABLED: "true"
+     permissions:
+       contents: write
+     steps:
+@@ -19,6 +22,8 @@ jobs:
+ 
+       - uses: dtolnay/rust-toolchain@1.96.0
+ 
++      - uses: mozilla-actions/sccache-action@v0.0.10
++
+       - uses: Swatinem/rust-cache@v2
+ 
+       - name: Install frontend dependencies
+diff --git a/CONTEXT.md b/CONTEXT.md
+index 2625174..718084e 100644
+--- a/CONTEXT.md
++++ b/CONTEXT.md
+@@ -5,7 +5,13 @@
+ > new milestone state, a decision made/reversed, or an open question resolved.
+ > Keep newest progress entries at the top of the log.
+ >
+-> **Last updated:** 2026-08-17
++> **Last updated:** 2026-08-19
++
++---
++
++## Progress log
++
++2026-08-19 | Rust compile-speed defaults | Workspace `[profile.dev.package."*"] opt-level = 1`, `.cargo/config.toml` parallel jobs, sccache in CI/release/cross-check, `scripts/fastcheck.sh -p <crate>` for scoped check. Policy in agent-standards `rust-build.md`.
+ 
+ ---
+ 
+diff --git a/Cargo.toml b/Cargo.toml
+index f48e532..28adf5b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -37,6 +37,9 @@ ammonia = "4"
+ 
+ # Release profile lives at the workspace root (member profiles are ignored).
+ # Tuned for a small, fast binary — the AllTheThings recipe.
++[profile.dev.package."*"]
++opt-level = 1
++
+ [profile.release]
+ codegen-units = 1
+ lto = true
+diff --git a/scripts/fastcheck.sh b/scripts/fastcheck.sh
+new file mode 100755
+index 0000000..1c572e7
+--- /dev/null
++++ b/scripts/fastcheck.sh
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++# Fast per-edit check: formatting and type correctness, no test run or Tauri bundle.
++# Pass -p wattmail-domain (or another workspace crate) for scoped cargo check.
++# scripts/verify.sh is the full gate before a commit.
++set -euo pipefail
++cd "$(dirname "$0")/.."
++export PATH="$HOME/.cargo/bin:$PATH"
++
++PACKAGE=""
++while getopts "p:" opt; do
++  case "$opt" in
++    p) PACKAGE="$OPTARG" ;;
++    *) exit 2 ;;
++  esac
++done
++
++npm run build
++cargo fmt --all -- --check
++
++if [ -n "$PACKAGE" ]; then
++  echo "==> cargo check -p $PACKAGE"
++  cargo check --locked -p "$PACKAGE" --all-targets
++else
++  echo "==> cargo clippy"
++  cargo clippy --all-targets -- -D warnings
++fi
++
++echo "fastcheck OK"
+-- 
+2.43.0
+
