@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.15. It has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.16. It has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.1
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-08-19 | Eir | v0.34.16 Ollama model list parse fix release | Ships raw `/api/tags` fetch (curl/IWR), BOM decoding, and `name`/`model` field parsing so Settings lists pulled models reliably on Windows.
 
 2026-08-19 | Eir | Ollama model list parses raw /api/tags JSON | Settings failed to parse models when PowerShell re-encoded the tags response (UTF-16/ConvertTo-Json). Fetch now uses curl.exe with IWR fallback, decodes BOMs, and reads `name` or `model` from the native Ollama payload; `_` allowed in tag names.
 
