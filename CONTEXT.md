@@ -10,7 +10,7 @@ Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.j
 
 ## Architectural decisions
 
-2026-08-19 | Eir | Rust compile-speed defaults | Workspace `[profile.dev.package."*"] opt-level = 1` for faster dev/test builds; CI/release add sccache (`RUSTC_WRAPPER` + GHA cache) on top of rust-cache; `scripts/fastcheck.ps1 -Package <crate>` runs scoped `cargo check`. Policy codified in agent-standards `rust-build.md`.
+2026-08-19 | Eir | Rust compile-speed defaults | Workspace `[profile.dev.package."*"] opt-level = 1` for faster dev/test builds; CI/release add sccache (`RUSTC_WRAPPER` + GHA cache) on top of rust-cache; `scripts/fastcheck.ps1 -Package <crate>` runs scoped `cargo check`. Policy in agent-standards `~/.agents/rust-build.md`.
 
 2026-08-19 | Eir | v0.34.16 Ollama model list parse fix release | Ships raw `/api/tags` fetch (curl/IWR), BOM decoding, and `name`/`model` field parsing so Settings lists pulled models reliably on Windows.
 

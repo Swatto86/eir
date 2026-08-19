@@ -135,7 +135,7 @@ For local iteration after a single-crate edit, `scripts/fastcheck.ps1 -Package e
 
 Optional local sccache: install sccache, then `set RUSTC_WRAPPER=sccache` (cmd) or `$env:RUSTC_WRAPPER='sccache'` (PowerShell) before cargo commands. Do not commit a hard-coded wrapper in `.cargo/config.toml` — not every machine has sccache.
 
-Cross-project Rust compile-speed policy lives in agent-standards `rust-build.md`.
+Cross-project Rust compile-speed policy lives in agent-standards `~/.agents/rust-build.md`.
 
 ### CI gate (`.github/workflows/ci.yml`)
 
