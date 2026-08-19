@@ -1,2 +1,10 @@
+# Parallel crate builds; Cargo picks a sensible default when omitted, but pinning
+# avoids under-utilizing CI runners and local many-core machines.
+[build]
+jobs = 0
+
+# sccache: set RUSTC_WRAPPER=sccache in the environment (CI does this automatically).
+# Do not hard-code a wrapper here — not every machine has sccache installed.
+
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]

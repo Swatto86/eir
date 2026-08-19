@@ -11,6 +11,12 @@ resolver = "2"
 # `rust.unsafe_code = "forbid"` is deliberately absent: cargo rejects a crate that has
 # both `[lints] workspace = true` and its own lint table, so a workspace-level forbid
 # could not be opted out of in eir-svc/eir-ui, both of which call Win32 directly.
+# Dev builds: compile dependencies with minimal optimization so incremental
+# rebuilds stay fast, while workspace crates remain at opt-level 0 (default).
+# Release profile is unchanged.
+[profile.dev.package."*"]
+opt-level = 1
+
 [workspace.lints.clippy]
 unwrap_used = "warn"
 expect_used = "warn"

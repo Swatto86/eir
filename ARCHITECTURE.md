@@ -125,6 +125,18 @@ the runtime-install prerequisite from both fresh and offline installs.
 
 `rust-toolchain.toml` at **repo root** pins `channel = "1.95.0"` — correctly at root (not under a crate) so rustup resolves it from any cwd. Both CI workflows pin `dtolnay/rust-toolchain@1.95.0` to match exactly (with an explanatory comment in `ci.yml:18-19`), satisfying the user's "pin Rust toolchain + match CI to local" rule.
 
+### Compile-speed defaults
+
+Workspace `Cargo.toml` sets `[profile.dev.package."*"] opt-level = 1` so third-party dependencies compile with minimal optimization while workspace crates stay at dev `opt-level = 0`. This speeds incremental `cargo check`, `cargo clippy`, and `cargo test` without changing release binaries.
+
+`.cargo/config.toml` sets `[build] jobs = 0` (use all logical CPUs). CI and release workflows install **sccache** (`mozilla-actions/sccache-action@v0.0.10`) with `RUSTC_WRAPPER=sccache` and `SCCACHE_GHA_ENABLED=true`, layered on top of `swatinem/rust-cache@v2`.
+
+For local iteration after a single-crate edit, `scripts/fastcheck.ps1 -Package eir-svc` (or `eir-proto` / `eir-ui`) runs formatting plus a scoped `cargo check` instead of the full-workspace clippy pass. Full-workspace `fastcheck.ps1` (no `-Package`) still runs clippy; `scripts/verify.ps1` remains the pre-commit gate.
+
+Optional local sccache: install sccache, then `set RUSTC_WRAPPER=sccache` (cmd) or `$env:RUSTC_WRAPPER='sccache'` (PowerShell) before cargo commands. Do not commit a hard-coded wrapper in `.cargo/config.toml` — not every machine has sccache.
+
+Cross-project Rust compile-speed policy lives in agent-standards `rust-build.md`.
+
 ### CI gate (`.github/workflows/ci.yml`)
 
 Triggers: `push` to `master`, and all `pull_request`. `permissions: contents: read`.
@@ -132,7 +144,7 @@ The workflow has a Windows verification job plus an Ubuntu job that audits the W
 Rust dependency graph:
 1. `actions/checkout@v6`, manifest/Cargo.lock version sync, the compiled NSIS-hook
    harness, release-workflow regressions, and the portable-runner regression.
-2. `dtolnay/rust-toolchain@1.95.0` with `rustfmt, clippy`, Rust caching, and fixed
+2. `dtolnay/rust-toolchain@1.95.0` with `rustfmt, clippy`, **sccache**, Rust caching, and fixed
    WebView2-CAB-only caching; every build re-derives the expanded runtime.
 3. JavaScript syntax and Rust formatting checks.
 4. **Stage service binary**: runs `build-svc.ps1` — required because `eir-ui`'s
@@ -156,7 +168,7 @@ The exact release commit must pass this workflow before it is tagged.
 ### Local gate scripts and lint policy
 
 `scripts/fastcheck.ps1` runs JavaScript syntax, formatting, conditional service staging,
-and locked clippy. `scripts/verify.ps1` runs manifest/Cargo.lock version sync, the
+and locked clippy (full workspace) or scoped `cargo check` when `-Package` is set. `scripts/verify.ps1` runs manifest/Cargo.lock version sync, the
 compiled installer-hook harness, release/portable regressions, JavaScript syntax,
 formatting, unconditional service/runtime staging, locked clippy and all-target tests, a
 locked workspace release build, portable import checks, and `cargo deny` for the Windows

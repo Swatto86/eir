@@ -23,6 +23,9 @@ jobs:
 
   verify:
     runs-on: windows-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -46,6 +49,9 @@ jobs:
         uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Cache Rust build artefacts
         uses: swatinem/rust-cache@v2

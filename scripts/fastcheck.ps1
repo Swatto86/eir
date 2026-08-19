@@ -7,7 +7,11 @@
     run after every edit. scripts/verify.ps1 is the full gate before a commit.
 #>
 [CmdletBinding()]
-param()
+param(
+    # Limit to one workspace crate (eir-proto, eir-svc, eir-ui) for faster iteration.
+    [ValidateSet('eir-proto', 'eir-svc', 'eir-ui')]
+    [string]$Package
+)
 
 $ErrorActionPreference = 'Stop'
 Set-Location (Join-Path $PSScriptRoot '..')
@@ -24,9 +28,20 @@ function Invoke-Step {
 
 Invoke-Step 'node --check ui/main.js' { node --check ui/main.js }
 Invoke-Step 'cargo fmt --check' { cargo fmt --all -- --check }
-if (-not (Test-Path 'eir-ui/bin/eir-svc.exe')) {
+
+$needsSvcBinary = -not $Package -or $Package -eq 'eir-ui'
+if ($needsSvcBinary -and -not (Test-Path 'eir-ui/bin/eir-svc.exe')) {
     Invoke-Step 'stage service binary' { & eir-ui/build-svc.ps1 }
 }
-Invoke-Step 'cargo clippy' { cargo clippy --locked --workspace --all-targets -- -D warnings }
+
+if ($Package) {
+    Invoke-Step "cargo check -p $Package" {
+        cargo check --locked -p $Package --all-targets
+    }
+} else {
+    Invoke-Step 'cargo clippy' {
+        cargo clippy --locked --workspace --all-targets -- -D warnings
+    }
+}
 
 Write-Host 'fastcheck OK' -ForegroundColor Green
