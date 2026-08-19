@@ -10,6 +10,8 @@ Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.j
 
 ## Architectural decisions
 
+2026-08-19 | Eir | Ollama model list parses raw /api/tags JSON | Settings failed to parse models when PowerShell re-encoded the tags response (UTF-16/ConvertTo-Json). Fetch now uses curl.exe with IWR fallback, decodes BOMs, and reads `name` or `model` from the native Ollama payload; `_` allowed in tag names.
+
 2026-08-19 | Eir | v0.34.15 Ollama pulled-models list and web search | Settings lists only live `/api/tags` (no static fallback). Optional `ollama_api_key` enables Ollama cloud web search on app-update checks before local chat completion.
 
 2026-08-19 | Eir | Ollama lists only pulled models; web search via cloud API key | Settings model list queries live `/api/tags` only — no static fallback. Failures surface as explicit errors (server down, nothing pulled). App-update `complete()` calls Ollama's `ollama.com/api/web_search` when `ollama_api_key` (or `OLLAMA_API_KEY`) is set, then runs local chat with results inlined; without a key it falls back to plain local chat.

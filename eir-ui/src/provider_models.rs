@@ -94,11 +94,45 @@ fn ollama_tags_url(base_v1: &str) -> String {
 async fn ollama_models(base_url: Option<&str>) -> Result<Vec<String>, String> {
     let base = normalize_ollama_base_url(base_url);
     let tags_url = ollama_tags_url(&base);
+    let stdout = ollama_fetch_tags_json(&tags_url)
+        .await
+        .map_err(|detail| format!("Could not query Ollama at {base} — {detail}"))?;
+    let models = parse_ollama_models(&decode_command_stdout(&stdout))
+        .ok_or_else(|| format!("Could not parse the model list from Ollama at {base}"))?;
+    if models.is_empty() {
+        return Err(
+            "No models pulled on this Ollama server — run `ollama pull <model>` first".into(),
+        );
+    }
+    Ok(models)
+}
+
+/// Fetch raw `/api/tags` JSON. Prefer `curl.exe` (no PowerShell encoding quirks);
+/// fall back to `Invoke-WebRequest` returning the response body as text.
+async fn ollama_fetch_tags_json(tags_url: &str) -> Result<Vec<u8>, String> {
+    if let Some(stdout) = ollama_fetch_tags_via_curl(tags_url).await {
+        return Ok(stdout);
+    }
+    ollama_fetch_tags_via_powershell(tags_url).await
+}
+
+async fn ollama_fetch_tags_via_curl(tags_url: &str) -> Option<Vec<u8>> {
+    let mut command = tokio::process::Command::new("curl.exe");
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let (status, stdout, _) = run_command_capped(
+        command.args(["-sS", "--max-time", "5", tags_url]),
+        Duration::from_secs(10),
+        MODEL_OUTPUT_CAP,
+    )
+    .await?;
+    (status.success() && !stdout.is_empty()).then_some(stdout)
+}
+
+async fn ollama_fetch_tags_via_powershell(tags_url: &str) -> Result<Vec<u8>, String> {
     let ps_url = tags_url.replace('\'', "''");
-    // Comma-prefix forces JSON array output even for a single pulled model (PS 5.1).
-    let script = format!(
-        "try {{ $names = @((Invoke-RestMethod -Uri '{ps_url}' -TimeoutSec 5).models.name); if (-not $names -or $names.Count -eq 0) {{ '[]' }} else {{ ,$names | ConvertTo-Json -Compress }} }} catch {{ throw $_ }}"
-    );
+    let script =
+        format!("(Invoke-WebRequest -Uri '{ps_url}' -UseBasicParsing -TimeoutSec 5).Content");
     let mut command = tokio::process::Command::new("powershell.exe");
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
@@ -110,25 +144,34 @@ async fn ollama_models(base_url: Option<&str>) -> Result<Vec<String>, String> {
         MODEL_OUTPUT_CAP,
     )
     .await
-    .ok_or_else(|| format!("Could not query Ollama at {base} — is the server running?"))?;
+    .ok_or_else(|| "is the server running?".to_string())?;
     if !status.success() {
-        let detail = String::from_utf8_lossy(&stderr);
-        let detail = detail.trim();
-        let msg = if detail.is_empty() {
-            format!("Ollama at {base} returned a non-zero exit status")
+        let detail = String::from_utf8_lossy(&stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "request failed".into()
         } else {
-            format!("Ollama at {base}: {detail}")
-        };
-        return Err(msg);
+            detail
+        });
     }
-    let models = parse_ollama_models(&String::from_utf8_lossy(&stdout))
-        .ok_or_else(|| format!("Could not parse the model list from Ollama at {base}"))?;
-    if models.is_empty() {
-        return Err(
-            "No models pulled on this Ollama server — run `ollama pull <model>` first".into(),
-        );
+    if stdout.is_empty() {
+        return Err("empty response".into());
     }
-    Ok(models)
+    Ok(stdout)
+}
+
+/// PowerShell often emits UTF-16 LE on Windows; curl/UTF-8 may include a BOM.
+fn decode_command_stdout(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let u16s: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return String::from_utf16_lossy(&u16s);
+    }
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8_lossy(&bytes[3..]).into_owned();
+    }
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 fn parse_ollama_models(output: &str) -> Option<Vec<String>> {
@@ -136,25 +179,35 @@ fn parse_ollama_models(output: &str) -> Option<Vec<String>> {
     if trimmed.is_empty() || trimmed == "[]" {
         return Some(Vec::new());
     }
-    if let Ok(models) = serde_json::from_str::<Vec<String>>(trimmed) {
-        let models: Vec<String> = models.into_iter().filter(|id| valid_model_id(id)).collect();
-        return Some(models);
-    }
-    if let Ok(model) = serde_json::from_str::<String>(trimmed) {
-        if valid_model_id(&model) {
-            return Some(vec![model]);
+    // Legacy path: PowerShell `ConvertTo-Json` on a name array.
+    if trimmed.starts_with('[') && !trimmed.contains("\"models\"") {
+        if let Ok(models) = serde_json::from_str::<Vec<String>>(trimmed) {
+            return Some(filter_ollama_model_ids(models));
         }
-        return Some(Vec::new());
+        if let Ok(model) = serde_json::from_str::<String>(trimmed) {
+            return Some(filter_ollama_model_ids(vec![model]));
+        }
     }
     let root: Value = serde_json::from_str(trimmed).ok()?;
-    let models: Vec<String> = root["models"]
-        .as_array()?
+    if let Some(models) = root.as_array() {
+        return Some(extract_ollama_model_ids(models));
+    }
+    root.get("models")
+        .and_then(|models| models.as_array())
+        .map(|models| extract_ollama_model_ids(models))
+}
+
+fn extract_ollama_model_ids(models: &[Value]) -> Vec<String> {
+    models
         .iter()
-        .filter_map(|model| model["name"].as_str())
+        .filter_map(|entry| entry["name"].as_str().or_else(|| entry["model"].as_str()))
         .filter(|id| valid_model_id(id))
         .map(str::to_string)
-        .collect();
-    Some(models)
+        .collect()
+}
+
+fn filter_ollama_model_ids(models: Vec<String>) -> Vec<String> {
+    models.into_iter().filter(|id| valid_model_id(id)).collect()
 }
 
 async fn openrouter_models() -> Option<Vec<String>> {
@@ -271,7 +324,7 @@ fn valid_model_id(id: &str) -> bool {
         && id.len() <= 256
         && id
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._:/@~,+=-".contains(c))
+            .all(|c| c.is_ascii_alphanumeric() || "._:/@~,+=_-".contains(c))
 }
 
 fn strings(values: &[&str]) -> Vec<String> {
@@ -329,5 +382,35 @@ mod tests {
     #[test]
     fn ollama_models_empty_array_means_none_pulled() {
         assert_eq!(parse_ollama_models("[]").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn ollama_models_parse_full_tags_response() {
+        let models = parse_ollama_models(
+            r#"{"models":[{"model":"llama3.2:latest","name":"llama3.2:latest"},{"model":"qwen2.5:7b","name":"qwen2.5:7b"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(models, ["llama3.2:latest", "qwen2.5:7b"]);
+    }
+
+    #[test]
+    fn ollama_models_parse_model_field_only() {
+        let models =
+            parse_ollama_models(r#"{"models":[{"model":"mistral:latest","size":123}]}"#).unwrap();
+        assert_eq!(models, ["mistral:latest"]);
+    }
+
+    #[test]
+    fn ollama_models_allow_underscores_in_tags() {
+        let models = parse_ollama_models(r#"{"models":[{"name":"deepseek-r1:8b_q4"}]}"#).unwrap();
+        assert_eq!(models, ["deepseek-r1:8b_q4"]);
+    }
+
+    #[test]
+    fn decode_command_stdout_handles_utf16_bom() {
+        let json = r#"{"models":[{"name":"a"}]}"#;
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(json.encode_utf16().flat_map(|unit| unit.to_le_bytes()));
+        assert!(decode_command_stdout(&bytes).contains(r#""name":"a""#));
     }
 }
