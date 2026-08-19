@@ -4,7 +4,9 @@
     Fast per-edit check: formatting and type/lint correctness, no test run.
 .DESCRIPTION
     Deliberately excludes `cargo test` and the Tauri bundle so it stays quick enough to
-    run after every edit. scripts/verify.ps1 is the full gate before a commit.
+    run after every edit. Pass `-Package eir-svc` (or eir-proto / eir-ui) for a scoped
+    `cargo check` instead of full-workspace clippy. scripts/verify.ps1 is the full gate
+    before a commit.
 #>
 [CmdletBinding()]
 param(
