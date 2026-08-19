@@ -179,14 +179,14 @@ fn parse_ollama_models(output: &str) -> Option<Vec<String>> {
     if trimmed.is_empty() || trimmed == "[]" {
         return Some(Vec::new());
     }
-    // Legacy path: PowerShell `ConvertTo-Json` on a name array.
+    // Legacy path: PowerShell `ConvertTo-Json` on a name array or a lone string.
     if trimmed.starts_with('[') && !trimmed.contains("\"models\"") {
         if let Ok(models) = serde_json::from_str::<Vec<String>>(trimmed) {
             return Some(filter_ollama_model_ids(models));
         }
-        if let Ok(model) = serde_json::from_str::<String>(trimmed) {
-            return Some(filter_ollama_model_ids(vec![model]));
-        }
+    }
+    if let Ok(model) = serde_json::from_str::<String>(trimmed) {
+        return Some(filter_ollama_model_ids(vec![model]));
     }
     let root: Value = serde_json::from_str(trimmed).ok()?;
     if let Some(models) = root.as_array() {
