@@ -597,11 +597,11 @@ Eir's signal layer is three independent background collectors that each maintain
 
 ## AI layer & prompts
 
-The AI layer lives in `eir-svc/src/ai/` (`mod.rs` re-exports `client` and `prompt`). It turns a `SignalSnapshot` into a structured `ClaudeDecision` (analysis + ranked problems + proposed fix actions), behind a provider abstraction that covers five backends. The monitoring loop in `eir-svc/src/main.rs` drives it, layers advisor-mode escalation on top, and records token/cost usage. By the codebase's layering convention this is an infrastructure adapter (concrete HTTP/subprocess clients) plus a pure prompt-builder; the domain types it produces (`ClaudeDecision`, `Problem`, `FixAction`) live in `eir-svc/src/models.rs`.
+The AI layer lives in `eir-svc/src/ai/` (`mod.rs` re-exports `client` and `prompt`). It turns a `SignalSnapshot` into a structured `ClaudeDecision` (analysis + ranked problems + proposed fix actions), behind a provider abstraction that covers six backends. The monitoring loop in `eir-svc/src/main.rs` drives it, layers advisor-mode escalation on top, and records token/cost usage. By the codebase's layering convention this is an infrastructure adapter (concrete HTTP/subprocess clients) plus a pure prompt-builder; the domain types it produces (`ClaudeDecision`, `Problem`, `FixAction`) live in `eir-svc/src/models.rs`.
 
 ### Provider abstraction (`ai/client.rs`)
 
-`AiClient` (`ai/client.rs`) wraps a single `reqwest::Client` (300s timeout, set for slow free OpenRouter models), the normalised reasoning `effort` string, and an internal `enum AiClientConfig` with one variant per provider: two native HTTP backends (`Anthropic`, `OpenRouter`) and three subprocess backends (`ClaudeCli`, `CodexCli`, `KiloCli`) that borrow a locally logged-in subscription session instead of taking a pasted key (only the OpenAI-compatible proxy stays removed — its legacy config value aliases to Anthropic on load). **v0.19 removed the API-key-based `KiloCode` gateway provider** (`api.kilo.ai`) in favour of `KiloCli`; a `provider = "kilocode"` (or legacy `"kilo"`) in an old config loads as `kilo_cli`:
+`AiClient` (`ai/client.rs`) wraps a single `reqwest::Client` (300s timeout, set for slow free OpenRouter models), the normalised reasoning `effort` string, and an internal `enum AiClientConfig` with one variant per provider: three native HTTP backends (`Anthropic`, `OpenRouter`, `Ollama`) and three subprocess backends (`ClaudeCli`, `CodexCli`, `KiloCli`) that borrow a locally logged-in subscription session instead of taking a pasted key (only the OpenAI-compatible proxy stays removed — its legacy config value aliases to Anthropic on load). **v0.19 removed the API-key-based `KiloCode` gateway provider** (`api.kilo.ai`) in favour of `KiloCli`; a `provider = "kilocode"` (or legacy `"kilo"`) in an old config loads as `kilo_cli`:
 
 All three subscription CLIs share one privilege boundary: when EirSvc is LocalSystem, it obtains the active console user's primary token with `WTSQueryUserToken` and starts a hidden process with `CreateProcessAsUserW`. Scratch-file redirection replaces standard-handle inheritance, which Windows forbids across sessions. User-owned CLI binaries therefore never execute as SYSTEM.
 
@@ -631,6 +631,11 @@ All three subscription CLIs share one privilege boundary: when EirSvc is LocalSy
   and resolves only that profile's platform-specific npm binary or shim. Output is
   NDJSON; text parts form the reply and the last `step_finish` supplies usage.
   Subscription/BYOK routing still requires a `kilo/` model prefix.
+- **`Ollama`** — local OpenAI-compatible streaming against `api.ollama_base_url`
+  (default `http://127.0.0.1:11434/v1`), **no API key**. Model is required.
+  LocalSystem reaches localhost directly. `call_openai_style` omits auth headers when
+  the key is empty. Vision is enabled via `supports_images()` (model-dependent).
+  App-update `complete()` has no web search on this path.
 
 Both SSE readers share a UTF-8-safe byte accumulator. Streaming and non-streaming HTTP
 bodies have a 4 MiB aggregate cap; CLI stdout/stderr are drained concurrently with fixed
