@@ -119,8 +119,7 @@ async fn ollama_models(base_url: Option<&str>) -> Option<Vec<String>> {
         Duration::from_secs(10),
         MODEL_OUTPUT_CAP,
     )
-    .await
-    .ok()?;
+    .await?;
     if !status.success() {
         return None;
     }
@@ -133,10 +132,7 @@ fn parse_ollama_models(output: &str) -> Option<Vec<String>> {
         return None;
     }
     if let Ok(models) = serde_json::from_str::<Vec<String>>(trimmed) {
-        let models: Vec<String> = models
-            .into_iter()
-            .filter(|id| valid_model_id(id))
-            .collect();
+        let models: Vec<String> = models.into_iter().filter(|id| valid_model_id(id)).collect();
         return (!models.is_empty()).then_some(models);
     }
     let root: Value = serde_json::from_str(trimmed).ok()?;

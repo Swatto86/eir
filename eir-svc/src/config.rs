@@ -642,6 +642,7 @@ audit_db = "./eir.db"
             anthropic_api_key: None,
             kilo_cli_user_profile: None,
             kilo_cli_path: None,
+            ollama_base_url: String::new(),
             decision_interval_secs: 900,
             event_log_poll_interval_secs: 45,
             wmi_poll_interval_secs: 300,
@@ -684,6 +685,7 @@ audit_db = "./eir.db"
             anthropic_api_key: None,
             kilo_cli_user_profile: None,
             kilo_cli_path: None,
+            ollama_base_url: String::new(),
             decision_interval_secs: 900,
             event_log_poll_interval_secs: 30,
             wmi_poll_interval_secs: 300,
@@ -1043,10 +1045,7 @@ audit_db = "./eir.db"
         .unwrap();
         assert_eq!(cfg.api.provider, ApiProvider::Ollama);
         assert_eq!(cfg.api.model, "llama3.2");
-        assert_eq!(
-            cfg.api.ollama_base_url,
-            "http://127.0.0.1:11434/v1"
-        );
+        assert_eq!(cfg.api.ollama_base_url, "http://127.0.0.1:11434/v1");
         let view = cfg.to_ui_settings();
         assert_eq!(view.provider, "ollama");
         assert_eq!(view.ollama_base_url, "http://127.0.0.1:11434/v1");
@@ -1067,10 +1066,7 @@ audit_db = "./eir.db"
             normalize_ollama_base_url("http://127.0.0.1:11434/v1/"),
             "http://127.0.0.1:11434/v1"
         );
-        assert_eq!(
-            normalize_ollama_base_url(""),
-            default_ollama_base_url()
-        );
+        assert_eq!(normalize_ollama_base_url(""), default_ollama_base_url());
     }
 
     #[test]
