@@ -48,7 +48,7 @@ The two talk over a secured local named pipe (`\\.\pipe\EirSvc`).
                                                        │   AI provider    │
                                                        │  OpenRouter /    │
                                                        │ Claude / Codex / │
-                                                       │      Kilo        │
+                                                       │  Kilo / Ollama   │
                                                        └──────────────────┘
 ```
 
@@ -87,7 +87,7 @@ Each decision cycle (default every 10 minutes):
 
 Everything is configurable in the **Settings** panel — no file editing required.
 
-Five providers:
+Six providers:
 
 | Provider | Cost | Web search | Notes |
 |----------|------|------------|-------|
@@ -96,6 +96,7 @@ Five providers:
 | **Codex CLI (your subscription)** | Uses your ChatGPT plan | Yes — CLI built-in | **No API key** — reuses your `codex login` session; binary and current model catalogue are auto-detected. The service launches it with your desktop-user token, never as LocalSystem. |
 | **Claude (Anthropic API)** | Pay-as-you-go | Yes — native web_search tool | API key from console.anthropic.com; token usage tracked, cost estimated from list pricing. |
 | **Kilo Code — your subscription (Kilo CLI)** | Uses your Kilo plan (Pass + addon BYOK included) | Yes — the CLI's built-in | **No API key** — borrows your logged-in `kilo` session, same way the Claude CLI borrows a logged-in Claude subscription. Install with `npm install -g @kilocode/cli`, run `kilo` once to sign in, then pick the provider in Settings with a `provider/model` id — **the `kilo/` prefix routes through your subscription/BYOK**, e.g. `kilo/minimax/minimax-m3`. Profile / binary are auto-detected. |
+| **Ollama (local)** | Free / local hardware | No | **No API key** — talks to a local Ollama server (default `http://127.0.0.1:11434/v1`). Install Ollama, `ollama pull` a model, then pick it in Settings. Vision works when the model supports it. App-update checks have no web search. |
 
 The monitoring loop and the **app-update check** both use your configured provider.
 The app-update check uses live web search where the provider supports it: OpenRouter's

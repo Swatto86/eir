@@ -401,6 +401,11 @@ enum AiClientConfig {
         model: String,
         user_profile: Option<String>,
     },
+    /// Local Ollama — OpenAI-compatible chat API, no API key.
+    Ollama {
+        base_url: String,
+        model: String,
+    },
 }
 
 impl AiClient {
@@ -490,6 +495,17 @@ impl AiClient {
                     configured_binary: cfg.kilo_cli_path.clone().filter(|path| is_real(path)),
                     model: cfg.model.clone(),
                     user_profile,
+                }
+            }
+            ApiProvider::Ollama => {
+                if cfg.model.trim().is_empty() {
+                    bail!("[api] a model is required for provider = \"ollama\" (e.g. llama3.2 or qwen2.5:7b)");
+                }
+                let base_url = crate::config::normalize_ollama_base_url(&cfg.ollama_base_url);
+                info!(base_url = %base_url, model = %cfg.model, "ollama provider configured");
+                AiClientConfig::Ollama {
+                    base_url,
+                    model: cfg.model.clone(),
                 }
             }
         };
@@ -679,6 +695,19 @@ impl AiClient {
                     effort,
                     user_profile.as_deref(),
                     &blob,
+                )
+                .await
+            }
+            AiClientConfig::Ollama { base_url, model } => {
+                let m = model_ov.unwrap_or(model);
+                self.call_openai_style(
+                    base_url,
+                    "",
+                    m,
+                    effort,
+                    Some(crate::ai::prompt::SYSTEM_PROMPT),
+                    context,
+                    &[],
                 )
                 .await
             }
@@ -911,11 +940,16 @@ impl AiClient {
         let resp = self
             .http
             .post(&url)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("content-type", "application/json")
-            // OpenRouter app attribution (optional but recommended).
-            .header("HTTP-Referer", "https://github.com/Swatto86/eir")
-            .header("X-Title", "Eir")
+            .header("content-type", "application/json");
+        let resp = if api_key.is_empty() {
+            resp
+        } else {
+            resp.header("Authorization", format!("Bearer {api_key}"))
+                // OpenRouter app attribution (optional but recommended).
+                .header("HTTP-Referer", "https://github.com/Swatto86/eir")
+                .header("X-Title", "Eir")
+        };
+        let resp = resp
             .json(&body)
             .send()
             .await
@@ -1380,6 +1414,12 @@ impl AiClient {
                 )
                 .await
             }
+            AiClientConfig::Ollama { base_url, model } => {
+                // No web search — model-only update checks.
+                let m = if ov.is_empty() { model.as_str() } else { ov };
+                self.call_openai_style(base_url, "", m, "", None, prompt, &[])
+                    .await
+            }
         }
     }
 
@@ -1443,6 +1483,12 @@ impl AiClient {
                 )
                 .await
             }
+            AiClientConfig::Ollama { base_url, model } => {
+                // No web search — model-only update checks.
+                let m = if ov.is_empty() { model.as_str() } else { ov };
+                self.call_openai_style(base_url, "", m, "", None, prompt, &[])
+                    .await
+            }
         }
     }
 
@@ -1455,6 +1501,7 @@ impl AiClient {
             self.config,
             AiClientConfig::Anthropic { .. }
                 | AiClientConfig::OpenRouter { .. }
+                | AiClientConfig::Ollama { .. }
                 | AiClientConfig::CodexCli { .. }
         )
     }
@@ -1482,6 +1529,11 @@ impl AiClient {
                 let m = if ov.is_empty() { model.as_str() } else { ov };
                 let api_key = openrouter_api_key(api_key.as_deref()).await?;
                 self.call_openai_style(OPENROUTER_BASE, &api_key, m, "", None, prompt, images)
+                    .await
+            }
+            AiClientConfig::Ollama { base_url, model } => {
+                let m = if ov.is_empty() { model.as_str() } else { ov };
+                self.call_openai_style(base_url, "", m, "", None, prompt, images)
                     .await
             }
             AiClientConfig::CodexCli {

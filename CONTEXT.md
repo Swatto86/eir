@@ -10,6 +10,8 @@ Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.j
 
 ## Architectural decisions
 
+2026-08-19 | Eir | Ollama local provider | Sixth AI provider `ollama` uses Ollama's OpenAI-compatible API at `http://127.0.0.1:11434/v1` (configurable `ollama_base_url`). No API key; model required. Service path reuses `call_openai_style` with empty auth headers. LocalSystem can reach localhost without user impersonation. Vision enabled via `supports_images()` (model-dependent at runtime). App-update checks have no web search. Settings UI lists models from `GET …/api/tags` with static fallbacks. Wire: `UiSettings`/`SettingsUpdate.ollama_base_url`.
+
 2026-08-17 | Eir | v0.34.13 verification downloads gh api stdout | The uploads.github.com fix landed: all five v0.34.13 assets reached the draft, then validation 404'd locally because `gh api --output` is not a flag (Windows gh printed usage and we retried it six times). Asset GET now copies process stdout into the validation file; usage errors fail closed.
 
 2026-08-17 | Eir | v0.34.13 asset POST uses uploads.github.com | The retried publish script built, signed, and smoked green, then 404'd six times posting `Eir_0.34.13_x64-setup.exe` to `api.github.com /releases/{id}/assets`. Release asset creation is `POST https://uploads.github.com/...` from the draft's `upload_url`; api.github.com only lists/deletes assets. Publish now posts to that upload host, fails closed on 4xx, and still retries 5xx.

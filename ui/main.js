@@ -237,6 +237,7 @@ function providerName(p) {
     codex_cli: 'Codex CLI',
     anthropic: 'Claude (Anthropic)',
     kilo_cli: 'Kilo CLI',
+    ollama: 'Ollama',
   })[p] || p || '';
 }
 
@@ -249,6 +250,7 @@ function analysisLabel(s) {
       : s.provider === 'claude_cli' ? 'default model'
       : s.provider === 'codex_cli' ? 'default model'
       : s.provider === 'kilo_cli' ? 'default model'
+      : s.provider === 'ollama' ? '(no model set)'
       : '(no model set)';
   }
   let label = `${providerName(s.provider)} · ${model}`;
@@ -275,6 +277,9 @@ function updateCheckLabel(s) {
   }
   if (s.provider === 'kilo_cli') {
     return `Kilo CLI · ${m || 'main model'} + web`;
+  }
+  if (s.provider === 'ollama') {
+    return `Ollama · ${m || 'main model'} (no web search)`;
   }
   const main = (s.model || '').trim() || (s.provider === 'openrouter' ? 'openrouter/free' : '');
   const web = s.provider === 'openrouter' ? ' + web' : '';
@@ -1263,7 +1268,7 @@ function renderUsage(u) {
   lastUsageSig = usageSig;
   // Claude CLI runs on the subscription: no charge, so cost cells show a dash
   // (the CLI's figures are only the equivalent API cost).
-  const free = provider === 'claude_cli' || provider === 'codex_cli';
+  const free = provider === 'claude_cli' || provider === 'codex_cli' || provider === 'ollama';
   const costCell = (c) => (free ? '—' : fmtGbp(c));
   const note = provider === 'openrouter'
     ? 'OpenRouter-reported cost — £0.00 on free models.'
@@ -1271,6 +1276,8 @@ function renderUsage(u) {
       ? 'No charge — uses your Claude subscription. Token counts shown for transparency.'
       : provider === 'codex_cli'
         ? 'No charge — uses your ChatGPT subscription. Token counts shown for transparency.'
+      : provider === 'ollama'
+        ? 'No charge — runs on your local Ollama server.'
       : provider === 'anthropic'
         ? 'Estimated from Anthropic list pricing.'
         : provider === 'kilo_cli'
@@ -1688,6 +1695,7 @@ const PROVIDER_HINTS = {
   codex_cli: 'Uses your ChatGPT subscription via the logged-in Codex CLI — no API key. Install Codex and run `codex login` once; Eir auto-detects your profile and codex.exe.',
   anthropic: 'Claude direct from Anthropic. A model is required (e.g. claude-opus-4-8, claude-haiku-4-5). Key: console.anthropic.com',
   kilo_cli: 'Uses your Kilo subscription via the logged-in Kilo CLI — no API key. Install with `npm install -g @kilocode/cli`, then run `kilo` once to sign in. Subscription models use the kilo/ prefix.',
+  ollama: 'Uses a local Ollama server — no API key. Install Ollama, pull a model (`ollama pull llama3.2`), then pick it here. App-update checks have no web search.',
 };
 
 const PROVIDER_MODEL_PLACEHOLDERS = {
@@ -1696,6 +1704,7 @@ const PROVIDER_MODEL_PLACEHOLDERS = {
   codex_cli: 'blank = CLI default, or choose a Codex model',
   anthropic: 'required, e.g. claude-opus-4-8 or claude-haiku-4-5',
   kilo_cli: 'Choose a kilo/ subscription model',
+  ollama: 'required, e.g. llama3.2 or qwen2.5:7b',
 };
 
 const PROVIDER_UPDATE_PLACEHOLDERS = {
@@ -1704,6 +1713,7 @@ const PROVIDER_UPDATE_PLACEHOLDERS = {
   codex_cli: 'blank = main model, with web search',
   anthropic: 'blank = Claude Haiku, with web search',
   kilo_cli: 'blank = main model, with web search',
+  ollama: 'blank = main model (no web search)',
 };
 
 const MODEL_INPUT_IDS = ['set-model', 'set-upd-model', 'set-adv-model'];
@@ -1735,7 +1745,11 @@ async function loadProviderModels(provider) {
   hint.textContent = 'Loading models…';
   MODEL_INPUT_IDS.forEach((id) => document.getElementById(id).setAttribute('aria-busy', 'true'));
   try {
-    const models = await invoke('list_provider_models', { provider });
+    const args = { provider };
+    if (provider === 'ollama') {
+      args.ollamaBaseUrl = document.getElementById('set-ollama-url').value.trim() || null;
+    }
+    const models = await invoke('list_provider_models', args);
     if (request !== modelListRequest || provider !== document.getElementById('set-provider').value) return;
     const selected = currentModelValues().filter(Boolean);
     const values = [...new Set([...selected, ...(models || [])])];
@@ -1779,6 +1793,11 @@ function switchProvider() {
   updateProviderHint();
 }
 document.getElementById('set-provider').addEventListener('change', switchProvider);
+document.getElementById('set-ollama-url').addEventListener('change', () => {
+  if (document.getElementById('set-provider').value === 'ollama') {
+    loadProviderModels('ollama');
+  }
+});
 
 let autostartRequest = 0;
 async function fillAutostartSetting() {
@@ -1852,6 +1871,7 @@ function fillSettings() {
       s.kilo_cli_user_profile_set ? '•••••• set — blank keeps it' : 'C:\\Users\\You  (blank = auto-detect)';
     document.getElementById('set-kilo-path').placeholder =
       s.kilo_cli_path_set ? '•••••• set — blank keeps it' : 'kilo  (blank = on PATH)';
+    document.getElementById('set-ollama-url').value = s.ollama_base_url || 'http://127.0.0.1:11434/v1';
     rememberModelValues(provider);
   }
   if (!dirtyCards.has('card-updater')) {
@@ -1873,6 +1893,7 @@ async function saveSettings() {
   const anKey = document.getElementById('set-an-key').value.trim();
   const kiloProfile = document.getElementById('set-kilo-profile').value.trim();
   const kiloPath = document.getElementById('set-kilo-path').value.trim();
+  const ollamaUrl = document.getElementById('set-ollama-url').value.trim();
   const settings = {
     provider: document.getElementById('set-provider').value,
     model: document.getElementById('set-model').value.trim(),
@@ -1882,6 +1903,7 @@ async function saveSettings() {
     anthropic_api_key: anKey || null,
     kilo_cli_user_profile: kiloProfile || null,
     kilo_cli_path: kiloPath || null,
+    ollama_base_url: ollamaUrl,
     confidence_threshold: numVal('set-conf', 80, 50, 95) / 100,
     decision_interval_secs: numVal('set-decint', 600, 10, 604800),
     event_log_poll_interval_secs: numVal('set-elpoll', 30, 5, 604800),
@@ -1911,6 +1933,12 @@ async function saveSettings() {
   if (settings.provider === 'kilo_cli') {
     if (!settings.model) {
       st.textContent = 'Kilo CLI needs a model — e.g. kilo/minimax/minimax-m3 or kilo/anthropic/claude-sonnet-5';
+      return;
+    }
+  }
+  if (settings.provider === 'ollama') {
+    if (!settings.model) {
+      st.textContent = 'Ollama needs a model — e.g. llama3.2 or qwen2.5:7b (run `ollama pull` first)';
       return;
     }
   }

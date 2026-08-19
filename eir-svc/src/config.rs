@@ -101,6 +101,9 @@ pub enum ApiProvider {
     /// surviving equivalent for an old config.toml.
     #[serde(rename = "kilo_cli", alias = "kilocode", alias = "kilo")]
     KiloCli,
+    /// Local Ollama server (OpenAI-compatible `/v1/chat/completions`).
+    #[serde(rename = "ollama")]
+    Ollama,
 }
 
 impl ApiProvider {
@@ -111,6 +114,7 @@ impl ApiProvider {
             ApiProvider::CodexCli => "codex_cli",
             ApiProvider::OpenRouter => "openrouter",
             ApiProvider::KiloCli => "kilo_cli",
+            ApiProvider::Ollama => "ollama",
         }
     }
 
@@ -120,6 +124,7 @@ impl ApiProvider {
             "codex_cli" => ApiProvider::CodexCli,
             "openrouter" | "open_router" => ApiProvider::OpenRouter,
             "kilo_cli" | "kilocode" | "kilo" => ApiProvider::KiloCli,
+            "ollama" => ApiProvider::Ollama,
             _ => ApiProvider::Anthropic,
         }
     }
@@ -167,6 +172,9 @@ pub struct ApiConfig {
     /// service always uses the sole active desktop user's profile and token.
     #[serde(default)]
     pub kilo_cli_user_profile: Option<String>,
+    /// ollama: OpenAI-compatible API root (default `http://127.0.0.1:11434/v1`).
+    #[serde(default = "default_ollama_base_url")]
+    pub ollama_base_url: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -197,6 +205,23 @@ pub struct MonitoringConfig {
 
 fn default_confidence() -> f32 {
     0.80
+}
+
+fn default_ollama_base_url() -> String {
+    "http://127.0.0.1:11434/v1".to_string()
+}
+
+/// Normalise an Ollama OpenAI-compatible base URL (`…/v1`, no trailing slash).
+pub fn normalize_ollama_base_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return default_ollama_base_url();
+    }
+    if trimmed.ends_with("/v1") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1")
+    }
 }
 fn default_true() -> bool {
     true
@@ -375,6 +400,7 @@ impl Config {
                 .as_deref()
                 .is_some_and(is_real),
             kilo_cli_path_set: self.api.kilo_cli_path.as_deref().is_some_and(is_real),
+            ollama_base_url: self.api.ollama_base_url.clone(),
             // Deprecated wire fields (see eir_proto::UiSettings).
             base_url: String::new(),
             api_key_set: false,
@@ -424,6 +450,9 @@ impl Config {
         // override on every unrelated settings save.
         keep(&mut self.api.kilo_cli_user_profile, u.kilo_cli_user_profile);
         keep(&mut self.api.kilo_cli_path, u.kilo_cli_path);
+        if !u.ollama_base_url.trim().is_empty() {
+            self.api.ollama_base_url = normalize_ollama_base_url(&u.ollama_base_url);
+        }
         self.monitoring.decision_interval_secs = u
             .decision_interval_secs
             .clamp(10, MAX_MONITORING_INTERVAL_SECS);
@@ -1000,6 +1029,48 @@ audit_db = "./eir.db"
         let view = reparsed.to_ui_settings();
         assert!(view.kilo_cli_user_profile_set);
         assert!(view.kilo_cli_path_set);
+    }
+
+    #[test]
+    fn ollama_provider_round_trips_with_base_url() {
+        let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
+        cfg.apply_update(SettingsUpdate {
+            provider: "ollama".into(),
+            model: "llama3.2".into(),
+            ollama_base_url: "http://127.0.0.1:11434".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(cfg.api.provider, ApiProvider::Ollama);
+        assert_eq!(cfg.api.model, "llama3.2");
+        assert_eq!(
+            cfg.api.ollama_base_url,
+            "http://127.0.0.1:11434/v1"
+        );
+        let view = cfg.to_ui_settings();
+        assert_eq!(view.provider, "ollama");
+        assert_eq!(view.ollama_base_url, "http://127.0.0.1:11434/v1");
+
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.api.provider, ApiProvider::Ollama);
+        assert_eq!(reparsed.api.ollama_base_url, "http://127.0.0.1:11434/v1");
+    }
+
+    #[test]
+    fn normalize_ollama_base_url_adds_v1_suffix() {
+        assert_eq!(
+            normalize_ollama_base_url("http://127.0.0.1:11434"),
+            "http://127.0.0.1:11434/v1"
+        );
+        assert_eq!(
+            normalize_ollama_base_url("http://127.0.0.1:11434/v1/"),
+            "http://127.0.0.1:11434/v1"
+        );
+        assert_eq!(
+            normalize_ollama_base_url(""),
+            default_ollama_base_url()
+        );
     }
 
     #[test]

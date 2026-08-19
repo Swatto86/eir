@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::{collections::HashSet, path::PathBuf, process::Stdio, time::Duration};
 
 const MODEL_OUTPUT_CAP: usize = 2 * 1024 * 1024;
+const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 
 const CLAUDE_MODELS: &[&str] = &[
     "haiku",
@@ -46,9 +47,21 @@ const OPENROUTER_MODELS: &[&str] = &[
     "deepseek/deepseek-v4-pro",
     "minimax/minimax-m3",
 ];
+const OLLAMA_MODELS: &[&str] = &[
+    "llama3.2",
+    "llama3.1",
+    "mistral",
+    "qwen2.5",
+    "gemma2",
+    "phi3",
+    "codellama",
+];
 
 #[tauri::command]
-pub async fn list_provider_models(provider: String) -> Result<Vec<String>, String> {
+pub async fn list_provider_models(
+    provider: String,
+    ollama_base_url: Option<String>,
+) -> Result<Vec<String>, String> {
     match provider.as_str() {
         "anthropic" | "claude_cli" => Ok(strings(CLAUDE_MODELS)),
         "codex_cli" => Ok(cli_models("codex", &["debug", "models"])
@@ -62,8 +75,79 @@ pub async fn list_provider_models(provider: String) -> Result<Vec<String>, Strin
         "openrouter" => Ok(openrouter_models()
             .await
             .unwrap_or_else(|| strings(OPENROUTER_MODELS))),
+        "ollama" => Ok(ollama_models(ollama_base_url.as_deref())
+            .await
+            .unwrap_or_else(|| strings(OLLAMA_MODELS))),
         _ => Err("Unknown AI provider".into()),
     }
+}
+
+fn normalize_ollama_base_url(raw: Option<&str>) -> String {
+    let trimmed = raw.unwrap_or("").trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return DEFAULT_OLLAMA_BASE_URL.to_string();
+    }
+    if trimmed.ends_with("/v1") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1")
+    }
+}
+
+fn ollama_tags_url(base_v1: &str) -> String {
+    let root = base_v1
+        .trim_end_matches('/')
+        .strip_suffix("/v1")
+        .unwrap_or_else(|| base_v1.trim_end_matches('/'));
+    format!("{root}/api/tags")
+}
+
+async fn ollama_models(base_url: Option<&str>) -> Option<Vec<String>> {
+    let base = normalize_ollama_base_url(base_url);
+    let tags_url = ollama_tags_url(&base);
+    let ps_url = tags_url.replace('\'', "''");
+    let script = format!(
+        "try {{ @((Invoke-RestMethod -Uri '{ps_url}' -TimeoutSec 5).models.name) | ConvertTo-Json -Compress }} catch {{ '' }}"
+    );
+    let mut command = tokio::process::Command::new("powershell.exe");
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let (status, stdout, _) = run_command_capped(
+        command
+            .args(["-NoProfile", "-Command", &script])
+            .stdin(Stdio::null()),
+        Duration::from_secs(10),
+        MODEL_OUTPUT_CAP,
+    )
+    .await
+    .ok()?;
+    if !status.success() {
+        return None;
+    }
+    parse_ollama_models(&String::from_utf8_lossy(&stdout))
+}
+
+fn parse_ollama_models(output: &str) -> Option<Vec<String>> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(models) = serde_json::from_str::<Vec<String>>(trimmed) {
+        let models: Vec<String> = models
+            .into_iter()
+            .filter(|id| valid_model_id(id))
+            .collect();
+        return (!models.is_empty()).then_some(models);
+    }
+    let root: Value = serde_json::from_str(trimmed).ok()?;
+    let models: Vec<String> = root["models"]
+        .as_array()?
+        .iter()
+        .filter_map(|model| model["name"].as_str())
+        .filter(|id| valid_model_id(id))
+        .map(str::to_string)
+        .collect();
+    (!models.is_empty()).then_some(models)
 }
 
 async fn openrouter_models() -> Option<Vec<String>> {
@@ -213,5 +297,19 @@ mod tests {
     fn line_catalog_removes_non_adjacent_duplicates() {
         let models = parse_line_models("kilo/a\nkilo/b\nkilo/a\n").unwrap();
         assert_eq!(models, ["kilo/a", "kilo/b"]);
+    }
+
+    #[test]
+    fn ollama_tags_url_strips_v1_suffix() {
+        assert_eq!(
+            ollama_tags_url("http://127.0.0.1:11434/v1"),
+            "http://127.0.0.1:11434/api/tags"
+        );
+    }
+
+    #[test]
+    fn ollama_models_parse_json_array() {
+        let models = parse_ollama_models(r#"["llama3.2:latest","mistral"]"#).unwrap();
+        assert_eq!(models, ["llama3.2:latest", "mistral"]);
     }
 }

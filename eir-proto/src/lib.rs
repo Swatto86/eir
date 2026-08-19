@@ -412,6 +412,9 @@ pub struct UiSettings {
     /// rationale as `kilo_cli_user_profile_set`.
     #[serde(default)]
     pub kilo_cli_path_set: bool,
+    /// ollama: OpenAI-compatible API root (e.g. `http://127.0.0.1:11434/v1`).
+    #[serde(default)]
+    pub ollama_base_url: String,
     /// Deprecated (pre-0.17 OpenAI-compatible provider). Always empty/false —
     /// kept on the wire so a not-yet-updated tray app, which requires these
     /// fields, can still decode the payload during an update's skew window.
@@ -449,6 +452,9 @@ pub struct SettingsUpdate {
     /// `None` = unchanged.
     #[serde(default)]
     pub kilo_cli_path: Option<String>,
+    /// ollama: OpenAI-compatible API root. Blank keeps the stored URL.
+    #[serde(default)]
+    pub ollama_base_url: String,
     pub decision_interval_secs: u64,
     pub event_log_poll_interval_secs: u64,
     pub wmi_poll_interval_secs: u64,

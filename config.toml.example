@@ -1,5 +1,5 @@
 [api]
-# Five providers: "openrouter", "claude_cli", "codex_cli", "anthropic", "kilo_cli".
+# Six providers: "openrouter", "claude_cli", "codex_cli", "anthropic", "kilo_cli", "ollama".
 # Everything here is editable in the app's Settings panel — no need to touch
 # this file after install.
 
@@ -66,6 +66,16 @@ effort = ""
 # model = "kilo/minimax/minimax-m3"                     # "kilo/" + any provider/model id from https://kilo.ai/models
 # kilo_cli_user_profile = "C:\\Users\\You"              # optional — blank = auto-detect
 # kilo_cli_path = "C:\\Users\\You\\AppData\\Roaming\\npm\\kilo.cmd"  # optional — blank = on PATH
+
+# ── Option F: Ollama — local models (no API key) ──────────────────────────────
+# Uses a local Ollama server via its OpenAI-compatible API. Install Ollama, pull
+# a model (`ollama pull llama3.2`), then set provider and model here. The service
+# runs as LocalSystem and can reach 127.0.0.1:11434 without user impersonation.
+# App-update checks have no web search on this path.
+#
+# provider = "ollama"
+# model = "llama3.2"   # required — e.g. llama3.2, qwen2.5:7b, mistral
+# ollama_base_url = "http://127.0.0.1:11434/v1"  # optional — default shown
 
 [monitoring]
 # Windows Event Log channels to tail
