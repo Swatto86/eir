@@ -87,7 +87,7 @@ pub enum Effect {
 }
 
 impl Effect {
-    fn to_json(&self) -> String {
+    pub(crate) fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| "{\"type\":\"skip\"}".to_string())
     }
 }

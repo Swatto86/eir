@@ -379,6 +379,8 @@ Managed state: `SharedStatus` (the cached payload), `UiCmdTx(mpsc::Sender<UiMsg>
 Commands (`main.rs:28-112`, plus `util.rs`):
 - `get_status` — **synchronous**, returns a clone of the cached `StatusPayload`. This is the UI's only read path; it never hits the pipe directly.
 - `decide_approval { id, approved }` → `UiMsg::Approve`.
+- `set_action_preference { id, preference }` → `UiMsg::SetActionPreference` (`preference` is `ignore` or `always_approve`).
+- `clear_action_preference { action_key }` → `UiMsg::ClearActionPreference` (reverses a saved preference from the Learned view).
 - `set_learned_fact { id, op }` → `UiMsg::SetLearnedFact` (`op` is `pin`, `disable`, or `forget`).
 - `toggle_pause` → `UiMsg::TogglePause`.
 - `clear_problems` / `clear_executions` → `ClearProblems` / `ClearExecutions`.
@@ -425,11 +427,11 @@ The frontend was fully rebuilt in v0.17 (still hand-written vanilla HTML/CSS/JS,
 
 ### Clear / Approve / Ignore / Update-now flows
 
-- **Approve / Reject**: a delegated click handler on `#approvals` parses the card's `data-id`, **disables both buttons** to prevent double-submit, and calls `decide_approval(id, approved)`; on error it re-enables them (`main.js:271-280, 456-462`). Since v0.24.3, approving an **irreversible** action (`!info.reversible`, marked `data-irreversible` on the button) takes two clicks: the first arms the button (orange, "Click again to confirm — cannot be undone") for 6 s, the second submits; the armed state survives the 2 s poll because the approvals signature guard skips rebuilds, and a list rebuild simply disarms it. The command → `UiMsg::Approve` → pipe → decision loop, which resolves it against the persistent queue. The card disappears on the next poll once the service drops it from `pending_approvals`.
+- **Approve / Reject / Ignore / Always Approve**: a delegated click handler on `#approvals` parses the card's `data-id`, **disables all action buttons** to prevent double-submit, and calls `decide_approval` or `set_action_preference`. **Ignore** dismisses the card and persists an `action_preferences` row keyed by `FixAction::dedup_key` so the same semantic fix is never re-queued. **Always Approve** saves the same preference, then claims and executes like Approve; future analysis-loop `RequireApproval` verdicts for that key are promoted to AutoApprove (still rate-limited; Block is never overridden; user-initiated `force_approval` paths are unaffected). Irreversible Always Approve takes the same two-click confirm as Approve. Both preferences are reversible from the Learned view (`clear_action_preference`). Reject still records into `approval_rejections` for RejectedSignal learning.
 - **Pause**: header button (and tray menu) → `toggle_pause` → `UiMsg::TogglePause`; the button label flips Pause/Resume based on `status.paused` (`main.js:228-229, 266-269`).
 - **Clear (Activity)**: one button fires both `clear_problems` and `clear_executions` then `refresh()`s (`main.js:601-604`). **Clear (Updates)** → `clear_update_history` (clears displayed attempts and learned update facts, but preserves scheduler timestamps so it cannot trigger an update).
-- **Ignore / AI guidance (per app)**: Ignore sends `set_app_ignore { id, ignore, note:"" }`; blank remains **"unchanged"** so a toggle cannot wipe guidance. “Guide AI” sends `set_app_note`, and the saved-guidance list provides full create/read/update/delete access even after an ignored app leaves the latest results. A failed row also exposes **Retry**, capability-gated by `targeted_update_retry`; it re-checks only that app with the latest guidance and renders the resulting success/current/failure reason in the same row.
-- **Learned fact override**: delegated click on `#learned-list` sends `set_learned_fact { id, op }`; the service updates the persisted fact and refreshes the broadcast list (`main.js:511-519`, `main.rs:930-934`).
+- **Ignore / AI guidance (per app)**: Ignore sends `set_app_ignore { id, ignore, note:"" }`; blank remains **"unchanged"** so a toggle cannot wipe guidance. Ignoring an app **removes it from Updates Available immediately** (and from the persisted last-cycle snapshot) and stops future checks; Unignore lives in Settings → Ignored apps. “Guide AI” sends `set_app_note`, and the saved-guidance list provides full create/read/update/delete access even after an ignored app leaves the latest results. A failed row also exposes **Retry**, capability-gated by `targeted_update_retry`; it re-checks only that app with the latest guidance and renders the resulting success/current/failure reason in the same row.
+- **Learned fact override**: delegated click on `#learned-list` sends `set_learned_fact { id, op }`; the service updates the persisted fact and refreshes the broadcast list. The same Learned view lists durable **Ignore / Always Approve** preferences (`#pref-list`) with one-click clear via `clear_action_preference`.
 - **Update now**: `#upd-now` → `run_updates_now` → `UiMsg::RunUpdatesNow`. Manual runs work even when scheduling is off; pause or an active updater task disables the button.
 
 ## Service decision loop, state & off-loop executor
@@ -1143,6 +1145,13 @@ detect patterns in the audit DB and adjust Eir's own behaviour — **auditable,
 reversible, user-overridable, and bounded so a learned fact can only ever make Eir *more*
 conservative** (skip, deprioritise, lower confidence, go idle), never more aggressive.
 
+**User action preferences (Ignore / Always Approve)** sit beside this layer, not inside it.
+They are explicit, reversible overrides keyed by `FixAction::dedup_key` in
+`action_preferences` (migration 0020). Ignore suppresses recurring approval cards;
+Always Approve promotes a matching analysis-loop `RequireApproval` to AutoApprove
+without expanding Block or bypassing rate limits / safety preflight. They are the hard
+controls when RejectedSignal's capped confidence haircut is not enough.
+
 ### Approach: deterministic core, AI as a later read-only advisor
 
 A two-tier hybrid, shipped deterministic-first:
@@ -1268,7 +1277,9 @@ behaviour change is the trust risk, and the card is the answer.
 3. **Phase 3 — Confidence + signal-noise learning; issue analysis uses learning.
    ✅ Shipped (v0.13.0).** `migration 0009` `approval_rejections` (written on
    `Approve{approved:false}`); `FixIneffective` (service fixes that never reduce failed
-   services — only when the type *never* helps) and `RejectedSignal` (exact action label)
+   services — only when the type *never* helps) and `RejectedSignal` (stable
+   `FixAction::dedup_key` subjects since migration 0020; legacy rows fall back to the
+   Debug label)
    → a **capped confidence haircut into the existing policy gate**, never for security
    actions; a read-only "what Eir has learned" section injected into the issue-analysis
    prompt (base + advisor-escalation), with the security carve-out applied to the prompt

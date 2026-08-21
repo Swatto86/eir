@@ -67,31 +67,46 @@ pub async fn fix_feedback_rows(pool: &SqlitePool, window_days: i64) -> Result<Ve
 
 /// Approval-rejection rows in the window — evidence for user-rejected-action detection.
 pub async fn rejection_rows(pool: &SqlitePool, window_days: i64) -> Result<Vec<RejectionRow>> {
-    let rows = sqlx::query("SELECT action_label FROM approval_rejections WHERE rejected_at > ?")
-        .bind(cutoff(window_days))
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT action_label, action_key FROM approval_rejections WHERE rejected_at > ?",
+    )
+    .bind(cutoff(window_days))
+    .fetch_all(pool)
+    .await?;
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
+        let label: String = r.try_get("action_label")?;
+        // Prefer the stable dedup key when present; fall back to the display label for
+        // rows written before migration 0020.
+        let action_key: Option<String> = r.try_get("action_key")?;
+        let subject = action_key
+            .filter(|k| !k.trim().is_empty())
+            .unwrap_or(label);
         out.push(RejectionRow {
-            action_label: r.try_get("action_label")?,
+            action_label: subject,
         });
     }
     Ok(out)
 }
 
 /// Record that the user rejected a queued action (drives RejectedSignal learning).
+/// `action_key` is [`crate::models::FixAction::dedup_key`]; empty is stored as NULL so
+/// legacy detectors still have the display label.
 pub async fn record_rejection(
     pool: &SqlitePool,
     decision_id: i64,
     action_label: &str,
+    action_key: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let key = action_key.trim();
     sqlx::query(
-        "INSERT INTO approval_rejections (decision_id, action_label, rejected_at) VALUES (?, ?, ?)",
+        "INSERT INTO approval_rejections (decision_id, action_label, action_key, rejected_at)
+         VALUES (?, ?, ?, ?)",
     )
     .bind(decision_id)
     .bind(action_label)
+    .bind(if key.is_empty() { None } else { Some(key) })
     .bind(&now)
     .execute(pool)
     .await?;
@@ -491,12 +506,12 @@ mod tests {
     #[tokio::test]
     async fn rejection_round_trips() {
         let pool = test_pool("reject").await;
-        record_rejection(&pool, 1, "ProcessKill { process_name: \"x\" }")
+        record_rejection(&pool, 1, "ProcessKill { process_name: \"x\" }", "process_kill|x")
             .await
             .unwrap();
         let rows = rejection_rows(&pool, 30).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].action_label, "ProcessKill { process_name: \"x\" }");
+        assert_eq!(rows[0].action_label, "process_kill|x");
         drop(pool);
     }
 

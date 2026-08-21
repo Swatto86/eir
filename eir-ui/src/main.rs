@@ -284,6 +284,27 @@ async fn decide_approval(
 }
 
 #[tauri::command]
+async fn set_action_preference(
+    id: u64,
+    preference: String,
+    tx: State<'_, UiCmdTx>,
+) -> Result<String, String> {
+    send_command(
+        &tx,
+        UiMsg::SetActionPreference { id, preference },
+    )
+    .await
+}
+
+#[tauri::command]
+async fn clear_action_preference(
+    action_key: String,
+    tx: State<'_, UiCmdTx>,
+) -> Result<String, String> {
+    send_command(&tx, UiMsg::ClearActionPreference { action_key }).await
+}
+
+#[tauri::command]
 async fn toggle_pause(tx: State<'_, UiCmdTx>) -> Result<String, String> {
     send_command(&tx, UiMsg::TogglePause).await
 }
@@ -1285,6 +1306,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             decide_approval,
+            set_action_preference,
+            clear_action_preference,
             toggle_pause,
             undo_registry,
             ask_eir,
@@ -1604,6 +1627,63 @@ mod tests {
                 "the guidance {label} path must restore focus"
             );
         }
+    }
+
+    #[test]
+    fn approval_cards_offer_ignore_and_always_approve() {
+        let javascript = include_str!("../../ui/main.js");
+        let (_, card) = javascript
+            .split_once("function approvalCard(info) {")
+            .expect("approvalCard is still here");
+        let body = &card[..card
+            .find("function renderApprovals(")
+            .expect("renderApprovals follows approvalCard")];
+        assert!(
+            body.contains("btn-ignore-fix"),
+            "approval cards must offer Ignore"
+        );
+        assert!(
+            body.contains("btn-always-approve"),
+            "approval cards must offer Always approve"
+        );
+        assert!(
+            body.contains("set_action_preference")
+                || javascript.contains("invoke('set_action_preference'"),
+            "Ignore / Always approve must call set_action_preference"
+        );
+    }
+
+    #[test]
+    fn ignored_update_apps_are_hidden_from_the_list() {
+        let javascript = include_str!("../../ui/main.js");
+        let (_, render) = javascript
+            .split_once("function renderUpdater(")
+            .expect("renderUpdater is still here");
+        assert!(
+            render.contains("!app.ignored") || render.contains("filter((app) => !app.ignored)"),
+            "renderUpdater must hide ignored apps from Updates Available"
+        );
+        let (_, row) = javascript
+            .split_once("function updaterAppRow(")
+            .expect("updaterAppRow is still here");
+        assert!(
+            row.contains("if (ign) return ''"),
+            "ignored rows must not render in Updates Available"
+        );
+    }
+
+    #[test]
+    fn remembered_preferences_can_be_cleared_from_learned() {
+        let javascript = include_str!("../../ui/main.js");
+        assert!(
+            javascript.contains("invoke('clear_action_preference'"),
+            "Learned view must clear action preferences"
+        );
+        let html = include_str!("../../ui/index.html");
+        assert!(
+            html.contains("id=\"pref-list\""),
+            "Learned view hosts the reversible preferences list"
+        );
     }
 
     #[test]

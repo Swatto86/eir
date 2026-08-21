@@ -255,7 +255,9 @@ pub fn detect_fix_ineffective(rows: &[FeedbackRow], quorum: i64) -> Vec<FixIneff
     out
 }
 
-/// Exact action labels the user rejected >= `quorum` times.
+/// Action labels / keys the user rejected >= `quorum` times. Prefer stable
+/// `FixAction::dedup_key` subjects (migration 0020+) so regenerable Debug parameters
+/// cannot fragment the count below quorum.
 pub fn detect_rejected(rows: &[RejectionRow], quorum: i64) -> Vec<RejectedCandidate> {
     let mut by_label: HashMap<String, i64> = HashMap::new();
     for r in rows {
