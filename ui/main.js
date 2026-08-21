@@ -34,10 +34,10 @@ const SERVICE_ACTION_SELECTOR = [
   '#ask-send', '#clear-ask',
   '#disk-scan', '.disk-clean',
   '#startup-scan', '.startup-toggle',
-  '.btn-approve', '.btn-reject',
+  '.btn-approve', '.btn-reject', '.btn-ignore-fix', '.btn-always-approve',
   '.act-undo', '#clear-activity', '#refresh-status',
   '#upd-now', '#clear-updates', '.upd-retry', '.upd-ignore', '.upd-note-save',
-  '.learned-act', '#set-save', '#test-provider', '#set-adv-save', '#set-upd-save',
+  '.learned-act', '.pref-clear', '#set-save', '#test-provider', '#set-adv-save', '#set-upd-save',
   '#pause-btn', '#game-btn',
 ].join(',');
 
@@ -135,7 +135,7 @@ const VIEW_TITLES = {
   updates: 'App Updates',
   disk: 'Disk Space',
   startup: 'Startup Apps',
-  learned: 'What Eir Has Learned',
+  learned: 'Learned & Preferences',
   settings: 'Settings',
   about: 'About',
 };
@@ -465,7 +465,7 @@ async function refreshInner() {
   } else if (settingsView.classList.contains('active') && !settingsHydrated) {
     fillSettings();
   }
-  renderLearned(status.learned_facts);
+  renderLearned(status.learned_facts, status.action_preferences);
   renderDigest(status.digest);
   renderHistory(status);
   renderAsk(status.ask);
@@ -995,7 +995,9 @@ function approvalCard(info) {
       <div class="approval-grid">${grid}</div>
       <div class="approval-actions">
         <button class="btn-approve" data-id="${info.id}"${info.reversible ? '' : ' data-irreversible="1"'}>Approve &amp; run</button>
+        <button class="btn-always-approve" data-id="${info.id}"${info.reversible ? '' : ' data-irreversible="1"'} title="Approve now and auto-approve this fix when it comes up again">Always approve</button>
         <button class="btn-reject"  data-id="${info.id}">Reject</button>
+        <button class="btn-ignore-fix" data-id="${info.id}" title="Dismiss and do not ask about this fix again">Ignore</button>
       </div>
     </div>`;
 }
@@ -1049,10 +1051,40 @@ async function decide(id, approved, card) {
       card.querySelectorAll('button').forEach((b) => (b.disabled = false));
       // Disarm any armed irreversible-confirm button; otherwise it stays stuck showing
       // "cannot be undone" with nothing actually pending confirmation after a failed send.
-      card.querySelectorAll('.btn-approve.confirm').forEach((b) => {
+      card.querySelectorAll('.btn-approve.confirm, .btn-always-approve.confirm').forEach((b) => {
         clearTimeout(b._confirmTimer);
         b.classList.remove('confirm');
-        b.textContent = 'Approve & run';
+        b.textContent = b.classList.contains('btn-always-approve') ? 'Always approve' : 'Approve & run';
+      });
+    }
+  } finally {
+    decidingIds.delete(id);
+  }
+}
+
+async function setApprovalPreference(id, preference, card) {
+  decidingIds.add(id);
+  if (card) {
+    if (card.contains(document.activeElement)) {
+      document.querySelector('.nav-btn[data-view="approvals"]').focus();
+    }
+    card.querySelectorAll('button').forEach((b) => (b.disabled = true));
+  }
+  try {
+    const result = await invoke('set_action_preference', { id, preference });
+    const fallback = preference === 'ignore'
+      ? 'Fix ignored; it will not ask again'
+      : 'Always approved; action queued';
+    toast(commandMessage(result, fallback), 'ok');
+  } catch (e) {
+    console.error('set_action_preference failed', e);
+    toast('Could not save preference: ' + e, 'err');
+    if (card) {
+      card.querySelectorAll('button').forEach((b) => (b.disabled = false));
+      card.querySelectorAll('.btn-always-approve.confirm').forEach((b) => {
+        clearTimeout(b._confirmTimer);
+        b.classList.remove('confirm');
+        b.textContent = 'Always approve';
       });
     }
   } finally {
@@ -1069,6 +1101,25 @@ document.getElementById('approvals').addEventListener('click', (e) => {
     const text = [target && target.textContent, details && details.textContent]
       .filter(Boolean).join('\n');
     copyText(text, copyBtn);
+    return;
+  }
+  const prefBtn = e.target.closest('.btn-ignore-fix, .btn-always-approve');
+  if (prefBtn) {
+    const id = parseInt(prefBtn.dataset.id, 10);
+    if (!Number.isFinite(id)) return;
+    const preference = prefBtn.classList.contains('btn-ignore-fix') ? 'ignore' : 'always_approve';
+    if (preference === 'always_approve' && prefBtn.dataset.irreversible && !prefBtn.classList.contains('confirm')) {
+      prefBtn.classList.add('confirm');
+      prefBtn.textContent = 'Click again — always approve (cannot be undone)';
+      toast('This action cannot be undone — activate Always approve again to confirm.', 'err');
+      prefBtn._confirmTimer = setTimeout(() => {
+        prefBtn.classList.remove('confirm');
+        prefBtn.textContent = 'Always approve';
+      }, 6000);
+      return;
+    }
+    clearTimeout(prefBtn._confirmTimer);
+    setApprovalPreference(id, preference, prefBtn.closest('.approval-card'));
     return;
   }
   const btn = e.target.closest('.btn-approve, .btn-reject');
@@ -1337,11 +1388,10 @@ function updaterAppRow(a, retrySupported, running) {
   // Ignore state comes from the service (a.ignored), so the toggle survives the 2s
   // poll instead of relying on a client-side style that the next render clobbers.
   const ign = !!a.ignored;
+  if (ign) return ''; // Hidden from Updates Available; reversible from Settings → Ignored apps.
   const showGuidance = a.state === 'failed' || a.state === 'skipped';
   const note = showGuidance && a.note ? `<span class="upd-result">AI guidance: ${esc(a.note)}</span>` : '';
-  const btn = ign
-    ? `<button class="upd-mini upd-ignore" data-id="${escAttr(a.id)}" data-ignore="0" title="Resume checking this app">Unignore</button>`
-    : `<button class="upd-mini upd-ignore" data-id="${escAttr(a.id)}" data-ignore="1" title="Don't check this app again">Ignore</button>`;
+  const btn = `<button class="upd-mini upd-ignore" data-id="${escAttr(a.id)}" data-ignore="1" title="Hide from Updates Available and stop checking">Ignore</button>`;
   const retry = a.state === 'failed' && retrySupported
     ? `<button class="upd-mini upd-retry" data-id="${escAttr(a.id)}"${running ? ' disabled' : ''} title="Re-check only this app using the latest saved guidance">Retry</button>`
     : '';
@@ -1349,7 +1399,7 @@ function updaterAppRow(a, retrySupported, running) {
     ? `<button class="upd-mini upd-guide">${a.note ? 'Edit guidance' : 'Guide AI'}</button>`
     : '';
   const guidanceEditor = showGuidance ? updaterNoteEditor(a.id, a.note) : '';
-  return `<div class="upd-row${ign ? ' upd-ignored' : ''}" data-id="${escAttr(a.id)}"${ign ? ' style="opacity:.5"' : ''}>
+  return `<div class="upd-row" data-id="${escAttr(a.id)}">
     <span class="upd-name" title="${escAttr(a.name)}">${esc(a.name)}</span>
     <span class="upd-ver">${ver}</span>${meth}${badge}
     ${guidanceButton}
@@ -1419,8 +1469,9 @@ function renderUpdater(u, paused, protocolVersion, capabilities) {
   const appsDirty = appsEl.querySelector('.upd-note-editor:not([hidden]) .upd-note-input[data-dirty="1"]');
   if (appsSig !== lastAppsSig && !appsDirty) {
     lastAppsSig = appsSig;
-    if (u.apps && u.apps.length) {
-      appsEl.innerHTML = u.apps.map((app) => updaterAppRow(app, retrySupported, u.running)).join('');
+    const visibleApps = (u.apps || []).filter((app) => !app.ignored);
+    if (visibleApps.length) {
+      appsEl.innerHTML = visibleApps.map((app) => updaterAppRow(app, retrySupported, u.running)).join('');
     } else if (u.running) {
       const phase = (u.phase && u.phase !== 'idle') ? u.phase : 'Checking for updates…';
       appsEl.innerHTML = `<div class="empty">${esc(phase)}</div>`;
@@ -1512,8 +1563,8 @@ document.getElementById('updater-apps').addEventListener('click', (e) => {
   ig.disabled = true;
   invoke('set_app_ignore', { id: ig.dataset.id, ignore, note: '' })
     .then((result) => {
-      const row = ig.closest('.upd-row'); if (row) row.style.opacity = ignore ? '.5' : '';
       toast(commandMessage(result, ignore ? 'App ignored' : 'App unignored'), 'ok');
+      refresh();
     })
     .catch((err) => { console.error('set_app_ignore failed', err); toast('Could not update ignore: ' + err, 'err'); })
     .finally(() => { ig.disabled = false; });
@@ -1570,7 +1621,7 @@ document.getElementById('view-updates').addEventListener('click', (e) => {
     .finally(() => { btn.disabled = false; });
 });
 
-// ── Learned facts ─────────────────────────────────────────────────────────────
+// ── Learned facts + action preferences ───────────────────────────────────────
 
 const LEARNED_BADGE = {
   user_pinned:   '<span class="upd-badge tag-ok">Pinned</span>',
@@ -1591,21 +1642,58 @@ function learnedRow(f) {
   </div>`;
 }
 
+function preferenceRow(p) {
+  const kind = p.preference === 'always_approve'
+    ? '<span class="upd-badge tag-ok">Always approve</span>'
+    : '<span class="upd-badge tag-block">Ignored</span>';
+  const clearLabel = p.preference === 'always_approve' ? 'Stop always approving' : 'Stop ignoring';
+  const target = p.target ? `<span class="upd-result">Target: ${esc(p.target)}</span>` : '';
+  return `<div class="upd-row" data-key="${escAttr(p.action_key)}">
+    <span class="upd-name">${esc(p.summary || p.action_key)}</span>${kind}
+    <button class="upd-mini pref-clear" data-key="${escAttr(p.action_key)}" title="${escAttr(clearLabel)}">${clearLabel}</button>
+    ${target}
+  </div>`;
+}
+
 let lastLearnedSig = null;
 
-function renderLearned(facts) {
+function renderLearned(facts, preferences) {
   const list = document.getElementById('learned-list');
+  const prefList = document.getElementById('pref-list');
   // Skip the innerHTML rebuild when nothing changed, so the 2s poll doesn't wipe a
   // text selection in the list (same guard as renderApprovals).
-  const sig = JSON.stringify(facts || []);
+  const sig = JSON.stringify({ f: facts || [], p: preferences || [] });
   if (sig === lastLearnedSig) return;
   lastLearnedSig = sig;
-  if (!facts || facts.length === 0) {
-    list.innerHTML = '<div class="empty">Nothing learned yet — Eir records patterns (like apps that update themselves) as it works.</div>';
-    return;
+  if (!preferences || preferences.length === 0) {
+    prefList.innerHTML = '<div class="empty">No Ignore or Always Approve preferences yet — set them from an Approvals card.</div>';
+  } else {
+    prefList.innerHTML = preferences.map(preferenceRow).join('');
   }
-  list.innerHTML = facts.map(learnedRow).join('');
+  if (!facts || facts.length === 0) {
+    list.innerHTML = '<div class="empty">Nothing learned yet. After enough repeated patterns (self-updating apps, fixes that never help, or actions you keep rejecting), Eir adapts conservatively — skipping noisy updates or proposing a fix less readily. For a hard stop or auto-run, use Ignore / Always Approve on an Approvals card.</div>';
+  } else {
+    list.innerHTML = facts.map(learnedRow).join('');
+  }
 }
+
+document.getElementById('pref-list').addEventListener('click', (e) => {
+  const btn = e.target.closest('.pref-clear');
+  if (!btn) return;
+  const actionKey = btn.dataset.key;
+  if (!actionKey) return;
+  btn.disabled = true;
+  invoke('clear_action_preference', { action_key: actionKey })
+    .then((result) => {
+      toast(commandMessage(result, 'Preference cleared'), 'ok');
+      refresh();
+    })
+    .catch((err) => {
+      console.error('clear_action_preference failed', err);
+      toast('Could not clear preference: ' + err, 'err');
+      btn.disabled = false;
+    });
+});
 
 document.getElementById('learned-list').addEventListener('click', (e) => {
   const btn = e.target.closest('.learned-act');

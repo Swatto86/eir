@@ -30,8 +30,8 @@ pub struct LearnedFacts {
     method_deprioritised: HashSet<(String, String)>,
     /// FixIneffective: action TYPE → confidence penalty.
     penalty_by_type: HashMap<String, f32>,
-    /// RejectedSignal: exact action label → confidence penalty.
-    penalty_by_label: HashMap<String, f32>,
+    /// RejectedSignal: exact action label OR stable dedup key → confidence penalty.
+    penalty_by_subject: HashMap<String, f32>,
     /// Plain-English lines describing what Eir has learned, for the issue-analysis prompt.
     summaries: Vec<String>,
 }
@@ -81,7 +81,7 @@ impl LearnedFacts {
                     Some(LearnedFactKind::RejectedSignal),
                     Some(Effect::ConfidencePenalty { amount }),
                 ) if !is_security(&row.subject) => {
-                    f.penalty_by_label.insert(row.subject.clone(), amount);
+                    f.penalty_by_subject.insert(row.subject.clone(), amount);
                     f.summaries.push(format!(
                         "You've repeatedly rejected '{}' ({}) — proposing it less readily.",
                         row.subject, row.evidence
@@ -99,18 +99,27 @@ impl LearnedFacts {
             .contains(&(app_base.to_string(), method.to_string()))
     }
 
-    /// The capped confidence penalty for a proposed action (its Debug-form label), summing
-    /// the by-type (FixIneffective) and by-exact-label (RejectedSignal) penalties. Always
-    /// 0 for security action types — learning never weakens a protective fix.
-    pub fn confidence_penalty(&self, action_label: &str) -> f32 {
+    /// The capped confidence penalty for a proposed action, summing the by-type
+    /// (FixIneffective) and by-subject (RejectedSignal) penalties. `action_key` is the
+    /// stable [`crate::models::FixAction::dedup_key`]; either that or the Debug label may
+    /// match a stored RejectedSignal subject. Always 0 for security action types —
+    /// learning never weakens a protective fix.
+    pub fn confidence_penalty(&self, action_label: &str, action_key: &str) -> f32 {
         if is_security(action_label) {
             return 0.0;
         }
         let at = action_type(action_label);
         let by_type = self.penalty_by_type.get(at).copied().unwrap_or(0.0);
-        let by_label = self
-            .penalty_by_label
+        let by_subject = self
+            .penalty_by_subject
             .get(action_label)
+            .or_else(|| {
+                if action_key.is_empty() {
+                    None
+                } else {
+                    self.penalty_by_subject.get(action_key)
+                }
+            })
             .copied()
             .unwrap_or(0.0);
         let bounded = |amount: f32| {
@@ -120,7 +129,7 @@ impl LearnedFacts {
                 0.0
             }
         };
-        (bounded(by_type) + bounded(by_label)).min(MAX_CONFIDENCE_PENALTY)
+        (bounded(by_type) + bounded(by_subject)).min(MAX_CONFIDENCE_PENALTY)
     }
 
     /// A read-only "what Eir has learned on this machine" block for the issue-analysis
@@ -153,7 +162,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), *v))
                 .collect(),
-            penalty_by_label: penalty_label
+            penalty_by_subject: penalty_label
                 .iter()
                 .map(|(k, v)| (k.to_string(), *v))
                 .collect(),
@@ -168,11 +177,24 @@ mod tests {
             &[("ServiceRestart { service_name: \"x\" }", 0.1)],
         );
         // 0.1 + 0.1 = 0.2, capped to MAX_CONFIDENCE_PENALTY.
-        let p = f.confidence_penalty("ServiceRestart { service_name: \"x\" }");
+        let p = f.confidence_penalty("ServiceRestart { service_name: \"x\" }", "");
         assert!((p - MAX_CONFIDENCE_PENALTY).abs() < 1e-6);
         // A different instance of the same type gets only the by-type penalty.
         assert!(
-            (f.confidence_penalty("ServiceRestart { service_name: \"y\" }") - 0.1).abs() < 1e-6
+            (f.confidence_penalty("ServiceRestart { service_name: \"y\" }", "") - 0.1).abs() < 1e-6
+        );
+    }
+
+    #[test]
+    fn rejected_signal_matches_stable_action_key() {
+        let f = facts_with(&[], &[("process_kill|chrome", 0.15)]);
+        assert!(
+            (f.confidence_penalty(
+                "ProcessKill { process_name: \"chrome\" }",
+                "process_kill|chrome"
+            ) - 0.15)
+                .abs()
+                < 1e-6
         );
     }
 
@@ -182,14 +204,14 @@ mod tests {
             &[("DefenderRealtimeEnable", 0.15)],
             &[("DefenderRealtimeEnable", 0.15)],
         );
-        assert_eq!(f.confidence_penalty("DefenderRealtimeEnable"), 0.0);
+        assert_eq!(f.confidence_penalty("DefenderRealtimeEnable", ""), 0.0);
     }
 
     #[test]
     fn unknown_action_has_no_penalty() {
         let f = facts_with(&[], &[]);
         assert_eq!(
-            f.confidence_penalty("DiskCleanup { target: \"temp\" }"),
+            f.confidence_penalty("DiskCleanup { target: \"temp\" }", "disk_cleanup|temp"),
             0.0
         );
     }
@@ -197,10 +219,10 @@ mod tests {
     #[test]
     fn malformed_penalties_can_never_raise_or_poison_confidence() {
         let negative = facts_with(&[("ServiceRestart", -0.2)], &[]);
-        assert_eq!(negative.confidence_penalty("ServiceRestart"), 0.0);
+        assert_eq!(negative.confidence_penalty("ServiceRestart", ""), 0.0);
 
         let non_finite = facts_with(&[("ServiceRestart", f32::NAN)], &[]);
-        assert_eq!(non_finite.confidence_penalty("ServiceRestart"), 0.0);
+        assert_eq!(non_finite.confidence_penalty("ServiceRestart", ""), 0.0);
     }
 
     #[test]
@@ -249,7 +271,7 @@ mod tests {
         let facts = LearnedFacts::load(&pool).await;
         // The security rejection is neither penalised nor surfaced to the diagnostician.
         assert_eq!(
-            facts.confidence_penalty("FirewallEnable { profile: \"all\" }"),
+            facts.confidence_penalty("FirewallEnable { profile: \"all\" }", "firewall_enable|all"),
             0.0
         );
         let prompt = facts.prompt_section().unwrap_or_default();
@@ -258,7 +280,9 @@ mod tests {
             "security action leaked into prompt: {prompt}"
         );
         // The ordinary rejection is still learned and surfaced.
-        assert!(facts.confidence_penalty("ProcessKill { process_name: \"x\" }") > 0.0);
+        assert!(
+            facts.confidence_penalty("ProcessKill { process_name: \"x\" }", "process_kill|x") > 0.0
+        );
         assert!(prompt.contains("ProcessKill"));
         drop(pool);
     }

@@ -42,6 +42,7 @@ const MAX_SERVICE_LINE_BYTES: usize = 12 * 1024 * 1024;
 const MAX_STATUS_PENDING_APPROVALS: usize = 32;
 const MAX_RECOVERY_APPROVALS: usize = 8;
 const MAX_STATUS_LEARNED_FACTS: usize = 512;
+const MAX_STATUS_ACTION_PREFERENCES: usize = 256;
 
 fn finite_f32(value: f32) -> f32 {
     if value.is_finite() {
@@ -66,6 +67,9 @@ fn status_for_wire(mut status: StatusPayload) -> StatusPayload {
         .pending_approvals
         .truncate(MAX_STATUS_PENDING_APPROVALS);
     status.learned_facts.truncate(MAX_STATUS_LEARNED_FACTS);
+    status
+        .action_preferences
+        .truncate(MAX_STATUS_ACTION_PREFERENCES);
     status.cpu = finite_f32(status.cpu);
     status.memory = finite_f32(status.memory);
     status.disk = finite_f32(status.disk);

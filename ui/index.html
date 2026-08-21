@@ -239,13 +239,17 @@
     .appr-details { margin-top: 8px; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; font-family: 'Cascadia Code', Consolas, monospace; font-size: 11.5px; color: var(--muted); white-space: pre-wrap; word-break: break-word; line-height: 1.5; user-select: text; }
     .approval-grid { display: grid; grid-template-columns: 110px 1fr; gap: 4px 12px; font-size: 13px; margin-bottom: 14px; user-select: text; }
     .approval-grid .label { color: var(--muted); }
-    .approval-actions { display: flex; gap: 8px; }
+    .approval-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .btn-approve { padding: 6px 20px; background: var(--green); border: none; border-radius: 8px; color: #fff; cursor: pointer; font-size: 13px; font-family: inherit; }
     .btn-approve:hover { filter: brightness(1.1); }
-    .btn-approve.confirm { background: var(--orange); }
-    .btn-approve:disabled, .btn-reject:disabled { opacity: .5; cursor: default; }
+    .btn-approve.confirm, .btn-always-approve.confirm { background: var(--orange); color: #fff; border-color: var(--orange); }
+    .btn-approve:disabled, .btn-reject:disabled, .btn-ignore-fix:disabled, .btn-always-approve:disabled { opacity: .5; cursor: default; }
     .btn-reject  { padding: 6px 20px; background: transparent; border: 1px solid var(--red); border-radius: 8px; color: var(--red); cursor: pointer; font-size: 13px; font-family: inherit; }
     .btn-reject:hover { background: color-mix(in srgb, var(--red) 12%, transparent); }
+    .btn-always-approve { padding: 6px 14px; background: transparent; border: 1px solid var(--green); border-radius: 8px; color: var(--green); cursor: pointer; font-size: 13px; font-family: inherit; }
+    .btn-always-approve:hover { background: color-mix(in srgb, var(--green) 12%, transparent); }
+    .btn-ignore-fix { padding: 6px 14px; background: transparent; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); cursor: pointer; font-size: 13px; font-family: inherit; }
+    .btn-ignore-fix:hover { color: var(--text); border-color: var(--muted); }
 
     /* ── Activity ── */
     .act-item { display: flex; gap: 10px; padding: 10px 15px; border-bottom: 1px solid var(--border); font-size: 13px; }
@@ -549,8 +553,12 @@
     <!-- ── Learned ── -->
     <section class="view" id="view-learned">
       <div class="card">
+        <div class="card-header">Remembered preferences</div>
+        <div id="pref-list"><div class="empty">No Ignore or Always Approve preferences yet — set them from an Approvals card.</div></div>
+      </div>
+      <div class="card" style="margin-top:12px">
         <div class="card-header">What Eir has learned about this machine</div>
-        <div id="learned-list"><div class="empty">Nothing learned yet — Eir records patterns (like apps that update themselves) as it works.</div></div>
+        <div id="learned-list"><div class="empty">Nothing learned yet. After enough repeated patterns (self-updating apps, fixes that never help, or actions you keep rejecting), Eir adapts conservatively — skipping noisy updates or proposing a fix less readily. For a hard stop or auto-run, use Ignore / Always Approve on an Approvals card.</div></div>
       </div>
     </section>
 
@@ -693,8 +701,8 @@
             <option value="allow_unsigned">Allow unsigned — least safe</option>
           </select>
         </div>
-        <div id="set-upd-ignored-wrap" hidden>
-          <div class="set-section-desc">Ignored apps</div>
+          <div id="set-upd-ignored-wrap" hidden>
+          <div class="set-section-desc">Ignored apps (hidden from Updates Available)</div>
           <div id="set-upd-ignored"></div>
         </div>
         <div class="set-note">Strictest → least-safe. This gates only <em>AI-found installers</em>; winget/Chocolatey/Store packages are trusted by their source. “Publisher match” needs a valid signature first, so unsigned installers (e.g. AutoHotkey and some open-source tools) are blocked under both signature options — update those via Chocolatey instead, or choose “Allow unsigned” (not recommended for unattended installs).</div>

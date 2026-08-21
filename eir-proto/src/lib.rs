@@ -61,6 +61,10 @@ pub struct StatusPayload {
     /// transparency card. `#[serde(default)]` keeps an older payload decodable.
     #[serde(default)]
     pub learned_facts: Vec<LearnedFactView>,
+    /// User-set Ignore / Always Approve preferences for specific fix actions.
+    /// Surfaced so they can be reversed. `#[serde(default)]` for older peers.
+    #[serde(default)]
+    pub action_preferences: Vec<ActionPreferenceView>,
     /// The latest weekly plain-English health digest, if one has been generated.
     /// `#[serde(default)]` keeps an older payload decodable.
     #[serde(default)]
@@ -236,6 +240,23 @@ pub struct LearnedFactView {
     pub status: String,
     /// detector | ai_labelled.
     pub source: String,
+}
+
+/// One durable Ignore / Always Approve preference for a semantic fix action.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ActionPreferenceView {
+    /// `FixAction::dedup_key` — stable across regenerable AI parameters.
+    pub action_key: String,
+    /// `ignore` | `always_approve`.
+    pub preference: String,
+    /// Human-readable description of what the action does.
+    pub summary: String,
+    /// Concrete target (process, path, service, …), when known.
+    #[serde(default)]
+    pub target: String,
+    /// Unix seconds when the preference was set.
+    #[serde(default)]
+    pub created_at: i64,
 }
 
 /// Advisor-mode status: whether the last analysis escalated to deeper reasoning, and
@@ -601,6 +622,18 @@ pub enum UiMsg {
         id: u64,
         approved: bool,
     },
+    /// Remember a preference for the semantic action behind a pending approval.
+    /// `preference` is `ignore` (dismiss and never re-queue) or `always_approve`
+    /// (approve now and auto-approve matching future proposals). Reversible via
+    /// [`ClearActionPreference`].
+    SetActionPreference {
+        id: u64,
+        preference: String,
+    },
+    /// Remove an Ignore / Always Approve preference by its stable action key.
+    ClearActionPreference {
+        action_key: String,
+    },
     TogglePause,
     UpdateSettings(Box<SettingsUpdate>),
     /// Clear the in-memory Recent Problems list.
@@ -761,5 +794,53 @@ mod tests {
                 "id": "example app"
             })
         );
+    }
+
+    #[test]
+    fn action_preference_messages_have_stable_wire_shape() {
+        let set = serde_json::to_value(UiMsg::SetActionPreference {
+            id: 7,
+            preference: "always_approve".to_string(),
+        })
+        .expect("serialize set");
+        assert_eq!(
+            set,
+            serde_json::json!({
+                "type": "set_action_preference",
+                "id": 7,
+                "preference": "always_approve"
+            })
+        );
+        let clear = serde_json::to_value(UiMsg::ClearActionPreference {
+            action_key: "process_kill|chrome".to_string(),
+        })
+        .expect("serialize clear");
+        assert_eq!(
+            clear,
+            serde_json::json!({
+                "type": "clear_action_preference",
+                "action_key": "process_kill|chrome"
+            })
+        );
+    }
+
+    #[test]
+    fn action_preferences_default_for_an_older_status_payload() {
+        let status: StatusPayload = serde_json::from_value(serde_json::json!({
+            "status": "Active",
+            "paused": false,
+            "cpu": 0.0,
+            "memory": 0.0,
+            "disk": 0.0,
+            "failed_services": [],
+            "last_analysis": "",
+            "recent_problems": [],
+            "recent_executions": [],
+            "error": null,
+            "usage": null,
+            "settings": null
+        }))
+        .expect("old status still decodes");
+        assert!(status.action_preferences.is_empty());
     }
 }

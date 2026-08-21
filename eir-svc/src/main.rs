@@ -12,6 +12,7 @@ mod learn;
 mod models;
 mod pipe_server;
 mod policy;
+mod prefs;
 mod safety;
 mod service_install;
 mod session;
@@ -20,8 +21,8 @@ mod startup_scan;
 mod updater;
 
 use eir_proto::{
-    AdvisorStatus, ApprovalInfo, ExecutionSummary, LearnedFactView, ProblemSummary, StatusPayload,
-    UiMsg, UiSettings, UpdaterStatus, UsageSummary,
+    ActionPreferenceView, AdvisorStatus, ApprovalInfo, ExecutionSummary, LearnedFactView,
+    ProblemSummary, StatusPayload, UiMsg, UiSettings, UpdaterStatus, UsageSummary,
 };
 use models::{
     CallUsage, ClaudeDecision, ExecutionResult, FixAction, PendingApproval, SignalSnapshot,
@@ -380,6 +381,8 @@ struct SvcState {
     in_flight: HashSet<String>,
     /// What Eir has learned about this machine (self-improvement), for the UI card.
     learned_facts: Vec<LearnedFactView>,
+    /// User Ignore / Always Approve preferences for specific fix actions.
+    action_preferences: Vec<ActionPreferenceView>,
     /// Advisor-mode status broadcast to the UI.
     advisor: Option<AdvisorStatus>,
     /// Escalation AI spend accumulated today (reset at the UTC day boundary).
@@ -457,6 +460,7 @@ impl Default for SvcState {
             updater_running: false,
             in_flight: HashSet::new(),
             learned_facts: Vec::new(),
+            action_preferences: Vec::new(),
             advisor: None,
             advisor_spent_today: 0.0,
             advisor_escalations_today: 0,
@@ -716,6 +720,7 @@ fn build_status(st: &SvcState) -> StatusPayload {
         updater: Some(st.updater.clone()),
         advisor: st.advisor.clone(),
         learned_facts: st.learned_facts.clone(),
+        action_preferences: st.action_preferences.clone(),
         digest: st.digest.clone(),
         history: st.history.clone(),
         ask: st.ask.clone(),
@@ -1489,6 +1494,8 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                     .any(|id| id.eq_ignore_ascii_case(&app.id));
                 app.note = cfg.updater.notes.get(&app.id).cloned().unwrap_or_default();
             }
+            // Ignored apps stay off Updates Available; Settings lists them for Unignore.
+            apps.retain(|app| !app.ignored);
             st.updater.notes = notes;
             st.updater.apps = apps;
             true
@@ -1618,6 +1625,10 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
             st.pending = pending;
         }
         Err(e) => warn!("Failed to load pending approvals: {e}"),
+    }
+    match prefs::list_preferences(&db).await {
+        Ok(prefs) => st.action_preferences = prefs,
+        Err(e) => warn!("Failed to load action preferences: {e}"),
     }
     if ai.is_some() && st.error.is_none() {
         st.status = resting_status(&st);
@@ -2195,10 +2206,41 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                             // rejecting, so the EXISTING policy gate accounts for it. Never lowers a
                             // security action (see apply::confidence_penalty).
                             let action_label = format!("{action:?}");
-                            let confidence =
-                                (problem.confidence - learned_facts.confidence_penalty(&action_label)).max(0.0);
+                            let action_key = action.dedup_key();
+                            let confidence = (problem.confidence
+                                - learned_facts.confidence_penalty(&action_label, &action_key))
+                            .max(0.0);
 
-                            match pol.evaluate(&action, confidence) {
+                            let mut verdict = pol.evaluate(&action, confidence);
+                            // User preferences for this semantic action. Ignore suppresses the
+                            // approval card entirely; Always Approve promotes RequireApproval to
+                            // the auto-execute path. Block is never overridden. Preferences are
+                            // consulted only on the analysis path — user-initiated force_approval
+                            // actions still require an explicit click.
+                            if matches!(verdict, policy::Verdict::RequireApproval(_)) {
+                                match prefs::get_preference(&db, &action_key).await {
+                                    Ok(Some(prefs::Preference::Ignore)) => {
+                                        info!(
+                                            action = %action_label,
+                                            "Skipped — user ignored this recurring fix"
+                                        );
+                                        continue;
+                                    }
+                                    Ok(Some(prefs::Preference::AlwaysApprove)) => {
+                                        info!(
+                                            action = %action_label,
+                                            "Always-approve preference — auto-executing"
+                                        );
+                                        verdict = policy::Verdict::AutoApprove;
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        warn!("Action preference lookup failed (continuing without it): {e}");
+                                    }
+                                }
+                            }
+
+                            match verdict {
                                 policy::Verdict::Block(reason) => {
                                     info!(reason = %reason, "Blocked by policy");
                                     // Show the gate-evaluated (penalty-adjusted) confidence, not
@@ -2679,8 +2721,13 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                     info!(id, diagnosis = %pa.info.diagnosis, "UI-rejected");
                                     // Record the rejection so self-improvement can learn to
                                     // stop proposing an action the user keeps refusing.
-                                    if let Err(e) =
-                                        learn::record_rejection(&db, pa.decision_id, &pa.info.action).await
+                                    if let Err(e) = learn::record_rejection(
+                                        &db,
+                                        pa.decision_id,
+                                        &pa.info.action,
+                                        &pa.action.dedup_key(),
+                                    )
+                                    .await
                                     {
                                         warn!("Failed to record rejection: {e}");
                                     }
@@ -2721,6 +2768,222 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                             // refresh the UI (the card disappears from the queue).
                             st.status = resting_status(&st);
                             pipe.broadcast_status(build_status(&st));
+                        }
+                        UiMsg::SetActionPreference { id, preference } => {
+                            let pref = prefs::Preference::from_token(preference.trim());
+                            let pending = st.pending.iter().find(|p| p.info.id == id).cloned();
+                            match (pref, pending) {
+                                (None, _) => {
+                                    command_result = Err(
+                                        "Preference must be ignore or always_approve".to_string(),
+                                    );
+                                }
+                                (_, None) => {
+                                    command_result =
+                                        Err("Approval is stale or already resolved".to_string());
+                                }
+                                (Some(pref), Some(pa)) => {
+                                    let key = pa.action.dedup_key();
+                                    let summary = if pa.info.action_summary.trim().is_empty() {
+                                        pa.info.action.clone()
+                                    } else {
+                                        pa.info.action_summary.clone()
+                                    };
+                                    if let Err(e) = prefs::set_preference(
+                                        &db,
+                                        &key,
+                                        pref,
+                                        &summary,
+                                        &pa.info.target,
+                                    )
+                                    .await
+                                    {
+                                        warn!("Failed to save action preference: {e}");
+                                        command_result =
+                                            Err(format!("Preference could not be saved: {e}"));
+                                    } else {
+                                        st.action_preferences = prefs::list_preferences(&db)
+                                            .await
+                                            .unwrap_or_default();
+                                        match pref {
+                                            prefs::Preference::Ignore => {
+                                                st.pending.retain(|p| p.info.id != id);
+                                                if let Err(e) =
+                                                    audit::delete_pending_approval(&db, id).await
+                                                {
+                                                    warn!(
+                                                        "Failed to retire ignored approval {id}: {e}"
+                                                    );
+                                                }
+                                                push_problem(
+                                                    &mut st,
+                                                    &pa.info.diagnosis,
+                                                    pa.info.confidence,
+                                                    &pa.info.action,
+                                                    false,
+                                                    false,
+                                                    Some(
+                                                        "ignored by user — will not ask again"
+                                                            .into(),
+                                                    ),
+                                                );
+                                                command_result = Ok(
+                                                    "Fix ignored; it will not ask again".to_string(),
+                                                );
+                                                if !st.paused {
+                                                    st.error = None;
+                                                }
+                                            }
+                                            prefs::Preference::AlwaysApprove => {
+                                                match audit::claim_pending_approval(&db, id, true)
+                                                    .await
+                                                {
+                                                    Ok(Some(claimed)) => {
+                                                        st.pending.retain(|p| p.info.id != id);
+                                                        let label = claimed.info.action.clone();
+                                                        let exec_key = claimed.action.dedup_key();
+                                                        match approved_action_ready(
+                                                            &pol, &db, &claimed,
+                                                        )
+                                                        .await
+                                                        {
+                                                            Ok(())
+                                                                if st
+                                                                    .in_flight
+                                                                    .insert(exec_key.clone()) =>
+                                                            {
+                                                                info!(
+                                                                    action = ?claimed.action,
+                                                                    "Always-approve — queueing for execution"
+                                                                );
+                                                                if let Err(e) =
+                                                                    exec_tx.send(ExecJob {
+                                                                        action: claimed.action,
+                                                                        decision_id: claimed
+                                                                            .decision_id,
+                                                                        baseline: claimed.baseline,
+                                                                        key: exec_key.clone(),
+                                                                        label: label.clone(),
+                                                                        diagnosis: claimed
+                                                                            .info
+                                                                            .diagnosis
+                                                                            .clone(),
+                                                                        confidence: claimed
+                                                                            .info
+                                                                            .confidence,
+                                                                        reason: Some(
+                                                                            "always approved by user"
+                                                                                .into(),
+                                                                        ),
+                                                                        approval_id: Some(id),
+                                                                    })
+                                                                {
+                                                                    warn!(
+                                                                        "Executor worker unavailable: {e}"
+                                                                    );
+                                                                    st.in_flight.remove(&exec_key);
+                                                                    command_result = Err(
+                                                                        "Executor is unavailable; preference was saved"
+                                                                            .to_string(),
+                                                                    );
+                                                                } else {
+                                                                    command_result = Ok(
+                                                                        "Always approved; action queued"
+                                                                            .to_string(),
+                                                                    );
+                                                                }
+                                                            }
+                                                            Ok(()) => {
+                                                                let _ = audit::delete_pending_approval(
+                                                                    &db, id,
+                                                                )
+                                                                .await;
+                                                                command_result = Ok(
+                                                                    "Always approved; action is already executing"
+                                                                        .to_string(),
+                                                                );
+                                                            }
+                                                            Err(
+                                                                ApprovalPreflightError::Resolved(
+                                                                    reason,
+                                                                ),
+                                                            ) => {
+                                                                warn!(
+                                                                    id,
+                                                                    %reason,
+                                                                    "Always-approve action no longer passes safety preflight"
+                                                                );
+                                                                let _ = audit::delete_pending_approval(
+                                                                    &db, id,
+                                                                )
+                                                                .await;
+                                                                command_result = Err(
+                                                                    "Preference saved, but this action is no longer allowed by current safety policy"
+                                                                        .to_string(),
+                                                                );
+                                                            }
+                                                            Err(
+                                                                ApprovalPreflightError::Retry(
+                                                                    reason,
+                                                                ),
+                                                            ) => {
+                                                                warn!(
+                                                                    id,
+                                                                    %reason,
+                                                                    "Always-approve safety preflight could not complete"
+                                                                );
+                                                                st.error = Some(reason);
+                                                                command_result = Err(
+                                                                    "Preference saved; safety checks could not complete — it will retry after restart"
+                                                                        .to_string(),
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                    Ok(None) => {
+                                                        command_result = Err(
+                                                            "Approval is stale or already resolved"
+                                                                .to_string(),
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "Failed to claim approval for always-approve {id}: {e}"
+                                                        );
+                                                        command_result = Err(format!(
+                                                            "Preference saved, but approval could not be claimed: {e}"
+                                                        ));
+                                                    }
+                                                }
+                                                if !st.paused && command_result.is_ok() {
+                                                    st.error = None;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            st.status = resting_status(&st);
+                            pipe.broadcast_status(build_status(&st));
+                        }
+                        UiMsg::ClearActionPreference { action_key } => {
+                            match prefs::clear_preference(&db, &action_key).await {
+                                Ok(true) => {
+                                    st.action_preferences =
+                                        prefs::list_preferences(&db).await.unwrap_or_default();
+                                    command_result = Ok("Preference cleared".to_string());
+                                    pipe.broadcast_status(build_status(&st));
+                                }
+                                Ok(false) => {
+                                    command_result =
+                                        Err("No preference found for that action".to_string());
+                                }
+                                Err(e) => {
+                                    warn!("Failed to clear action preference: {e}");
+                                    command_result =
+                                        Err(format!("Preference could not be cleared: {e}"));
+                                }
+                            }
                         }
                         UiMsg::RunUpdatesNow => {
                             if st.paused {
@@ -2890,22 +3153,46 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                     cfg = next;
                                 }
                             }
-                            // Reflect the toggle on the live row so the UI shows it
-                            // immediately — the broadcast below carries the unchanged
-                            // apps list from the last cycle, so without this the
-                            // optimistic dim would revert on the next poll.
+                            // Reflect the toggle on the live list immediately. Ignoring an
+                            // app removes it from Updates Available (reversible from Settings);
+                            // unignoring only clears the flag — the app reappears on the next
+                            // check if an update is still available.
                             if command_result.is_ok() {
-                                for a in st.updater.apps.iter_mut() {
-                                    if a.id.eq_ignore_ascii_case(&key) {
-                                        a.ignored = ignore;
-                                        if !n.is_empty() {
-                                            a.note = n.to_string();
+                                if ignore {
+                                    st.updater
+                                        .apps
+                                        .retain(|a| !a.id.eq_ignore_ascii_case(&key));
+                                    if st.updater.last_run > 0 {
+                                        if let Err(e) = updater::history::record_cycle_status(
+                                            &db,
+                                            st.updater.last_run,
+                                            &st.updater.notes,
+                                            &st.updater.apps,
+                                        )
+                                        .await
+                                        {
+                                            warn!(
+                                                "Failed to persist updater list after ignore: {e}"
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    for a in st.updater.apps.iter_mut() {
+                                        if a.id.eq_ignore_ascii_case(&key) {
+                                            a.ignored = false;
+                                            if !n.is_empty() {
+                                                a.note = n.to_string();
+                                            }
                                         }
                                     }
                                 }
                                 st.updater.app_notes = cfg.updater.note_views();
                                 st.updater.settings = cfg.updater.to_view();
-                                command_result = Ok("App setting saved".to_string());
+                                command_result = Ok(if ignore {
+                                    "App ignored; hidden from Updates Available".to_string()
+                                } else {
+                                    "App unignored".to_string()
+                                });
                                 pipe.broadcast_status(build_status(&st));
                             }
                             }
