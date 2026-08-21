@@ -42,4 +42,5 @@ flowchart LR
 
 ## Recent Context & Decisions
 
+- **2026-08-21** — Cut v0.34.17: Approvals Ignore / Always Approve, Updates Available hide-on-ignore, RejectedSignal action_key fix, Cargo `jobs = 0` removed for Rust 1.95 CI.
 - **2026-08-21** — Approvals gained reversible Ignore and Always Approve (`action_preferences`). Updates Available hides ignored apps immediately. Learned kept and improved: rejection learning keys on `dedup_key`; Learned view hosts preference reverse-UI; empty-state copy clarifies automatic learning vs hard preferences.

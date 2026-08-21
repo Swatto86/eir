@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.16. It has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.17. It has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.1
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-08-21 | Eir | v0.34.17 approval preferences release | Ships reversible Approvals Ignore / Always Approve (keyed by FixAction::dedup_key), hides ignored apps from Updates Available, fixes RejectedSignal to count stable action keys, and removes invalid Cargo `jobs = 0` so CI/release builds on Rust 1.95.
 
 2026-08-21 | Eir | Approval Ignore / Always Approve + hide ignored updates | Approvals cards can Ignore (never re-queue) or Always Approve (auto-run matching future proposals) a semantic fix keyed by `FixAction::dedup_key`; both reverse from the Learned view. Ignored updater apps disappear from Updates Available immediately (Settings Unignore). Learned kept: RejectedSignal now counts stable action keys so quorum can form; UI clarifies automatic learning vs hard preferences.
 

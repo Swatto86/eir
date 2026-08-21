@@ -1,7 +1,5 @@
-# Parallel crate builds; Cargo picks a sensible default when omitted, but pinning
-# avoids under-utilizing CI runners and local many-core machines.
-[build]
-jobs = 0
+# Parallel crate builds: omit `jobs` so Cargo picks a host-appropriate default.
+# (`jobs = 0` used to mean "auto" but Cargo 1.95+ rejects it.)
 
 # sccache: set RUSTC_WRAPPER=sccache in the environment (CI does this automatically).
 # Do not hard-code a wrapper here — not every machine has sccache installed.
