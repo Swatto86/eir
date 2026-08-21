@@ -184,7 +184,10 @@ mod tests {
             path.to_string_lossy().replace('\\', "/")
         );
         let pool = SqlitePool::connect(&url).await.expect("open");
-        sqlx::migrate!("../migrations").run(&pool).await.expect("migrate");
+        sqlx::migrate!("../migrations")
+            .run(&pool)
+            .await
+            .expect("migrate");
         pool
     }
 
@@ -217,7 +220,9 @@ mod tests {
             get_preference(&pool, "process_kill|chrome").await.unwrap(),
             Some(Preference::AlwaysApprove)
         );
-        assert!(clear_preference(&pool, "process_kill|chrome").await.unwrap());
+        assert!(clear_preference(&pool, "process_kill|chrome")
+            .await
+            .unwrap());
         assert_eq!(
             get_preference(&pool, "process_kill|chrome").await.unwrap(),
             None

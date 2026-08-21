@@ -289,11 +289,7 @@ async fn set_action_preference(
     preference: String,
     tx: State<'_, UiCmdTx>,
 ) -> Result<String, String> {
-    send_command(
-        &tx,
-        UiMsg::SetActionPreference { id, preference },
-    )
-    .await
+    send_command(&tx, UiMsg::SetActionPreference { id, preference }).await
 }
 
 #[tauri::command]

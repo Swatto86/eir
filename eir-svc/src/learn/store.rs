@@ -79,9 +79,7 @@ pub async fn rejection_rows(pool: &SqlitePool, window_days: i64) -> Result<Vec<R
         // Prefer the stable dedup key when present; fall back to the display label for
         // rows written before migration 0020.
         let action_key: Option<String> = r.try_get("action_key")?;
-        let subject = action_key
-            .filter(|k| !k.trim().is_empty())
-            .unwrap_or(label);
+        let subject = action_key.filter(|k| !k.trim().is_empty()).unwrap_or(label);
         out.push(RejectionRow {
             action_label: subject,
         });
@@ -506,9 +504,14 @@ mod tests {
     #[tokio::test]
     async fn rejection_round_trips() {
         let pool = test_pool("reject").await;
-        record_rejection(&pool, 1, "ProcessKill { process_name: \"x\" }", "process_kill|x")
-            .await
-            .unwrap();
+        record_rejection(
+            &pool,
+            1,
+            "ProcessKill { process_name: \"x\" }",
+            "process_kill|x",
+        )
+        .await
+        .unwrap();
         let rows = rejection_rows(&pool, 30).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].action_label, "process_kill|x");
