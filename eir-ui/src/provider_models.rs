@@ -1,5 +1,12 @@
 use crate::util::run_command_capped;
-use std::{collections::HashSet, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 const MODEL_OUTPUT_CAP: usize = 2 * 1024 * 1024;
 
@@ -22,12 +29,6 @@ const CODEX_MODELS: &[&str] = &[
     "gpt-5.4-mini",
     "gpt-5.3-codex-spark",
 ];
-const OPENCODE_MODELS: &[&str] = &[
-    "ollama/llama3.2",
-    "opencode/big-pickle",
-    "anthropic/claude-sonnet-4-6",
-    "openai/gpt-5.4-mini",
-];
 const CURSOR_MODELS: &[&str] = &[
     "auto",
     "composer-2.5",
@@ -44,10 +45,16 @@ pub async fn list_provider_models(provider: String) -> Result<Vec<String>, Strin
             .await
             .and_then(|out| parse_codex_models(&out))
             .unwrap_or_else(|| strings(CODEX_MODELS))),
-        "opencode_cli" => Ok(cli_models("opencode", &["models"])
-            .await
-            .and_then(|out| parse_line_models(&out))
-            .unwrap_or_else(|| strings(OPENCODE_MODELS))),
+        "opencode_cli" => {
+            let out = cli_models("opencode", &["models"]).await.ok_or_else(|| {
+                "Could not run `opencode models`. Is OpenCode installed (npm) and reachable?"
+                    .to_string()
+            })?;
+            parse_line_models(&out).ok_or_else(|| {
+                "OpenCode returned no usable model ids. Try `opencode models` in a terminal."
+                    .to_string()
+            })
+        }
         "cursor_cli" => Ok(cli_models("agent", &["--list-models"])
             .await
             .and_then(|out| parse_cursor_models(&out))
@@ -79,21 +86,52 @@ async fn cli_models(binary: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&stdout).into_owned())
 }
 
+/// Prefer real Windows executables / `.cmd` shims over npm's extensionless Unix
+/// shebang script (`#!/bin/sh`), which CreateProcess rejects on Windows.
 fn resolve_binary(name: &str) -> PathBuf {
+    let mut candidates = Vec::new();
+
+    if let Some(profile) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        let profile = PathBuf::from(profile);
+        candidates.push(
+            profile
+                .join(r"AppData\Roaming\npm")
+                .join(format!("{name}.cmd")),
+        );
+        candidates.push(
+            profile
+                .join(r"AppData\Roaming\npm")
+                .join(format!("{name}.exe")),
+        );
+        candidates.push(profile.join(r".local\bin").join(format!("{name}.exe")));
+        candidates.push(profile.join(r".local\bin").join(name));
+    }
+
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
-            for candidate in [
-                dir.join(name),
-                dir.join(format!("{name}.exe")),
-                dir.join(format!("{name}.cmd")),
-            ] {
-                if candidate.is_file() {
-                    return candidate;
-                }
-            }
+            candidates.push(dir.join(format!("{name}.cmd")));
+            candidates.push(dir.join(format!("{name}.exe")));
+            candidates.push(dir.join(name));
+        }
+    }
+
+    for candidate in candidates {
+        if candidate.is_file() && !is_unix_shebang_shim(&candidate) {
+            return candidate;
         }
     }
     PathBuf::from(name)
+}
+
+fn is_unix_shebang_shim(path: &Path) -> bool {
+    if path.extension().is_some() {
+        return false;
+    }
+    let mut buf = [0u8; 2];
+    File::open(path)
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .map(|_| buf == *b"#!")
+        .unwrap_or(false)
 }
 
 fn strings(ids: &[&str]) -> Vec<String> {
@@ -156,6 +194,7 @@ fn parse_cursor_models(output: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn line_catalog_keeps_provider_slash_ids() {
@@ -168,6 +207,36 @@ mod tests {
                 "opencode/big-pickle".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn line_catalog_keeps_nested_ollama_ids() {
+        let out = "ollama/huihui_ai/qwen3.8-abliterated:latest\n";
+        let models = parse_line_models(out).unwrap();
+        assert_eq!(
+            models,
+            vec!["ollama/huihui_ai/qwen3.8-abliterated:latest".to_string()]
+        );
+    }
+
+    #[test]
+    fn unix_shebang_shim_is_skipped_on_windows() {
+        let dir = std::env::temp_dir().join(format!("eir-shim-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("opencode");
+        let cmd = dir.join("opencode.cmd");
+        {
+            let mut f = File::create(&shim).unwrap();
+            writeln!(f, "#!/bin/sh\necho unix-shim").unwrap();
+        }
+        {
+            let mut f = File::create(&cmd).unwrap();
+            writeln!(f, "@echo off").unwrap();
+        }
+        assert!(is_unix_shebang_shim(&shim));
+        assert!(!is_unix_shebang_shim(&cmd));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
