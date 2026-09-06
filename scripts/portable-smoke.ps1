@@ -104,19 +104,18 @@ try {
     if (-not $portableService) {
         throw 'Portable package did not launch its foreground service'
     }
-    $fixedRuntime = $null
-    for ($i = 0; $i -lt 60 -and -not $fixedRuntime; $i++) {
+    $webview = $null
+    for ($i = 0; $i -lt 60 -and -not $webview; $i++) {
         Start-Sleep -Milliseconds 500
-        $fixedRuntime = Get-Process msedgewebview2 -ErrorAction SilentlyContinue |
+        $webview = Get-Process msedgewebview2 -ErrorAction SilentlyContinue |
             Where-Object {
                 $_.StartTime -ge $started -and
-                (Test-ProcessPathInDirectory -Path $_.Path -Directory $extractDir) -and
-                $_.Path -like '*Microsoft.WebView2.FixedVersionRuntime.*.x64*'
+                $_.Path -notlike '*Microsoft.WebView2.FixedVersionRuntime.*.x64*'
             } |
             Select-Object -First 1
     }
-    if (-not $fixedRuntime) {
-        throw 'Portable Eir did not use its bundled fixed WebView2 runtime'
+    if (-not $webview) {
+        throw 'Portable Eir did not start the system Evergreen WebView2 runtime'
     }
     $connected = $false
     for ($i = 0; $i -lt 60 -and (-not $connected); $i++) {

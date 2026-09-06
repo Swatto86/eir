@@ -94,15 +94,11 @@ The dependency graph is acyclic and points inward: `eir-proto` depends on nothin
 - `beforeBuildCommand`: `powershell -NoProfile -ExecutionPolicy Bypass -File eir-ui\build-svc.ps1`
 - `beforeDevCommand`: `""` (empty)
 
-`eir-ui/build-svc.ps1` prepares the two generated bundle inputs. It:
-1. Runs `scripts/prepare-webview2.ps1`, which caches only the pinned fixed WebView2 CAB,
-   verifies its SHA-256, always expands it into a fresh staging directory, verifies the
-   extracted runtime executable's Authenticode signature, and only then replaces the
-   generated runtime directory.
-2. Runs `cargo build --locked -p eir-svc --release` (exits 1 on failure).
-3. Resolves the workspace target dir via `cargo metadata --locked --no-deps` →
+`eir-ui/build-svc.ps1` prepares the generated bundle input. It:
+1. Runs `cargo build --locked -p eir-svc --release` (exits 1 on failure).
+2. Resolves the workspace target dir via `cargo metadata --locked --no-deps` →
    `.target_directory`.
-4. Copies `<target>/release/eir-svc.exe` → `eir-ui/bin/eir-svc.exe`, creating `bin/`
+3. Copies `<target>/release/eir-svc.exe` → `eir-ui/bin/eir-svc.exe`, creating `bin/`
    if absent.
 
 `eir-ui/bin/` is **gitignored** (`.gitignore:4` `eir-ui/bin/`; `git check-ignore` confirms `eir-ui/bin/eir-svc.exe` is ignored). So the staged service binary is a build-time artifact, never committed. `tauri.conf.json` `bundle.resources` then pulls it into the installer:
@@ -114,12 +110,13 @@ The dependency graph is acyclic and points inward: `eir-proto` depends on nothin
 This means `eir-svc.exe` ends up at the install root (renamed from `bin/`), alongside the config template and policy file. This is the project-specific application of the user's Tauri rule "wire `beforeBuildCommand` to every generated-frontend-asset step" — here the only generated artifact is the service binary, so that's what the hook builds.
 
 **Build data flow:** `cargo tauri build -- --locked` (in `eir-ui`) → runs `build-svc.ps1`
-(verifies/expands the fixed WebView2 runtime and stages `eir-svc.exe`) →
+(stages `eir-svc.exe`) →
 `tauri_build`/`tauri-codegen` embeds `ui/` HTML+JS into `eir.exe` → NSIS packages the
-UI, service, config/policy, installer hooks, and fixed runtime into
+UI, service, config/policy, and installer hooks into
 `Eir_<version>_x64-setup.exe`, plus signed updater artifacts
-(`createUpdaterArtifacts: true`). `webviewInstallMode.type = "fixedRuntime"` removes
-the runtime-install prerequisite from both fresh and offline installs.
+(`createUpdaterArtifacts: true`). `webviewInstallMode.type = "downloadBootstrapper"`
+uses the machine Evergreen WebView2 runtime (downloads Microsoft’s small bootstrapper
+only when the runtime is missing). Older fixed-runtime trees are removed on upgrade.
 
 ### Toolchain pinning
 
@@ -144,8 +141,7 @@ The workflow has a Windows verification job plus an Ubuntu job that audits the W
 Rust dependency graph:
 1. `actions/checkout@v6`, manifest/Cargo.lock version sync, the compiled NSIS-hook
    harness, release-workflow regressions, and the portable-runner regression.
-2. `dtolnay/rust-toolchain@1.95.0` with `rustfmt, clippy`, **sccache**, Rust caching, and fixed
-   WebView2-CAB-only caching; every build re-derives the expanded runtime.
+2. `dtolnay/rust-toolchain@1.95.0` with `rustfmt, clippy`, **sccache**, and Rust caching.
 3. JavaScript syntax and Rust formatting checks.
 4. **Stage service binary**: runs `build-svc.ps1` — required because `eir-ui`'s
     `tauri_build` validates bundle resources during clippy/tests.
@@ -243,8 +239,9 @@ transactional at the boundary:
 
 ### Portable runtime boundary
 
-The portable artifact self-extracts the UI, EirSvc, default config/policy, and pinned
-WebView2 runtime, then `portable-run.ps1` owns their lifecycle. A native
+The portable artifact self-extracts the UI, EirSvc, and default config/policy, then
+`portable-run.ps1` owns their lifecycle. The UI uses the machine Evergreen WebView2
+runtime (same as the installed app). A native
 `Local\EirPortable` mutex permits one portable instance per Windows session without
 colliding with the installed app. The runner opens a delete-on-close sibling sentinel;
 EirSvc polls that lease and exits when the runner closes or dies. It starts EirSvc only
@@ -264,9 +261,8 @@ Collector-setting changes are saved and take effect after the user restarts port
 
 The Windows MSVC target uses static CRT linkage. The portable import gate rejects UI or
 service binaries that still import `VCRUNTIME*.dll`, `MSVCP*.dll`, or
-`WebView2Loader.dll`, keeping the published executable free of unshipped runtime DLL
-prerequisites. The v0.34.6 portable package passed the real extraction, fixed-WebView,
-private-pipe, persistence, shutdown, and cleanup smoke locally.
+`WebView2Loader.dll`, keeping the published executable free of unshipped Visual C++ /
+loader DLL prerequisites (WebView2 itself is the system Evergreen runtime).
 
 ### Version-bump locations
 

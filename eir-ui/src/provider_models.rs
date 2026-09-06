@@ -1,9 +1,7 @@
 use crate::util::run_command_capped;
-use serde_json::Value;
 use std::{collections::HashSet, path::PathBuf, process::Stdio, time::Duration};
 
 const MODEL_OUTPUT_CAP: usize = 2 * 1024 * 1024;
-const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 
 const CLAUDE_MODELS: &[&str] = &[
     "haiku",
@@ -24,232 +22,38 @@ const CODEX_MODELS: &[&str] = &[
     "gpt-5.4-mini",
     "gpt-5.3-codex-spark",
 ];
-const KILO_MODELS: &[&str] = &[
-    "kilo/x-ai/grok-4.20",
-    "kilo/x-ai/grok-4.3",
-    "kilo/z-ai/glm-5.2",
-    "kilo/z-ai/glm-4.7",
-    "kilo/anthropic/claude-opus-4.8",
-    "kilo/anthropic/claude-sonnet-5",
-    "kilo/openai/gpt-5.6-sol",
-    "kilo/google/gemini-3.1-pro-preview",
-    "kilo/deepseek/deepseek-v4-pro",
-    "kilo/moonshotai/kimi-k2.7-code",
-    "kilo/minimax/minimax-m3",
-];
-const OPENROUTER_MODELS: &[&str] = &[
-    "openrouter/free",
-    "openrouter/auto",
+const OPENCODE_MODELS: &[&str] = &[
+    "ollama/llama3.2",
+    "opencode/big-pickle",
+    "anthropic/claude-sonnet-4-6",
     "openai/gpt-5.4-mini",
-    "anthropic/claude-sonnet-5",
-    "google/gemini-3.1-pro-preview",
-    "x-ai/grok-4.20",
-    "deepseek/deepseek-v4-pro",
-    "minimax/minimax-m3",
+];
+const CURSOR_MODELS: &[&str] = &[
+    "auto",
+    "composer-2.5",
+    "composer-2.5-fast",
+    "gpt-5.6-sol-high",
+    "claude-sonnet-5-thinking-high",
 ];
 
 #[tauri::command]
-pub async fn list_provider_models(
-    provider: String,
-    ollama_base_url: Option<String>,
-) -> Result<Vec<String>, String> {
+pub async fn list_provider_models(provider: String) -> Result<Vec<String>, String> {
     match provider.as_str() {
-        "anthropic" | "claude_cli" => Ok(strings(CLAUDE_MODELS)),
+        "claude_cli" => Ok(strings(CLAUDE_MODELS)),
         "codex_cli" => Ok(cli_models("codex", &["debug", "models"])
             .await
             .and_then(|out| parse_codex_models(&out))
             .unwrap_or_else(|| strings(CODEX_MODELS))),
-        "kilo_cli" => Ok(cli_models("kilo", &["models", "--pure"])
+        "opencode_cli" => Ok(cli_models("opencode", &["models"])
             .await
             .and_then(|out| parse_line_models(&out))
-            .unwrap_or_else(|| strings(KILO_MODELS))),
-        "openrouter" => Ok(openrouter_models()
+            .unwrap_or_else(|| strings(OPENCODE_MODELS))),
+        "cursor_cli" => Ok(cli_models("agent", &["--list-models"])
             .await
-            .unwrap_or_else(|| strings(OPENROUTER_MODELS))),
-        "ollama" => ollama_models(ollama_base_url.as_deref()).await,
+            .and_then(|out| parse_cursor_models(&out))
+            .unwrap_or_else(|| strings(CURSOR_MODELS))),
         _ => Err("Unknown AI provider".into()),
     }
-}
-
-fn normalize_ollama_base_url(raw: Option<&str>) -> String {
-    let trimmed = raw.unwrap_or("").trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return DEFAULT_OLLAMA_BASE_URL.to_string();
-    }
-    if trimmed.ends_with("/v1") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/v1")
-    }
-}
-
-fn ollama_tags_url(base_v1: &str) -> String {
-    let root = base_v1
-        .trim_end_matches('/')
-        .strip_suffix("/v1")
-        .unwrap_or_else(|| base_v1.trim_end_matches('/'));
-    format!("{root}/api/tags")
-}
-
-async fn ollama_models(base_url: Option<&str>) -> Result<Vec<String>, String> {
-    let base = normalize_ollama_base_url(base_url);
-    let tags_url = ollama_tags_url(&base);
-    let stdout = ollama_fetch_tags_json(&tags_url)
-        .await
-        .map_err(|detail| format!("Could not query Ollama at {base} — {detail}"))?;
-    let models = parse_ollama_models(&decode_command_stdout(&stdout))
-        .ok_or_else(|| format!("Could not parse the model list from Ollama at {base}"))?;
-    if models.is_empty() {
-        return Err(
-            "No models pulled on this Ollama server — run `ollama pull <model>` first".into(),
-        );
-    }
-    Ok(models)
-}
-
-/// Fetch raw `/api/tags` JSON. Prefer `curl.exe` (no PowerShell encoding quirks);
-/// fall back to `Invoke-WebRequest` returning the response body as text.
-async fn ollama_fetch_tags_json(tags_url: &str) -> Result<Vec<u8>, String> {
-    if let Some(stdout) = ollama_fetch_tags_via_curl(tags_url).await {
-        return Ok(stdout);
-    }
-    ollama_fetch_tags_via_powershell(tags_url).await
-}
-
-async fn ollama_fetch_tags_via_curl(tags_url: &str) -> Option<Vec<u8>> {
-    let mut command = tokio::process::Command::new("curl.exe");
-    #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
-    let (status, stdout, _) = run_command_capped(
-        command.args(["-sS", "--max-time", "5", tags_url]),
-        Duration::from_secs(10),
-        MODEL_OUTPUT_CAP,
-    )
-    .await?;
-    (status.success() && !stdout.is_empty()).then_some(stdout)
-}
-
-async fn ollama_fetch_tags_via_powershell(tags_url: &str) -> Result<Vec<u8>, String> {
-    let ps_url = tags_url.replace('\'', "''");
-    let script =
-        format!("(Invoke-WebRequest -Uri '{ps_url}' -UseBasicParsing -TimeoutSec 5).Content");
-    let mut command = tokio::process::Command::new("powershell.exe");
-    #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
-    let (status, stdout, stderr) = run_command_capped(
-        command
-            .args(["-NoProfile", "-Command", &script])
-            .stdin(Stdio::null()),
-        Duration::from_secs(10),
-        MODEL_OUTPUT_CAP,
-    )
-    .await
-    .ok_or_else(|| "is the server running?".to_string())?;
-    if !status.success() {
-        let detail = String::from_utf8_lossy(&stderr).trim().to_string();
-        return Err(if detail.is_empty() {
-            "request failed".into()
-        } else {
-            detail
-        });
-    }
-    if stdout.is_empty() {
-        return Err("empty response".into());
-    }
-    Ok(stdout)
-}
-
-/// PowerShell often emits UTF-16 LE on Windows; curl/UTF-8 may include a BOM.
-fn decode_command_stdout(bytes: &[u8]) -> String {
-    if bytes.starts_with(&[0xFF, 0xFE]) {
-        let u16s: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect();
-        return String::from_utf16_lossy(&u16s);
-    }
-    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        return String::from_utf8_lossy(&bytes[3..]).into_owned();
-    }
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-fn parse_ollama_models(output: &str) -> Option<Vec<String>> {
-    let trimmed = output.trim();
-    if trimmed.is_empty() || trimmed == "[]" {
-        return Some(Vec::new());
-    }
-    // Legacy path: PowerShell `ConvertTo-Json` on a name array or a lone string.
-    if trimmed.starts_with('[') && !trimmed.contains("\"models\"") {
-        if let Ok(models) = serde_json::from_str::<Vec<String>>(trimmed) {
-            return Some(filter_ollama_model_ids(models));
-        }
-    }
-    if let Ok(model) = serde_json::from_str::<String>(trimmed) {
-        return Some(filter_ollama_model_ids(vec![model]));
-    }
-    let root: Value = serde_json::from_str(trimmed).ok()?;
-    if let Some(models) = root.as_array() {
-        return Some(extract_ollama_model_ids(models));
-    }
-    root.get("models")
-        .and_then(|models| models.as_array())
-        .map(|models| extract_ollama_model_ids(models))
-}
-
-fn extract_ollama_model_ids(models: &[Value]) -> Vec<String> {
-    models
-        .iter()
-        .filter(|entry| ollama_model_usable_for_chat(entry))
-        .filter_map(|entry| entry["name"].as_str().or_else(|| entry["model"].as_str()))
-        .filter(|id| valid_model_id(id))
-        .map(str::to_string)
-        .collect()
-}
-
-/// Chat/analysis needs a completion model — skip embedding-only entries when
-/// Ollama advertises capabilities (older servers without the field are kept).
-fn ollama_model_usable_for_chat(entry: &Value) -> bool {
-    match entry.get("capabilities").and_then(|caps| caps.as_array()) {
-        Some(caps) => caps.iter().any(|cap| cap.as_str() == Some("completion")),
-        None => true,
-    }
-}
-
-fn filter_ollama_model_ids(models: Vec<String>) -> Vec<String> {
-    models.into_iter().filter(|id| valid_model_id(id)).collect()
-}
-
-async fn openrouter_models() -> Option<Vec<String>> {
-    let mut command = tokio::process::Command::new("powershell.exe");
-    #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
-    let (status, stdout, _) = run_command_capped(
-        command
-            .args([
-                "-NoProfile",
-                "-Command",
-                "try { @((Invoke-RestMethod -Uri 'https://openrouter.ai/api/v1/models' -TimeoutSec 15).data.id) | ConvertTo-Json -Compress } catch { '' }",
-            ])
-            .stdin(Stdio::null()),
-        Duration::from_secs(20),
-        MODEL_OUTPUT_CAP,
-    )
-    .await?;
-    if !status.success() {
-        return None;
-    }
-    let mut models: Vec<String> = serde_json::from_slice::<Vec<String>>(&stdout)
-        .ok()?
-        .into_iter()
-        .filter(|id| valid_model_id(id))
-        .collect();
-    models.sort_unstable();
-    models.dedup();
-    if !models.iter().any(|model| model == "openrouter/free") {
-        models.insert(0, "openrouter/free".into());
-    }
-    (!models.is_empty()).then_some(models)
 }
 
 async fn cli_models(binary: &str, args: &[&str]) -> Option<String> {
@@ -278,67 +82,75 @@ async fn cli_models(binary: &str, args: &[&str]) -> Option<String> {
 fn resolve_binary(name: &str) -> PathBuf {
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
-            for extension in ["exe", "cmd", "bat"] {
-                let candidate = dir.join(format!("{name}.{extension}"));
+            for candidate in [
+                dir.join(name),
+                dir.join(format!("{name}.exe")),
+                dir.join(format!("{name}.cmd")),
+            ] {
                 if candidate.is_file() {
                     return candidate;
                 }
             }
         }
     }
-    let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
-    if let Some(profile) = profile {
-        let candidates = match name {
-            "codex" => vec![
-                profile.join("AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe"),
-                profile.join(".codex\\packages\\standalone\\current\\bin\\codex.exe"),
-                profile.join("AppData\\Roaming\\npm\\codex.cmd"),
-            ],
-            "kilo" => vec![profile.join("AppData\\Roaming\\npm\\kilo.cmd")],
-            _ => Vec::new(),
-        };
-        if let Some(candidate) = candidates.into_iter().find(|path| path.is_file()) {
-            return candidate;
-        }
-    }
     PathBuf::from(name)
 }
 
-fn parse_codex_models(output: &str) -> Option<Vec<String>> {
-    let root: Value = serde_json::from_str(output).ok()?;
-    let models: Vec<String> = root["models"]
-        .as_array()?
-        .iter()
-        .filter(|model| model["visibility"].as_str() == Some("list"))
-        .filter_map(|model| model["slug"].as_str())
-        .filter(|id| valid_model_id(id))
-        .map(str::to_string)
-        .collect();
-    (!models.is_empty()).then_some(models)
-}
-
-fn parse_line_models(output: &str) -> Option<Vec<String>> {
-    let mut seen = HashSet::new();
-    let models: Vec<String> = output
-        .lines()
-        .map(str::trim)
-        .filter(|id| valid_model_id(id))
-        .map(str::to_string)
-        .filter(|id| seen.insert(id.clone()))
-        .collect();
-    (!models.is_empty()).then_some(models)
+fn strings(ids: &[&str]) -> Vec<String> {
+    ids.iter().map(|s| (*s).to_string()).collect()
 }
 
 fn valid_model_id(id: &str) -> bool {
+    let id = id.trim();
     !id.is_empty()
-        && id.len() <= 256
+        && id.len() <= 200
         && id
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._:/@~,+=_-".contains(c))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | ':' | '@'))
 }
 
-fn strings(values: &[&str]) -> Vec<String> {
-    values.iter().map(|value| (*value).to_string()).collect()
+fn parse_line_models(output: &str) -> Option<Vec<String>> {
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    for line in output.lines() {
+        let id = line.trim();
+        if !valid_model_id(id) || !seen.insert(id.to_string()) {
+            continue;
+        }
+        models.push(id.to_string());
+    }
+    (!models.is_empty()).then_some(models)
+}
+
+fn parse_codex_models(output: &str) -> Option<Vec<String>> {
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    for line in output.lines() {
+        let id = line.split_whitespace().next().unwrap_or("").trim();
+        if !valid_model_id(id) || !seen.insert(id.to_string()) {
+            continue;
+        }
+        models.push(id.to_string());
+    }
+    (!models.is_empty()).then_some(models)
+}
+
+/// `agent --list-models` emits `id - Display Name` lines after a header.
+fn parse_cursor_models(output: &str) -> Option<Vec<String>> {
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.eq_ignore_ascii_case("Available models") {
+            continue;
+        }
+        let id = line.split(" - ").next().unwrap_or(line).trim();
+        if !valid_model_id(id) || !seen.insert(id.to_string()) {
+            continue;
+        }
+        models.push(id.to_string());
+    }
+    (!models.is_empty()).then_some(models)
 }
 
 #[cfg(test)]
@@ -346,102 +158,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codex_catalog_filters_hidden_models() {
-        let models = parse_codex_models(
-            r#"{"models":[
-                {"slug":"gpt-5.6-sol","visibility":"list"},
-                {"slug":"codex-auto-review","visibility":"hide"}
-            ]}"#,
-        )
-        .unwrap();
-        assert_eq!(models, ["gpt-5.6-sol"]);
-    }
-
-    #[test]
-    fn line_catalog_rejects_logs_and_shell_characters() {
-        let models = parse_line_models("kilo/openai/gpt-5.6-sol\nlog line\nbad&id\n").unwrap();
-        assert_eq!(models, ["kilo/openai/gpt-5.6-sol"]);
-    }
-
-    #[test]
-    fn line_catalog_removes_non_adjacent_duplicates() {
-        let models = parse_line_models("kilo/a\nkilo/b\nkilo/a\n").unwrap();
-        assert_eq!(models, ["kilo/a", "kilo/b"]);
-    }
-
-    #[test]
-    fn ollama_tags_url_strips_v1_suffix() {
+    fn line_catalog_keeps_provider_slash_ids() {
+        let out = "ollama/llama3.2\nopencode/big-pickle\nbad id with spaces\n";
+        let models = parse_line_models(out).unwrap();
         assert_eq!(
-            ollama_tags_url("http://127.0.0.1:11434/v1"),
-            "http://127.0.0.1:11434/api/tags"
+            models,
+            vec![
+                "ollama/llama3.2".to_string(),
+                "opencode/big-pickle".to_string()
+            ]
         );
     }
 
     #[test]
-    fn ollama_models_parse_json_array() {
-        let models = parse_ollama_models(r#"["llama3.2:latest","mistral"]"#).unwrap();
-        assert_eq!(models, ["llama3.2:latest", "mistral"]);
+    fn cursor_catalog_takes_id_before_dash() {
+        let out =
+            "Available models\n\nauto - Auto (current, default)\ncomposer-2.5 - Composer 2.5\n";
+        let models = parse_cursor_models(out).unwrap();
+        assert_eq!(models, vec!["auto".to_string(), "composer-2.5".to_string()]);
     }
 
     #[test]
-    fn ollama_models_parse_single_json_string() {
-        let models = parse_ollama_models(r#""llama3.2:latest""#).unwrap();
-        assert_eq!(models, ["llama3.2:latest"]);
-    }
-
-    #[test]
-    fn ollama_models_empty_array_means_none_pulled() {
-        assert_eq!(parse_ollama_models("[]").unwrap(), Vec::<String>::new());
-    }
-
-    #[test]
-    fn ollama_models_parse_full_tags_response() {
-        let models = parse_ollama_models(
-            r#"{"models":[{"model":"llama3.2:latest","name":"llama3.2:latest"},{"model":"qwen2.5:7b","name":"qwen2.5:7b"}]}"#,
-        )
-        .unwrap();
-        assert_eq!(models, ["llama3.2:latest", "qwen2.5:7b"]);
-    }
-
-    #[test]
-    fn ollama_models_parse_model_field_only() {
-        let models =
-            parse_ollama_models(r#"{"models":[{"model":"mistral:latest","size":123}]}"#).unwrap();
-        assert_eq!(models, ["mistral:latest"]);
-    }
-
-    #[test]
-    fn ollama_models_allow_underscores_in_tags() {
-        let models = parse_ollama_models(r#"{"models":[{"name":"deepseek-r1:8b_q4"}]}"#).unwrap();
-        assert_eq!(models, ["deepseek-r1:8b_q4"]);
-    }
-
-    #[test]
-    fn ollama_models_skip_embedding_only_entries() {
-        let models = parse_ollama_models(
-            r#"{"models":[
-                {"name":"qwen2.5-coder:14b","capabilities":["completion","tools"]},
-                {"name":"nomic-embed-text:latest","capabilities":["embedding"]}
-            ]}"#,
-        )
-        .unwrap();
-        assert_eq!(models, ["qwen2.5-coder:14b"]);
-    }
-
-    #[test]
-    fn ollama_models_parse_user_tags_payload() {
-        let models =
-            parse_ollama_models(include_str!("../test/fixtures/ollama-tags-sample.json")).unwrap();
-        assert_eq!(models.len(), 4);
-        assert!(!models.iter().any(|m| m.contains("nomic-embed-text")));
-        assert!(models.iter().any(|m| m.contains("qwen3.8-abliterated")));
-    }
-
-    #[test]
-    fn decode_command_stdout_handles_utf16_bom() {
-        let json = r#"{"models":[{"name":"a"}]}"#;
-        let mut bytes = vec![0xFF, 0xFE];
-        bytes.extend(json.encode_utf16().flat_map(|unit| unit.to_le_bytes()));
-        assert!(decode_command_stdout(&bytes).contains(r#""name":"a""#));
+    fn codex_catalog_takes_first_token() {
+        let out = "gpt-5.6-sol  (default)\ngpt-5.4-mini\n";
+        let models = parse_codex_models(out).unwrap();
+        assert_eq!(
+            models,
+            vec!["gpt-5.6-sol".to_string(), "gpt-5.4-mini".to_string()]
+        );
     }
 }

@@ -2,8 +2,6 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-& (Join-Path $PSScriptRoot '..\scripts\prepare-webview2.ps1') | Out-Null
-
 cargo build --locked -p eir-svc --release
 if ($LASTEXITCODE -ne 0) { exit 1 }
 

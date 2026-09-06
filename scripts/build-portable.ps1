@@ -30,8 +30,6 @@ foreach ($path in @($outputPath) + $iexpressTemporaryFiles) {
     }
 }
 
-$runtime = & (Join-Path $PSScriptRoot 'prepare-webview2.ps1')
-$cabPath = $runtime.CabPath
 $launcherPath = (Resolve-Path (Join-Path $PSScriptRoot 'portable-launch.cmd')).Path
 $runnerPath = (Resolve-Path (Join-Path $PSScriptRoot 'portable-run.ps1')).Path
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -42,14 +40,12 @@ $iexpressProcess = $null
 try {
     Copy-Item -LiteralPath $eirPath -Destination (Join-Path $stage 'eir.exe')
     Copy-Item -LiteralPath $servicePath -Destination (Join-Path $stage 'eir-svc.exe')
-    Copy-Item -LiteralPath $cabPath -Destination $stage
     Copy-Item -LiteralPath $launcherPath -Destination $stage
     Copy-Item -LiteralPath $runnerPath -Destination $stage
     Copy-Item -LiteralPath (Join-Path $repoRoot 'config.toml.example') `
         -Destination (Join-Path $stage 'config.toml')
     Copy-Item -LiteralPath (Join-Path $repoRoot 'policy.toml') -Destination $stage
 
-    $cabName = Split-Path -Leaf $cabPath
     $sedPath = Join-Path $stage 'portable.sed'
     @"
 [Version]
@@ -84,15 +80,13 @@ SourceFiles0=$stage\
 %FILE3%=
 %FILE4%=
 %FILE5%=
-%FILE6%=
 [Strings]
 FILE0="eir.exe"
 FILE1="eir-svc.exe"
-FILE2="$cabName"
-FILE3="portable-launch.cmd"
-FILE4="portable-run.ps1"
-FILE5="config.toml"
-FILE6="policy.toml"
+FILE2="portable-launch.cmd"
+FILE3="portable-run.ps1"
+FILE4="config.toml"
+FILE5="policy.toml"
 "@ | Set-Content -LiteralPath $sedPath -Encoding Ascii
 
     $iexpressProcess = Start-Process -FilePath "$env:SystemRoot\System32\iexpress.exe" `

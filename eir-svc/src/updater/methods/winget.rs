@@ -78,8 +78,8 @@ fn no_package_found(output: &str) -> bool {
 /// because LocalSystem has no winget alias in PATH.
 pub(crate) async fn run_winget(args: Vec<String>, dur: std::time::Duration) -> (i32, String) {
     match detect::winget_path_async().await {
-        Some(p) if winget_should_use_active_user(crate::ai::client::running_as_local_system()) => {
-            crate::ai::client::run_winget_as_active_user(&p, &args, dur)
+        Some(p) if winget_should_use_active_user(crate::ai::cli_user::running_as_local_system()) => {
+            crate::ai::cli_user::run_winget_as_active_user(&p, &args, dur)
                 .await
                 .unwrap_or_else(|error| {
                     (

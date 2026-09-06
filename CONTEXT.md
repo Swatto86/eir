@@ -10,6 +10,10 @@ Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.j
 
 ## Architectural decisions
 
+2026-09-06 | Eir | No bundled fixed WebView2 | Installer and portable use the machine Evergreen WebView2 runtime (`webviewInstallMode: downloadBootstrapper`). Fixed-runtime CAB/prepare script and CI cache removed; upgrades delete any leftover `Microsoft.WebView2.FixedVersionRuntime.*` tree in Program Files.
+
+2026-09-06 | Eir | Four CLI-only AI providers | Service AI path is OpenCode / Claude / Codex / Cursor CLIs only. HTTP Anthropic, OpenRouter, Ollama, and Kilo CLI removed from `eir-svc`. Shared NDJSON/process/user-launch helpers under `eir-svc/src/ai/cli_*.rs`. Proto/config keep deprecated wire fields for older trays.
+
 2026-08-21 | Eir | v0.34.17 approval preferences release | Ships reversible Approvals Ignore / Always Approve (keyed by FixAction::dedup_key), hides ignored apps from Updates Available, fixes RejectedSignal to count stable action keys, and removes invalid Cargo `jobs = 0` so CI/release builds on Rust 1.95.
 
 2026-08-21 | Eir | Approval Ignore / Always Approve + hide ignored updates | Approvals cards can Ignore (never re-queue) or Always Approve (auto-run matching future proposals) a semantic fix keyed by `FixAction::dedup_key`; both reverse from the Learned view. Ignored updater apps disappear from Updates Available immediately (Settings Unignore). Learned kept: RejectedSignal now counts stable action keys so quorum can form; UI clarifies automatic learning vs hard preferences.

@@ -56,12 +56,6 @@ jobs:
       - name: Cache Rust build artefacts
         uses: swatinem/rust-cache@v2
 
-      - name: Cache fixed WebView2 runtime
-        uses: actions/cache@v5
-        with:
-          path: target/webview2
-          key: webview2-fixed-150.0.4078.105-x64
-
       - name: Format
         run: cargo fmt --all --check
 

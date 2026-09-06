@@ -8,8 +8,11 @@ Set-StrictMode -Version Latest
 $buildScript = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'build-portable.ps1') -Raw
 $smokeScript = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'portable-smoke.ps1') -Raw
 $launchScript = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'portable-launch.cmd') -Raw
-if ($buildScript -notmatch '(?m)^Compress=0\r?$') {
-    throw 'Portable packaging must not recompress the already-compressed WebView2 CAB.'
+if ($buildScript -match 'prepare-webview2|FixedVersionRuntime') {
+    throw 'Portable packaging must not ship a fixed WebView2 CAB or runtime.'
+}
+if ($launchScript -match 'expand\.exe|FixedVersionRuntime|EIR_WEBVIEW2') {
+    throw 'Portable launcher must not expand or pin a fixed WebView2 runtime.'
 }
 if ($buildScript -notmatch '\[int\]\$IExpressTimeoutSeconds' -or
     $buildScript -notmatch '\.WaitForExit\(\$IExpressTimeoutSeconds \* 1000\)' -or
@@ -33,6 +36,10 @@ foreach ($fragment in @(
     if (-not $smokeScript.Contains($fragment)) {
         throw 'Portable smoke does not force its required info marker and restore ambient RUST_LOG.'
     }
+}
+if ($smokeScript -notmatch 'system Evergreen WebView2' -or
+    $smokeScript -match 'bundled fixed WebView2') {
+    throw 'Portable smoke must require the system Evergreen WebView2 runtime.'
 }
 
 $root = Join-Path ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\target'))) `

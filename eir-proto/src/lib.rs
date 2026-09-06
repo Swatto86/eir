@@ -409,8 +409,9 @@ pub struct UiSettings {
     /// supports it). Empty = a provider-appropriate default.
     pub update_check_model: String,
     /// Reasoning effort: one of low, medium, high, xhigh, max. Empty = the
-    /// provider default. Maps to the equivalent Anthropic, OpenRouter,
-    /// Claude CLI, Codex CLI, or Kilo CLI reasoning control.
+    /// provider default. Maps to `--effort` (Claude CLI),
+    /// `model_reasoning_effort` (Codex CLI), `--variant` (OpenCode CLI), or is
+    /// unused (Cursor CLI).
     #[serde(default)]
     pub effort: String,
     pub decision_interval_secs: u64,
@@ -422,23 +423,34 @@ pub struct UiSettings {
     /// anything below this is blocked.
     #[serde(default)]
     pub confidence_threshold: f32,
+    /// Deprecated HTTP/API-key providers — always false from the service;
+    /// kept so an older tray app can still decode the payload.
+    #[serde(default)]
     pub openrouter_key_set: bool,
+    #[serde(default)]
     pub anthropic_key_set: bool,
-    /// Whether a kilo_cli user-profile override is configured (the Windows
-    /// profile whose logged-in Kilo session the LocalSystem service borrows).
-    /// `#[serde(default)]` keeps an older payload decodable.
+    /// Deprecated kilo_cli overrides — always false from the service.
     #[serde(default)]
     pub kilo_cli_user_profile_set: bool,
-    /// Whether a kilo_cli binary path override is configured. Same default
-    /// rationale as `kilo_cli_user_profile_set`.
     #[serde(default)]
     pub kilo_cli_path_set: bool,
-    /// ollama: OpenAI-compatible API root (e.g. `http://127.0.0.1:11434/v1`).
+    /// Deprecated ollama fields — always empty/false from the service.
     #[serde(default)]
     pub ollama_base_url: String,
-    /// Whether an Ollama cloud API key is configured (for web search).
     #[serde(default)]
     pub ollama_key_set: bool,
+    /// Whether an opencode_cli binary path override is configured.
+    #[serde(default)]
+    pub opencode_cli_path_set: bool,
+    /// Whether an opencode_cli user-profile override is configured.
+    #[serde(default)]
+    pub opencode_cli_user_profile_set: bool,
+    /// Whether a cursor_cli binary path override is configured.
+    #[serde(default)]
+    pub cursor_cli_path_set: bool,
+    /// Whether a cursor_cli user-profile override is configured.
+    #[serde(default)]
+    pub cursor_cli_user_profile_set: bool,
     /// Deprecated (pre-0.17 OpenAI-compatible provider). Always empty/false —
     /// kept on the wire so a not-yet-updated tray app, which requires these
     /// fields, can still decode the payload during an update's skew window.
@@ -465,24 +477,36 @@ pub struct SettingsUpdate {
     pub update_check_model: String,
     #[serde(default)]
     pub effort: String,
+    /// Deprecated secret fields — ignored by the service; kept with
+    /// `serde(default)` so an older tray app's update still decodes.
+    #[serde(default)]
     pub openrouter_api_key: Option<String>,
+    #[serde(default)]
     pub anthropic_api_key: Option<String>,
-    /// kilo_cli: the Windows user profile whose logged-in Kilo session the
-    /// LocalSystem service borrows (e.g. `C:\Users\You`). Blank = auto-detect
-    /// by scanning `C:\Users` for `.local\share\kilo\auth.json`. `None` = unchanged.
     #[serde(default)]
     pub kilo_cli_user_profile: Option<String>,
-    /// kilo_cli: path to the `kilo` binary. Blank = auto-detect on PATH.
-    /// `None` = unchanged.
     #[serde(default)]
     pub kilo_cli_path: Option<String>,
-    /// ollama: OpenAI-compatible API root. Blank keeps the stored URL.
     #[serde(default)]
     pub ollama_base_url: String,
-    /// ollama: cloud API key for web search (`ollama.com/settings/keys`).
-    /// `None` = unchanged.
     #[serde(default)]
     pub ollama_api_key: Option<String>,
+    /// opencode_cli: path to the `opencode` binary. Blank = auto-detect.
+    /// `None` = unchanged.
+    #[serde(default)]
+    pub opencode_cli_path: Option<String>,
+    /// opencode_cli: optional profile hint for interactive/dev runs.
+    /// `None` = unchanged.
+    #[serde(default)]
+    pub opencode_cli_user_profile: Option<String>,
+    /// cursor_cli: path to the `agent` binary. Blank = auto-detect.
+    /// `None` = unchanged.
+    #[serde(default)]
+    pub cursor_cli_path: Option<String>,
+    /// cursor_cli: optional profile hint for interactive/dev runs.
+    /// `None` = unchanged.
+    #[serde(default)]
+    pub cursor_cli_user_profile: Option<String>,
     pub decision_interval_secs: u64,
     pub event_log_poll_interval_secs: u64,
     pub wmi_poll_interval_secs: u64,

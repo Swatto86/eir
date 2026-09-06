@@ -584,23 +584,16 @@
         <div class="set-grid">
           <label for="set-provider">AI provider</label>
           <select id="set-provider">
-            <optgroup label="API services">
-              <option value="openrouter">OpenRouter — free models available</option>
-              <option value="anthropic">Anthropic — API key</option>
-            </optgroup>
-            <optgroup label="Signed-in subscription CLIs">
-              <option value="claude_cli">Claude CLI — Claude subscription</option>
-              <option value="codex_cli">Codex CLI — ChatGPT subscription</option>
-              <option value="kilo_cli">Kilo CLI — Kilo subscription</option>
-            </optgroup>
-            <optgroup label="Local">
-              <option value="ollama">Ollama — local models</option>
-            </optgroup>
+            <option value="opencode_cli">OpenCode CLI — cloud or local Ollama</option>
+            <option value="claude_cli">Claude CLI — Claude subscription</option>
+            <option value="codex_cli">Codex CLI — ChatGPT subscription</option>
+            <option value="cursor_cli">Cursor CLI — Cursor agent</option>
           </select>
           <span class="set-hint" id="provider-hint" aria-live="polite"></span>
           <label for="set-model">Model</label>
-          <input id="set-model" type="search" list="provider-models" autocomplete="off" spellcheck="false" aria-describedby="provider-hint model-hint" placeholder="openrouter/free (auto-routes to a free model)">
-          <datalist id="provider-models"></datalist>
+          <select id="set-model" aria-describedby="provider-hint model-hint" aria-busy="false">
+            <option value="">Loading models…</option>
+          </select>
           <span class="set-hint" id="model-hint" aria-live="polite"></span>
           <label for="set-effort">Reasoning effort</label>
           <select id="set-effort">
@@ -612,19 +605,17 @@
             <option value="max">Max</option>
           </select>
           <label for="set-upd-model">App-update model</label>
-          <input id="set-upd-model" type="search" list="provider-models" autocomplete="off" spellcheck="false" aria-describedby="model-hint" placeholder="blank = a cheap default with web search where supported">
-          <label for="set-or-key" data-provider-only="openrouter">OpenRouter key</label>
-          <input id="set-or-key" data-provider-only="openrouter" type="password" autocomplete="off">
-          <label for="set-an-key" data-provider-only="anthropic" hidden>Anthropic key</label>
-          <input id="set-an-key" data-provider-only="anthropic" type="password" autocomplete="off" hidden>
-          <label for="set-kilo-profile" data-provider-only="kilo_cli" hidden>Kilo CLI user profile</label>
-          <input id="set-kilo-profile" data-provider-only="kilo_cli" type="text" placeholder="C:\Users\You  (blank = auto-detect)" hidden>
-          <label for="set-kilo-path" data-provider-only="kilo_cli" hidden>Kilo CLI binary path</label>
-          <input id="set-kilo-path" data-provider-only="kilo_cli" type="text" placeholder="kilo  (blank = on PATH)" hidden>
-          <label for="set-ollama-url" data-provider-only="ollama" hidden>Ollama base URL</label>
-          <input id="set-ollama-url" data-provider-only="ollama" type="text" placeholder="http://127.0.0.1:11434/v1" hidden>
-          <label for="set-ollama-key" data-provider-only="ollama" hidden>Ollama web-search key</label>
-          <input id="set-ollama-key" data-provider-only="ollama" type="password" autocomplete="off" placeholder="ollama.com/settings/keys" hidden>
+          <select id="set-upd-model" aria-describedby="model-hint" aria-busy="false">
+            <option value="">Same as main model</option>
+          </select>
+          <label for="set-opencode-path" data-provider-only="opencode_cli" hidden>OpenCode binary path</label>
+          <input id="set-opencode-path" data-provider-only="opencode_cli" type="text" placeholder="opencode  (blank = auto-detect)" hidden>
+          <label for="set-opencode-profile" data-provider-only="opencode_cli" hidden>OpenCode user profile</label>
+          <input id="set-opencode-profile" data-provider-only="opencode_cli" type="text" placeholder="C:\Users\You  (blank = auto-detect)" hidden>
+          <label for="set-cursor-path" data-provider-only="cursor_cli" hidden>Cursor agent binary path</label>
+          <input id="set-cursor-path" data-provider-only="cursor_cli" type="text" placeholder="agent  (blank = auto-detect)" hidden>
+          <label for="set-cursor-profile" data-provider-only="cursor_cli" hidden>Cursor user profile</label>
+          <input id="set-cursor-profile" data-provider-only="cursor_cli" type="text" placeholder="C:\Users\You  (blank = auto-detect)" hidden>
           <label for="set-conf">Auto-fix confidence (%)</label>
           <input id="set-conf" type="number" min="50" max="95" step="5" placeholder="80">
           <label for="set-decint">Decision interval (s)</label>
@@ -657,7 +648,9 @@
           <label for="set-adv-enabled">Enable advisor mode</label>
           <input id="set-adv-enabled" type="checkbox">
           <label for="set-adv-model">Escalation model</label>
-          <input id="set-adv-model" type="search" list="provider-models" autocomplete="off" spellcheck="false" aria-describedby="model-hint" placeholder="blank = keep the base model">
+          <select id="set-adv-model" aria-describedby="model-hint" aria-busy="false">
+            <option value="">Same as main model</option>
+          </select>
           <label for="set-adv-effort">Escalation effort</label>
           <select id="set-adv-effort">
             <option value="">Keep base</option>

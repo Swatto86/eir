@@ -1,3 +1,11 @@
+pub mod claude_cli;
+pub mod cli_ndjson;
+pub mod cli_process;
+pub mod cli_user;
 pub mod client;
+mod client_complete;
+pub mod codex_cli;
+pub mod cursor_cli;
 pub mod json;
+pub mod opencode_cli;
 pub mod prompt;

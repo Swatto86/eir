@@ -87,23 +87,18 @@ Each decision cycle (default every 10 minutes):
 
 Everything is configurable in the **Settings** panel — no file editing required.
 
-Six providers:
+Four CLI providers (no API keys pasted into Eir):
 
 | Provider | Cost | Web search | Notes |
 |----------|------|------------|-------|
-| **OpenRouter** *(default)* | Free models | Yes — web plugin | Recommended. `openrouter/free` auto-routes to a current free model; needs an API key. |
-| **Claude CLI (your subscription)** | Uses your Claude plan | Yes — CLI built-in | **No API key** — reuses your logged-in `claude` session; profile and binary auto-detected. |
-| **Codex CLI (your subscription)** | Uses your ChatGPT plan | Yes — CLI built-in | **No API key** — reuses your `codex login` session; binary and current model catalogue are auto-detected. The service launches it with your desktop-user token, never as LocalSystem. |
-| **Claude (Anthropic API)** | Pay-as-you-go | Yes — native web_search tool | API key from console.anthropic.com; token usage tracked, cost estimated from list pricing. |
-| **Kilo Code — your subscription (Kilo CLI)** | Uses your Kilo plan (Pass + addon BYOK included) | Yes — the CLI's built-in | **No API key** — borrows your logged-in `kilo` session, same way the Claude CLI borrows a logged-in Claude subscription. Install with `npm install -g @kilocode/cli`, run `kilo` once to sign in, then pick the provider in Settings with a `provider/model` id — **the `kilo/` prefix routes through your subscription/BYOK**, e.g. `kilo/minimax/minimax-m3`. Profile / binary are auto-detected. |
-| **Ollama (local)** | Free / local hardware | With API key | **No key for local chat** — talks to a local Ollama server (default `http://127.0.0.1:11434/v1`). Install Ollama, `ollama pull` a model, then pick it in Settings (only pulled models are listed). Optional key from [ollama.com/settings/keys](https://ollama.com/settings/keys) enables web search on app-update checks. Vision works when the model supports it. |
+| **OpenCode CLI** *(default)* | Local Ollama free; cloud per your OpenCode plan | Yes — CLI `--auto` on app-update checks | **No API key in Eir** — uses the logged-in `opencode` CLI. Pick `ollama/<model>` for local Ollama, or any `provider/model` from `opencode models`. |
+| **Claude CLI** | Uses your Claude plan | Yes — CLI built-in | **No API key** — reuses your logged-in `claude` session; profile and binary auto-detected. |
+| **Codex CLI** | Uses your ChatGPT plan | Yes — CLI built-in | **No API key** — reuses your `codex login` session; binary and model catalogue auto-detected. Launched with your desktop-user token, never as LocalSystem. |
+| **Cursor CLI** (`agent`) | Uses your Cursor plan | Ask-mode (read-only) | **No API key** — uses the logged-in Cursor `agent` CLI. Run `agent login` once. |
 
 The monitoring loop and the **app-update check** both use your configured provider.
-The app-update check uses live web search where the provider supports it: OpenRouter's
-web plugin (works with free models — about £0.004 per check for the search),
-Anthropic's native web-search tool, the Claude or Codex CLI's built-in search
-(`update_check_model`, blank = a provider default), or the Kilo CLI's own
-`--auto` agent-loop search.
+App-update checks use live web search where the provider supports it (OpenCode `--auto`,
+Claude/Codex built-in search). Cursor runs in ask mode.
 
 Settings includes a **Test provider** button that sends a real request through the
 service and reports its correlated result. Other UI commands also wait for their
@@ -163,22 +158,22 @@ are reported instead of being silently treated as queued.
    [latest release](https://github.com/Swatto86/eir/releases/latest).
 2. Run it **as Administrator**. The installer registers and starts the `EirSvc`
    service in a protected Program Files directory and seeds the default config. It
-   includes a pinned WebView2 runtime, so Windows does not need one preinstalled.
+   uses the machine **Evergreen WebView2** runtime (already present on most Windows
+   10/11 PCs with Edge); if missing, the installer downloads Microsoft’s small
+   WebView2 bootstrapper.
 3. Launch **Eir** from the Start Menu — the tray icon appears once the service
    connects.
-4. The default provider is **OpenRouter**. Open **Settings**, paste your
-   [OpenRouter API key](https://openrouter.ai/keys), and Save — that's all it needs
-   (the `openrouter/free` model is preset). Prefer Claude? Switch the provider to
-   **Claude CLI** or **Codex CLI**, which reuse your logged-in subscription and
-   need no key — or use an Anthropic API key (console.anthropic.com) plus a
-   model, or your logged-in **Kilo CLI** session.
+4. Open **Settings** and pick a provider. Default is **OpenCode CLI** — set a
+   model such as `ollama/<name>` for local Ollama, or any `provider/model` from
+   `opencode models`. **Claude CLI**, **Codex CLI**, and **Cursor CLI** (`agent`)
+   reuse your logged-in subscriptions and need no key in Eir.
 
 Already installed? Eir updates itself automatically.
 
-The release also provides a single-file portable tray executable with the same pinned
-WebView2 runtime embedded and extracted to a temporary directory while it runs. It needs
-no installer, administrator rights, preinstalled WebView2, or Visual C++ runtime: it runs
-EirSvc under the launching user's token for that session. One portable instance may run
+The release also provides a single-file portable tray executable. It needs no
+installer or administrator rights, and uses the same Evergreen WebView2 runtime as
+other desktop apps (plus no Visual C++ redistributable). It runs EirSvc under the
+launching user's token for that session. One portable instance may run
 per Windows session and can coexist with an installed Eir. Its config, policy, audit
 database, and logs persist under `%LOCALAPPDATA%\EirPortable`; closing the portable UI
 also stops its foreground service. Portable mode never changes Start-with-Windows and
@@ -194,7 +189,7 @@ that every configured package manager was available.
 ## Configuration
 
 All settings live in the in-app **Settings** panel: start-with-Windows, AI provider
-and models, API keys, advisor escalation, polling intervals, watched event-log
+and models, advisor escalation, polling intervals, watched event-log
 channels and directories, and app-updater settings. Provider/monitoring settings are
 persisted to `config.toml` next to the installed service executable, or under
 `%LOCALAPPDATA%\EirPortable` in portable mode. Provider/model changes apply live; only
@@ -217,8 +212,8 @@ cargo install tauri-cli --version "^2"
 powershell -NoProfile -File icons\gen-icon.ps1
 
 # 3. Build the installer. This runs build-svc.ps1 first (which compiles EirSvc
-#    and stages bin\eir-svc.exe), verifies a fresh extraction of the pinned
-#    WebView2 CAB, then bundles the tray app + service + runtime into NSIS.
+#    and stages bin\eir-svc.exe), then bundles the tray app + service into NSIS.
+#    WebView2 uses the machine Evergreen runtime (downloadBootstrapper if absent).
 cargo tauri build --config eir-ui/tauri.conf.json -- --locked
 ```
 

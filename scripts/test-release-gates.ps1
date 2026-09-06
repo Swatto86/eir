@@ -26,8 +26,8 @@ $ci = Read-RepoFile '.github\workflows\ci.yml'
 $release = Read-RepoFile '.github\workflows\release.yml'
 $publish = Read-RepoFile 'scripts\publish-release.ps1'
 $versions = Read-RepoFile 'scripts\check-versions.ps1'
-$prepare = Read-RepoFile 'scripts\prepare-webview2.ps1'
 $buildService = Read-RepoFile 'eir-ui\build-svc.ps1'
+$tauriConfig = Read-RepoFile 'eir-ui\tauri.conf.json'
 $serviceSmoke = Read-RepoFile 'scripts\service-smoke.ps1'
 $portableSmoke = Read-RepoFile 'scripts\portable-smoke.ps1'
 $verify = Read-RepoFile 'scripts\verify.ps1'
@@ -89,14 +89,16 @@ foreach ($pair in @(
 }
 
 if ($ci -match 'eir-ui/Microsoft\.WebView2\.FixedVersionRuntime' -or
-    $release -match 'eir-ui/Microsoft\.WebView2\.FixedVersionRuntime') {
-    throw 'Expanded WebView2 runtime must not be restored from the workflow cache.'
+    $release -match 'eir-ui/Microsoft\.WebView2\.FixedVersionRuntime' -or
+    $ci -match 'target/webview2' -or
+    $release -match 'target/webview2' -or
+    $buildService -match 'prepare-webview2' -or
+    $tauriConfig -match 'fixedRuntime') {
+    throw 'Fixed WebView2 runtime packaging must stay removed (Evergreen downloadBootstrapper only).'
 }
-Assert-Contains $prepare '(?s)Get-AuthenticodeSignature.*Move-Item[^\r\n]*\$extractedRuntime[^\r\n]*\$runtimePath' 'WebView2 extraction is not verified before replacing the runtime.'
-Assert-Contains $prepare '\$env:SystemRoot[^\r\n]*Microsoft\.PowerShell\.Security\.psd1' 'WebView2 preparation does not use the trusted absolute signature-module path.'
-Assert-Contains $prepare '(?s)PSEdition -eq ''Desktop''.*?Import-Module \$securityModule -Force.*?Get-AuthenticodeSignature' 'Windows PowerShell does not explicitly load the trusted signature module before verification.'
-if ($prepare -match '(?s)if\s*\(-not\s*\(Test-Path[^\r\n]*\$runtimeExe.*?expand\.exe') {
-    throw 'WebView2 runtime can bypass verified CAB extraction through local reuse.'
+Assert-Contains $tauriConfig '"type"\s*:\s*"downloadBootstrapper"' 'Installer must use Evergreen WebView2 downloadBootstrapper.'
+if (Test-Path -LiteralPath (Join-Path $repoRoot 'scripts\prepare-webview2.ps1')) {
+    throw 'prepare-webview2.ps1 must be deleted; fixed runtime packaging is retired.'
 }
 
 if ($release -match '(?m)^\s+tagName:') {

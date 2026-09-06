@@ -410,8 +410,8 @@ FunctionEnd
   !insertmacro EirRemoveBundleOutput "config.toml.example"
   !insertmacro EirRemoveBundleOutput "policy.toml"
   !insertmacro EirRemoveBundleOutput "uninstall.exe"
-  ; Tauri expands the fixed WebView2 runtime into this exact directory. The .NET
-  ; directory primitive removes links themselves and never follows directory links.
+  ; Older releases bundled a fixed WebView2 tree (~650 MB). Remove it on upgrade so
+  ; Program Files does not keep the obsolete runtime after switching to Evergreen.
   !insertmacro EirRemoveBundleTree "Microsoft.WebView2.FixedVersionRuntime.150.0.4078.105.x64"
   Goto preinstall_done
 

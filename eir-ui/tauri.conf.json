@@ -59,8 +59,8 @@
     "windows": {
       "allowDowngrades": false,
       "webviewInstallMode": {
-        "type": "fixedRuntime",
-        "path": "Microsoft.WebView2.FixedVersionRuntime.150.0.4078.105.x64"
+        "type": "downloadBootstrapper",
+        "silent": true
       },
       "nsis": {
         "installMode": "perMachine",

@@ -232,12 +232,10 @@ const STATUS_META = {
 
 function providerName(p) {
   return ({
-    openrouter: 'OpenRouter',
+    opencode_cli: 'OpenCode CLI',
     claude_cli: 'Claude CLI',
     codex_cli: 'Codex CLI',
-    anthropic: 'Claude (Anthropic)',
-    kilo_cli: 'Kilo CLI',
-    ollama: 'Ollama',
+    cursor_cli: 'Cursor CLI',
   })[p] || p || '';
 }
 
@@ -246,11 +244,8 @@ function analysisLabel(s) {
   if (!s) return '';
   let model = (s.model || '').trim();
   if (!model) {
-    model = s.provider === 'openrouter' ? 'openrouter/free'
-      : s.provider === 'claude_cli' ? 'default model'
-      : s.provider === 'codex_cli' ? 'default model'
-      : s.provider === 'kilo_cli' ? 'default model'
-      : s.provider === 'ollama' ? '(no model set)'
+    model = (s.provider === 'claude_cli' || s.provider === 'codex_cli' || s.provider === 'cursor_cli')
+      ? 'default model'
       : '(no model set)';
   }
   let label = `${providerName(s.provider)} · ${model}`;
@@ -263,28 +258,22 @@ function analysisLabel(s) {
 function updateCheckLabel(s) {
   if (!s) return '';
   const m = (s.update_check_model || '').trim();
-  if (s.provider === 'anthropic') {
-    return `Claude · ${m || 'claude-haiku-4-5'} + web`;
-  }
+  const main = (s.model || '').trim();
   if (s.provider === 'claude_cli') {
     const lower = m.toLowerCase();
     const isClaude = ['haiku', 'sonnet', 'opus'].includes(lower) || lower.startsWith('claude');
     return `Claude CLI · ${isClaude ? m : 'haiku'} + web`;
   }
   if (s.provider === 'codex_cli') {
-    const main = (s.model || '').trim();
     return `Codex CLI · ${m || main || 'default model'} + web`;
   }
-  if (s.provider === 'kilo_cli') {
-    return `Kilo CLI · ${m || 'main model'} + web`;
+  if (s.provider === 'cursor_cli') {
+    return `Cursor CLI · ${m || main || 'default model'}`;
   }
-  if (s.provider === 'ollama') {
-    const web = s.ollama_key_set ? ' + web' : ' (no web search key)';
-    return `Ollama · ${m || 'main model'}${web}`;
+  if (s.provider === 'opencode_cli') {
+    return `OpenCode CLI · ${m || main || '(no model set)'} + web`;
   }
-  const main = (s.model || '').trim() || (s.provider === 'openrouter' ? 'openrouter/free' : '');
-  const web = s.provider === 'openrouter' ? ' + web' : '';
-  return `${providerName(s.provider)} · ${m || main}${web}`;
+  return `${providerName(s.provider)} · ${m || main || '(no model set)'}`;
 }
 
 // ── Refresh loop ──────────────────────────────────────────────────────────────
@@ -1318,22 +1307,19 @@ function renderUsage(u) {
   const usageSig = JSON.stringify({ u, provider, gbpRate });
   if (usageSig === lastUsageSig) return;
   lastUsageSig = usageSig;
-  // Claude CLI runs on the subscription: no charge, so cost cells show a dash
-  // (the CLI's figures are only the equivalent API cost).
-  const free = provider === 'claude_cli' || provider === 'codex_cli' || provider === 'ollama';
+  // Subscription / local CLIs: no charge, so cost cells show a dash
+  // (figures are only the equivalent API cost when reported).
+  const free = provider === 'claude_cli' || provider === 'codex_cli'
+    || provider === 'opencode_cli' || provider === 'cursor_cli';
   const costCell = (c) => (free ? '—' : fmtGbp(c));
-  const note = provider === 'openrouter'
-    ? 'OpenRouter-reported cost — £0.00 on free models.'
-    : provider === 'claude_cli'
-      ? 'No charge — uses your Claude subscription. Token counts shown for transparency.'
-      : provider === 'codex_cli'
-        ? 'No charge — uses your ChatGPT subscription. Token counts shown for transparency.'
-      : provider === 'ollama'
-        ? 'No charge — runs on your local Ollama server.'
-      : provider === 'anthropic'
-        ? 'Estimated from Anthropic list pricing.'
-        : provider === 'kilo_cli'
-          ? 'Kilo-reported cost — usually covered by your Kilo plan; real for BYOK models.'
+  const note = provider === 'claude_cli'
+    ? 'No charge — uses your Claude subscription. Token counts shown for transparency.'
+    : provider === 'codex_cli'
+      ? 'No charge — uses your ChatGPT subscription. Token counts shown for transparency.'
+      : provider === 'cursor_cli'
+        ? 'No charge — uses your Cursor subscription. Token counts shown for transparency.'
+        : provider === 'opencode_cli'
+          ? 'No charge for local Ollama models; other OpenCode models follow your OpenCode plan.'
           : 'Provider-reported cost where available.';
   document.getElementById('usage-body').innerHTML = `
     <div class="usage-grid">
@@ -1779,30 +1765,10 @@ function numVal(id, def, min, max) {
 }
 
 const PROVIDER_HINTS = {
-  openrouter: 'One key, hundreds of models — free ones included. Blank model uses openrouter/free. Key: openrouter.ai/keys',
+  opencode_cli: 'Uses the logged-in OpenCode CLI — no API key in Eir. Pick a cloud model (provider/model) or a local Ollama model (ollama/…). Install OpenCode and sign in once; pull Ollama models with `ollama pull`.',
   claude_cli: 'Uses your Claude subscription via the logged-in claude CLI — no API key. Auto-detects your profile and claude.exe. Blank model = the CLI default; aliases like haiku/sonnet/opus work.',
   codex_cli: 'Uses your ChatGPT subscription via the logged-in Codex CLI — no API key. Install Codex and run `codex login` once; Eir auto-detects your profile and codex.exe.',
-  anthropic: 'Claude direct from Anthropic. A model is required (e.g. claude-opus-4-8, claude-haiku-4-5). Key: console.anthropic.com',
-  kilo_cli: 'Uses your Kilo subscription via the logged-in Kilo CLI — no API key. Install with `npm install -g @kilocode/cli`, then run `kilo` once to sign in. Subscription models use the kilo/ prefix.',
-  ollama: 'Uses a local Ollama server for chat — no key needed for that. For app-update web search, add a free key from ollama.com/settings/keys. Only pulled models appear in the list.',
-};
-
-const PROVIDER_MODEL_PLACEHOLDERS = {
-  openrouter: 'Choose a model; blank uses openrouter/free',
-  claude_cli: 'blank = CLI default, or haiku / sonnet / opus',
-  codex_cli: 'blank = CLI default, or choose a Codex model',
-  anthropic: 'required, e.g. claude-opus-4-8 or claude-haiku-4-5',
-  kilo_cli: 'Choose a kilo/ subscription model',
-  ollama: 'required, e.g. llama3.2 or qwen2.5:7b',
-};
-
-const PROVIDER_UPDATE_PLACEHOLDERS = {
-  openrouter: 'blank = main model, with web search',
-  claude_cli: 'blank = Haiku, with web search',
-  codex_cli: 'blank = main model, with web search',
-  anthropic: 'blank = Claude Haiku, with web search',
-  kilo_cli: 'blank = main model, with web search',
-  ollama: 'blank = main model, with web search when key set',
+  cursor_cli: 'Uses your Cursor subscription via the logged-in `agent` CLI — no API key. Install the Cursor agent CLI and run `agent login` once; Eir auto-detects agent on PATH.',
 };
 
 const MODEL_INPUT_IDS = ['set-model', 'set-upd-model', 'set-adv-model'];
@@ -1819,80 +1785,94 @@ function rememberModelValues(provider) {
   if (provider) modelValuesByProvider.set(provider, currentModelValues());
 }
 
-function restoreModelValues(provider) {
-  const values = modelValuesByProvider.get(provider) || ['', '', ''];
-  MODEL_INPUT_IDS.forEach((id, index) => {
-    document.getElementById(id).value = values[index] || '';
-  });
+function mainModelBlankLabel(provider) {
+  if (provider === 'opencode_cli') return 'Choose a model…';
+  return 'CLI default';
 }
 
-async function loadProviderModels(provider) {
+/** Rebuild a model <select> from the provider catalogue, keeping the current value. */
+function fillModelSelect(selectId, models, preferred, blankLabel) {
+  const el = document.getElementById(selectId);
+  const want = (preferred || '').trim();
+  const ids = [];
+  const seen = new Set();
+  const add = (id) => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    ids.push(id);
+  };
+  add('');
+  if (want) add(want);
+  (models || []).forEach(add);
+
+  const fragment = document.createDocumentFragment();
+  ids.forEach((id) => {
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = id ? id : blankLabel;
+    fragment.appendChild(opt);
+  });
+  el.replaceChildren(fragment);
+  el.value = seen.has(want) ? want : '';
+}
+
+async function loadProviderModels(provider, preferredValues) {
   const request = ++modelListRequest;
-  const list = document.getElementById('provider-models');
   const hint = document.getElementById('model-hint');
-  list.replaceChildren();
+  const preferred = preferredValues || currentModelValues();
   hint.textContent = 'Loading models…';
-  MODEL_INPUT_IDS.forEach((id) => document.getElementById(id).setAttribute('aria-busy', 'true'));
+  MODEL_INPUT_IDS.forEach((id) => {
+    const el = document.getElementById(id);
+    el.setAttribute('aria-busy', 'true');
+    el.disabled = true;
+  });
   try {
-    const args = { provider };
-    if (provider === 'ollama') {
-      args.ollamaBaseUrl = document.getElementById('set-ollama-url').value.trim() || null;
-    }
-    const models = await invoke('list_provider_models', args);
+    const models = await invoke('list_provider_models', { provider });
     if (request !== modelListRequest || provider !== document.getElementById('set-provider').value) return;
-    const selected = currentModelValues().filter(Boolean);
-    const values = [...new Set([...selected, ...(models || [])])];
-    const fragment = document.createDocumentFragment();
-    values.forEach((value) => {
-      const option = document.createElement('option');
-      option.value = value;
-      fragment.appendChild(option);
-    });
-    list.replaceChildren(fragment);
-    const countLabel = provider === 'ollama'
-      ? `${values.length} pulled model${values.length === 1 ? '' : 's'}`
-      : `${values.length} model${values.length === 1 ? '' : 's'}`;
-    hint.textContent = `${countLabel} — open the list or type to filter.`;
+    const list = Array.isArray(models) ? models : [];
+    fillModelSelect('set-model', list, preferred[0], mainModelBlankLabel(provider));
+    fillModelSelect('set-upd-model', list, preferred[1], 'Same as main model');
+    fillModelSelect('set-adv-model', list, preferred[2], 'Same as main model');
+    hint.textContent = list.length
+      ? `${list.length} model${list.length === 1 ? '' : 's'} available — choose from the lists below.`
+      : 'No models returned — the current selection is still preserved.';
   } catch (e) {
     if (request === modelListRequest) {
-      const msg = typeof e === 'string' ? e : String(e);
-      hint.textContent = provider === 'ollama'
-        ? msg
-        : 'Model list unavailable — the current model is still preserved.';
-      if (provider !== 'ollama') console.error('list_provider_models failed', e);
+      // Keep whatever is selected; still offer blank + current values so Save works.
+      fillModelSelect('set-model', [], preferred[0], mainModelBlankLabel(provider));
+      fillModelSelect('set-upd-model', [], preferred[1], 'Same as main model');
+      fillModelSelect('set-adv-model', [], preferred[2], 'Same as main model');
+      hint.textContent = 'Model list unavailable — current selection kept. Is the CLI installed and on PATH?';
+      console.error('list_provider_models failed', e);
     }
   } finally {
     if (request === modelListRequest) {
-      MODEL_INPUT_IDS.forEach((id) => document.getElementById(id).removeAttribute('aria-busy'));
+      MODEL_INPUT_IDS.forEach((id) => {
+        const el = document.getElementById(id);
+        el.removeAttribute('aria-busy');
+        el.disabled = false;
+      });
     }
   }
 }
 
-function updateProviderHint() {
+function updateProviderHint(preferredModels) {
   const provider = document.getElementById('set-provider').value;
   document.getElementById('provider-hint').textContent = PROVIDER_HINTS[provider] || '';
-  document.getElementById('set-model').placeholder = PROVIDER_MODEL_PLACEHOLDERS[provider] || '';
-  document.getElementById('set-upd-model').placeholder =
-    PROVIDER_UPDATE_PLACEHOLDERS[provider] || '';
   document.querySelectorAll('[data-provider-only]').forEach((field) => {
     field.hidden = field.dataset.providerOnly !== provider;
   });
-  loadProviderModels(provider);
+  loadProviderModels(provider, preferredModels);
 }
 
 function switchProvider() {
   const provider = document.getElementById('set-provider').value;
   rememberModelValues(activeModelProvider);
   activeModelProvider = provider;
-  restoreModelValues(provider);
-  updateProviderHint();
+  const preferred = modelValuesByProvider.get(provider) || ['', '', ''];
+  updateProviderHint(preferred);
 }
 document.getElementById('set-provider').addEventListener('change', switchProvider);
-document.getElementById('set-ollama-url').addEventListener('change', () => {
-  if (document.getElementById('set-provider').value === 'ollama') {
-    loadProviderModels('ollama');
-  }
-});
 
 let autostartRequest = 0;
 async function fillAutostartSetting() {
@@ -1942,14 +1922,17 @@ function fillSettings() {
   // A service restart invalidates the old snapshot, but must not erase edits the
   // user was typing when the pipe dropped. Rehydrate each clean card independently.
   if (!dirtyCards.has('card-provider')) {
-    const provider = s.provider || 'openrouter';
+    const provider = s.provider || 'opencode_cli';
     document.getElementById('set-provider').value = provider;
     activeModelProvider = provider;
     savedProvider = provider;
-    updateProviderHint();
-    document.getElementById('set-model').value = s.model || '';
+    const adv = (lastStatus.advisor && lastStatus.advisor.settings) || {};
+    updateProviderHint([
+      s.model || '',
+      s.update_check_model || '',
+      adv.escalation_model || '',
+    ]);
     document.getElementById('set-effort').value = s.effort || '';
-    document.getElementById('set-upd-model').value = s.update_check_model || '';
     document.getElementById('set-conf').value = Math.round((s.confidence_threshold || 0.80) * 100);
     document.getElementById('set-decint').value = s.decision_interval_secs || 600;
     document.getElementById('set-elpoll').value = s.event_log_poll_interval_secs || 30;
@@ -1958,17 +1941,14 @@ function fillSettings() {
     document.getElementById('set-dirs').value = (s.log_directories || []).join(', ');
     document.getElementById('set-game-auto').checked = s.game_mode_auto !== false;
     document.getElementById('set-game-power').checked = !!s.game_mode_power_boost;
-    document.getElementById('set-or-key').placeholder =
-      s.openrouter_key_set ? '•••••• set — blank keeps it' : 'not set';
-    document.getElementById('set-an-key').placeholder =
-      s.anthropic_key_set ? '•••••• set — blank keeps it' : 'not set';
-    document.getElementById('set-kilo-profile').placeholder =
-      s.kilo_cli_user_profile_set ? '•••••• set — blank keeps it' : 'C:\\Users\\You  (blank = auto-detect)';
-    document.getElementById('set-kilo-path').placeholder =
-      s.kilo_cli_path_set ? '•••••• set — blank keeps it' : 'kilo  (blank = on PATH)';
-    document.getElementById('set-ollama-url').value = s.ollama_base_url || 'http://127.0.0.1:11434/v1';
-    document.getElementById('set-ollama-key').placeholder =
-      s.ollama_key_set ? '•••••• set — blank keeps it' : 'ollama.com/settings/keys (for web search)';
+    document.getElementById('set-opencode-path').placeholder =
+      s.opencode_cli_path_set ? '•••••• set — blank keeps it' : 'opencode  (blank = auto-detect)';
+    document.getElementById('set-opencode-profile').placeholder =
+      s.opencode_cli_user_profile_set ? '•••••• set — blank keeps it' : 'C:\\Users\\You  (blank = auto-detect)';
+    document.getElementById('set-cursor-path').placeholder =
+      s.cursor_cli_path_set ? '•••••• set — blank keeps it' : 'agent  (blank = auto-detect)';
+    document.getElementById('set-cursor-profile').placeholder =
+      s.cursor_cli_user_profile_set ? '•••••• set — blank keeps it' : 'C:\\Users\\You  (blank = auto-detect)';
     rememberModelValues(provider);
   }
   if (!dirtyCards.has('card-updater')) {
@@ -1986,23 +1966,25 @@ function fillSettings() {
 
 async function saveSettings() {
   const splitList = (v) => v.split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
-  const orKey = document.getElementById('set-or-key').value.trim();
-  const anKey = document.getElementById('set-an-key').value.trim();
-  const kiloProfile = document.getElementById('set-kilo-profile').value.trim();
-  const kiloPath = document.getElementById('set-kilo-path').value.trim();
-  const ollamaUrl = document.getElementById('set-ollama-url').value.trim();
-  const ollamaKey = document.getElementById('set-ollama-key').value.trim();
+  const opencodePath = document.getElementById('set-opencode-path').value.trim();
+  const opencodeProfile = document.getElementById('set-opencode-profile').value.trim();
+  const cursorPath = document.getElementById('set-cursor-path').value.trim();
+  const cursorProfile = document.getElementById('set-cursor-profile').value.trim();
   const settings = {
     provider: document.getElementById('set-provider').value,
     model: document.getElementById('set-model').value.trim(),
     effort: document.getElementById('set-effort').value,
     update_check_model: document.getElementById('set-upd-model').value.trim(),
-    openrouter_api_key: orKey || null,
-    anthropic_api_key: anKey || null,
-    kilo_cli_user_profile: kiloProfile || null,
-    kilo_cli_path: kiloPath || null,
-    ollama_base_url: ollamaUrl,
-    ollama_api_key: ollamaKey || null,
+    openrouter_api_key: null,
+    anthropic_api_key: null,
+    kilo_cli_user_profile: null,
+    kilo_cli_path: null,
+    ollama_base_url: '',
+    ollama_api_key: null,
+    opencode_cli_path: opencodePath || null,
+    opencode_cli_user_profile: opencodeProfile || null,
+    cursor_cli_path: cursorPath || null,
+    cursor_cli_user_profile: cursorProfile || null,
     confidence_threshold: numVal('set-conf', 80, 50, 95) / 100,
     decision_interval_secs: numVal('set-decint', 600, 10, 604800),
     event_log_poll_interval_secs: numVal('set-elpoll', 30, 5, 604800),
@@ -2014,43 +1996,20 @@ async function saveSettings() {
   };
   const st = document.getElementById('set-status');
 
-  const s = (lastStatus && lastStatus.settings) || {};
   const providerChanged = !!savedProvider && savedProvider !== settings.provider;
-  if (settings.provider === 'openrouter' && !settings.model) {
-    settings.model = 'openrouter/free';
-  }
-  if (settings.provider === 'anthropic') {
-    if (!anKey && !s.anthropic_key_set) {
-      st.textContent = 'Claude needs an Anthropic API key — enter one above, then Save.';
-      return;
-    }
-    if (!settings.model) {
-      st.textContent = 'Claude needs a model — e.g. claude-opus-4-8 or claude-haiku-4-5';
-      return;
-    }
-  }
-  if (settings.provider === 'kilo_cli') {
-    if (!settings.model) {
-      st.textContent = 'Kilo CLI needs a model — e.g. kilo/minimax/minimax-m3 or kilo/anthropic/claude-sonnet-5';
-      return;
-    }
-  }
-  if (settings.provider === 'ollama') {
-    if (!settings.model) {
-      st.textContent = 'Ollama needs a model — e.g. llama3.2 or qwen2.5:7b (run `ollama pull` first)';
-      return;
-    }
+  if (settings.provider === 'opencode_cli' && !settings.model) {
+    st.textContent = 'OpenCode needs a model — e.g. ollama/llama3.2 or a cloud provider/model id';
+    return;
   }
 
   st.textContent = 'Saving…';
   try {
     const result = await invoke('update_settings', { settings });
     st.textContent = commandMessage(result, 'Settings applied.');
-    document.getElementById('set-or-key').value = '';
-    document.getElementById('set-an-key').value = '';
-    document.getElementById('set-ollama-key').value = '';
-    document.getElementById('set-kilo-profile').value = '';
-    document.getElementById('set-kilo-path').value = '';
+    document.getElementById('set-opencode-path').value = '';
+    document.getElementById('set-opencode-profile').value = '';
+    document.getElementById('set-cursor-path').value = '';
+    document.getElementById('set-cursor-profile').value = '';
     dirtyCards.delete('card-provider');
     savedProvider = settings.provider;
     if (providerChanged) {
@@ -2072,7 +2031,15 @@ function fillAdvisorSettings(s) {
   if (!s) return;
   document.getElementById('set-adv-save').disabled = false;
   document.getElementById('set-adv-enabled').checked = !!s.enabled;
-  document.getElementById('set-adv-model').value = s.escalation_model || '';
+  const advModel = s.escalation_model || '';
+  const advSelect = document.getElementById('set-adv-model');
+  if (advModel && ![...advSelect.options].some((o) => o.value === advModel)) {
+    const opt = document.createElement('option');
+    opt.value = advModel;
+    opt.textContent = advModel;
+    advSelect.appendChild(opt);
+  }
+  advSelect.value = advModel;
   document.getElementById('set-adv-effort').value = s.escalation_effort || '';
   document.getElementById('set-adv-conf').value = Math.round(
     (s.low_confidence_threshold != null ? s.low_confidence_threshold : 0.6) * 100

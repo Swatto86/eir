@@ -73,59 +73,59 @@ impl AdvisorConfig {
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ApiProvider {
-    /// Anthropic native API (`/v1/messages`, API key). The legacy
-    /// `openai_compatible` provider aliases here so an old config.toml still
-    /// loads (it then needs a key set in Settings before analysis resumes).
+    /// OpenCode via the local `opencode` CLI — no API key; models can include
+    /// cloud providers and local `ollama/...`. Legacy openrouter / kilo / ollama
+    /// provider names alias here so an old config.toml still loads.
     #[default]
     #[serde(
-        rename = "anthropic",
+        rename = "opencode_cli",
+        alias = "openrouter",
+        alias = "open_router",
+        alias = "kilo_cli",
+        alias = "kilocode",
+        alias = "kilo",
+        alias = "ollama"
+    )]
+    OpenCode,
+    /// Claude via the local `claude` CLI — no API key, uses the machine's
+    /// logged-in Claude subscription session. Legacy `anthropic` /
+    /// `openai_compatible` names alias here.
+    #[serde(
+        rename = "claude_cli",
+        alias = "anthropic",
         alias = "openai_compatible",
         alias = "open_ai_compatible"
     )]
-    Anthropic,
-    /// Claude via the local `claude` CLI — no API key, uses the machine's
-    /// logged-in Claude subscription session.
-    #[serde(rename = "claude_cli")]
-    ClaudeCli,
+    Claude,
     /// Codex via the local `codex` CLI — no API key, uses the machine's
     /// logged-in ChatGPT subscription session.
     #[serde(rename = "codex_cli")]
-    CodexCli,
-    /// OpenRouter (openrouter.ai) — OpenAI-compatible; supports free models.
-    #[serde(rename = "openrouter", alias = "open_router")]
-    OpenRouter,
-    /// Kilo Code via the local `kilo` CLI — borrows the machine's logged-in
-    /// Kilo session (Kilo Pass / Token-Plan addons / BYOK all flow through it
-    /// automatically); no API key to paste. The removed `kilocode` gateway
-    /// provider (and its `kilo` alias) now aliases here too — the closest
-    /// surviving equivalent for an old config.toml.
-    #[serde(rename = "kilo_cli", alias = "kilocode", alias = "kilo")]
-    KiloCli,
-    /// Local Ollama server (OpenAI-compatible `/v1/chat/completions`).
-    #[serde(rename = "ollama")]
-    Ollama,
+    Codex,
+    /// Cursor Agent via the local `agent` CLI — no API key; uses the machine's
+    /// logged-in Cursor subscription session.
+    #[serde(rename = "cursor_cli")]
+    Cursor,
 }
 
 impl ApiProvider {
     pub fn as_str(&self) -> &'static str {
         match self {
-            ApiProvider::Anthropic => "anthropic",
-            ApiProvider::ClaudeCli => "claude_cli",
-            ApiProvider::CodexCli => "codex_cli",
-            ApiProvider::OpenRouter => "openrouter",
-            ApiProvider::KiloCli => "kilo_cli",
-            ApiProvider::Ollama => "ollama",
+            ApiProvider::OpenCode => "opencode_cli",
+            ApiProvider::Claude => "claude_cli",
+            ApiProvider::Codex => "codex_cli",
+            ApiProvider::Cursor => "cursor_cli",
         }
     }
 
     fn parse(s: &str) -> ApiProvider {
         match s {
-            "claude_cli" => ApiProvider::ClaudeCli,
-            "codex_cli" => ApiProvider::CodexCli,
-            "openrouter" | "open_router" => ApiProvider::OpenRouter,
-            "kilo_cli" | "kilocode" | "kilo" => ApiProvider::KiloCli,
-            "ollama" => ApiProvider::Ollama,
-            _ => ApiProvider::Anthropic,
+            "claude_cli" | "anthropic" | "openai_compatible" | "open_ai_compatible" => {
+                ApiProvider::Claude
+            }
+            "codex_cli" => ApiProvider::Codex,
+            "cursor_cli" => ApiProvider::Cursor,
+            // Default + legacy HTTP/CLI providers that now map to OpenCode.
+            _ => ApiProvider::OpenCode,
         }
     }
 }
@@ -134,21 +134,15 @@ impl ApiProvider {
 pub struct ApiConfig {
     #[serde(default)]
     pub provider: ApiProvider,
-    /// Anthropic native: API key from console.anthropic.com
-    pub anthropic_api_key: Option<String>,
-    /// OpenRouter API key (provider = "openrouter").
-    pub openrouter_api_key: Option<String>,
-    /// Model name. Empty = a provider default (OpenRouter: openrouter/free).
+    /// Model name. Empty = provider / CLI default.
     #[serde(default)]
     pub model: String,
     /// Model for the on-demand app-update check (empty = a cheap provider default).
     #[serde(default)]
     pub update_check_model: String,
     /// Reasoning effort: low|medium|high|xhigh|max, empty = provider default.
-    /// Maps to `output_config.effort` (Anthropic), `reasoning.effort`
-    /// (OpenRouter), `--effort` (Claude CLI), `model_reasoning_effort`
-    /// (Codex CLI), or `--variant` (kilo CLI);
-    /// models without a reasoning dial may reject it.
+    /// Maps to `--effort` (Claude CLI), `model_reasoning_effort` (Codex CLI),
+    /// or `--variant` (OpenCode CLI); Cursor has no effort dial.
     #[serde(default)]
     pub effort: String,
     /// claude_cli: path to the claude binary. Blank = auto-detect
@@ -163,20 +157,19 @@ pub struct ApiConfig {
     /// resolved user profile, then PATH.
     #[serde(default)]
     pub codex_cli_path: Option<String>,
-    /// kilo_cli: path to the `kilo` binary (from `npm install -g @kilocode/cli`
-    /// or the standalone Windows zip). Blank = "kilo" on PATH.
+    /// opencode_cli: path to the `opencode` binary. Blank = auto-detect.
     #[serde(default)]
-    pub kilo_cli_path: Option<String>,
-    /// kilo_cli: optional profile hint for interactive/dev runs. The Kilo CLI
-    /// stores its session in `.local\share\kilo\auth.json`; the LocalSystem
-    /// service always uses the sole active desktop user's profile and token.
+    pub opencode_cli_path: Option<String>,
+    /// opencode_cli: optional profile hint for interactive/dev runs.
     #[serde(default)]
-    pub kilo_cli_user_profile: Option<String>,
-    /// ollama: OpenAI-compatible API root (default `http://127.0.0.1:11434/v1`).
-    #[serde(default = "default_ollama_base_url")]
-    pub ollama_base_url: String,
-    /// ollama: API key from ollama.com/settings/keys for cloud web search.
-    pub ollama_api_key: Option<String>,
+    pub opencode_cli_user_profile: Option<String>,
+    /// cursor_cli: path to the `agent` binary. Blank = auto-detect
+    /// (`<profile>\.local\bin\agent.cmd`, then PATH).
+    #[serde(default)]
+    pub cursor_cli_path: Option<String>,
+    /// cursor_cli: optional profile hint for interactive/dev runs.
+    #[serde(default)]
+    pub cursor_cli_user_profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -209,22 +202,6 @@ fn default_confidence() -> f32 {
     0.80
 }
 
-fn default_ollama_base_url() -> String {
-    "http://127.0.0.1:11434/v1".to_string()
-}
-
-/// Normalise an Ollama OpenAI-compatible base URL (`…/v1`, no trailing slash).
-pub fn normalize_ollama_base_url(raw: &str) -> String {
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return default_ollama_base_url();
-    }
-    if trimmed.ends_with("/v1") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/v1")
-    }
-}
 fn default_true() -> bool {
     true
 }
@@ -380,7 +357,6 @@ fn sanitize_loaded_log_directories(directories: Vec<String>) -> Vec<String> {
 impl Config {
     /// Current settings for the UI (no secrets — only whether they are set).
     pub fn to_ui_settings(&self) -> UiSettings {
-        let set = |o: &Option<String>| o.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
         UiSettings {
             provider: self.api.provider.as_str().to_string(),
             model: self.api.model.clone(),
@@ -394,16 +370,25 @@ impl Config {
             event_log_channels: self.monitoring.event_log_channels.clone(),
             log_directories: self.monitoring.log_directories.clone(),
             confidence_threshold: self.monitoring.confidence_threshold,
-            openrouter_key_set: set(&self.api.openrouter_api_key),
-            anthropic_key_set: set(&self.api.anthropic_api_key),
-            kilo_cli_user_profile_set: self
+            // Deprecated wire fields (always empty/false — see eir_proto::UiSettings).
+            openrouter_key_set: false,
+            anthropic_key_set: false,
+            kilo_cli_user_profile_set: false,
+            kilo_cli_path_set: false,
+            ollama_base_url: String::new(),
+            ollama_key_set: false,
+            opencode_cli_path_set: self.api.opencode_cli_path.as_deref().is_some_and(is_real),
+            opencode_cli_user_profile_set: self
                 .api
-                .kilo_cli_user_profile
+                .opencode_cli_user_profile
                 .as_deref()
                 .is_some_and(is_real),
-            kilo_cli_path_set: self.api.kilo_cli_path.as_deref().is_some_and(is_real),
-            ollama_base_url: self.api.ollama_base_url.clone(),
-            ollama_key_set: set(&self.api.ollama_api_key),
+            cursor_cli_path_set: self.api.cursor_cli_path.as_deref().is_some_and(is_real),
+            cursor_cli_user_profile_set: self
+                .api
+                .cursor_cli_user_profile
+                .as_deref()
+                .is_some_and(is_real),
             // Deprecated wire fields (see eir_proto::UiSettings).
             base_url: String::new(),
             api_key_set: false,
@@ -435,9 +420,8 @@ impl Config {
         self.api.model = u.model;
         self.api.update_check_model = u.update_check_model;
         self.api.effort = normalize_effort(&u.effort);
-        // A blank/whitespace value means "unchanged" (the UI can't show a stored
-        // secret, so it sends the field blank on every save). Store the trimmed
-        // value so a pasted key with a trailing newline/space still authenticates.
+        // Blank/whitespace means "unchanged" for path/profile overrides (the UI
+        // sends blank on every unrelated save).
         let keep = |cur: &mut Option<String>, new: Option<String>| {
             if let Some(v) = new {
                 let v = v.trim();
@@ -446,17 +430,16 @@ impl Config {
                 }
             }
         };
-        keep(&mut self.api.openrouter_api_key, u.openrouter_api_key);
-        keep(&mut self.api.anthropic_api_key, u.anthropic_api_key);
-        keep(&mut self.api.ollama_api_key, u.ollama_api_key);
-        // Same "blank = unchanged" rule for the kilo_cli hint overrides: the field
-        // is always blank on load, so treating blank as "clear" wiped a configured
-        // override on every unrelated settings save.
-        keep(&mut self.api.kilo_cli_user_profile, u.kilo_cli_user_profile);
-        keep(&mut self.api.kilo_cli_path, u.kilo_cli_path);
-        if !u.ollama_base_url.trim().is_empty() {
-            self.api.ollama_base_url = normalize_ollama_base_url(&u.ollama_base_url);
-        }
+        keep(&mut self.api.opencode_cli_path, u.opencode_cli_path);
+        keep(
+            &mut self.api.opencode_cli_user_profile,
+            u.opencode_cli_user_profile,
+        );
+        keep(&mut self.api.cursor_cli_path, u.cursor_cli_path);
+        keep(
+            &mut self.api.cursor_cli_user_profile,
+            u.cursor_cli_user_profile,
+        );
         self.monitoring.decision_interval_secs = u
             .decision_interval_secs
             .clamp(10, MAX_MONITORING_INTERVAL_SECS);
@@ -570,6 +553,18 @@ fn sanitize_loaded(mut cfg: Config) -> Config {
         AdvisorConfig::default().low_confidence_threshold,
     );
     cfg.updater.sanitize();
+    // Bare model ids with no provider/ prefix were only valid for the removed
+    // standalone Ollama provider; OpenCode expects `ollama/<name>`.
+    if cfg.api.provider == ApiProvider::OpenCode {
+        let model = cfg.api.model.trim();
+        if !model.is_empty() && !model.contains('/') {
+            cfg.api.model = format!("ollama/{model}");
+        }
+        let upd = cfg.api.update_check_model.trim();
+        if !upd.is_empty() && !upd.contains('/') {
+            cfg.api.update_check_model = format!("ollama/{upd}");
+        }
+    }
     cfg
 }
 
@@ -607,7 +602,7 @@ mod tests {
 
     const SAMPLE: &str = r#"
 [api]
-provider = "anthropic"
+provider = "opencode_cli"
 model = ""
 [monitoring]
 event_log_channels = ["System"]
@@ -618,6 +613,12 @@ decision_interval_secs = 600
 [persistence]
 audit_db = "./eir.db"
 "#;
+
+    #[test]
+    fn shipped_config_toml_example_parses() {
+        let example = include_str!("../../config.toml.example");
+        toml::from_str::<Config>(example).expect("config.toml.example must deserialize");
+    }
 
     #[test]
     fn portable_root_overrides_executable_directory_for_relative_state() {
@@ -638,16 +639,14 @@ audit_db = "./eir.db"
     fn apply_update_then_toml_round_trips() {
         let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
         cfg.apply_update(SettingsUpdate {
-            provider: "openrouter".into(),
-            model: "nvidia/nemotron-3-super-120b-a12b:free".into(),
-            update_check_model: "claude-haiku-4-5".into(),
+            provider: "opencode_cli".into(),
+            model: "ollama/llama3.2".into(),
+            update_check_model: "ollama/llama3.2".into(),
             effort: "High".into(),
-            openrouter_api_key: Some("sk-or-test".into()),
-            anthropic_api_key: None,
-            ollama_api_key: None,
-            kilo_cli_user_profile: None,
-            kilo_cli_path: None,
-            ollama_base_url: String::new(),
+            opencode_cli_path: Some(r"C:\tools\opencode.exe".into()),
+            opencode_cli_user_profile: None,
+            cursor_cli_path: None,
+            cursor_cli_user_profile: None,
             decision_interval_secs: 900,
             event_log_poll_interval_secs: 45,
             wmi_poll_interval_secs: 300,
@@ -656,25 +655,24 @@ audit_db = "./eir.db"
             confidence_threshold: 0.9,
             game_mode_auto: true,
             game_mode_power_boost: false,
+            ..Default::default()
         })
         .unwrap();
         // Must serialize to TOML the loader can read back (else a settings save bricks the service).
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.api.provider.as_str(), "openrouter");
-        assert_eq!(reparsed.api.model, "nvidia/nemotron-3-super-120b-a12b:free");
+        assert_eq!(reparsed.api.provider.as_str(), "opencode_cli");
+        assert_eq!(reparsed.api.model, "ollama/llama3.2");
         assert_eq!(
-            reparsed.api.openrouter_api_key.as_deref(),
-            Some("sk-or-test")
+            reparsed.api.opencode_cli_path.as_deref(),
+            Some(r"C:\tools\opencode.exe")
         );
         assert_eq!(reparsed.monitoring.decision_interval_secs, 900);
         assert_eq!(reparsed.monitoring.confidence_threshold, 0.9);
-        assert_eq!(reparsed.api.update_check_model, "claude-haiku-4-5");
+        assert_eq!(reparsed.api.update_check_model, "ollama/llama3.2");
         // Effort is normalised (case-folded) and round-trips.
         assert_eq!(reparsed.api.effort, "high");
         assert_eq!(reparsed.monitoring.event_log_channels.len(), 2);
-        // Blank api key keeps the prior value (None here).
-        assert!(reparsed.api.anthropic_api_key.is_none());
     }
 
     #[test]
@@ -682,16 +680,14 @@ audit_db = "./eir.db"
         let cfg: Config = toml::from_str(SAMPLE).unwrap();
         // Provider/model/key/effort/threshold/decision-interval do NOT need restart.
         let no_restart = SettingsUpdate {
-            provider: "openrouter".into(),
+            provider: "opencode_cli".into(),
             model: "x".into(),
             update_check_model: "y".into(),
             effort: "high".into(),
-            openrouter_api_key: Some("sk-xxx".into()),
-            anthropic_api_key: None,
-            ollama_api_key: None,
-            kilo_cli_user_profile: None,
-            kilo_cli_path: None,
-            ollama_base_url: String::new(),
+            opencode_cli_path: None,
+            opencode_cli_user_profile: None,
+            cursor_cli_path: None,
+            cursor_cli_user_profile: None,
             decision_interval_secs: 900,
             event_log_poll_interval_secs: 30,
             wmi_poll_interval_secs: 300,
@@ -700,6 +696,7 @@ audit_db = "./eir.db"
             confidence_threshold: 0.7,
             game_mode_auto: true,
             game_mode_power_boost: false,
+            ..Default::default()
         };
         assert!(!cfg.settings_update_needs_restart(&no_restart));
         // Each collector field individually triggers restart.
@@ -920,22 +917,21 @@ audit_db = "./eir.db"
     #[test]
     fn legacy_open_router_provider_alias_still_parses() {
         // Older configs serialized OpenRouter as "open_router"; must still load.
-        let toml = SAMPLE.replace("\"anthropic\"", "\"open_router\"");
+        let toml = SAMPLE.replace("\"opencode_cli\"", "\"open_router\"");
         let cfg: Config = toml::from_str(&toml).unwrap();
-        assert_eq!(cfg.api.provider.as_str(), "openrouter");
+        assert_eq!(cfg.api.provider.as_str(), "opencode_cli");
     }
 
     #[test]
-    fn removed_provider_aliases_to_anthropic() {
-        // A config written by an older build (openai_compatible, possibly with
-        // its now-removed base_url/api_key fields) must still load — it aliases
-        // to Anthropic and unknown keys are ignored by the toml loader.
+    fn removed_provider_aliases_to_claude_cli() {
+        // A config written by an older build (openai_compatible / anthropic)
+        // aliases to claude_cli; unknown keys are ignored by the toml loader.
         let src = SAMPLE.replace(
-            "provider = \"anthropic\"",
+            "provider = \"opencode_cli\"",
             "provider = \"openai_compatible\"\nbase_url = \"http://localhost:8080/v1\"\napi_key = \"not-needed\"",
         );
         let cfg: Config = toml::from_str(&src).unwrap();
-        assert_eq!(cfg.api.provider.as_str(), "anthropic");
+        assert_eq!(cfg.api.provider.as_str(), "claude_cli");
     }
 
     #[test]
@@ -944,16 +940,16 @@ audit_db = "./eir.db"
         // optional profile/binary hints) parses as its own provider again and
         // survives a save/load cycle.
         let src = SAMPLE.replace(
-            "provider = \"anthropic\"",
+            "provider = \"opencode_cli\"",
             "provider = \"claude_cli\"\nuser_profile = 'C:\\Users\\X'\nclaude_cli_path = 'C:\\Users\\X\\.local\\bin\\claude.exe'",
         );
         let cfg: Config = toml::from_str(&src).unwrap();
-        assert_eq!(cfg.api.provider, ApiProvider::ClaudeCli);
+        assert_eq!(cfg.api.provider, ApiProvider::Claude);
         assert_eq!(cfg.api.user_profile.as_deref(), Some("C:\\Users\\X"));
 
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.api.provider, ApiProvider::ClaudeCli);
+        assert_eq!(reparsed.api.provider, ApiProvider::Claude);
         assert_eq!(
             reparsed.api.claude_cli_path.as_deref(),
             Some("C:\\Users\\X\\.local\\bin\\claude.exe")
@@ -967,15 +963,15 @@ audit_db = "./eir.db"
     #[test]
     fn codex_cli_provider_round_trips_with_no_key_or_model() {
         let src = SAMPLE.replace(
-            "provider = \"anthropic\"",
+            "provider = \"opencode_cli\"",
             "provider = \"codex_cli\"\ncodex_cli_path = 'C:\\tools\\codex.exe'",
         );
         let cfg: Config = toml::from_str(&src).unwrap();
-        assert_eq!(cfg.api.provider, ApiProvider::CodexCli);
+        assert_eq!(cfg.api.provider, ApiProvider::Codex);
 
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.api.provider, ApiProvider::CodexCli);
+        assert_eq!(reparsed.api.provider, ApiProvider::Codex);
         assert_eq!(
             reparsed.api.codex_cli_path.as_deref(),
             Some("C:\\tools\\codex.exe")
@@ -996,105 +992,93 @@ audit_db = "./eir.db"
     }
 
     #[test]
-    fn kilocode_provider_alias_loads_as_kilo_cli() {
-        // The removed API-key "kilocode" gateway provider aliases to the
-        // surviving subscription path (kilo_cli) rather than failing to parse.
+    fn kilocode_provider_alias_loads_as_opencode_cli() {
         let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
         cfg.apply_update(SettingsUpdate {
             provider: "kilocode".into(),
-            model: "kilo/anthropic/claude-sonnet-5".into(),
+            model: "ollama/llama3.2".into(),
             ..Default::default()
         })
         .unwrap();
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.api.provider, ApiProvider::KiloCli);
+        assert_eq!(reparsed.api.provider, ApiProvider::OpenCode);
     }
 
     #[test]
-    fn kilo_cli_provider_round_trips_with_overrides() {
+    fn opencode_cli_provider_round_trips_with_overrides() {
         let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
         cfg.apply_update(SettingsUpdate {
-            provider: "kilo_cli".into(),
-            model: "kilo/minimax/minimax-m3".into(),
-            kilo_cli_user_profile: Some("C:\\Users\\You".into()),
-            kilo_cli_path: Some("C:\\Users\\You\\AppData\\Roaming\\npm\\kilo.cmd".into()),
+            provider: "opencode_cli".into(),
+            model: "ollama/llama3.2".into(),
+            opencode_cli_user_profile: Some(r"C:\Users\You".into()),
+            opencode_cli_path: Some(r"C:\Users\You\.local\bin\opencode.exe".into()),
             ..Default::default()
         })
         .unwrap();
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.api.provider, ApiProvider::KiloCli);
-        assert_eq!(reparsed.api.model, "kilo/minimax/minimax-m3");
+        assert_eq!(reparsed.api.provider, ApiProvider::OpenCode);
+        assert_eq!(reparsed.api.model, "ollama/llama3.2");
         assert_eq!(
-            reparsed.api.kilo_cli_user_profile.as_deref(),
-            Some("C:\\Users\\You")
+            reparsed.api.opencode_cli_user_profile.as_deref(),
+            Some(r"C:\Users\You")
         );
         assert_eq!(
-            reparsed.api.kilo_cli_path.as_deref(),
-            Some("C:\\Users\\You\\AppData\\Roaming\\npm\\kilo.cmd")
+            reparsed.api.opencode_cli_path.as_deref(),
+            Some(r"C:\Users\You\.local\bin\opencode.exe")
         );
         let view = reparsed.to_ui_settings();
-        assert!(view.kilo_cli_user_profile_set);
-        assert!(view.kilo_cli_path_set);
+        assert!(view.opencode_cli_user_profile_set);
+        assert!(view.opencode_cli_path_set);
+        assert!(!view.kilo_cli_path_set);
+        assert!(!view.openrouter_key_set);
     }
 
     #[test]
-    fn ollama_provider_round_trips_with_base_url() {
+    fn cursor_cli_provider_round_trips_with_overrides() {
         let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
         cfg.apply_update(SettingsUpdate {
-            provider: "ollama".into(),
-            model: "llama3.2".into(),
-            ollama_base_url: "http://127.0.0.1:11434".into(),
+            provider: "cursor_cli".into(),
+            model: "auto".into(),
+            cursor_cli_path: Some(r"C:\Users\You\.local\bin\agent.cmd".into()),
+            cursor_cli_user_profile: Some(r"C:\Users\You".into()),
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(cfg.api.provider, ApiProvider::Ollama);
-        assert_eq!(cfg.api.model, "llama3.2");
-        assert_eq!(cfg.api.ollama_base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(cfg.api.provider, ApiProvider::Cursor);
         let view = cfg.to_ui_settings();
-        assert_eq!(view.provider, "ollama");
-        assert_eq!(view.ollama_base_url, "http://127.0.0.1:11434/v1");
-
+        assert_eq!(view.provider, "cursor_cli");
+        assert!(view.cursor_cli_path_set);
+        assert!(view.cursor_cli_user_profile_set);
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.api.provider, ApiProvider::Ollama);
-        assert_eq!(reparsed.api.ollama_base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(reparsed.api.provider, ApiProvider::Cursor);
+        assert_eq!(
+            reparsed.api.cursor_cli_path.as_deref(),
+            Some(r"C:\Users\You\.local\bin\agent.cmd")
+        );
     }
 
     #[test]
-    fn normalize_ollama_base_url_adds_v1_suffix() {
-        assert_eq!(
-            normalize_ollama_base_url("http://127.0.0.1:11434"),
-            "http://127.0.0.1:11434/v1"
-        );
-        assert_eq!(
-            normalize_ollama_base_url("http://127.0.0.1:11434/v1/"),
-            "http://127.0.0.1:11434/v1"
-        );
-        assert_eq!(normalize_ollama_base_url(""), default_ollama_base_url());
-    }
-
-    #[test]
-    fn kilo_cli_blank_overrides_keep_stored_values() {
-        // The Settings panel can't render a stored hint override, so it sends the
-        // field blank on every save. Blank must therefore mean "unchanged" (like the
-        // API keys) — otherwise an unrelated save would silently wipe a configured
-        // kilo_cli override.
+    fn opencode_cli_blank_overrides_keep_stored_values() {
         let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
-        cfg.api.kilo_cli_user_profile = Some("C:\\Users\\Old".into());
-        cfg.api.kilo_cli_path = Some("C:\\old\\kilo.cmd".into());
+        cfg.api.opencode_cli_user_profile = Some(r"C:\Users\Old".into());
+        cfg.api.opencode_cli_path = Some(r"C:\old\opencode.exe".into());
         cfg.apply_update(SettingsUpdate {
-            provider: "kilo_cli".into(),
-            kilo_cli_user_profile: Some(String::new()),
-            kilo_cli_path: Some(String::new()),
+            provider: "opencode_cli".into(),
+            opencode_cli_user_profile: Some(String::new()),
+            opencode_cli_path: Some(String::new()),
             ..Default::default()
         })
         .unwrap();
         assert_eq!(
-            cfg.api.kilo_cli_user_profile.as_deref(),
-            Some("C:\\Users\\Old")
+            cfg.api.opencode_cli_user_profile.as_deref(),
+            Some(r"C:\Users\Old")
         );
-        assert_eq!(cfg.api.kilo_cli_path.as_deref(), Some("C:\\old\\kilo.cmd"));
+        assert_eq!(
+            cfg.api.opencode_cli_path.as_deref(),
+            Some(r"C:\old\opencode.exe")
+        );
     }
 }

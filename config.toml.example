@@ -1,26 +1,25 @@
 [api]
-# Six providers: "openrouter", "claude_cli", "codex_cli", "anthropic", "kilo_cli", "ollama".
+# Four CLI providers: "opencode_cli", "claude_cli", "codex_cli", "cursor_cli".
 # Everything here is editable in the app's Settings panel — no need to touch
-# this file after install.
+# this file after install. Legacy provider names (openrouter, anthropic, kilo_cli,
+# ollama, …) still load and map onto OpenCode or Claude CLI.
 
-# ── Option A (default): OpenRouter — free models available ─────────────────────
-# Lowest-cost option. The `openrouter/free` meta-model auto-routes to a current
-# free model, so you don't have to track model names. Get a key at
-# https://openrouter.ai/keys
-provider = "openrouter"
-openrouter_api_key = ""   # required — paste your sk-or-v1-... key (or set it in Settings)
-model = "openrouter/free" # auto-routes to a free model; or pin one from https://openrouter.ai/models
+# ── Option A (default): OpenCode CLI — cloud models or local Ollama ───────────
+# Uses the logged-in `opencode` CLI. No API key is pasted into Eir.
+# Local models use the `ollama/<name>` form (pull first with `ollama pull`).
+# Cloud models use `provider/model` as listed by `opencode models`.
+provider = "opencode_cli"
+model = "ollama/llama3.2"   # required — e.g. ollama/… or anthropic/claude-sonnet-4-6
+# opencode_cli_path = ""              # optional — blank = auto-detect
+# opencode_cli_user_profile = ""      # optional — blank = auto-detect
 
-# Model for the on-demand app-update check. OpenRouter/Kilo: blank = the main
-# model (OpenRouter adds live web search via its web plugin). Anthropic: blank =
-# claude-haiku-4-5 with native web search. Claude CLI: blank = haiku. Codex
-# CLI: blank = the main model. Both CLIs use their built-in search. Editable
-# in Settings.
+# Model for the on-demand app-update check. Blank = the main model.
+# OpenCode / Claude / Codex use their built-in web search where available.
 update_check_model = ""
 
 # Reasoning effort: low|medium|high|xhigh|max (blank = provider default).
-# Anthropic → output_config.effort; OpenRouter → reasoning.effort;
-# Claude CLI → --effort; Codex CLI → model_reasoning_effort; Kilo CLI → --variant.
+# Claude CLI → --effort; Codex CLI → model_reasoning_effort;
+# OpenCode CLI → --variant; Cursor CLI has no effort dial.
 effort = ""
 
 # ── Option B: Claude via your subscription (Claude CLI — no API key) ──────────
@@ -41,138 +40,35 @@ effort = ""
 # model = ""   # blank = the CLI default, or e.g. "gpt-5.6-terra"
 # codex_cli_path = "C:\\Users\\YourName\\.codex\\packages\\standalone\\current\\bin\\codex.exe"
 
-# ── Option D: Anthropic native API ────────────────────────────────────────────
-# Key from https://console.anthropic.com — token usage is tracked and cost is
-# estimated from list pricing.
-# provider = "anthropic"
-# anthropic_api_key = "sk-ant-..."
-# model = "claude-opus-4-8"   # or claude-sonnet-4-6 / claude-haiku-4-5
-
-# ── Option E: Kilo Code CLI — your Kilo Pass / Token-Plan subscription ─────────
-# No API key. Borrows the machine's logged-in `kilo` session, so Kilo Pass
-# credits, Token-Plan addons (e.g. "MiniMax Token Plan Plus"), and BYOK all
-# flow through transparently — exactly like the Claude CLI borrows your
-# Claude subscription.
-#
-# Install: `npm install -g @kilocode/cli`, then run `kilo` once interactively
-# to sign in. Eir auto-detects the profile holding .local\share\kilo\auth.json
-# and launches the CLI with the active desktop user's Windows token.
-#
-# The "kilo/" model prefix is what routes a call through your subscription/
-# Token-Plan/BYOK; a bare provider/model id instead requires your own
-# credentials with that upstream provider.
-#
-# provider = "kilo_cli"
-# model = "kilo/minimax/minimax-m3"                     # "kilo/" + any provider/model id from https://kilo.ai/models
-# kilo_cli_user_profile = "C:\\Users\\You"              # optional — blank = auto-detect
-# kilo_cli_path = "C:\\Users\\You\\AppData\\Roaming\\npm\\kilo.cmd"  # optional — blank = on PATH
-
-# ── Option F: Ollama — local models (no API key) ──────────────────────────────
-# Uses a local Ollama server via its OpenAI-compatible API. Install Ollama, pull
-# a model (`ollama pull llama3.2`), then set provider and model here. The service
-# runs as LocalSystem and can reach 127.0.0.1:11434 without user impersonation.
-# App-update checks have no web search on this path.
-#
-# provider = "ollama"
-# model = "llama3.2"   # required — e.g. llama3.2, qwen2.5:7b, mistral
-# ollama_base_url = "http://127.0.0.1:11434/v1"  # optional — default shown
-# ollama_api_key = ""  # optional — from ollama.com/settings/keys; enables web search on app-update checks
+# ── Option D: Cursor via the `agent` CLI (Cursor subscription — no API key) ───
+# Uses the logged-in Cursor agent CLI. Install it and run `agent login` once.
+# provider = "cursor_cli"
+# model = ""   # blank = CLI default, or e.g. "auto" / "composer-2.5"
+# cursor_cli_path = ""            # optional — blank = auto-detect `agent`
+# cursor_cli_user_profile = ""    # optional — blank = auto-detect
 
 [monitoring]
-# Windows Event Log channels to tail
-event_log_channels = ["System", "Application", "Security"]
-
-# Extra directories to watch in addition to the auto-discovered ones.
-# Standard locations (C:\Windows\Logs, %APPDATA%, %LOCALAPPDATA%,
-# %PROGRAMDATA%, %TEMP%) are discovered automatically at startup and
-# re-checked every 20 cycles. Add paths here only for non-standard locations.
-log_directories = [
-    # "D:\\MyApp\\Logs",
-]
-
-# How often to poll WMI for system state (CPU, memory, disk, services)
-wmi_poll_interval_secs = 300
-
-# How often to check the event log for new entries
-event_log_poll_interval_secs = 30
-
-# How often the scheduled decision cycle runs (collect signals → analyse → act).
-# Eir also reacts EVENT-DRIVEN: the moment a collector captures an error it wakes
-# the loop (debounced ~10s, at most once a minute), so this interval is just the
-# background sweep — 600s (10 min) keeps usage low without slowing reactions.
 decision_interval_secs = 600
-
-# Minimum AI confidence (0.0–1.0) for a whitelisted, reversible fix to
-# auto-execute; anything below this is blocked. Lower = more autonomous (acts on
-# weaker hunches), higher = more cautious. Editable in the app's Settings panel.
+event_log_poll_interval_secs = 30
+wmi_poll_interval_secs = 300
 confidence_threshold = 0.80
+# event_log_channels = ["System", "Application"]
+# log_directories = []
+game_mode_auto = true
+game_mode_power_boost = true
 
-[persistence]
-audit_db = "./eir.db"
-
-# ── Autonomous app updater ────────────────────────────────────────────────────
-# Eir can keep your installed apps up to date by itself: it checks for updates,
-# applies them with the best method, and — if one fails — reads the actual error
-# and tries another way (winget -> Chocolatey -> Microsoft Store -> an
-# AI-found official installer). Because the service runs as LocalSystem, this needs
-# NO UAC prompt. Everything here is editable in the app's Settings panel.
-#
-# This whole section is optional: omit it and the defaults below apply (the updater
-# stays OFF until you enable it).
-[updater]
-# Master switch. Off by default — running installers unattended is opt-in.
-enabled = false
-
-# How often an unattended update cycle runs (seconds). 86400 = once a day.
-schedule_interval_secs = 86400
-
-# Package-manager methods to use, in preference order. Unknown names are ignored.
-methods = ["winget", "choco", "msstore"]
-
-# Whether AI-found official native installers may be downloaded and run for apps no
-# package manager can update.
-native_enabled = true
-
-# How strictly a downloaded native installer must be signed before it is allowed to
-# run (decided in Rust, never by the AI):
-#   "require_valid"            — must have a valid Authenticode signature (default)
-#   "require_publisher_match"  — valid AND signer matches the expected publisher
-#   "allow_unsigned"           — run regardless of signature (least safe)
-native_signature_policy = "require_valid"
-
-# Safety caps.
-max_attempts_per_app = 3      # methods tried per app before giving up
-max_apps_per_run = 20         # apps acted on per cycle
-max_installer_mb = 256        # largest native installer to download
-
-# Auto-install Chocolatey when that method needs it.
-bootstrap_managers = true
-
-# Apps to skip entirely (by stable, version-stripped display name). Matching ignores
-# Chocolatey package suffixes, so "discord" also covers "discord.install". Note: a few
-# apps that update themselves and hang package managers (e.g. Discord) are skipped
-# automatically and need no entry here.
-ignored = []
-
-# Per-app hints for the AI, e.g. tell it an app is self-built or where its real
-# releases live. Keyed by the same stable app name.
-# [updater.notes]
-# "my custom tool" = "self-built — never report an update"
-
-# ── Advisor mode (AI self-tunes its reasoning) ────────────────────────────────
-# When the AI flags a hard/ambiguous situation (or its confidence is low), Eir can
-# re-analyse ONCE at a higher reasoning effort and/or a stronger model — cheap/fast
-# for routine cycles, deeper only when it matters. The escalation tier is fixed
-# config (never AI-chosen); the AI only gets to say "I'm not sure, look harder".
-# A hard count cap (24/day) remains the only backstop. Off by default. Editable in
-# the app's Settings.
 [advisor]
 enabled = false
-
-# The stronger model to switch to for the deeper pass (empty = keep the base
-# model), e.g. Anthropic: "claude-opus-4-8"; OpenRouter/Kilo: a paid model id.
-escalation_model = ""
-escalation_effort = ""              # low|medium|high|xhigh|max (blank = keep base)
-
-# Escalate when the best reported confidence is below this (0.0–1.0).
+# escalation_model = ""
+# escalation_effort = "high"
 low_confidence_threshold = 0.6
+
+[updater]
+enabled = true
+interval_secs = 86400
+# max_apps_per_run = 20
+# max_attempts_per_app = 2
+
+[persistence]
+# SQLite audit database (relative to the install / portable state directory).
+audit_db = "eir.db"
