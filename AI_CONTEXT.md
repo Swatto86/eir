@@ -42,6 +42,7 @@ flowchart LR
 
 ## Recent Context & Decisions
 
+- **2026-09-06** — Cut v0.34.18: CLI-only providers (OpenCode/Claude/Codex/Cursor), Evergreen WebView2 (no fixed runtime; ~8 MB installer), OpenCode model list uses `opencode.cmd` instead of the Unix npm shim fallback of four fake models.
 - **2026-09-06** — Packaging no longer embeds a fixed WebView2 runtime. NSIS uses `downloadBootstrapper` (Evergreen); portable relies on the same system runtime. `scripts/prepare-webview2.ps1` deleted; installer hooks still remove any leftover fixed-runtime tree on upgrade.
 - **2026-09-06** — AI providers are CLI-only: OpenCode (`opencode`), Claude (`claude`), Codex (`codex`), Cursor (`agent`). HTTP Anthropic/OpenRouter/Ollama and the Kilo CLI are removed from `eir-svc`. Shared helpers live in `eir-svc/src/ai/cli_*.rs`; provider callers in `opencode_cli.rs`, `cursor_cli.rs`, `codex_cli.rs`, and `client.rs`.
 - **2026-08-21** — Cut v0.34.17: Approvals Ignore / Always Approve, Updates Available hide-on-ignore, RejectedSignal action_key fix, Cargo `jobs = 0` removed for Rust 1.95 CI.

@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.17. It has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.18. It has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,8 @@ Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.1
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-09-06 | Eir | v0.34.18 CLI providers + Evergreen WebView2 | Ships OpenCode / Claude / Codex / Cursor CLI-only AI providers, drops the ~220 MB fixed WebView2 runtime for Evergreen `downloadBootstrapper` (~8 MB NSIS), and fixes OpenCode model enumeration to prefer `opencode.cmd` over npm’s Unix shim.
 
 2026-09-06 | Eir | No bundled fixed WebView2 | Installer and portable use the machine Evergreen WebView2 runtime (`webviewInstallMode: downloadBootstrapper`). Fixed-runtime CAB/prepare script and CI cache removed; upgrades delete any leftover `Microsoft.WebView2.FixedVersionRuntime.*` tree in Program Files.
 
