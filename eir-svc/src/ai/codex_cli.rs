@@ -140,6 +140,7 @@ async fn run_codex_cli(
                         what: "codex CLI",
                         scratch_prefix: "eir-codex",
                         workspace_flag: None,
+                        workspace_files: |_| Vec::new(),
                         timeout_ms: 300_000,
                     },
                     &args,

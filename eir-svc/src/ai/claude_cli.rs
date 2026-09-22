@@ -134,6 +134,7 @@ pub(crate) async fn call_claude_cli(
                         what: "claude CLI",
                         scratch_prefix: "eir-claude",
                         workspace_flag: None,
+                        workspace_files: |_| Vec::new(),
                         timeout_ms: 300_000,
                     },
                     &args,

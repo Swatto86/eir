@@ -128,6 +128,7 @@ pub(crate) async fn call_cursor_cli(
                         what: "cursor CLI",
                         scratch_prefix: "eir-cursor",
                         workspace_flag: Some("--workspace"),
+                        workspace_files: |_| Vec::new(),
                         timeout_ms: 300_000,
                     },
                     &args,

@@ -334,8 +334,9 @@ fn close_delimited_at(s: &str, start: usize) -> Option<usize> {
 }
 
 /// Repair the JSON-ish slips cheaper models make: smart quotes, `//` / `/* */`
-/// comments, trailing commas, and raw control characters inside strings.
-fn sanitize_json(input: &str) -> String {
+/// comments, trailing commas, and raw control characters inside strings. String-aware,
+/// so it also turns a JSONC config file into strict JSON.
+pub(crate) fn sanitize_json(input: &str) -> String {
     let s = input.trim().trim_start_matches('\u{feff}');
     let s = s.replace(['\u{201c}', '\u{201d}'], "\"");
     let chars: Vec<char> = s.chars().collect();

@@ -42,6 +42,7 @@ pub(crate) async fn run_winget_as_active_user(
                 what: "winget",
                 scratch_prefix: "eir-winget",
                 workspace_flag: None,
+                workspace_files: |_| Vec::new(),
                 timeout_ms,
             },
             &args,

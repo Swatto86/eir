@@ -10,6 +10,8 @@ Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.j
 
 ## Architectural decisions
 
+2026-09-22 | Eir | OpenCode runs get a scratch `opencode.json` | Each OpenCode scratch workspace carries a project-level config disabling every MCP server from the user's global OpenCode config, so unattended cycles cannot drive the user's Playwright browser or computer-use servers. Hook: `UserCliSpec::workspace_files`.
+
 2026-09-06 | Eir | v0.34.18 CLI providers + Evergreen WebView2 | Ships OpenCode / Claude / Codex / Cursor CLI-only AI providers, drops the ~220 MB fixed WebView2 runtime for Evergreen `downloadBootstrapper` (~8 MB NSIS), and fixes OpenCode model enumeration to prefer `opencode.cmd` over npm’s Unix shim.
 
 2026-09-06 | Eir | No bundled fixed WebView2 | Installer and portable use the machine Evergreen WebView2 runtime (`webviewInstallMode: downloadBootstrapper`). Fixed-runtime CAB/prepare script and CI cache removed; upgrades delete any leftover `Microsoft.WebView2.FixedVersionRuntime.*` tree in Program Files.

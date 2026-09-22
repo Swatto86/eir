@@ -6,8 +6,10 @@ use crate::ai::cli_process::{
     CliProcessOutput,
 };
 use crate::ai::cli_user::running_as_local_system;
+use crate::ai::json::sanitize_json;
 use crate::models::CallUsage;
 use anyhow::{bail, Context, Result};
+use tracing::warn;
 
 #[cfg(windows)]
 use crate::ai::cli_user::{run_cli_as_active_user, UserCliSpec};
@@ -40,6 +42,64 @@ pub(crate) fn resolve_opencode_binary(
         }
     }
     "opencode".into()
+}
+
+/// Project-level OpenCode config written into every scratch workspace.
+const SCRATCH_CONFIG_NAME: &str = "opencode.json";
+
+/// Files written into the scratch workspace beside the prompt. OpenCode treats `--dir` as
+/// the project, so a project-level `opencode.json` there overrides the desktop user's
+/// global config: every MCP server the user has enabled for interactive work (Playwright
+/// browser, computer use, memory…) is disabled for Eir's unattended run, which otherwise
+/// launched a visible automated Chrome each decision cycle. Built-in tools are untouched.
+pub(crate) fn opencode_workspace_files(profile: &str) -> Vec<(String, Vec<u8>)> {
+    let mut mcp = serde_json::Map::new();
+    for name in user_mcp_servers(profile) {
+        mcp.insert(name, serde_json::json!({ "enabled": false }));
+    }
+    let config = serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": mcp,
+    });
+    vec![(
+        SCRATCH_CONFIG_NAME.to_string(),
+        config.to_string().into_bytes(),
+    )]
+}
+
+/// MCP server names from the user's global OpenCode config (`<profile>/.config/opencode/`).
+fn user_mcp_servers(profile: &str) -> Vec<String> {
+    let dir = std::path::Path::new(profile)
+        .join(".config")
+        .join("opencode");
+    let mut names = Vec::new();
+    for file in ["opencode.json", "opencode.jsonc"] {
+        let path = dir.join(file);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "Cannot read the user's OpenCode config; its MCP servers stay enabled for this run");
+                continue;
+            }
+        };
+        // `.jsonc` (and hand-edited `.json`) may carry comments and trailing commas.
+        match serde_json::from_str::<serde_json::Value>(&sanitize_json(&raw)) {
+            Ok(config) => names.extend(
+                config
+                    .get("mcp")
+                    .and_then(serde_json::Value::as_object)
+                    .into_iter()
+                    .flat_map(|servers| servers.keys().cloned()),
+            ),
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "Cannot parse the user's OpenCode config; its MCP servers stay enabled for this run")
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn opencode_variant(effort: &str) -> Option<&'static str> {
@@ -105,6 +165,7 @@ pub(crate) async fn call_opencode_cli(
                         what: "opencode CLI",
                         scratch_prefix: "eir-opencode",
                         workspace_flag: Some("--dir"),
+                        workspace_files: opencode_workspace_files,
                         timeout_ms: 300_000,
                     },
                     &args,
@@ -125,11 +186,21 @@ pub(crate) async fn call_opencode_cli(
         let configured_binary = configured_binary.map(str::to_owned);
         let user_profile = user_profile.map(str::to_owned);
         let profile_for_resolution = user_profile.clone();
-        let binary = tokio::task::spawn_blocking(move || {
-            resolve_opencode_binary(
+        let (binary, extra_files) = tokio::task::spawn_blocking(move || {
+            let binary = resolve_opencode_binary(
                 configured_binary.as_deref(),
                 profile_for_resolution.as_deref(),
-            )
+            );
+            let profile = profile_for_resolution
+                .or_else(|| current_user_profile().map(|p| p.to_string_lossy().into_owned()));
+            let extra_files = match profile.as_deref() {
+                Some(profile) => opencode_workspace_files(profile),
+                None => {
+                    warn!("No user profile for the opencode CLI; MCP servers cannot be disabled for this run");
+                    Vec::new()
+                }
+            };
+            (binary, extra_files)
         })
         .await
         .context("Join OpenCode binary resolution task")?;
@@ -138,10 +209,10 @@ pub(crate) async fn call_opencode_cli(
         tokio::fs::create_dir_all(&workspace)
             .await
             .context("Create OpenCode scratch workspace")?;
-        for (name, bytes) in files {
+        for (name, bytes) in files.iter().chain(&extra_files) {
             tokio::fs::write(workspace.join(name), bytes)
                 .await
-                .context("Write OpenCode image attachment")?;
+                .with_context(|| format!("Write OpenCode workspace file {name}"))?;
         }
         let mut command = cli_process(&binary);
         command
@@ -207,6 +278,82 @@ mod tests {
         assert!(args.iter().any(|a| a == "--auto"));
         assert!(args.iter().any(|a| a == "--file=eir-image-0.png"));
         assert!(!args.iter().any(|a| a == "--dir"));
+    }
+
+    fn temp_profile(tag: &str) -> std::path::PathBuf {
+        let profile =
+            std::env::temp_dir().join(format!("eir-oc-profile-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&profile);
+        profile
+    }
+
+    #[test]
+    fn scratch_config_disables_every_mcp_server_from_the_user_config() {
+        let profile = temp_profile("mcp");
+        let dir = profile.join(".config").join("opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("opencode.json"),
+            r#"{"permission":"allow","mcp":{"browser":{"type":"local","command":["node"],"enabled":true},"memory":{"type":"local","command":["node"]}}}"#,
+        )
+        .unwrap();
+        let files = opencode_workspace_files(&profile.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&profile);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "opencode.json");
+        let config: serde_json::Value = serde_json::from_slice(&files[0].1).unwrap();
+        assert_eq!(config["mcp"]["browser"]["enabled"], false);
+        assert_eq!(config["mcp"]["memory"]["enabled"], false);
+        assert_eq!(config["mcp"].as_object().unwrap().len(), 2);
+        assert!(
+            config.get("tools").is_none(),
+            "built-in tools must stay available"
+        );
+        assert!(config.get("permission").is_none());
+        // The workspace config is never attached to the prompt.
+        assert!(!build_args("m", "", false, &[])
+            .unwrap()
+            .iter()
+            .any(|a| a.contains("opencode.json")));
+    }
+
+    #[test]
+    fn scratch_config_reads_commented_jsonc_and_merges_both_files() {
+        let profile = temp_profile("jsonc");
+        let dir = profile.join(".config").join("opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("opencode.jsonc"),
+            "{
+  \"$schema\": \"https://opencode.ai/config.json\",
+  // portable settings
+  \"mcp\": {
+    /* shared */ \"notes\": { \"type\": \"local\", \"command\": [\"node\"], },
+  },
+  \"autoupdate\": \"notify\",
+}
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("opencode.json"),
+            r#"{"mcp":{"browser":{"type":"local","command":["node"]}}}"#,
+        )
+        .unwrap();
+        let files = opencode_workspace_files(&profile.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&profile);
+        let config: serde_json::Value = serde_json::from_slice(&files[0].1).unwrap();
+        assert_eq!(config["mcp"]["notes"]["enabled"], false);
+        assert_eq!(config["mcp"]["browser"]["enabled"], false);
+        assert_eq!(config["mcp"].as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn scratch_config_without_user_config_is_valid_json() {
+        let profile = temp_profile("none");
+        let files = opencode_workspace_files(&profile.to_string_lossy());
+        let config: serde_json::Value = serde_json::from_slice(&files[0].1).unwrap();
+        assert!(config["mcp"].as_object().unwrap().is_empty());
     }
 
     #[test]

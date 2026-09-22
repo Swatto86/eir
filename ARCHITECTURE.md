@@ -635,12 +635,21 @@ All three subscription CLIs share one privilege boundary: when EirSvc is LocalSy
   native and npm layouts/shim. Usage comes from the CLI JSON envelope; reported cost is
   equivalent API value, not a subscription charge. Blank model uses the CLI default.
 - **`CodexCli`** — Codex on the active desktop user's **ChatGPT subscription**, **no API key**. `resolve_codex_binary` tries the configured override, OpenAI desktop install, Codex standalone package, npm native layouts/shim, then PATH. Each call gets a fresh empty scratch cwd and runs `codex [--search] --ask-for-approval never exec --json --sandbox read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules --color never`, with the prompt on stdin. `-m` selects a model; reasoning uses `-c model_reasoning_effort=…` (`max` clamps to `xhigh` before GPT-5.6). `parse_codex_ndjson` takes final `agent_message` text and `turn.completed` usage, subtracting cached input from the base input bucket to avoid double-counting; subscription cost is unknown/zero. Only the update-check path adds global `--search`.
-- **`KiloCli`** — Kilo Code on the active user's **subscription** (Kilo Pass,
-  Token-Plan addons, or BYOK): spawns `kilo run --auto --format json --agent ask`,
-  **no API key**. Like Claude, LocalSystem derives the sole active user's profile/token
-  and resolves only that profile's platform-specific npm binary or shim. Output is
-  NDJSON; text parts form the reply and the last `step_finish` supplies usage.
-  Subscription/BYOK routing still requires a `kilo/` model prefix.
+- **`OpenCodeCli`** — OpenCode on the active desktop user's login, **no API key**:
+  spawns `opencode run --format json [-m …] [--variant …] [--auto] --dir <scratch>`
+  with the prompt on stdin. Like Claude, LocalSystem derives the sole active user's
+  profile/token and resolves only that profile's npm shim or `.local/bin` binary. Output
+  is NDJSON; text parts form the reply and the last `step_finish` supplies usage.
+  **MCP isolation:** OpenCode treats `--dir` as the project and merges the user's global
+  `~/.config/opencode/opencode.json` into every run, so an unattended cycle inherited the
+  user's interactive MCP servers (Playwright browser, computer use, memory) and opened a
+  visible automated Chrome to "research" log entries. `opencode_workspace_files` now
+  writes a project-level `opencode.json` into each scratch workspace that sets
+  `enabled: false` for every MCP server named in the user's global config (read under
+  the user's token; unreadable/unparseable config logs a warning and leaves them on).
+  Built-in tools (webfetch/websearch) stay available for the update-check path. The
+  `UserCliSpec::workspace_files` hook carries such files for any CLI; the other
+  providers pass none (Codex already runs `--ignore-user-config`).
 - **`Ollama`** — local OpenAI-compatible streaming against `api.ollama_base_url`
   (default `http://127.0.0.1:11434/v1`). Model is required; local chat needs no key.
   Optional `ollama_api_key` (or `OLLAMA_API_KEY`) calls Ollama's cloud

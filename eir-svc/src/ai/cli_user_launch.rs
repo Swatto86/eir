@@ -201,12 +201,18 @@ fn read_file_capped(path: &std::path::Path) -> Result<String> {
     file.take(CLI_OUTPUT_CAP as u64).read_to_end(&mut bytes)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
+/// Extra scratch-workspace files for a CLI run, derived from the desktop user's profile.
+pub(crate) type WorkspaceFiles = fn(&str) -> Vec<(String, Vec<u8>)>;
+
 pub(crate) struct UserCliSpec<'a> {
     pub configured_binary: Option<&'a str>,
     pub resolve_binary: fn(Option<&str>, Option<&str>) -> String,
     pub what: &'a str,
     pub scratch_prefix: &'a str,
     pub workspace_flag: Option<&'a str>,
+    /// Extra files written into the scratch workspace (never attached to the prompt), given
+    /// the desktop user's profile directory — e.g. a project-level CLI config.
+    pub workspace_files: WorkspaceFiles,
     pub timeout_ms: u32,
 }
 pub(crate) fn run_cli_as_active_user(
@@ -222,6 +228,7 @@ pub(crate) fn run_cli_as_active_user(
         what,
         scratch_prefix,
         workspace_flag,
+        workspace_files,
         timeout_ms,
     } = spec;
     let session = active_user_session_id()
@@ -256,6 +263,10 @@ pub(crate) fn run_cli_as_active_user(
             std::fs::File::create(&stderr)?;
             for (name, bytes) in files {
                 std::fs::write(workspace.join(name), bytes)?;
+            }
+            for (name, bytes) in workspace_files(&profile) {
+                std::fs::write(workspace.join(&name), bytes)
+                    .with_context(|| format!("Write {what} workspace file {name}"))?;
             }
         }
         let application = format!(
