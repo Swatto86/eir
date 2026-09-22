@@ -196,6 +196,12 @@ pub struct MonitoringConfig {
     /// on exit. Off by default (marginal on desktops; changes display/sleep timeouts).
     #[serde(default)]
     pub game_mode_power_boost: bool,
+    /// Run decision cycles, the autonomous updater and the digest only while the tray app
+    /// is connected. On by default: with no tray there is nobody to see findings or approve
+    /// fixes, so the service keeps collecting signals and resumes the moment the tray opens.
+    /// Set false for a headless machine that should self-heal unattended.
+    #[serde(default = "default_true")]
+    pub require_tray: bool,
 }
 
 fn default_confidence() -> f32 {

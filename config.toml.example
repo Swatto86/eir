@@ -56,6 +56,9 @@ confidence_threshold = 0.80
 # log_directories = []
 game_mode_auto = true
 game_mode_power_boost = true
+# Idle (no AI analysis, updater or digest) while the tray app is closed; resume when it
+# opens. Set false for a headless PC that should self-heal unattended.
+require_tray = true
 
 [advisor]
 enabled = false

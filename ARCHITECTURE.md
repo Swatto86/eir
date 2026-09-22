@@ -37,6 +37,10 @@ pings a capacity-1 trigger channel the moment it captures something actionable
 (an Error event-log entry, an error-bearing log write, a new failed service or
 security fault), and the loop *schedules* a reaction ~10 s later (debounce, so a
 burst coalesces into one analysis) with a 60 s minimum gap between reactions.
+Both triggers pass a **tray presence gate** first: with `monitoring.require_tray`
+(default on) the loop idles — collectors keep running, but no analysis, updater
+cycle or digest starts — while no UI client is connected to the pipe, and runs a
+cycle immediately when one connects (`PipeServer::client_changes`).
 The cycle itself: collect signals → compute an *actionable fingerprint* and only
 call the AI when something actionable changed (plus a periodic heartbeat) → AI
 returns structured problems each with a confidence and a proposed `FixAction` →

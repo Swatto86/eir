@@ -10,6 +10,8 @@ Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.j
 
 ## Architectural decisions
 
+2026-09-22 | Eir | Service idles without the tray | `monitoring.require_tray` (default true) makes the decision loop skip analysis, updater and digest while no UI is connected to the pipe, and run a cycle as soon as one connects. Collectors keep running. Headless machines set it false.
+
 2026-09-22 | Eir | OpenCode runs get a scratch `opencode.json` | Each OpenCode scratch workspace carries a project-level config disabling every MCP server from the user's global OpenCode config, so unattended cycles cannot drive the user's Playwright browser or computer-use servers. Hook: `UserCliSpec::workspace_files`.
 
 2026-09-06 | Eir | v0.34.18 CLI providers + Evergreen WebView2 | Ships OpenCode / Claude / Codex / Cursor CLI-only AI providers, drops the ~220 MB fixed WebView2 runtime for Evergreen `downloadBootstrapper` (~8 MB NSIS), and fixes OpenCode model enumeration to prefer `opencode.cmd` over npm’s Unix shim.

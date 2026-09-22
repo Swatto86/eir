@@ -1638,8 +1638,14 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
     let mut ticker = interval(Duration::from_secs(cfg.monitoring.decision_interval_secs));
     info!(
         interval_secs = cfg.monitoring.decision_interval_secs,
+        require_tray = cfg.monitoring.require_tray,
         "Decision loop started"
     );
+    // Tray presence: with `monitoring.require_tray` the loop idles (no analysis, updater
+    // or digest — collectors keep running) while no UI is connected, and runs a cycle
+    // as soon as one connects. `tray_idle_logged` keeps the idle notice to one line.
+    let mut tray_changes = pipe.client_changes();
+    let mut tray_idle_logged = false;
     // Finished update cycles report back here; an in-flight cycle never blocks the loop.
     let (update_done_tx, mut update_done_rx) =
         tokio::sync::mpsc::channel::<updater::orchestrator::CycleSummary>(2);
@@ -1740,6 +1746,20 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                     .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
                 tokio::select! {
                     _ = ticker.tick() => {}
+                    Ok(()) = tray_changes.changed() => {
+                        let connected = *tray_changes.borrow_and_update() > 0;
+                        if !cfg.monitoring.require_tray {
+                            continue;
+                        }
+                        if !connected {
+                            info!("Tray disconnected — decision cycles idle until it reconnects");
+                            tray_idle_logged = true;
+                            continue;
+                        }
+                        info!("Tray connected — resuming decision cycles");
+                        tray_idle_logged = false;
+                        // fall through: run a cycle now instead of waiting for the next tick
+                    }
                     Some(()) = trigger_rx.recv() => {
                         // A collector saw something actionable — schedule a
                         // reaction after the debounce, but no sooner than the
@@ -3703,6 +3723,17 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                         last_fingerprint = None;
                     }
                     was_gaming = g;
+                }
+
+                // ── Tray presence gate ───────────────────────────────────────
+                // Everything below spends AI calls or changes the machine; with no tray
+                // to show or approve the result, wait (like Pause) until one connects.
+                if cfg.monitoring.require_tray && !pipe.ui_connected() {
+                    if !tray_idle_logged {
+                        info!("No tray connected — decision cycles idle until it opens (monitoring.require_tray)");
+                        tray_idle_logged = true;
+                    }
+                    continue;
                 }
 
                 // ── Autonomous updater: start a scheduled cycle when due ──────

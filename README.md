@@ -150,7 +150,8 @@ are reported instead of being silently treated as queued.
   all have explicit limits, so a bad provider or local client cannot grow service
   memory without bound.
 - **Stays out of the way** — closing the window hides to the tray; the service keeps
-  running. The tray app can start with Windows and launch hidden.
+  running. Quit the tray app and the service idles (no AI analysis or updates)
+  until it opens again, unless `require_tray = false` is set for a headless PC. The tray app can start with Windows and launch hidden.
 
 ## Install
 

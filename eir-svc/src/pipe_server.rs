@@ -235,6 +235,8 @@ fn build_pipe_security_descriptor() -> Option<usize> {
 pub struct PipeServer {
     status_tx: watch::Sender<StatusPayload>,
     result_tx: broadcast::Sender<ResultEnvelope>,
+    /// Number of verified UI clients currently connected (0 or 1: one client at a time).
+    clients: watch::Sender<usize>,
 }
 
 #[derive(Clone)]
@@ -284,10 +286,12 @@ fn spawn_named_with_verifier(
     });
     let (result_tx, _) = broadcast::channel(32);
     let (ui_cmd_tx, ui_cmd_rx) = mpsc::channel::<UiRequest>(8);
+    let (clients_tx, _) = watch::channel(0usize);
 
     let srv = PipeServer {
         status_tx: status_tx.clone(),
         result_tx: result_tx.clone(),
+        clients: clients_tx.clone(),
     };
 
     tokio::spawn(listener_task(
@@ -295,6 +299,7 @@ fn spawn_named_with_verifier(
         status_tx,
         result_tx,
         ui_cmd_tx,
+        clients_tx,
         verify_client,
         verify_session,
     ));
@@ -307,6 +312,7 @@ async fn listener_task(
     status_tx: watch::Sender<StatusPayload>,
     result_tx: broadcast::Sender<ResultEnvelope>,
     ui_cmd_tx: mpsc::Sender<UiRequest>,
+    clients: watch::Sender<usize>,
     verify_client: ClientVerifier,
     verify_session: SessionVerifier,
 ) {
@@ -373,6 +379,7 @@ async fn listener_task(
         }
 
         info!("UI connected to service pipe");
+        clients.send_modify(|n| *n += 1);
 
         let (reader, mut writer) = tokio::io::split(server);
         let mut status_rx = status_tx.subscribe();
@@ -531,6 +538,7 @@ async fn listener_task(
         let _ = write_task.await;
         session_watch_task.abort();
         let _ = session_watch_task.await;
+        clients.send_modify(|n| *n = n.saturating_sub(1));
         info!("UI disconnected from service pipe");
     }
 }
@@ -538,6 +546,16 @@ async fn listener_task(
 impl PipeServer {
     pub fn broadcast_status(&self, status: StatusPayload) {
         let _ = self.status_tx.send(status);
+    }
+
+    /// Whether a verified UI client is connected right now.
+    pub fn ui_connected(&self) -> bool {
+        *self.clients.borrow() > 0
+    }
+
+    /// Watch the connected-client count; fires on every connect and disconnect.
+    pub fn client_changes(&self) -> watch::Receiver<usize> {
+        self.clients.subscribe()
     }
 
     pub fn command_result(&self, request_id: Option<u64>, result: Result<String, String>) {
@@ -1333,6 +1351,31 @@ mod tests {
 
     /// A client's Approve message is forwarded to the command channel, where the
     /// decision loop resolves it against the persistent queue. Reproduces the
+    /// The connected-client count follows a verified client's lifetime, so the decision
+    /// loop can idle without a tray and resume the moment one opens.
+    #[tokio::test]
+    async fn ui_connected_tracks_the_client_lifetime() {
+        let name = r"\\.\pipe\EirSvcTestConnected";
+        let (srv, _ui_rx) = spawn_named(name);
+        let mut changes = srv.client_changes();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!srv.ui_connected());
+
+        let client = open_test_pipe(name).expect("client connect");
+        tokio::time::timeout(Duration::from_secs(5), changes.wait_for(|n| *n == 1))
+            .await
+            .expect("connect should be counted")
+            .expect("watch open");
+        assert!(srv.ui_connected());
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), changes.wait_for(|n| *n == 0))
+            .await
+            .expect("disconnect should be counted")
+            .expect("watch open");
+        assert!(!srv.ui_connected());
+    }
+
     /// UI → service approval path.
     #[tokio::test]
     async fn approve_message_is_forwarded_to_command_channel() {
