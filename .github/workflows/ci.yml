@@ -74,6 +74,31 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace --all-targets
 
+      # windows-latest ships neither WebDriver tool the e2e suite below needs,
+      # and scripts/run-e2e.ps1 deliberately never downloads either one on its
+      # own (right for a developer machine, useless on a bare runner) — so CI
+      # provisions them itself: a pinned, hash-verified tauri-driver (mirrors
+      # the ComputeQuiet/SwatPulse reference harnesses) and a WebView2-matched,
+      # Microsoft-signature-verified msedgedriver.
+      - name: Install tauri-driver
+        shell: bash
+        run: |
+          bash scripts/setup-tauri-driver.sh
+          echo "$PWD/.webdriver" >> "$GITHUB_PATH"
+
+      - name: Provision msedgedriver for e2e
+        shell: pwsh
+        run: ./scripts/setup-msedgedriver-ci.ps1
+
+      # Drives the real debug eir.exe + eir-svc.exe through tauri-driver and the
+      # real webview, fully isolated from the installed Eir — see e2e/service.ts.
+      # windows-ci.ps1 applies the WebView2 remote-debugging policy override
+      # GitHub's elevated runners need (see its header comment) and removes it
+      # afterwards regardless of outcome.
+      - name: End-to-end suite
+        shell: pwsh
+        run: ./e2e/windows-ci.ps1
+
       # The full bundle build runs beforeBuildCommand (stages eir-svc.exe) and signs
       # the updater artefacts, so a broken bundle can't ship green. Build-only — no
       # tagName, so nothing is published.

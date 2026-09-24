@@ -82,6 +82,21 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace --all-targets
 
+      # Same WebDriver end-to-end gate as ci.yml, re-run on the tagged commit.
+      - name: Install tauri-driver
+        shell: bash
+        run: |
+          bash scripts/setup-tauri-driver.sh
+          echo "$PWD/.webdriver" >> "$GITHUB_PATH"
+
+      - name: Provision msedgedriver for e2e
+        shell: pwsh
+        run: ./scripts/setup-msedgedriver-ci.ps1
+
+      - name: End-to-end suite
+        shell: pwsh
+        run: ./e2e/windows-ci.ps1
+
       # Build and sign only. GitHub draft creation/upload lives in publish-release.ps1
       # so a 503 replacing an existing draft asset cannot abort after the Windows build.
       - name: Build installer and updater artifacts

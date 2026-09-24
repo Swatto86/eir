@@ -34,6 +34,11 @@ Invoke-Step 'cargo fmt --check' { cargo fmt --all -- --check }
 Invoke-Step 'stage service binary' { & eir-ui/build-svc.ps1 }
 Invoke-Step 'cargo clippy' { cargo clippy --locked --workspace --all-targets -- -D warnings }
 Invoke-Step 'cargo test' { cargo test --locked --workspace --all-targets }
+# Builds the debug eir.exe + eir-svc.exe and drives them through the real
+# webview and named pipe, fully isolated from any installed Eir — see
+# e2e/service.ts. Requires tauri-driver and a WebView2-matched msedgedriver;
+# scripts/run-e2e.ps1 locates both and reports rather than silently fetching.
+Invoke-Step 'e2e' { & (Join-Path $PSScriptRoot 'run-e2e.ps1') }
 Invoke-Step 'cargo build --release' { cargo build --locked --workspace --release }
 Invoke-Step 'portable imports' {
     & (Join-Path $PSScriptRoot 'check-portable-imports.ps1') `

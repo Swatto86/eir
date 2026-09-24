@@ -4,3 +4,6 @@ config.toml
 !.cargo/config.toml
 eir-ui/bin/
 eir-ui/Microsoft.WebView2.FixedVersionRuntime.*.x64/
+e2e/node_modules/
+# CI-only, pinned WebDriver download (scripts/setup-tauri-driver.sh)
+/.webdriver/
