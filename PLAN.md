@@ -1,8 +1,8 @@
 # Eir roadmap — v0.35.0
 
-**Release line:** v0.34.19 (published)
+**Release line:** v0.35.0 (published 2026-09-24 from 3b3837a)
 
-**Current code:** v0.35.0 (local release candidate; not tagged or published)
+**Current code:** v0.35.0
 
 ## What v0.35.0 adds
 

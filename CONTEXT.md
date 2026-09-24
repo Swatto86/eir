@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. The published release line is v0.34.19; v0.35.0 (guardian features) is a local candidate. It has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.35.0 (published 2026-09-24). It has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
