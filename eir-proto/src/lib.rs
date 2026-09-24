@@ -5,6 +5,10 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const CAP_COMMAND_RESULTS: &str = "command_results";
 pub const CAP_PROVIDER_TEST: &str = "provider_test";
 pub const CAP_TARGETED_UPDATE_RETRY: &str = "targeted_update_retry";
+/// The service accepts [`UiMsg::ReportScreenError`] from the tray's on-screen watcher.
+pub const CAP_SCREEN_ERRORS: &str = "screen_errors";
+/// The service accepts [`UiMsg::Investigate`] (user-requested focused analysis).
+pub const CAP_INVESTIGATE: &str = "investigate";
 
 /// Everything this service build supports, for every StatusPayload it sends —
 /// the startup seed, the degraded projection, and the decision loop's snapshot.
@@ -15,6 +19,8 @@ pub fn service_capabilities() -> Vec<String> {
         CAP_COMMAND_RESULTS.to_string(),
         CAP_PROVIDER_TEST.to_string(),
         CAP_TARGETED_UPDATE_RETRY.to_string(),
+        CAP_SCREEN_ERRORS.to_string(),
+        CAP_INVESTIGATE.to_string(),
     ]
 }
 
@@ -102,6 +108,27 @@ pub struct StatusPayload {
     /// Collector tokens whose latest value is unavailable or degraded.
     #[serde(default)]
     pub signal_errors: Vec<String>,
+    /// What Eir noticed recently (newest first): error events, failing app logs,
+    /// on-screen error messages and hung apps. Memory-only. `#[serde(default)]`.
+    #[serde(default)]
+    pub recent_signals: Vec<SignalView>,
+    /// The user-requested investigation that is queued or running, if any.
+    /// `#[serde(default)]` keeps an older payload decodable.
+    #[serde(default)]
+    pub investigation: Option<String>,
+}
+
+/// One thing Eir noticed, for the dashboard's live feed. Display-only.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct SignalView {
+    /// Unix seconds when it was noticed.
+    pub at: i64,
+    /// Where it came from: `event_log`, `app_log`, `screen` or `hung`.
+    pub source: String,
+    /// The application or event source it concerns.
+    pub app: String,
+    /// A short, bounded description.
+    pub summary: String,
 }
 
 /// One point of the dashboard resource timeline. Percentages, unix-seconds `at`.
@@ -466,6 +493,11 @@ pub struct UiSettings {
     /// Switch to the High Performance power plan while Game Mode is active. `#[serde(default)]`.
     #[serde(default)]
     pub game_mode_power_boost: bool,
+    /// Report on-screen error messages and hung apps to the service (the tray reads this
+    /// to decide whether to run its watcher). An older service omits it (false), which
+    /// also keeps a newer tray from sending a message that service cannot decode.
+    #[serde(default)]
+    pub watch_screen_errors: bool,
 }
 
 /// A settings change from the UI. Secret fields are `None` to mean "unchanged";
@@ -521,6 +553,9 @@ pub struct SettingsUpdate {
     /// Switch to High Performance power plan during Game Mode. `#[serde(default)]`.
     #[serde(default)]
     pub game_mode_power_boost: bool,
+    /// Watch for on-screen error messages. `None` (an older tray) leaves it unchanged.
+    #[serde(default)]
+    pub watch_screen_errors: Option<bool>,
 }
 
 /// Aggregated AI usage, surfaced in the UI so the user can see how much of
@@ -739,6 +774,22 @@ pub enum UiMsg {
     },
     /// Verify the saved provider/model from the LocalSystem service context.
     TestProvider,
+    /// The tray saw an error message box or a hung ("Not Responding") window on the
+    /// desktop. Untrusted text: the service bounds it and treats it as a signal only.
+    ReportScreenError {
+        /// Executable name of the owning process (e.g. `outlook.exe`).
+        app: String,
+        title: String,
+        text: String,
+        /// True for a hung window rather than an error dialog.
+        #[serde(default)]
+        hung: bool,
+    },
+    /// Investigate a problem the user describes and fix it through the normal policy
+    /// gate. Runs one focused analysis cycle as soon as possible.
+    Investigate {
+        description: String,
+    },
 }
 
 #[cfg(test)]
@@ -866,5 +917,61 @@ mod tests {
         }))
         .expect("old status still decodes");
         assert!(status.action_preferences.is_empty());
+    }
+
+    #[test]
+    fn guardian_messages_have_stable_wire_shape() {
+        assert_eq!(
+            serde_json::to_value(UiMsg::ReportScreenError {
+                app: "outlook.exe".to_string(),
+                title: "Microsoft Outlook".to_string(),
+                text: "Cannot start Microsoft Outlook.".to_string(),
+                hung: false,
+            })
+            .expect("serialize screen error"),
+            serde_json::json!({
+                "type": "report_screen_error",
+                "app": "outlook.exe",
+                "title": "Microsoft Outlook",
+                "text": "Cannot start Microsoft Outlook.",
+                "hung": false
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(UiMsg::Investigate {
+                description: "Outlook keeps crashing".to_string(),
+            })
+            .expect("serialize investigate"),
+            serde_json::json!({"type": "investigate", "description": "Outlook keeps crashing"})
+        );
+        // A report without `hung` still decodes (defaults to an error dialog).
+        assert!(matches!(
+            serde_json::from_value::<UiMsg>(serde_json::json!({
+                "type": "report_screen_error", "app": "a.exe", "title": "t", "text": "x"
+            }))
+            .expect("decode"),
+            UiMsg::ReportScreenError { hung: false, .. }
+        ));
+    }
+
+    #[test]
+    fn guardian_fields_default_for_older_peers() {
+        let status: StatusPayload = serde_json::from_value(serde_json::json!({
+            "status": "Active", "paused": false, "cpu": 0.0, "memory": 0.0, "disk": 0.0,
+            "failed_services": [], "last_analysis": "", "recent_problems": [],
+            "recent_executions": [], "error": null, "usage": null, "settings": null
+        }))
+        .expect("old status still decodes");
+        assert!(status.recent_signals.is_empty());
+        assert!(status.investigation.is_none());
+        let update: SettingsUpdate = serde_json::from_value(serde_json::json!({
+            "provider": "claude_cli", "model": "", "update_check_model": "",
+            "decision_interval_secs": 600, "event_log_poll_interval_secs": 45,
+            "wmi_poll_interval_secs": 300, "event_log_channels": [], "log_directories": []
+        }))
+        .expect("old settings update still decodes");
+        assert_eq!(update.watch_screen_errors, None);
+        assert!(service_capabilities().contains(&CAP_SCREEN_ERRORS.to_string()));
+        assert!(service_capabilities().contains(&CAP_INVESTIGATE.to_string()));
     }
 }

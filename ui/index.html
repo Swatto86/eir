@@ -284,6 +284,8 @@
     .act-undo { padding: 1px 8px; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 6px; cursor: pointer; font-size: 11px; font-family: inherit; white-space: nowrap; }
     .act-undo:hover { background: var(--surface-2); color: var(--text); }
     .act-undo:disabled { opacity: .5; cursor: default; }
+    .noticed-actions { display: flex; gap: 6px; margin-top: 5px; }
+    .investigating { padding: 10px 15px; font-size: 13px; color: var(--muted); }
     .row-age { margin-left: auto; padding-left: 8px; color: var(--muted); font-size: 11px; white-space: nowrap; }
 
     /* ── Settings ── */
@@ -394,6 +396,7 @@
         <div class="hero-main">
           <div class="hero-status" id="hero-status">Initializing…</div>
           <div class="hero-sub">System guardian — watching Windows and reacting to errors as they happen.</div>
+          <div class="hero-sub" id="hero-investigating" role="status" style="display:none"></div>
           <div class="hero-err" id="hero-err" role="alert" style="display:none"></div>
           <div class="hero-actions" id="hero-actions" style="display:none;gap:8px;margin-top:8px">
             <button class="btn small" id="hero-fix" style="display:none">Open Settings</button>
@@ -437,6 +440,11 @@
         </div>
       </div>
 
+      <div class="card" id="noticed-card" style="display:none">
+        <div class="card-header">What Eir noticed</div>
+        <div id="noticed-list"></div>
+      </div>
+
       <div class="card" id="digest-card" style="display:none">
         <div class="card-header">This week<span class="hspacer"></span><span class="row-age" id="digest-when"></span></div>
         <div class="ai-now-text" id="digest-text"></div>
@@ -474,11 +482,13 @@
             <button class="btn" id="ask-attach-folder" title="Attach a folder's text files as context">📁 Folder</button>
             <span class="set-status" id="ask-status" role="status"></span>
             <div style="flex:1"></div>
+            <button class="btn" id="ask-investigate" title="Have Eir look into this problem now and fix what it safely can">Investigate &amp; fix</button>
             <button class="btn primary" id="ask-send">Ask Eir</button>
           </div>
         </div>
       </div>
-      <div class="set-note" style="padding:0 2px">Eir answers from what it can see on this PC right now — attach files, screenshots or a folder to give it more. It won't give you commands to run; it applies fixes itself, through its approval system.</div>
+      <div class="set-note" style="padding:0 2px">Ask how anything on this PC works, or what an error means — Eir answers from what it can see right now, and you can attach files, screenshots or a folder. Describe a problem and press <b>Investigate &amp; fix</b> to have Eir look into it straight away and fix what it safely can; anything disruptive waits in Approvals.</div>
+      <div class="card" id="ask-investigating" style="display:none"><div class="investigating" role="status"></div></div>
       <div id="ask-list"></div>
     </section>
 
@@ -632,8 +642,10 @@
           <input id="set-game-auto" type="checkbox">
           <label for="set-game-power" title="Switch to the High Performance power plan during Game Mode, restored on exit">Game Mode power boost</label>
           <input id="set-game-power" type="checkbox">
+          <label for="set-watch-screen" title="Let Eir notice error message boxes and apps that stop responding, and react to them">Watch on-screen errors</label>
+          <input id="set-watch-screen" type="checkbox">
         </div>
-        <div class="set-note">Eir reacts to errors the moment they land (debounced ~10&nbsp;s); the decision interval is just the background sweep. Game Mode pauses the updater &amp; housekeeping while a fullscreen game runs.</div>
+        <div class="set-note">Eir reacts to errors the moment they land (debounced ~10&nbsp;s) — including error message boxes and frozen apps on screen when that is switched on; the decision interval is just the background sweep. Game Mode pauses the updater &amp; housekeeping while a fullscreen game runs.</div>
         <div class="set-actions">
           <button class="btn primary" id="set-save" disabled>Save settings</button>
           <button class="btn" id="test-provider" title="Update the Eir service to enable provider testing" disabled>Test provider</button>

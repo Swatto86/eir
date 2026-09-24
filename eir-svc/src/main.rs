@@ -435,6 +435,14 @@ struct SvcState {
     /// the auto-detector's heartbeat lease. Gaming is active if this is set OR the lease is
     /// live.
     gaming_manual: bool,
+    /// On-screen error reports from the tray, waiting for the next decision cycle.
+    screen_errors: signals::screen::ScreenErrorBuffer,
+    /// The dashboard's "What Eir noticed" feed (newest first, capped). Memory-only.
+    recent_signals: VecDeque<eir_proto::SignalView>,
+    /// The user-requested investigation that is queued or running.
+    investigation: Option<String>,
+    /// Unix seconds the last investigation was accepted (0 = never), for the spend guard.
+    last_investigate_at: i64,
 }
 
 impl Default for SvcState {
@@ -482,6 +490,10 @@ impl Default for SvcState {
             startup_targets: std::collections::HashMap::new(),
             gaming_until: 0,
             gaming_manual: false,
+            screen_errors: signals::screen::ScreenErrorBuffer::default(),
+            recent_signals: VecDeque::new(),
+            investigation: None,
+            last_investigate_at: 0,
         }
     }
 }
@@ -730,6 +742,34 @@ fn build_status(st: &SvcState) -> StatusPayload {
         svc_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         signals_at: st.signals_at,
         signal_errors: st.signal_errors.clone(),
+        recent_signals: st.recent_signals.iter().cloned().collect(),
+        investigation: st.investigation.clone(),
+    }
+}
+
+/// Ask history kept in memory (newest first).
+const MAX_ASK_ENTRIES: usize = 10;
+
+fn push_ask_entry(st: &mut SvcState, entry: eir_proto::AskEntry) {
+    st.ask_entries.push_front(entry);
+    st.ask_entries.truncate(MAX_ASK_ENTRIES);
+}
+
+/// Report a finished user-requested investigation in the Ask history and clear it, keeping
+/// any Ask error notice that is already showing.
+fn finish_investigation(st: &mut SvcState, answer: String) {
+    if let Some(description) = st.investigation.take() {
+        push_ask_entry(
+            st,
+            eir_proto::AskEntry {
+                question: format!("Investigate & fix: {description}"),
+                answer: ask::bound_answer(answer),
+                at: chrono::Utc::now().timestamp(),
+                attachments: vec![],
+            },
+        );
+        let carry = st.ask.as_ref().and_then(|a| a.error.clone());
+        refresh_ask(st, carry);
     }
 }
 
@@ -1300,6 +1340,13 @@ fn actionable_fingerprint(snap: &SignalSnapshot) -> Option<String> {
             parts.push(format!("E|{}|{}|{}", e.level, e.source, e.event_id));
         }
     }
+    for e in &snap.screen_errors {
+        if e.hung {
+            parts.push(format!("H|{}", e.app));
+        } else {
+            parts.push(format!("D|{}|{}", e.app, e.title));
+        }
+    }
     let sys = &snap.system_state;
     // Faults (failed services, firewall off, Defender faults) share their
     // definition with the WMI reactive trigger — see SystemState::fault_parts.
@@ -1556,6 +1603,8 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
     // instead of on the next scheduled tick. Capacity 1 + try_send coalesces
     // bursts.
     let (trigger_tx, mut trigger_rx) = tokio::sync::mpsc::channel::<()>(1);
+    // The loop's own sender, for signals that arrive over the pipe (on-screen errors).
+    let loop_trigger = trigger_tx.clone();
     let (event_log_shared, _el_shutdown) = signals::event_log::spawn(
         cfg.monitoring.event_log_channels.clone(),
         cfg.monitoring.event_log_poll_interval_secs,
@@ -1721,6 +1770,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
     const GAMING_LEASE_SECS: i64 = 90;
     let mut last_cycle_at = tokio::time::Instant::now();
     let mut react_at: Option<tokio::time::Instant> = None;
+    // True while the running analysis carries the user's investigation request, so its
+    // result (or failure) is reported back in the Ask history exactly once.
+    let mut investigation_in_flight = false;
     // Last-known Game Mode state, tracked across the SetGaming handler and the per-tick
     // reconcile so a lease that lapses with no explicit off (e.g. a crashed tray) still
     // triggers the power-plan restore + a re-analysis.
@@ -1998,15 +2050,15 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                         Err(e) => warn!("Failed to compute usage summary: {e}"),
                                     }
                                 }
-                                if st.ask_entries.len() >= 10 {
-                                    st.ask_entries.pop_back();
-                                }
-                                st.ask_entries.push_front(eir_proto::AskEntry {
-                                    question,
-                                    answer: ask::bound_answer(answer),
-                                    at: chrono::Utc::now().timestamp(),
-                                    attachments,
-                                });
+                                push_ask_entry(
+                                    &mut st,
+                                    eir_proto::AskEntry {
+                                        question,
+                                        answer: ask::bound_answer(answer),
+                                        at: chrono::Utc::now().timestamp(),
+                                        attachments,
+                                    },
+                                );
                                 // Preserve a rejection notice that arrived while this
                                 // answer was in flight (a duplicate submission rejected
                                 // mid-run) — clearing it here would erase the only signal
@@ -2101,6 +2153,12 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                     "Error".to_string()
                                 };
                                 st.error = Some(format!("AI: {e}"));
+                                if std::mem::take(&mut investigation_in_flight) {
+                                    finish_investigation(
+                                        &mut st,
+                                        format!("Eir couldn't complete the investigation: {e}"),
+                                    );
+                                }
                                 pipe.broadcast_status(build_status(&st));
                                 continue;
                             }
@@ -2126,6 +2184,13 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
 
                         st.last_analysis = claude_decision.analysis.clone();
                         st.last_analysis_unix = chrono::Utc::now().timestamp();
+                        if std::mem::take(&mut investigation_in_flight) {
+                            finish_investigation(
+                                &mut st,
+                                ask::investigation_answer(&claude_decision),
+                            );
+                            pipe.broadcast_status(build_status(&st));
+                        }
                         // Match the idle-skip/heartbeat gates: don't clear an error the
                         // user may have paused because of.
                         if !st.paused {
@@ -2453,6 +2518,10 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                         UiMsg::TogglePause => {
                             st.paused = !st.paused;
                             st.status = resting_status(&st);
+                            if !st.paused && st.investigation.is_some() {
+                                // A queued investigation runs as soon as monitoring resumes.
+                                react_at = Some(tokio::time::Instant::now());
+                            }
                             command_result = Ok(if st.paused {
                                 "Monitoring paused".to_string()
                             } else {
@@ -3414,6 +3483,14 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                         )
                                     })
                                     .collect();
+                                let state_details =
+                                    ask::describe_state(&signals::wmi::current(&wmi_shared));
+                                let noticed: Vec<String> = st
+                                    .recent_signals
+                                    .iter()
+                                    .take(12)
+                                    .map(ask::feed_line)
+                                    .collect();
                                 let db_a = db.clone();
                                 let ai_a = ai_ref.clone();
                                 let done = ask_done_tx.clone();
@@ -3434,6 +3511,12 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                         let learned = learn::LearnedFacts::load(&db_a)
                                             .await
                                             .prompt_section();
+                                        let machine = tokio::task::spawn_blocking(|| {
+                                            signals::profile::describe(&signals::profile::read())
+                                        })
+                                        .await
+                                        .ok()
+                                        .flatten();
                                         let ctx = ask::AskContext {
                                             cpu,
                                             memory,
@@ -3444,6 +3527,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                             recent_problems,
                                             recent_executions,
                                             learned,
+                                            machine,
+                                            state_details,
+                                            noticed,
                                         };
                                         let attach_section =
                                             ask::format_text_attachments(&text_files);
@@ -3484,6 +3570,64 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                         };
                                     let _ = done.send((q, labels_c, result));
                                 });
+                            }
+                        }
+                        UiMsg::ReportScreenError {
+                            app,
+                            title,
+                            text,
+                            hung,
+                        } => {
+                            if !cfg.monitoring.watch_screen_errors {
+                                command_result =
+                                    Err("On-screen error watching is turned off".to_string());
+                            } else {
+                                match signals::screen::normalise(
+                                    &app,
+                                    &title,
+                                    &text,
+                                    hung,
+                                    chrono::Utc::now(),
+                                ) {
+                                    Ok(report) => {
+                                        let view = signals::feed::screen_view(&report);
+                                        if st.screen_errors.push(report) {
+                                            info!(app = %view.app, hung, "On-screen error reported by the tray");
+                                            signals::feed::push(&mut st.recent_signals, vec![view]);
+                                            // Wake the reactive path like any other collector.
+                                            let _ = loop_trigger.try_send(());
+                                            pipe.broadcast_status(build_status(&st));
+                                        }
+                                        command_result = Ok("Reported".to_string());
+                                    }
+                                    Err(reason) => command_result = Err(reason.to_string()),
+                                }
+                            }
+                        }
+                        UiMsg::Investigate { description } => {
+                            let now = chrono::Utc::now().timestamp();
+                            match ask::investigate_rejection_reason(
+                                &description,
+                                ai.is_some(),
+                                st.paused,
+                                st.investigation.is_some(),
+                                st.last_investigate_at,
+                                now,
+                            ) {
+                                Some(reason) => command_result = Err(reason.to_string()),
+                                None => {
+                                    info!("User asked Eir to investigate a problem");
+                                    st.investigation = Some(description.trim().to_string());
+                                    st.last_investigate_at = now;
+                                    // Run as soon as the loop is free; an in-flight analysis
+                                    // finishes first (the reaction arm waits for it).
+                                    react_at = Some(tokio::time::Instant::now());
+                                    command_result = Ok(
+                                        "Investigating — the result will appear in Ask Eir"
+                                            .to_string(),
+                                    );
+                                    pipe.broadcast_status(build_status(&st));
+                                }
                             }
                         }
                         UiMsg::ClearAsk => {
@@ -3767,29 +3911,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                     continue;
                 }
 
-                // ── Collect signals ──────────────────────────────────────────
-                let history =
-                    audit::get_recent_decisions(&db, 5).await.unwrap_or_else(|e| {
-                        warn!("Failed to load decision history: {e}");
-                        vec![]
-                    });
-
-                let snapshot = SignalSnapshot {
-                    timestamp:        chrono::Utc::now(),
-                    event_log:        signals::event_log::drain(&event_log_shared),
-                    file_changes:     signals::file_watch::drain(&file_watch_shared),
-                    system_state:     signals::wmi::current(&wmi_shared),
-                    decision_history: history.clone(),
-                };
-
-                info!(
-                    event_entries = snapshot.event_log.len(),
-                    file_changes  = snapshot.file_changes.len(),
-                    "Signal snapshot collected"
-                );
-
                 // ── Update metrics in broadcast ──────────────────────────────
-                apply_live_metrics(&mut st, &snapshot.system_state);
+                let system_state = signals::wmi::current(&wmi_shared);
+                apply_live_metrics(&mut st, &system_state);
                 // Refresh the dashboard resource timeline (last 24h, thinned) once per
                 // tick — cheap, and off the per-broadcast path (build_status only clones
                 // the cached vec). Reads the same per-cycle series the trend detector uses.
@@ -3868,6 +3992,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                 }
 
                 if analysis_running {
+                    // The event-log / log-file / on-screen buffers are deliberately left
+                    // undrained: draining here threw away every error that arrived while an
+                    // analysis ran. The reaction queued behind this analysis picks them up.
                     info!("Analysis already in flight - skipping this pass");
                     st.status = resting_status(&st);
                     if !st.paused {
@@ -3876,6 +4003,34 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                     pipe.broadcast_status(build_status(&st));
                     continue;
                 }
+
+                // ── Collect signals ──────────────────────────────────────────
+                let history =
+                    audit::get_recent_decisions(&db, 5).await.unwrap_or_else(|e| {
+                        warn!("Failed to load decision history: {e}");
+                        vec![]
+                    });
+
+                let snapshot = SignalSnapshot {
+                    timestamp:        chrono::Utc::now(),
+                    event_log:        signals::event_log::drain(&event_log_shared),
+                    file_changes:     signals::file_watch::drain(&file_watch_shared),
+                    system_state,
+                    decision_history: history.clone(),
+                    screen_errors:    st.screen_errors.drain(),
+                    user_report:      st.investigation.clone(),
+                };
+
+                info!(
+                    event_entries = snapshot.event_log.len(),
+                    file_changes  = snapshot.file_changes.len(),
+                    screen_errors = snapshot.screen_errors.len(),
+                    "Signal snapshot collected"
+                );
+                signals::feed::push(
+                    &mut st.recent_signals,
+                    signals::feed::from_snapshot(&snapshot),
+                );
 
                 // ── Feedback after-states ────────────────────────────────────
                 if let Err(e) =
@@ -3954,8 +4109,10 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                 // the first analysis, on any actionable change, and on a periodic
                 // heartbeat, so the UI shows a current result even on a healthy box.
                 let fingerprint = actionable_fingerprint(&snapshot);
-                let changed =
-                    fingerprint.is_some() && fingerprint.as_deref() != last_fingerprint.as_deref();
+                // A user-requested investigation always runs, whatever the fingerprint says.
+                let changed = snapshot.user_report.is_some()
+                    || (fingerprint.is_some()
+                        && fingerprint.as_deref() != last_fingerprint.as_deref());
                 let heartbeat_due = last_analysis_at
                     .map(|t| t.elapsed() >= ANALYSIS_HEARTBEAT)
                     .unwrap_or(true);
@@ -4009,6 +4166,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                 }
 
                 analysis_running = true;
+                investigation_in_flight = snapshot.user_report.is_some();
                 let ai_task = ai.clone();
                 let advisor_cfg = cfg.advisor.clone();
                 let spent_baseline = st.advisor_spent_today;
@@ -4516,7 +4674,57 @@ mod analysis_outcome_tests {
                 security: Default::default(),
             },
             decision_history: vec![],
+            screen_errors: vec![],
+            user_report: None,
         }
+    }
+
+    #[test]
+    fn on_screen_errors_make_a_healthy_snapshot_actionable() {
+        let mut snap = snapshot();
+        assert_eq!(actionable_fingerprint(&snap), None);
+        let report = |app: &str, title: &str, hung| {
+            signals::screen::normalise(app, title, "Cannot start.", hung, chrono::Utc::now())
+                .expect("valid report")
+        };
+        snap.screen_errors = vec![
+            report("outlook.exe", "Microsoft Outlook", false),
+            report("winword.exe", "Report.docx - Word", true),
+        ];
+        assert_eq!(
+            actionable_fingerprint(&snap).as_deref(),
+            Some("D|outlook.exe|Microsoft Outlook\nH|winword.exe")
+        );
+    }
+
+    #[test]
+    fn a_finished_investigation_lands_in_ask_history_once() {
+        let mut st = SvcState {
+            investigation: Some("Outlook won't start".into()),
+            ..Default::default()
+        };
+        finish_investigation(&mut st, "The Spooler crashed.".into());
+        assert!(st.investigation.is_none());
+        assert_eq!(st.ask_entries.len(), 1);
+        assert_eq!(
+            st.ask_entries[0].question,
+            "Investigate & fix: Outlook won't start"
+        );
+        assert_eq!(st.ask_entries[0].answer, "The Spooler crashed.");
+        assert_eq!(st.ask.as_ref().map(|a| a.entries.len()), Some(1));
+        finish_investigation(&mut st, "again".into());
+        assert_eq!(st.ask_entries.len(), 1, "nothing to finish twice");
+        for i in 0..20 {
+            push_ask_entry(
+                &mut st,
+                eir_proto::AskEntry {
+                    question: format!("q{i}"),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(st.ask_entries.len(), MAX_ASK_ENTRIES);
+        assert_eq!(st.ask_entries[0].question, "q19");
     }
 
     /// The channel carries `Result<AnalysisSuccess, String>` straight from the

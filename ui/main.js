@@ -31,7 +31,7 @@ function commandMessage(result, fallback) {
 }
 
 const SERVICE_ACTION_SELECTOR = [
-  '#ask-send', '#clear-ask',
+  '#ask-send', '#clear-ask', '#ask-investigate',
   '#disk-scan', '.disk-clean',
   '#startup-scan', '.startup-toggle',
   '.btn-approve', '.btn-reject', '.btn-ignore-fix', '.btn-always-approve',
@@ -458,6 +458,8 @@ async function refreshInner() {
   renderDigest(status.digest);
   renderHistory(status);
   renderAsk(status.ask);
+  renderNoticed(status);
+  renderInvestigation(status);
   renderDisk(status.disk_insights, status.paused);
   renderStartup(status.startup, status.paused);
 
@@ -609,6 +611,96 @@ function renderAsk(ask) {
     </div>`).join('');
   list.innerHTML = html;
 }
+
+// ── What Eir noticed + Investigate & fix ──────────────────────────────────────
+
+const SIGNAL_LABELS = { event_log: 'Event log', app_log: 'App log', screen: 'On screen', hung: 'Not responding' };
+const SIGNAL_ICONS = { event_log: '⚠', app_log: '📄', screen: '🗔', hung: '⏳' };
+function signalLabel(v) { return SIGNAL_LABELS[v.source] || 'Signal'; }
+function describeSignal(v) { return `${signalLabel(v)} from ${v.app}: ${v.summary}`; }
+
+let lastNoticedSig = '';
+let noticedItems = [];
+function renderNoticed(status) {
+  const items = (status.recent_signals || []).slice(0, 8);
+  const canFix = (status.capabilities || []).includes('investigate')
+    && !status.investigation && !status.paused;
+  const sig = JSON.stringify({ items, canFix });
+  if (sig === lastNoticedSig) return;
+  lastNoticedSig = sig;
+  noticedItems = items;
+  document.getElementById('noticed-card').style.display = items.length ? 'block' : 'none';
+  document.getElementById('noticed-list').innerHTML = items.map((v, i) => `
+    <div class="act-item">
+      <div class="act-icon" aria-hidden="true">${SIGNAL_ICONS[v.source] || '•'}</div>
+      <div class="act-main">
+        <div class="act-head"><span class="act-text"><b>${esc(signalLabel(v))}</b> · ${esc(v.app)}</span><span class="act-when" data-ts="${v.at}">${ago(v.at)}</span></div>
+        <div class="act-why">${esc(v.summary)}</div>
+        <div class="noticed-actions">
+          <button class="act-undo" data-explain="${i}" title="Ask Eir what this means and why it happened">Explain</button>
+          <button class="act-undo" data-fix="${i}" title="Have Eir investigate this now and fix what it safely can"${canFix ? '' : ' disabled'}>Fix</button>
+        </div>
+      </div>
+    </div>`).join('');
+}
+
+async function investigateProblem(description, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const result = await invoke('investigate', { description });
+    toast(commandMessage(result, 'Investigating'), 'ok');
+    return true;
+  } catch (e) {
+    toast('Could not start the investigation: ' + e, 'err');
+    if (btn) btn.disabled = false;
+    return false;
+  } finally {
+    refresh();
+  }
+}
+
+document.getElementById('noticed-list').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-explain], [data-fix]');
+  if (!btn) return;
+  const isExplain = btn.dataset.explain !== undefined;
+  const item = noticedItems[Number(isExplain ? btn.dataset.explain : btn.dataset.fix)];
+  if (!item) return;
+  if (isExplain) {
+    showView('ask');
+    document.getElementById('ask-input').value =
+      `Explain this — ${describeSignal(item).replace(/[.\s]+$/, '')}. What does it mean, why might it have happened, and does it matter?`;
+    submitAsk();
+  } else {
+    investigateProblem(describeSignal(item), btn);
+  }
+});
+
+let investigationWas = '';
+function renderInvestigation(status) {
+  const inv = status.investigation || '';
+  const hero = document.getElementById('hero-investigating');
+  setText(hero, inv ? `Investigating: ${inv}` : '');
+  hero.style.display = inv ? 'block' : 'none';
+  const card = document.getElementById('ask-investigating');
+  setText(card.querySelector('.investigating'), inv ? `Eir is investigating: ${inv}` : '');
+  card.style.display = inv ? 'block' : 'none';
+  const btn = document.getElementById('ask-investigate');
+  btn.hidden = !(status.capabilities || []).includes('investigate');
+  btn.disabled = !!inv || !!status.paused;
+  setText(btn, inv ? 'Investigating…' : 'Investigate & fix');
+  if (investigationWas && !inv) toast('Investigation finished — see Ask Eir.', 'ok');
+  investigationWas = inv;
+}
+
+document.getElementById('ask-investigate').addEventListener('click', async (e) => {
+  const input = document.getElementById('ask-input');
+  const description = input.value.trim();
+  if (!description) {
+    document.getElementById('ask-status').textContent = 'Describe the problem first.';
+    return;
+  }
+  if (await investigateProblem(description, e.currentTarget)) input.value = '';
+});
 
 let askSending = false;
 let askAttachmentBusy = false;
@@ -1732,7 +1824,7 @@ function setServiceSettingsCardLoading(id, loading) {
   document.getElementById(id)
     .querySelectorAll('input, select, textarea, button')
     .forEach((control) => {
-      if (loading || !['test-provider', 'm-scoop'].includes(control.id)) {
+      if (loading || !['test-provider', 'm-scoop', 'set-watch-screen'].includes(control.id)) {
         control.disabled = loading;
       }
     });
@@ -1941,6 +2033,7 @@ function fillSettings() {
     document.getElementById('set-dirs').value = (s.log_directories || []).join(', ');
     document.getElementById('set-game-auto').checked = s.game_mode_auto !== false;
     document.getElementById('set-game-power').checked = !!s.game_mode_power_boost;
+    document.getElementById('set-watch-screen').checked = !!s.watch_screen_errors;
     document.getElementById('set-opencode-path').placeholder =
       s.opencode_cli_path_set ? '•••••• set — blank keeps it' : 'opencode  (blank = auto-detect)';
     document.getElementById('set-opencode-profile').placeholder =
@@ -1962,6 +2055,14 @@ function fillSettings() {
   settingsHydrated = !!(lastStatus.updater && lastStatus.updater.settings
     && lastStatus.advisor && lastStatus.advisor.settings);
   setServiceSettingsLoading(false);
+  // An older service cannot watch the screen; leave the box visibly unavailable.
+  const watchBox = document.getElementById('set-watch-screen');
+  watchBox.disabled = !canWatchScreen();
+  watchBox.title = watchBox.disabled ? 'Update the Eir service to enable this' : '';
+}
+
+function canWatchScreen() {
+  return ((lastStatus && lastStatus.capabilities) || []).includes('screen_errors');
 }
 
 async function saveSettings() {
@@ -1993,6 +2094,7 @@ async function saveSettings() {
     log_directories: splitList(document.getElementById('set-dirs').value),
     game_mode_auto: document.getElementById('set-game-auto').checked,
     game_mode_power_boost: document.getElementById('set-game-power').checked,
+    watch_screen_errors: canWatchScreen() ? document.getElementById('set-watch-screen').checked : null,
   };
   const st = document.getElementById('set-status');
 

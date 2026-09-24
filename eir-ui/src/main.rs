@@ -4,11 +4,13 @@ mod ask_attach;
 mod game_detect;
 mod pipe_client;
 mod provider_models;
+mod screen_watch;
 mod util;
 
 use eir_proto::{
     AdvisorSettingsUpdate, CommandResult, SettingsUpdate, StatusPayload, UiMsg, UiRequest,
-    UpdaterSettingsUpdate, CAP_COMMAND_RESULTS, CAP_PROVIDER_TEST, CAP_TARGETED_UPDATE_RETRY,
+    UpdaterSettingsUpdate, CAP_COMMAND_RESULTS, CAP_INVESTIGATE, CAP_PROVIDER_TEST,
+    CAP_TARGETED_UPDATE_RETRY,
 };
 use pipe_client::{CommandWaiters, SharedStatus};
 use serde::{Deserialize, Serialize};
@@ -308,6 +310,21 @@ async fn toggle_pause(tx: State<'_, UiCmdTx>) -> Result<String, String> {
 #[tauri::command]
 async fn undo_registry(id: i64, tx: State<'_, UiCmdTx>) -> Result<String, String> {
     send_command(&tx, UiMsg::UndoRegistry { id }).await
+}
+
+/// Ask the service to investigate a described problem and fix it through its policy gate.
+#[tauri::command]
+async fn investigate(description: String, tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    let chars = description.trim().chars().count();
+    if chars == 0 || chars > 1000 {
+        return Err("Describe the problem in up to 1000 characters".to_string());
+    }
+    if !supports(&tx.status, CAP_INVESTIGATE) {
+        return Err(
+            "The running service does not support investigations; update it first".to_string(),
+        );
+    }
+    send_command(&tx, UiMsg::Investigate { description }).await
 }
 
 #[tauri::command]
@@ -1106,6 +1123,9 @@ fn main() {
     let status_for_detect = status.clone();
     let connected_for_detect = connected.clone();
     let ui_cmd_tx_for_detect = ui_cmd_tx.clone();
+    let status_for_watch = status.clone();
+    let connected_for_watch = connected.clone();
+    let ui_cmd_tx_for_watch = ui_cmd_tx.clone();
     let ui_cmd_state = UiCmdTx {
         sender: ui_cmd_tx,
         connected: connected.clone(),
@@ -1248,6 +1268,13 @@ fn main() {
                 connected_for_detect,
             ));
 
+            // Background: on-screen error / hung-app watcher (reports over the pipe).
+            tauri::async_runtime::spawn(screen_watch::run(
+                status_for_watch,
+                ui_cmd_tx_for_watch,
+                connected_for_watch,
+            ));
+
             let status_tray = status_for_loop.clone();
             let icon_for_loop = icon_base.clone();
             let pause_item_tray = pause_item.clone();
@@ -1307,6 +1334,7 @@ fn main() {
             toggle_pause,
             undo_registry,
             ask_eir,
+            investigate,
             clear_ask,
             scan_disk,
             clean_disk_entry,

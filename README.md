@@ -126,6 +126,18 @@ are reported instead of being silently treated as queued.
 - **Reacts as errors land** — signal collectors wake the decision loop the moment an
   error appears (debounced ~10 s, at most once a minute), so fixes start in seconds
   instead of on the next scheduled sweep.
+- **Sees the errors you see** — the tray spots classic error message boxes and apps that
+  stop responding ("Not Responding") within a few seconds and hands them to the service
+  as a high-priority signal. The dashboard's **What Eir noticed** card lists every error,
+  failing app log, on-screen message and frozen app as it happens, each with **Explain**
+  and **Fix** buttons. Switch it off in Settings → *Watch on-screen errors*.
+- **Investigate & fix on demand** — describe a problem in Ask Eir (or press Fix beside a
+  noticed error) and Eir runs a focused analysis straight away, reports what it found in
+  the chat, and applies fixes through the same safety policy (disruptive ones still wait
+  in Approvals).
+- **Explains the system** — Ask Eir knows this PC's Windows edition and build, hardware,
+  live health, recent errors and how Eir itself works, so it can explain what a service,
+  error code or setting does, why something happened, and what Eir is doing about it.
 - **Advisor mode** — optional bounded escalation that lets Eir re-run one analysis at
   a stronger model or higher reasoning effort when the base model flags ambiguity or
   reports low confidence. A hard cap of 24 escalations per day keeps it bounded; spend

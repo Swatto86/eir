@@ -1,6 +1,6 @@
 ## Projects
 
-Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.18. It has three crates:
+Eir — Rust/Tauri v2 Windows desktop agent. The published release line is v0.34.19; v0.35.0 (guardian features) is a local candidate. It has three crates:
 
 - `eir-proto`: shared serde wire contract for the UI/service named pipe.
 - `eir-svc`: LocalSystem Windows service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
@@ -9,6 +9,10 @@ Eir — Rust/Tauri v2 Windows desktop agent. The current release line is v0.34.1
 Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
 
 ## Architectural decisions
+
+2026-09-24 | Eir | Guardian: on-screen errors, investigate & fix, explainer | The tray reports error message boxes and hung windows (`UiMsg::ReportScreenError`, setting `monitoring.watch_screen_errors`, default on) as a fourth signal source; a dashboard feed lists what Eir noticed with Explain / Fix. `UiMsg::Investigate` runs a focused analysis on a user-described problem through the unchanged policy gate and reports the result in Ask. Ask Eir gains a machine profile, live details, the feed and a "how Eir works" section. Both new messages are capability-gated (`screen_errors`, `investigate`) for tray/service skew.
+
+2026-09-24 | Eir | Collector buffers drain only when an analysis can use them | A scheduled tick landing during an in-flight analysis used to drain the event-log / log-file buffers and then bail, silently discarding errors that arrived mid-analysis. The drain now happens after the `analysis_running` check; metrics still refresh every tick.
 
 2026-09-22 | Eir | Service idles without the tray | `monitoring.require_tray` (default true) makes the decision loop skip analysis, updater and digest while no UI is connected to the pipe, and run a cycle as soon as one connects. Collectors keep running. Headless machines set it false.
 

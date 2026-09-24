@@ -1,6 +1,9 @@
 pub mod event_log;
+pub mod feed;
 pub mod file_watch;
 pub mod log_parser;
+pub mod profile;
+pub mod screen;
 pub mod wmi;
 
 /// Reactive-guardian trigger: collectors ping this (capacity-1, `try_send`, so a

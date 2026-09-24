@@ -202,6 +202,11 @@ pub struct MonitoringConfig {
     /// Set false for a headless machine that should self-heal unattended.
     #[serde(default = "default_true")]
     pub require_tray: bool,
+    /// Have the tray report error message boxes and hung ("Not Responding") windows so
+    /// Eir reacts to the errors the user actually sees. On by default; the text goes to
+    /// the configured AI provider like log excerpts do.
+    #[serde(default = "default_true")]
+    pub watch_screen_errors: bool,
 }
 
 fn default_confidence() -> f32 {
@@ -400,6 +405,7 @@ impl Config {
             api_key_set: false,
             game_mode_auto: self.monitoring.game_mode_auto,
             game_mode_power_boost: self.monitoring.game_mode_power_boost,
+            watch_screen_errors: self.monitoring.watch_screen_errors,
         }
     }
 
@@ -463,6 +469,9 @@ impl Config {
             finite_or(u.confidence_threshold, 0.50, 0.95, default_confidence());
         self.monitoring.game_mode_auto = u.game_mode_auto;
         self.monitoring.game_mode_power_boost = u.game_mode_power_boost;
+        if let Some(on) = u.watch_screen_errors {
+            self.monitoring.watch_screen_errors = on;
+        }
         Ok(())
     }
 }
@@ -847,6 +856,35 @@ audit_db = "./eir.db"
         assert_eq!(loaded.monitoring.decision_interval_secs, 555);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn screen_error_watch_defaults_on_and_an_older_tray_leaves_it_unchanged() {
+        let mut cfg: Config = toml::from_str(SAMPLE).expect("sample loads");
+        assert!(
+            cfg.monitoring.watch_screen_errors,
+            "on for a config written before it"
+        );
+        assert!(cfg.to_ui_settings().watch_screen_errors);
+        let update = |watch| SettingsUpdate {
+            provider: "claude_cli".into(),
+            decision_interval_secs: 600,
+            event_log_poll_interval_secs: 45,
+            wmi_poll_interval_secs: 300,
+            confidence_threshold: 0.8,
+            watch_screen_errors: watch,
+            ..Default::default()
+        };
+        cfg.apply_update(update(Some(false))).expect("apply off");
+        assert!(!cfg.monitoring.watch_screen_errors);
+        cfg.apply_update(update(None)).expect("older tray update");
+        assert!(
+            !cfg.monitoring.watch_screen_errors,
+            "None keeps the stored choice"
+        );
+        let reparsed: Config =
+            toml::from_str(&toml::to_string_pretty(&cfg).expect("serialize")).expect("reparse");
+        assert!(!reparsed.monitoring.watch_screen_errors);
     }
 
     #[test]

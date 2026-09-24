@@ -1,8 +1,26 @@
-# Eir roadmap — v0.34.17
+# Eir roadmap — v0.35.0
 
-**Release line:** v0.34.17
+**Release line:** v0.34.19 (published)
 
-**Current code:** v0.34.17
+**Current code:** v0.35.0 (local release candidate; not tagged or published)
+
+## What v0.35.0 adds
+
+- On-screen errors: the tray reports classic error message boxes and hung windows
+  (`ReportScreenError`), a fourth signal source that triggers the reactive path.
+- Dashboard "What Eir noticed" feed with Explain / Fix per item.
+- Investigate & fix: a user-described problem runs one focused analysis; fixes go through
+  the unchanged policy gate and the outcome is posted to Ask Eir.
+- Ask Eir explains the system: machine profile, live details, recent errors and how Eir
+  works.
+- Fix: collector buffers are no longer drained and discarded by a scheduled tick that lands
+  during an in-flight analysis.
+
+None of this adds repair authority: every fix still comes from the same action catalogue and
+policy gate.
+
+Before publishing v0.35.0: run the packaged upgrade from v0.34.19 and one live acceptance pass
+(error box → feed → analysis; Investigate & fix → Ask entry) against the installed service.
 
 ## v0.34.17 release gate
 

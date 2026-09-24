@@ -1247,6 +1247,8 @@ mod tests {
             file_changes: vec![],
             system_state: SystemState::default(),
             decision_history: vec![],
+            screen_errors: vec![],
+            user_report: None,
         };
         let decision = ClaudeDecision {
             analysis: "healthy".into(),

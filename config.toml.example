@@ -59,6 +59,9 @@ game_mode_power_boost = true
 # Idle (no AI analysis, updater or digest) while the tray app is closed; resume when it
 # opens. Set false for a headless PC that should self-heal unattended.
 require_tray = true
+# Let the tray report error message boxes and "Not Responding" apps so Eir reacts to the
+# errors you actually see.
+watch_screen_errors = true
 
 [advisor]
 enabled = false

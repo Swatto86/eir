@@ -10,6 +10,26 @@ pub struct SignalSnapshot {
     pub file_changes: Vec<FileChange>,
     pub system_state: SystemState,
     pub decision_history: Vec<PastDecision>,
+    /// Error message boxes and hung windows the tray saw on the desktop since the last
+    /// cycle (see `screen_errors`).
+    #[serde(default)]
+    pub screen_errors: Vec<ScreenError>,
+    /// A problem the user asked Eir to investigate (see `UiMsg::Investigate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_report: Option<String>,
+}
+
+/// An error dialog or hung ("Not Responding") window seen on the user's desktop.
+/// All text is untrusted and already bounded by `screen_errors::normalise`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct ScreenError {
+    pub timestamp: DateTime<Utc>,
+    /// Executable name of the owning process.
+    pub app: String,
+    pub title: String,
+    pub text: String,
+    /// True for a hung window rather than an error dialog.
+    pub hung: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

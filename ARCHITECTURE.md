@@ -7,7 +7,7 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-09-06 · **Code:** v0.34.18
+**Last updated:** 2026-09-24 · **Code:** v0.35.0
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
@@ -35,7 +35,7 @@ wire contract (newline-delimited JSON) over the secured local named pipe
 10 min, `decision_interval_secs`) and a **reactive path** — each signal collector
 pings a capacity-1 trigger channel the moment it captures something actionable
 (an Error event-log entry, an error-bearing log write, a new failed service or
-security fault), and the loop *schedules* a reaction ~10 s later (debounce, so a
+security fault, or an error dialog / hung window the tray reports), and the loop *schedules* a reaction ~10 s later (debounce, so a
 burst coalesces into one analysis) with a 60 s minimum gap between reactions.
 Both triggers pass a **tray presence gate** first: with `monitoring.require_tray`
 (default on) the loop idles — collectors keep running, but no analysis, updater
@@ -559,7 +559,7 @@ Identical fingerprints across cycles mean nothing changed → skipped until the 
 
 ## Signal sources
 
-Eir's signal layer is three independent background collectors that each maintain their own in-memory buffer, plus a per-cycle aggregation step in the decision loop that drains them into one `SignalSnapshot`. Each collector runs on its own cadence and writes to a shared, lock-guarded buffer; the decision loop reads a consistent slice of all three on each tick. All collectors live under `eir-svc/src/signals/` (`mod.rs` is just the module list — `event_log`, `file_watch`, `log_parser`, `wmi`).
+Eir's signal layer is three independent background collectors in the service plus an on-screen watcher in the tray (Source 4), each feeding its own bounded buffer, plus a per-cycle aggregation step in the decision loop that drains them into one `SignalSnapshot`. Each collector runs on its own cadence and writes to a shared, lock-guarded buffer; the decision loop reads a consistent slice of all three on each tick. All collectors live under `eir-svc/src/signals/` (`mod.rs` is just the module list — `event_log`, `file_watch`, `log_parser`, `wmi`).
 
 ### Data model (`eir-svc/src/models.rs`)
 
@@ -602,11 +602,50 @@ Eir's signal layer is three independent background collectors that each maintain
 - **Defender parse (`get_defender` + `parse_defender_status`, lines 364–395):** one `ps_capped` call runs `Get-MpComputerStatus -ErrorAction SilentlyContinue` and formats `'{0}|{1}|{2}'` from `RealTimeProtectionEnabled|AntivirusEnabled|AntivirusSignatureAge`. `parse_defender_status` splits on `|`; each field parses independently to `Some`/`None` (bools tolerant of casing/whitespace, age as `u32`), so any garbage/empty field degrades to `None` instead of failing the snapshot. Absent Defender / timeout → empty output → all `None`.
 - Unit tests in-file cover the firewall GPO matrix and Defender parsing (lines 484–529).
 
+### Source 4 — On-screen errors (`eir-ui/src/screen_watch.rs` → `signals/screen.rs`)
+
+- **Why the tray:** the LocalSystem service runs in session 0 and cannot see the desktop,
+  so the tray (active user's session) polls every 2 s. It reports two things:
+  - **Error message boxes** — visible `#32770` dialogs shaped like a message box (≤ 10
+    child controls including a Button, so property sheets full of labels are skipped)
+    whose title/Static text contains error wording (`looks_like_error`). Control text is
+    read with `SendMessageTimeoutW(WM_GETTEXT, SMTO_ABORTIFHUNG, 250 ms)`.
+  - **Hung windows** — visible top-level windows `IsHungAppWindow` reports on two
+    consecutive polls (so ≥ ~7 s unresponsive), excluding DWM `Ghost` windows. Titles
+    come from `GetWindowTextW`, which does not message the hung window.
+  Each window handle is reported once while it stays on screen (`Tracker`), only while
+  the pipe is connected, the service advertises `CAP_SCREEN_ERRORS`, and
+  `monitoring.watch_screen_errors` (default on) is set. Eir's own windows are skipped.
+- **Wire:** `UiMsg::ReportScreenError { app, title, text, hung }`. Untrusted: the service
+  (`signals::screen::normalise`) strips the app to its file name, collapses whitespace
+  and control characters, caps app/title/text at 120/200/1500 chars, and rejects empty
+  reports. `ScreenErrorBuffer` drops a repeat of the same app/title/text within 10 min
+  and keeps at most 20 undelivered reports. A new report is pushed to the feed at once
+  and pings the reactive trigger via the loop's own `TriggerTx` clone.
+- **Delivery:** drained one-shot into `SignalSnapshot.screen_errors`; the fingerprint adds
+  `D|app|title` (dialog) or `H|app` (hang); the prompt renders an **ON-SCREEN ERRORS**
+  section (removed from the snapshot JSON) and the system prompt tells the model to
+  correlate it with Application Error 1000 / Hang 1002 / .NET 1026 events and never to
+  `process_kill` a hung foreground app.
+- **Verified live:** `screen_watch::tests::real_desktop_error_box_and_frozen_window_are_observed`
+  (opt-in, needs an interactive desktop) spawns a real WinForms error box and a genuinely
+  frozen window and asserts both are observed with the right app/text.
+
+### "What Eir noticed" feed (`signals/feed.rs`)
+
+`st.recent_signals` (memory-only, newest first, cap 30) is broadcast as
+`StatusPayload.recent_signals: Vec<SignalView {at, source, app, summary}>`. Sources:
+Error-level event-log entries and ERROR/FATAL log events from each drained snapshot
+(`feed::from_snapshot`; warnings are too noisy to list), plus screen reports at the moment
+they arrive (`feed::screen_view`). An identical item within 10 min is not repeated;
+summaries are one line, ≤ 240 chars. The dashboard renders the newest 8 with **Explain**
+(pre-fills and sends an Ask question) and **Fix** (starts an investigation).
+
 ### Aggregation and the actionable fingerprint (`eir-svc/src/main.rs`)
 
 - **Wiring:** all three spawn at startup (`event_log::spawn`, `file_watch::spawn` after `discover_watch_dirs`, `wmi::spawn`), each holding a clone of the reactive `TriggerTx` (`signals/mod.rs` — capacity-1 tokio mpsc, `try_send` so a burst coalesces and a send never blocks); a 5 s settle sleep follows before status flips to "Active".
 - **WMI trigger:** each snapshot computes `fault_key` from the shared `SystemState::fault_parts()` (failed services, firewall explicitly off, Defender faults while Defender is the active AV) and pings the trigger whenever the key **changed** — including a fault *clearing* (key → empty), so a recovered service is reflected within one reactive debounce instead of waiting for the next scheduled decision tick. An unchanged key never re-triggers, so a persistent fault doesn't fire every poll. A pure recovery leaves `actionable_fingerprint` empty, so the idle-skip gate suppresses the expensive AI **analysis** — the wake just refreshes the UI (clears the stale failed-service chip). It reaches the loop body like any other reactive wake, so the bounded once-per-fact learned-fact labeller may still run if a fact is unlabelled (unchanged from prior behaviour); steady-state that's zero.
-- **Per cycle:** the decision loop builds the snapshot from `event_log::drain` and `file_watch::drain` (both one-shot reads), `wmi::current` (clone of latest), plus DB decision history.
+- **Per cycle:** the decision loop refreshes live metrics from `wmi::current` first; it drains `event_log::drain`, `file_watch::drain` and the screen-error buffer (all one-shot reads) only **after** the `analysis_running` bail-out. Before v0.35.0 a scheduled tick that landed during a (possibly minutes-long) analysis drained the buffers and then discarded them, so errors that arrived mid-analysis never reached the AI; now they stay buffered for the reaction queued behind the analysis.
 - **`actionable_fingerprint`** decides whether a cycle is even worth an AI call and dedups unchanged states. It is built from **shared predicates in `models.rs`** so the fingerprint and the reactive triggers can't drift: `LogEvent::is_actionable()` (`F|path|sev|count`), `EventLogEntry::is_actionable()` (`E|level|source|id`), and `SystemState::fault_parts()` (`S|name`, `FW|name` only when explicitly `Some(false)`, `DEF|realtime_off`/`DEF|sig_stale` for age `>3` only when Defender is the active AV), plus CPU/MEM/DISK `>90` flags. Parts are sorted and joined; **empty → `None` → skip the Claude call.** Identical fingerprint across cycles means nothing changed, so it's skipped.
 
 ## AI layer & prompts
@@ -939,6 +978,23 @@ gate as an AI-proposed fix (`route_user_action`, `main.rs`). An unknown/stale id
 Active-user operations use `session::active_user_session_id`, which accepts exactly one
 `WTSActive` console or RDP session and fails closed if none or multiple are active.
 
+### Investigate & fix (`UiMsg::Investigate`)
+
+The user describes a problem in Ask Eir (or presses **Fix** on a noticed item). The tray
+checks `CAP_INVESTIGATE`; the service gates it with `ask::investigate_rejection_reason`
+(non-empty, ≤ 1000 chars, provider configured, not paused, none queued, ≥ 60 s since the
+last) and stores it in `st.investigation`, then sets `react_at = now` so the next pass runs
+as soon as no analysis is in flight. That pass puts the text in
+`SignalSnapshot.user_report`, bypasses the idle-skip gate, and the prompt renders a
+**USER-REQUESTED INVESTIGATION** section (untrusted data; the model must answer it in
+`analysis`, while the usual rules for `problems` still apply). The resulting fixes route
+through exactly the same policy / preference / rate-limit path as any analysis — the
+request grants no extra authority. When the analysis finishes (or fails), the loop's
+`investigation_in_flight` flag makes `finish_investigation` add one Ask history entry
+("Investigate & fix: …") with `ask::investigation_answer` — the analysis plus each finding
+and the plain-English fix from `explain::explain` — and clears `st.investigation`
+(broadcast as `StatusPayload.investigation` while queued/running).
+
 ### F11 — Health timeline (`audit::metric_history` + `ui` sparklines)
 
 `audit::metric_history(pool, cutoff_rfc3339, cap)` reads the previously UI-invisible
@@ -954,9 +1010,16 @@ library, consistent with the no-dependency frontend.
 A free-text question is answered with live context. `ask::ask_rejection_reason` (pure) gates
 each request (empty / >1000 chars / no provider / already running / <15 s since the last — a
 spend guard on the open pipe). On accept, the loop snapshots the context (metrics, failed
-services, recent problems/executions) and spawns an off-loop task that gathers the DB-derived
-trend + learned facts, builds a bounded prompt (`ask::build_prompt`, pure — instructs the model
-to answer diagnostically and **never** emit commands/actions), and calls `AiClient::complete_text`
+services, recent problems/executions, plain-English live details from `ask::describe_state` —
+uptime, free memory/disk, connected adapters, drive health, last Windows Update, firewall and
+Defender — and the newest 12 "What Eir noticed" lines) and spawns an off-loop task that gathers
+the DB-derived trend + learned facts and a one-line machine profile (`signals::profile`:
+Windows edition/version/build from the registry — `ProductName` corrected to Windows 11 when
+the build is ≥ 22000 — maker/model, CPU, total RAM), builds a bounded prompt (`ask::build_prompt`, pure — instructs the model
+to answer diagnostically and **never** emit commands/actions; since v0.35.0 it also carries a
+static **HOW EIR WORKS** section and allows general Windows knowledge to explain what a
+component, service or error code does, while specifics about this PC must come from the
+context), and calls `AiClient::complete_text`
 (main/default model, no web search — the labeller/digest entry point). The answer is
 display-only; **nothing is parsed or executed from it** — fixes still come only from the decision
 cycle. History (`st.ask_entries`) is memory-only (cap 10, newest first), lost on restart. As of
@@ -1371,6 +1434,9 @@ next work; [CONTEXT.md](CONTEXT.md) records durable decisions and releases.
 - Automatic file discovery is one directory level deep, limited to recent files, and reads
   the newest 64 KiB per change. Explicit watched directories bypass discovery, not the tail
   limit.
+- The on-screen watcher reads classic Win32 message boxes (`#32770`) only. Custom-drawn
+  dialogs (WPF, Electron, UWP) and TaskDialog body text are not read; those apps are still
+  covered through their event-log crash/hang records and log files.
 - Disk capacity covers the system drive. CPU and some security/disk/network probes depend on
   bounded PowerShell or Windows APIs; probe failures retain last-good values and surface
   source errors/freshness instead of publishing healthy zeroes.
