@@ -23,9 +23,15 @@ $root = Split-Path -Parent $PSScriptRoot
 function Find-TauriDriver {
     $cmd = Get-Command tauri-driver -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
-    $candidate = Join-Path $env:USERPROFILE '.cargo\bin\tauri-driver.exe'
-    if (Test-Path $candidate) { return $candidate }
-    throw "tauri-driver was not found on PATH or at $candidate. Install it with: cargo install tauri-driver --locked"
+    # scripts/setup-tauri-driver.sh (CI) verifies and unpacks it into .webdriver.
+    $candidates = @(
+        (Join-Path $root '.webdriver\tauri-driver.exe'),
+        (Join-Path $env:USERPROFILE '.cargo\bin\tauri-driver.exe')
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) { return $candidate }
+    }
+    throw "tauri-driver was not found on PATH or at $($candidates -join ', '). Install it with: cargo install tauri-driver --locked"
 }
 
 function Find-Msedgedriver {
@@ -63,6 +69,7 @@ function Find-Msedgedriver {
 Write-Host '== tauri-driver ==' -ForegroundColor Cyan
 $tauriDriver = Find-TauriDriver
 Write-Host "  using $tauriDriver"
+$env:EIR_E2E_TAURI_DRIVER = $tauriDriver
 
 Write-Host '== msedgedriver ==' -ForegroundColor Cyan
 $env:EIR_E2E_MSEDGEDRIVER = Find-Msedgedriver

@@ -234,7 +234,10 @@ export const config: WebdriverIO.Config = {
       // EIR_PORTABLE / EIR_PORTABLE_PIPE reach eir.exe because tauri-driver
       // spawns the app with its own inherited environment — verified by the
       // boot spec (invoke('is_portable') + the fake analysis text appearing).
-      tauriDriver = spawn("tauri-driver", ["--native-driver", nativeDriver], {
+      // scripts/run-e2e.ps1 passes the driver it located (PATH, .webdriver or
+      // ~/.cargo/bin); a direct `wdio run` falls back to PATH.
+      const tauriDriverBin = process.env.EIR_E2E_TAURI_DRIVER || "tauri-driver";
+      tauriDriver = spawn(tauriDriverBin, ["--native-driver", nativeDriver], {
         stdio: [null, process.stdout, process.stderr],
         shell: false,
         env: {

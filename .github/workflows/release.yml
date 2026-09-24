@@ -87,7 +87,7 @@ jobs:
         shell: bash
         run: |
           bash scripts/setup-tauri-driver.sh
-          echo "$PWD/.webdriver" >> "$GITHUB_PATH"
+          cygpath -w "$PWD/.webdriver" >> "$GITHUB_PATH"
 
       - name: Provision msedgedriver for e2e
         shell: pwsh
