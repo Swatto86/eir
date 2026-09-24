@@ -8,4 +8,5 @@ pub mod codex_cli;
 pub mod cursor_cli;
 pub mod json;
 pub mod opencode_cli;
+mod opencode_sessions;
 pub mod prompt;

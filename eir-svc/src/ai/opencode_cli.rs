@@ -7,6 +7,7 @@ use crate::ai::cli_process::{
 };
 use crate::ai::cli_user::running_as_local_system;
 use crate::ai::json::sanitize_json;
+use crate::ai::opencode_sessions::{spawn_cleanup, CleanupTarget};
 use crate::models::CallUsage;
 use anyhow::{bail, Context, Result};
 use tracing::warn;
@@ -150,7 +151,7 @@ pub(crate) async fn call_opencode_cli(
     let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
     let args = build_args(model, effort, web_search, &names)?;
 
-    let output = if running_as_local_system() {
+    let run: Result<CliProcessOutput> = if running_as_local_system() {
         #[cfg(windows)]
         {
             let binary = configured_binary.map(str::to_owned);
@@ -175,7 +176,8 @@ pub(crate) async fn call_opencode_cli(
                 )
             })
             .await
-            .context("Join OpenCode user-process task")??
+            .context("Join OpenCode user-process task")
+            .and_then(|result| result)
         }
         #[cfg(not(windows))]
         {
@@ -239,13 +241,21 @@ pub(crate) async fn call_opencode_cli(
             Err(error) => Err(error),
         };
         let _ = tokio::fs::remove_dir_all(&workspace).await;
-        let (status, stdout, stderr) = waited?;
-        CliProcessOutput {
+        waited.map(|(status, stdout, stderr)| CliProcessOutput {
             code: status.code().map(|code| code as u32).unwrap_or(u32::MAX),
             stdout,
             stderr,
-        }
+        })
     };
+    // Every run leaves an OpenCode session behind, whatever its outcome; delete it.
+    spawn_cleanup(CleanupTarget {
+        configured_binary: configured_binary.map(str::to_owned),
+        user_profile: user_profile.map(str::to_owned),
+        scratch_name: format!("eir-opencode-{}-{seq}", std::process::id()),
+        stdout: run.as_ref().ok().map(|o| o.stdout.clone()),
+        seq,
+    });
+    let output = run?;
 
     if output.code != 0 {
         let err = char_preview(output.stderr.trim(), 2000);
