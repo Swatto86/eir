@@ -1,0 +1,3 @@
+# Shell scripts must be LF even on a Windows checkout: Bash rejects CRLF, and CI runs them
+# on windows-latest, whose Git converts text to CRLF by default.
+*.sh text eol=lf
