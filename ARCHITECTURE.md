@@ -151,6 +151,11 @@ Rust dependency graph:
     `tauri_build` validates bundle resources during clippy/tests.
 5. **Clippy/test**: locked `cargo clippy --workspace --all-targets -- -D warnings` and
    `cargo test --workspace --all-targets`.
+5a. **WebDriver end-to-end suite**: installs a pinned, SHA-256-checked `tauri-driver`
+   (`scripts/setup-tauri-driver.sh`) and a Microsoft-signed `msedgedriver` matching the
+   runner's WebView2 (`scripts/setup-msedgedriver-ci.ps1`), then runs `e2e/windows-ci.ps1`
+   (a CI-only WebView2 remote-debugging policy override, removed afterwards) →
+   `scripts/run-e2e.ps1`. `release.yml` re-runs the same three steps on the tagged commit.
 6. **Full Tauri build**: `tauri-apps/tauri-action@v0` builds and signs the real bundle
    with the lockfile enforced, without publishing.
 7. **Portable boundary/import check**: verifies the release executables' imports before
@@ -173,7 +178,33 @@ compiled installer-hook harness, release/portable regressions, JavaScript syntax
 formatting, unconditional service/runtime staging, locked clippy and all-target tests, a
 locked workspace release build, portable import checks, and `cargo deny` for the Windows
 target. It does not build the NSIS bundle — that stays a separate locked
-`cargo tauri build`/CI step.
+`cargo tauri build`/CI step. After the tests it runs the WebDriver suite
+(`scripts/run-e2e.ps1`), which locates but never downloads `tauri-driver` and a
+WebView2-matched, signature-checked `msedgedriver` (`EIR_E2E_MSEDGEDRIVER` overrides).
+
+### WebDriver end-to-end suite (`e2e/`)
+
+WebdriverIO 9 + `tauri-driver` drive the real debug `eir.exe` and `eir-svc.exe`
+(`target/debug`, built side by side) through the real WebView2 webview and named pipe —
+no app-side test plugin or feature flag. Specs: boot (and proof the UI is on the isolated
+pipe via `is_portable` plus the fake analysis text), the "What Eir noticed" feed from a
+real injected error message box, Explain → Ask answer, Investigate & fix → Ask entry,
+"Watch on-screen errors" persisting across a service + UI restart, and clean exit with
+intact state files.
+
+- **Isolation** reuses portable mode: `e2e/service.ts` starts `eir-svc.exe portable
+  <sentinel> <random EirSvcPortable pipe> <state root>` with `LOCALAPPDATA` redirected to a
+  per-run temp folder, and tauri-driver is spawned with `EIR_PORTABLE`/`EIR_PORTABLE_PIPE`,
+  which reach `eir.exe` by ordinary environment inheritance. The installed `EirSvc`, its
+  pipe and the real `%LOCALAPPDATA%\EirPortable` are never touched; only PIDs the suite
+  started are stopped (by exact executable path, never by image name).
+- **Fake AI**: the isolated config selects `claude_cli` with its binary pointed at
+  `e2e/fixtures/fake-claude.cmd` → `fake-claude.mjs`, which answers from the prompt text
+  (analysis/investigation → a ClaudeDecision, Ask → plain text) and always returns
+  `"problems": []`, so the real executor can never act on the test machine.
+- **Launcher/worker split**: wdio's `onPrepare`/`onComplete` run in the launcher process
+  and specs in a forked worker, so run state crosses via the `EIR_E2E_RUN` environment
+  variable and path-based PID lookup rather than in-memory handles.
 
 `[workspace.lints.clippy]` (root `Cargo.toml`) sets `unwrap_used` and `expect_used` to
 `warn`, which the `-D warnings` gate turns into build failures; all three crates take
@@ -693,6 +724,19 @@ All three subscription CLIs share one privilege boundary: when EirSvc is LocalSy
   Built-in tools (webfetch/websearch) stay available for the update-check path. The
   `UserCliSpec::workspace_files` hook carries such files for any CLI; the other
   providers pass none (Codex already runs `--ignore-user-config`).
+  **Session cleanup (`ai/opencode_sessions.rs`):** every `opencode run` stores a session
+  holding the whole prompt in the user's `opencode.db`, and Eir never resumes one; before
+  v0.35.0 that grew the database to ~4 GB in a fortnight. After every run — success,
+  failure or timeout — a background task (bounded to 120 s, errors only logged) deletes
+  it with `opencode session delete <id>` as the same user (LocalSystem: a second
+  `run_cli_as_active_user`; portable: same binary and profile env). The id is the
+  top-level `sessionID` on the run's NDJSON events; a run killed before printing anything
+  is found instead via `opencode session list --format json -n 50` by its unique scratch
+  directory name `eir-opencode-<pid>-<seq>`. The list runs from the temp folder because
+  OpenCode scopes it to the working directory's project (from a git repo it lists nothing).
+  Ids are validated (`ses_` + `[A-Za-z0-9_-]`) before reaching a command line. Opt-in real
+  checks: `cargo test -p eir-svc -- --ignored real_opencode` (a bogus-model run spends no
+  model call; mutation-tested by disabling cleanup).
 - **`Ollama`** — local OpenAI-compatible streaming against `api.ollama_base_url`
   (default `http://127.0.0.1:11434/v1`). Model is required; local chat needs no key.
   Optional `ollama_api_key` (or `OLLAMA_API_KEY`) calls Ollama's cloud

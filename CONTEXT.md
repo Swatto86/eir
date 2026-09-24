@@ -10,6 +10,10 @@ Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.j
 
 ## Architectural decisions
 
+2026-09-24 | Eir | WebDriver end-to-end suite via portable-mode isolation | `e2e/` (WebdriverIO 9 + tauri-driver) drives the real debug eir.exe + eir-svc.exe with no app-side test plugin: the service runs in portable mode on a random pipe with LOCALAPPDATA redirected per run, the AI is a fake claude_cli that always returns empty problems, and only suite-started PIDs are stopped. Part of verify.ps1, ci.yml and release.yml; drivers are pinned/hash- or signature-checked in CI and located, never downloaded, locally.
+
+2026-09-24 | Eir | OpenCode sessions are deleted after every run | Eir never resumes an OpenCode session, but each run stored one with the whole prompt, growing the user's opencode.db by gigabytes. `ai/opencode_sessions.rs` deletes the run's session in the background (id from NDJSON `sessionID`, else by scratch-directory name via `session list` run from the temp folder, since list is project-scoped). This replaces the user's \Swatto\OpencodePruneEir scheduled-task workaround once v0.35.0 is installed.
+
 2026-09-24 | Eir | Guardian: on-screen errors, investigate & fix, explainer | The tray reports error message boxes and hung windows (`UiMsg::ReportScreenError`, setting `monitoring.watch_screen_errors`, default on) as a fourth signal source; a dashboard feed lists what Eir noticed with Explain / Fix. `UiMsg::Investigate` runs a focused analysis on a user-described problem through the unchanged policy gate and reports the result in Ask. Ask Eir gains a machine profile, live details, the feed and a "how Eir works" section. Both new messages are capability-gated (`screen_errors`, `investigate`) for tray/service skew.
 
 2026-09-24 | Eir | Collector buffers drain only when an analysis can use them | A scheduled tick landing during an in-flight analysis used to drain the event-log / log-file buffers and then bail, silently discarding errors that arrived mid-analysis. The drain now happens after the `analysis_running` check; metrics still refresh every tick.

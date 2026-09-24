@@ -52,15 +52,18 @@ $checksums = "target/release/Eir_${tag}_SHA256SUMS.txt"
 $releaseNotes = @'
 ## Eir {tag}
 
-Autonomous Windows system repair agent. Eir monitors system health and
-uses AI to diagnose and fix problems automatically — service failures,
-disk pressure, log corruption, driver issues, and more.
+Autonomous Windows guardian. Eir watches system health — event logs, app
+logs, services, disk, security, and error messages or frozen apps on screen —
+uses AI to diagnose problems as they happen, fixes what it safely can, and
+explains how your PC works when you ask.
 
 ### Install
 1. Download and run the Windows setup `.exe` below as Administrator.
    The installer registers and starts the `EirSvc` Windows service and seeds `config.toml` automatically.
-2. Pick your AI provider and model in **Settings** — use OpenRouter, a logged-in Claude/Codex/Kilo CLI subscription, or an Anthropic API key.
+2. Pick your AI provider and model in **Settings** — a logged-in OpenCode, Claude, Codex or Cursor CLI on this PC (no API key needed).
 3. Launch **Eir** from the Start Menu — the tray icon appears once the service connects.
+
+Requires the Microsoft Edge WebView2 Runtime (built into Windows 10/11; the installer fetches it if missing).
 
 Already running an earlier version? It updates itself automatically.
 

@@ -43,6 +43,7 @@ flowchart LR
 
 ## Recent Context & Decisions
 
+- **2026-09-24** — OpenCode session cleanup: `eir-svc/src/ai/opencode_sessions.rs` deletes each run's session (NDJSON `sessionID`, fallback `session list -n 50` from the temp folder matched by scratch dir name); wired in `opencode_cli::call_opencode_cli` for every outcome.
 - **2026-09-24** — v0.35.0 guardian work: tray `screen_watch.rs` reports error dialogs / hung windows (`ReportScreenError`) → `signals/screen.rs` → prompt ON-SCREEN ERRORS + feed; `Investigate` runs a focused analysis (`SignalSnapshot.user_report`) and posts the outcome to Ask; Ask context adds `signals/profile.rs`, `ask::describe_state`, feed lines and HOW EIR WORKS; fixed collector buffers being drained and discarded during an in-flight analysis.
 - **2026-09-06** — Cut v0.34.18: CLI-only providers (OpenCode/Claude/Codex/Cursor), Evergreen WebView2 (no fixed runtime; ~8 MB installer), OpenCode model list uses `opencode.cmd` instead of the Unix npm shim fallback of four fake models.
 - **2026-09-06** — Packaging no longer embeds a fixed WebView2 runtime. NSIS uses `downloadBootstrapper` (Evergreen); portable relies on the same system runtime. `scripts/prepare-webview2.ps1` deleted; installer hooks still remove any leftover fixed-runtime tree on upgrade.

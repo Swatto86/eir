@@ -46,9 +46,9 @@ The two talk over a secured local named pipe (`\\.\pipe\EirSvc`).
                                                                 │
                                                        ┌────────▼─────────┐
                                                        │   AI provider    │
-                                                       │  OpenRouter /    │
-                                                       │ Claude / Codex / │
-                                                       │  Kilo / Ollama   │
+                                                       │ OpenCode / Claude│
+                                                       │ / Codex / Cursor │
+                                                       │   CLI (as user)  │
                                                        └──────────────────┘
 ```
 
@@ -237,6 +237,35 @@ Rust builds):
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify.ps1
 ```
 
+### End-to-end suite
+
+`e2e/` is a WebdriverIO + `tauri-driver` suite that drives the real debug
+`eir.exe` + `eir-svc.exe` through the real webview and named pipe — boot,
+"What Eir noticed" from a real injected error dialog, Explain, Investigate &
+fix, settings persistence across a restart, and a clean exit. It runs fully
+isolated from an installed Eir: a random portable pipe
+(`EIR_PORTABLE=1` / `\\.\pipe\EirSvcPortable-<random>`), its own temp state
+under an overridden `LOCALAPPDATA`, and a fake `claude_cli` binary
+(`e2e/fixtures/fake-claude.cmd`) that never contacts a real model and always
+reports zero problems, so the real fix executor can never act on the machine
+running the suite. See `e2e/service.ts` for how the isolation is enforced.
+
+Requirements: `tauri-driver` (`cargo install tauri-driver --locked`) and a
+`msedgedriver` matching the installed WebView2 Runtime version (Microsoft
+signature verified before use).
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run-e2e.ps1
+```
+
+It's also its own step in `scripts\verify.ps1` (after `cargo test`) and in
+CI's `windows-latest` job. `scripts\run-e2e.ps1` never downloads either
+WebDriver tool itself — it only locates and verifies what's already on the
+machine. CI has nothing pre-installed, so it provisions both itself first:
+`scripts\setup-tauri-driver.sh` (a pinned, hash-verified `tauri-driver`) and
+`scripts\setup-msedgedriver-ci.ps1` (a WebView2-version-matched,
+Microsoft-signature-verified `msedgedriver`).
+
 For v0.34.6 and later, the tag workflow also requires the exact tag
 `v<manifest-version>`, reruns its gates from that tag SHA, and keeps the release draft
 until the exact installer `.sig` and `latest.json` version, URL, and signature agree.
@@ -272,7 +301,7 @@ until the exact installer `.sig` and `latest.json` version, URL, and signature a
   runner lease shuts it down if the runner exits.
 - Destructive actions are blocked at the policy layer and require explicit approval;
   software uninstalls are never permitted.
-- User-owned files, Winget, and Claude/Codex/Kilo sessions are scoped to the sole active
+- User-owned files, Winget, and OpenCode/Claude/Codex/Cursor sessions are scoped to the sole active
   desktop user and accessed with that user's Windows token. Multiple active sessions
   fail closed; user-controlled reparse paths are rejected.
 - Updater and executor boundaries reject ambiguous installed identities, unsafe

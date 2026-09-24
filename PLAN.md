@@ -15,12 +15,17 @@
   works.
 - Fix: collector buffers are no longer drained and discarded by a scheduled tick that lands
   during an in-flight analysis.
+- Fix: OpenCode sessions are deleted after every run (they had grown the user's
+  opencode.db by gigabytes).
+- WebDriver end-to-end suite (`e2e/`) in the local gate, CI and the release workflow.
 
 None of this adds repair authority: every fix still comes from the same action catalogue and
 policy gate.
 
-Before publishing v0.35.0: run the packaged upgrade from v0.34.19 and one live acceptance pass
-(error box → feed → analysis; Investigate & fix → Ask entry) against the installed service.
+Pre-publish evidence (2026-09-24): the packaged v0.34.19 → v0.35.0 upgrade was installed on
+the owner's PC (service running, tray launched from the Start Menu and connected, a real error
+box reported by the installed tray); a portable live pass with a real provider analysed an
+on-screen error and a hung window; the e2e suite covers Explain and Investigate & fix.
 
 ## v0.34.17 release gate
 
