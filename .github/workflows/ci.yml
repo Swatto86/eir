@@ -30,7 +30,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # The release version lives in four manifests and three Cargo.lock entries.
+      # The release version lives in five manifests and four Cargo.lock entries.
       - name: Check version sync
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-versions.ps1
 

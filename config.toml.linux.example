@@ -35,8 +35,8 @@ require_tray = false
 # event_log_channels = ["caddy.service", "ssh.service"]
 
 [advisor]
-# Escalation (a deeper, more expensive re-analysis pass) is disabled by default on
-# Linux per the owner's deployment decision — see CONTEXT.md's decision entry.
+# Escalation (a deeper, more expensive re-analysis pass) is off by default on every
+# platform; this headless example keeps it off.
 enabled = false
 
 [service]
@@ -48,6 +48,8 @@ socket_allow_gids = []
 
 [notify]
 # Optional external alert command; empty (the default) disables the hook entirely.
+# NOT YET CALLED: the hook is implemented and tested, but no decision-loop event
+# invokes it yet, so setting a command currently sends nothing.
 # DISABLED by default — do not configure this without the machine owner's explicit
 # go-ahead, since it sends messages to an external chat (Discord/Telegram/etc).
 # Eir appends the alert text as the command's final argument at call time and applies

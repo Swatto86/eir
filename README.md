@@ -4,7 +4,7 @@
 
 # Eir
 
-**An autonomous Windows system-repair agent.**
+**An autonomous Windows system-repair agent, with a headless Linux build.**
 
 Eir watches your machine's health, diagnoses problems with an AI model, and fixes
 them — asking for approval before anything risky.
@@ -30,6 +30,11 @@ It runs as a pair:
   app updates. It's where you approve fixes and change every setting.
 
 The two talk over a secured local named pipe (`\\.\pipe\EirSvc`).
+
+The same service also builds for Linux, where it runs headless under systemd with
+no tray and is driven from the command line by `eirctl` — see
+[Linux (headless)](#linux-headless). Linux is built from source; releases publish
+Windows downloads only.
 
 > The name comes from **Eir**, the Norse goddess of healing — the agent doesn't
 > just *watch* the system, it *mends* it. (Pronounced "air".)
@@ -211,11 +216,13 @@ Portable mode saves those collector changes and asks you to restart portable Eir
 Updater/advisor settings also apply live.
 
 `config.toml.example` documents every field for reference, but you should never need
-to edit it by hand.
+to edit it by hand. The headless Linux build has no Settings panel; it is configured
+from `config.toml.linux.example` (see [Linux (headless)](#linux-headless)).
 
 ## Building from source
 
-Requirements: **Rust** (stable, MSVC toolchain), **Tauri CLI**, and Windows.
+Requirements: **Rust** (stable, MSVC toolchain), **Tauri CLI**, and Windows. (The
+headless Linux build has its own steps under [Linux (headless)](#linux-headless).)
 
 ```powershell
 # 1. Tauri CLI (once)
@@ -277,15 +284,22 @@ tray, no named pipe. The decision loop, policy gate, approvals, learning, audit 
 and Ask/Investigate are the same OS-neutral code as Windows; every OS-facing edge
 (collectors, executor, AI-CLI launch, control-plane transport) has a Linux
 implementation alongside the Windows one. `eir-ui` (the Tauri tray) is never built on
-Linux — control is entirely through `eirctl`, a small companion CLI (workspace crate
-`eir-cli`) that talks the exact same `UiRequest`/`ServiceMsg` JSON-line wire protocol
-as the Windows tray, over a Unix domain socket instead of a named pipe.
+Linux — control is entirely through `eirctl`, a small companion CLI (workspace
+directory `eir-cli`, Cargo package and binary `eirctl`) that talks the exact same
+`UiRequest`/`ServiceMsg` JSON-line wire protocol as the Windows tray, over a Unix
+domain socket instead of a named pipe.
+
+There are no Linux release downloads: build it from source as below. It has been
+built and run on Ubuntu 26.04, and CI builds and tests it on Ubuntu on every push to
+`master`.
 
 **What's different from Windows:**
 - **Collectors**: `journald` (polled, not streamed) replaces the Windows Event Log;
   `/proc`, `systemctl`, and `ip -j addr show` replace WMI/registry reads. There is no
   Linux analogue of the Windows Firewall/Defender/Windows-Update fields — they stay at
-  their "unknown" defaults.
+  their "unknown" defaults and are left out of what Ask and Investigate tell the AI.
+  Watching arbitrary log directories is not implemented on Linux yet; the journal is
+  the log source.
 - **Fixes**: only `service_restart`/`service_stop`/`service_start` (via `systemctl`),
   `log_cleanup`, `disk_cleanup` (`apt-get clean` / `journalctl --vacuum-time` / a
   bounded `/tmp` purge), `process_kill` (exact-name, via `/proc`), and `file_delete`
@@ -312,13 +326,27 @@ as the Windows tray, over a Unix domain socket instead of a named pipe.
 - **Logs** go to the journal: `journalctl -u eir`.
 - **Real time**: a unit that crashes is an immediate trigger (systemd's "unit result"
   journal event), each analysis re-reads the failed-unit list and includes the recent
-  log of every failed unit, so the AI sees why it failed.
+  log of every failed unit, so the AI sees why it failed. After a successful fix the
+  failed-unit list is re-read at once, so a restarted unit stops showing as failed
+  straight away.
+- **Approval cards read for Linux**: service actions name the systemd unit, and a file
+  delete is classified against Linux locations — `~/.cache` and other cache folders,
+  `/tmp`, `/var/tmp` and `/var/crash` count as low-risk, while `Documents`, `Desktop`,
+  `Pictures`, `Downloads`, `Videos` and `Music` in a home directory are flagged as
+  personal data.
+- **No tray-only features**: there is no Settings panel, app updater, disk-space or
+  startup tool, on-screen error watching or Game Mode on Linux, and `eirctl` has no
+  commands for learned facts or Ignore/Always Approve preferences (learning itself
+  still runs). Settings live in `/etc/eir/config.toml`; after editing it, run
+  `sudo systemctl restart eir`.
 
 ### Install
 
 ```bash
-# 1. Build (from this repo, on Linux)
-cargo build --release --locked -p eir-svc -p eir-cli
+# 1. Build (from this repo, on Linux). Package names, not directories: the
+#    eir-cli directory holds the `eirctl` package. Never --workspace — the Tauri
+#    tray (eir-ui) is Windows-only.
+cargo build --release --locked -p eir-svc -p eirctl
 
 # 2. Install the binaries, config and policy
 sudo install -m 755 target/release/eir-svc /usr/local/bin/eir-svc
@@ -330,7 +358,10 @@ sudo install -m 640 policy.linux.toml          /etc/eir/policy.toml
 # 3. Install and start the service
 sudo install -m 644 packaging/systemd/eir.service /etc/systemd/system/eir.service
 # The AI CLI writes its scratch workspace and login state in linux_ai_user's home,
-# which the unit's sandbox (ProtectHome=read-only) otherwise blocks:
+# which the unit's sandbox (ProtectHome=read-only) otherwise blocks. This example is
+# for the Claude CLI as `ubuntu`; list your CLI's own state instead (~/.codex for
+# Codex, ~/.local/share/opencode for OpenCode, ~/.cursor for Cursor), always keeping
+# ~/.cache, where Eir puts each call's scratch workspace:
 sudo mkdir -p /etc/systemd/system/eir.service.d
 printf '[Service]\nReadWritePaths=/home/ubuntu/.cache -/home/ubuntu/.claude -/home/ubuntu/.claude.json\n' \
   | sudo tee /etc/systemd/system/eir.service.d/10-ai-user.conf   # use your linux_ai_user's home
@@ -346,25 +377,42 @@ At minimum, edit `/etc/eir/config.toml`'s `[api]` section: set `provider` and
 `socket_allow_gids` — root is always allowed):
 
 ```bash
-eirctl status               # live metrics, failed units, pending approvals
+eirctl status               # live metrics, failed units, recent signals and fixes
 eirctl approvals             # actions awaiting a human decision
 eirctl approve <id>          # or: eirctl reject <id>
-eirctl pause                 # pause monitoring (eirctl resume to continue)
+eirctl pause                 # pause monitoring
+eirctl resume                # continue monitoring
 eirctl ask "what is eating memory right now"
-eirctl investigate "check for anything unusual"
+eirctl investigate "check for anything unusual"   # fixes still go through policy
 ```
 
-`eirctl --json <command>` emits the raw decoded payload for scripting. Set `$EIR_SOCKET`
-to point at a non-default `service.socket_path`.
+- `--json` prints `status` or `approvals` as the raw JSON payload, for scripts.
+- `ask` and `investigate` wait up to five minutes for the answer (`--timeout <secs>`
+  changes that). An investigation's fixes follow the same policy as any other, so on
+  a default Linux install they wait in `eirctl approvals`.
+- Exit codes: `0` done, `1` the service refused the request, `2` usage error, `3`
+  could not connect, lost the connection or timed out.
+- Set `$EIR_SOCKET` when the service uses a non-default `[service] socket_path`.
+
+**Running without root or systemd.** `EIR_RUNTIME_ROOT=<dir> eir-svc run` reads
+`config.toml` and `policy.toml` from `<dir>` instead of `/etc/eir`, and resolves a
+relative `audit_db` there too. This exists for testing, and also lets an ordinary user
+run Eir where systemd is unavailable (for example in a container): point `[service]
+socket_path` at a directory that user can write, and set `EIR_SOCKET` to match for
+`eirctl`. Run that way the AI CLI runs as that same user (there is no privilege to
+drop), fixes that need root such as `systemctl` restarts or journal and apt clean-ups
+fail, and collectors that need systemd or a missing tool (the journal, failed units,
+and network interfaces where `ip` is absent) report errors; CPU, memory and disk
+monitoring, Ask and Investigate still work.
 
 ## Project layout
 
 | Crate | Layer | Responsibility |
 |-------|-------|----------------|
 | `eir-proto` | shared | Wire types for the UI ↔ service pipe/socket protocol. |
-| `eir-svc` | service | LocalSystem/root service: signal collection, AI client, policy, execution, audit DB. |
+| `eir-svc` | service | Windows LocalSystem service or Linux systemd service: signal collection, AI client, policy, execution, audit DB. |
 | `eir-ui` | presentation | Tauri tray app; static frontend in `ui/`. Windows only. |
-| `eir-cli` (binary `eirctl`) | presentation | Linux control CLI over the Unix control socket. |
+| `eir-cli` (package and binary `eirctl`) | presentation | Linux control CLI over the Unix control socket; a stub that exits on Windows. |
 
 ## Security model
 
@@ -395,7 +443,19 @@ to point at a non-default `service.socket_path`.
 - Updater and executor boundaries reject ambiguous installed identities, unsafe
   installer paths/arguments, protected process targets, and unverifiable/no-effect
   operations instead of reporting them as successful.
-- API keys are stored in the local `config.toml` and never logged.
+- Eir holds no AI provider API keys: every provider is a CLI that signs in with its own
+  login, outside Eir.
+- **On Linux** the service runs as root under a hardened systemd unit
+  (`ProtectSystem=strict`, `ProtectHome=read-only`, `NoNewPrivileges`; writable paths
+  are limited to its own state and runtime directories, `/var/log`, the apt cache and
+  the AI user's CLI directories you add). `eirctl` connects over a Unix
+  socket (`/run/eir/eir.sock`); the service checks the connecting process's kernel
+  credentials (`SO_PEERCRED`) before reading anything and accepts only root or a
+  uid/gid listed in `[service] socket_allow_uids`/`socket_allow_gids`. The socket file
+  is deliberately connectable by anyone so that check, not file permissions, is the
+  gate. No network listener is opened. The AI CLI never runs as root (see the Linux
+  section above), and core units such as `ssh.service` and `tailscaled.service` cannot
+  be stopped or restarted by Eir whatever `policy.toml` says.
 
 ## License
 

@@ -1,8 +1,9 @@
 # Eir roadmap — v0.35.0
 
-**Release line:** v0.35.0 (published 2026-09-24 from 3b3837a)
+**Release line:** v0.35.0 (published 2026-09-24 from 3b3837a; Windows assets only)
 
-**Current code:** v0.35.0
+**Current code:** v0.35.0 plus the headless Linux build (`eir-svc` + `eirctl`) on `master`,
+not yet released
 
 ## What v0.35.0 adds
 
@@ -27,27 +28,27 @@ the owner's PC (service running, tray launched from the Start Menu and connected
 box reported by the installed tray); a portable live pass with a real provider analysed an
 on-screen error and a hung window; the e2e suite covers Explain and Investigate & fix.
 
-## v0.34.17 release gate
+## Headless Linux build (on `master`, unreleased)
 
-Publication follows the repository's mandatory order:
+- `eir-svc` builds and runs on Linux under systemd with no tray. `eirctl` (directory
+  `eir-cli`, package `eirctl`) drives it over a Unix socket whose peer credentials are
+  checked: status, approvals, approve/reject, pause/resume, ask and investigate.
+- journald, `/proc`, `systemctl` and `ip` replace the Windows collectors. A crashed unit
+  triggers an analysis at once, and every analysis carries failed units' recent logs.
+- Deliberately stricter than Windows: 7 fix types, an empty auto-execute whitelist (every
+  fix waits for `eirctl approve`), a protected-units backstop, and the AI CLI dropped to a
+  non-root `linux_ai_user` with only its primary group and no-new-privileges.
+- Built from source only (README "Linux (headless)"); CI's `verify-linux` job gates it.
+  Running on swatbox (systemd, root) and swatbot (container without systemd, as an
+  ordinary user).
 
-1. Push the release commit and wait for CI to pass on that exact SHA.
-2. Apply the exact `v<manifest-version>` tag. The tag workflow must check out that SHA
-   and rerun its gates; it may publish only after the exact installer `.sig`, updater
-   metadata version/tagged URL/signature, smoke-tested portable executable, and
-   checksums agree.
+The Windows build, policy and behaviour are unchanged by it.
 
-## What v0.34.17 ships
+Not done, on purpose, until there is a reason: Linux release artifacts, log-directory
+watching on Linux, and `[notify]` call sites (these need Swatto's go-ahead before anything
+messages an external chat).
 
-- Approvals: reversible **Ignore** and **Always Approve** for a semantic fix
-  (`FixAction::dedup_key`), managed from the Learned preferences list.
-- App Updates: Ignore removes an app from Updates Available immediately; Unignore
-  remains in Settings.
-- Learned: RejectedSignal counts stable action keys so repeated rejects can form a
-  fact; UI clarifies automatic learning vs hard preferences.
-- Build: remove invalid Cargo `jobs = 0` so Rust 1.95 CI/release builds succeed.
-
-## After v0.34.17
+## Next work
 
 Keep the next work narrow and evidence-led:
 
@@ -65,4 +66,12 @@ families, or policy tuning that can expand automatic authority.
 
 Every behavioural fix starts with a failing regression check. A candidate is ready only
 when the full local gate, packaged upgrade, real WebView workflow, standalone executable
-smoke, and exact-SHA CI all pass. CI must pass before the tag that starts publication.
+smoke, and exact-SHA CI all pass.
+
+Publication follows the repository's mandatory order:
+
+1. Push the release commit and wait for CI to pass on that exact SHA.
+2. Apply the exact `v<manifest-version>` tag. The tag workflow must check out that SHA
+   and rerun its gates; it may publish only after the exact installer `.sig`, updater
+   metadata version/tagged URL/signature, smoke-tested portable executable, and
+   checksums agree.

@@ -15,8 +15,9 @@
 //! permissive (directory `0755`, socket `0666`) — `peer_cred()` above is the real,
 //! authoritative gate, exactly like the Windows pipe already documents for its own DACL
 //! ("elevated Administrators... accepted for maintenance/CI"). eir-svc runs as root
-//! under systemd (`packaging/systemd/eir.service`'s `User=root`/`Group=root`, with no
-//! dedicated group), so a tighter directory/socket mode (e.g. `0750`/`0660` root:root)
+//! under systemd (root is the default; `packaging/systemd/eir.service` deliberately
+//! omits `User=`/`Group=`, and there is no dedicated group), so a tighter
+//! directory/socket mode (e.g. `0750`/`0660` root:root)
 //! would make the documented `socket_allow_uids`/`socket_allow_gids` multi-user feature
 //! unreachable for any uid outside root's own group: such a uid would get `EACCES`
 //! opening the socket before a single byte — and therefore before `peer_cred()` — was

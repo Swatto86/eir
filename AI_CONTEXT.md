@@ -6,8 +6,9 @@ Eir is a Rust/Tauri v2 Windows desktop agent: a LocalSystem service (`eir-svc`) 
 
 ## Tech Stack & Architecture
 
-- **Languages:** Rust 2021 (MSVC on Windows, also builds `eir-svc`/`eir-cli` on Linux/glibc), static HTML/JS frontend (no npm/Vite).
-- **Crates:** `eir-proto` (serde wire), `eir-svc` (service + SQLite audit; Windows LocalSystem or Linux systemd), `eir-ui` (Tauri v2 tray, Windows only), `eir-cli` (binary `eirctl`, Linux control CLI, two-line stub on Windows).
+- **Languages:** Rust 2021 (MSVC on Windows, also builds `eir-svc`/`eirctl` on Linux/glibc), static HTML/JS frontend (no npm/Vite; `e2e/` alone uses npm, for the WebDriver suite).
+- **Crates:** `eir-proto` (serde wire), `eir-svc` (service + SQLite audit; Windows LocalSystem or Linux systemd), `eir-ui` (Tauri v2 tray, Windows only), `eir-cli` directory (package and binary `eirctl` — use `-p eirctl`; Linux control CLI, two-line stub on Windows).
+- **AI providers:** four CLIs only — OpenCode (`opencode`), Claude (`claude`), Codex (`codex`), Cursor (`agent`); no API keys or HTTP model calls. Old `openrouter`/`kilo*`/`ollama` configs load as OpenCode, `anthropic` as Claude.
 - **Persistence:** SQLite via sqlx migrations under `migrations/`; config in `config.toml`.
 - **Patterns:** decision loop with off-loop AI/executor workers; policy AutoApprove / RequireApproval / Block; conservative self-improvement (`learn/`); durable user action preferences (`prefs`).
 
@@ -43,6 +44,7 @@ flowchart LR
 
 ## Recent Context & Decisions
 
+- **2026-09-25** — Linux follow-ups found live on swatbox: the status `watch` channel now uses `send_replace` so a snapshot published while no client is connected still reaches the next one (every `eirctl` call is a new client); `eirctl resume` added (`pause` no longer toggles); approval cards and `classify_file` read right on Linux (systemd wording, Linux cache/tmp/crash paths low-risk, home Documents/Desktop/etc. personal); Ask/Investigate on Linux drop the Windows Update/Firewall/Defender lines and point at `eirctl`; failed services are rescanned straight after a successful fix; a preflight-refused approval returns its reason. Deployed from source on swatbox (systemd, root) and swatbot (container, no systemd, `EIR_RUNTIME_ROOT`, user `box`).
 - **2026-09-25** — Headless Linux build: `eir-svc` runs under systemd (`packaging/systemd/eir.service`, `Restart=always`), controlled by the new `eirctl` CLI (`eir-cli` crate) over a Unix socket (`pipe_server::unix`, `SO_PEERCRED`-checked). Directory-module splits (`mod.rs`/`windows.rs`/`unix.rs`) for `pipe_server`, `signals::{event_log,wmi,profile}`, `executor::{logs,services}`. Privilege-drop AI-CLI launcher `ai/cli_user_launch_unix.rs` (`setgroups`→`setgid`→`setuid` to `[api] linux_ai_user`) fixes `running_as_local_system()`'s previous hardcoded-`false` gap. Linux auto-execute whitelist is empty (`policy.linux.toml`); two-layer protected-units backstop in `executor/services/unix.rs`. `[notify]` hook (`notify.rs`) implemented+tested, disabled by default, no call site yet.
 - **2026-09-24** — OpenCode session cleanup: `eir-svc/src/ai/opencode_sessions.rs` deletes each run's session (NDJSON `sessionID`, fallback `session list -n 50` from the temp folder matched by scratch dir name); wired in `opencode_cli::call_opencode_cli` for every outcome.
 - **2026-09-24** — v0.35.0 guardian work: tray `screen_watch.rs` reports error dialogs / hung windows (`ReportScreenError`) → `signals/screen.rs` → prompt ON-SCREEN ERRORS + feed; `Investigate` runs a focused analysis (`SignalSnapshot.user_report`) and posts the outcome to Ask; Ask context adds `signals/profile.rs`, `ask::describe_state`, feed lines and HOW EIR WORKS; fixed collector buffers being drained and discarded during an in-flight analysis.

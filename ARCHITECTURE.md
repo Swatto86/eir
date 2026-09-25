@@ -7,13 +7,16 @@
 
 # Eir — Architecture & Design
 
-**Last updated:** 2026-09-24 · **Code:** v0.35.0
+**Last updated:** 2026-09-25 · **Code:** v0.35.0 plus the unreleased headless Linux build on `master`
 
 Eir is an autonomous Windows system guardian: it watches a machine's health,
 uses an AI model to diagnose problems **as they happen** (event-driven, not just
 polled), and applies least-destructive fixes — auto-running reversible
 whitelisted repairs and queuing anything disruptive for approval. It also keeps
-installed apps up to date unattended.
+installed apps up to date unattended. The same service builds for Linux, where it
+runs headless under systemd and is controlled by the `eirctl` CLI instead of the
+tray (see [Linux platform split](#linux-platform-split)); the rest of this document
+describes Windows unless it says otherwise.
 
 ## Overview
 
@@ -29,7 +32,8 @@ Eir runs as **two cooperating processes**:
 They never link against each other; they communicate only through the `eir-proto`
 wire contract (newline-delimited JSON) over the secured local named pipe
 `\\.\pipe\EirSvc`. Layering points inward: `eir-proto` (pure contract types) ←
-`eir-svc` / `eir-ui` (each depends only on `eir-proto`).
+`eir-svc` / `eir-ui` / `eirctl` (each depends only on `eir-proto`). On Linux the
+tray is replaced by `eirctl`, which speaks the same protocol over a Unix socket.
 
 **The decision cycle** runs on two triggers: a scheduled sweep (default every
 10 min, `decision_interval_secs`) and a **reactive path** — each signal collector
@@ -71,21 +75,22 @@ which is the substrate the self-improvement layer learns from (see
 
 ## Workspace, build & delivery pipeline
 
-Eir is a single Cargo workspace (`resolver = "2"`) with three crates, plus a static, hand-written frontend and a Tauri-driven NSIS delivery pipeline. There is **no JavaScript toolchain** — no `package.json`, no bundler, no `npm` step anywhere — which shapes the entire build.
+Eir is a single Cargo workspace (`resolver = "2"`) with four crates, plus a static, hand-written frontend and a Tauri-driven NSIS delivery pipeline. The app has **no JavaScript toolchain** — no bundler and no `npm` step in any build — which shapes the entire build. The only `package.json` is the WebDriver end-to-end suite's (`e2e/`), a test harness that never feeds a build.
 
 ### Crate layout & layering
 
-`Cargo.toml` (repo root) declares `members = ["eir-proto", "eir-svc", "eir-ui"]`. Mapping to the layering model (per `README.md` "Project layout", confirmed in each `Cargo.toml`):
+`Cargo.toml` (repo root) declares `members = ["eir-proto", "eir-svc", "eir-ui", "eir-cli"]`. Mapping to the layering model (per `README.md` "Project layout", confirmed in each `Cargo.toml`):
 
 | Crate | Layer | Binary | Responsibility |
 |-------|-------|--------|----------------|
-| `eir-proto` | shared/contract | (lib) | Wire types for the UI↔service named-pipe protocol (serde, snake_case). Pure types, no I/O. Depended on by both other crates (`eir-proto = { path = "../eir-proto" }`). |
-| `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service: signal collection, AI client, policy, execution, autonomous updater, SQLite audit DB. Heavy `windows` 0.58 feature set. |
-| `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), `windows-service` 0.7 (SCM queries + install from About), tracing. `build-dependencies`: `tauri-build` 2. |
+| `eir-proto` | shared/contract | (lib) | Wire types for the UI↔service protocol (named pipe on Windows, Unix socket on Linux; serde, snake_case). Pure types, no I/O. Depended on by every other crate (`eir-proto = { path = "../eir-proto" }`). |
+| `eir-svc` | infrastructure/service | `eir-svc` (`src/main.rs`) | LocalSystem Windows service, or root systemd service on Linux: signal collection, AI client, policy, execution, autonomous updater (Windows), SQLite audit DB. Heavy `windows` 0.58 feature set on Windows; `libc` on Unix. |
+| `eir-ui` | presentation/composition root | `eir` (`src/main.rs`) | Tauri v2 tray app, Windows only. Wires the system together and renders status/approvals/updates. Deps: `tauri` 2 (`tray-icon`), `tauri-plugin-autostart` 2, `tauri-plugin-updater` 2, `tokio` (full), `image` (png), `windows-service` 0.7 (SCM queries + install from About), tracing. `build-dependencies`: `tauri-build` 2. |
+| `eir-cli` (package `eirctl`) | presentation | `eirctl` (`src/main.rs`) | Linux control CLI over the service's Unix socket (`src/unix.rs`); on Windows a two-line stub that prints why and exits 1, so workspace-wide clippy/tests stay green. Deps: `eir-proto`, `serde_json`, and `tokio` on Unix only. |
 
-All three crates are versioned in lockstep — currently `0.34.8` in every `[package] version` (`eir-proto/Cargo.toml:3`, `eir-svc/Cargo.toml:3`, `eir-ui/Cargo.toml:3`), matching `eir-ui/tauri.conf.json` and the three corresponding `Cargo.lock` package entries. `scripts/check-versions.ps1` gates all seven values.
+All four crates are versioned in lockstep — currently `0.35.0` in every `[package] version` (`eir-proto`, `eir-svc`, `eir-ui` and `eir-cli` `Cargo.toml`), matching `eir-ui/tauri.conf.json` and the four corresponding `Cargo.lock` package entries (`eir-proto`, `eir-svc`, `eir-ui`, `eirctl`). `scripts/check-versions.ps1` gates all nine values.
 
-The dependency graph is acyclic and points inward: `eir-proto` depends on nothing internal; `eir-svc` and `eir-ui` each depend only on `eir-proto`. The UI and service never link against each other — they are separate processes coupled solely through the `eir-proto` wire contract over `\\.\pipe\EirSvc`.
+The dependency graph is acyclic and points inward: `eir-proto` depends on nothing internal; `eir-svc`, `eir-ui` and `eirctl` each depend only on `eir-proto`. The UI and service never link against each other — they are separate processes coupled solely through the `eir-proto` wire contract over `\\.\pipe\EirSvc` (or, on Linux, between `eirctl` and the service over the Unix socket).
 
 `build.rs` (repo root, `eir-ui`'s — `eir-ui/build.rs` is 42 bytes, the root `build.rs` shown is `tauri_build::build()`) is the standard Tauri build hook that runs `tauri_build::build()` to validate the bundle config and embed the frontend at compile time.
 
@@ -131,7 +136,7 @@ only when the runtime is missing). Older fixed-runtime trees are removed on upgr
 
 Workspace `Cargo.toml` sets `[profile.dev.package."*"] opt-level = 1` so third-party dependencies compile with minimal optimization while workspace crates stay at dev `opt-level = 0`. This speeds incremental `cargo check`, `cargo clippy`, and `cargo test` without changing release binaries.
 
-`.cargo/config.toml` sets `[build] jobs = 0` (use all logical CPUs). CI and release workflows install **sccache** (`mozilla-actions/sccache-action@v0.0.10`) with `RUSTC_WRAPPER=sccache` and `SCCACHE_GHA_ENABLED=true`, layered on top of `swatinem/rust-cache@v2`.
+`.cargo/config.toml` leaves `jobs` unset so Cargo picks its own parallelism (Cargo 1.95+ rejects the old `jobs = 0`), and links the Windows MSVC target with a static CRT (`+crt-static`). The Windows CI and release jobs install **sccache** (`mozilla-actions/sccache-action@v0.0.10`) with `RUSTC_WRAPPER=sccache` and `SCCACHE_GHA_ENABLED=true`, layered on top of `swatinem/rust-cache@v2`.
 
 For local iteration after a single-crate edit, `scripts/fastcheck.ps1 -Package eir-svc` (or `eir-proto` / `eir-ui`) runs formatting plus a scoped `cargo check` instead of the full-workspace clippy pass. Full-workspace `fastcheck.ps1` (no `-Package`) still runs clippy; `scripts/verify.ps1` remains the pre-commit gate.
 
@@ -142,8 +147,11 @@ Cross-project Rust compile-speed policy lives in agent-standards `~/.agents/rust
 ### CI gate (`.github/workflows/ci.yml`)
 
 Triggers: `push` to `master`, and all `pull_request`. `permissions: contents: read`.
-The workflow has a Windows verification job plus an Ubuntu job that audits the Windows
-Rust dependency graph:
+The workflow has three jobs: `dependency-audit` (Ubuntu; `cargo deny check advisories`
+for the Windows target), `verify-linux` (Ubuntu; locked `cargo clippy … -D warnings`
+and `cargo test`, both scoped to `-p eir-proto -p eir-svc -p eirctl --all-targets` —
+never `--workspace` and never `eir-ui`, whose Tauri build needs GTK/WebKitGTK packages
+the job does not install), and the Windows `verify` job:
 1. `actions/checkout@v6`, manifest/Cargo.lock version sync, the compiled NSIS-hook
    harness, release-workflow regressions, and the portable-runner regression.
 2. `dtolnay/rust-toolchain@1.95.0` with `rustfmt, clippy`, **sccache**, and Rust caching.
@@ -208,7 +216,7 @@ intact state files.
   variable and path-based PID lookup rather than in-memory handles.
 
 `[workspace.lints.clippy]` (root `Cargo.toml`) sets `unwrap_used` and `expect_used` to
-`warn`, which the `-D warnings` gate turns into build failures; all three crates take
+`warn`, which the `-D warnings` gate turns into build failures; all four crates take
 `[lints] workspace = true`, and `clippy.toml` allows both in tests. A panic in the service
 is an outage, so production exceptions are per-site `#[allow]`s with a stated reason —
 currently only the service install/uninstall CLI paths and the Tokio runtime builds in
@@ -239,6 +247,10 @@ the Windows release job, whose write permission is scoped to release contents:
    URL, and the exact signature asset contents before the draft is published (`PATCH`
    `draft=false` on that release id, re-asserting `tag_name`). Client 4xx fails closed;
    5xx is retried.
+
+Releases carry Windows assets only. There is no Linux release artifact: the headless
+Linux build is compiled from source (README "Linux (headless)"), and only CI's
+`verify-linux` job gates it; `release.yml` does not rebuild it.
 
 `tauri-action` builds and signs only. The NSIS installer (`Eir_<version>_x64-setup.exe`),
 `.sig`, `latest.json`, portable, and checksums are attached by the retried publish
@@ -302,17 +314,18 @@ loader DLL prerequisites (WebView2 itself is the system Evergreen runtime).
 
 ### Version-bump locations
 
-A release version has **four authoritative manifest declarations** that must move
-together, plus three derived lockfile entries:
+A release version has **five authoritative manifest declarations** that must move
+together, plus four derived lockfile entries:
 - `eir-ui/tauri.conf.json` → `"version"` (drives installer filename, About, updater compare).
-- `eir-proto/Cargo.toml`, `eir-svc/Cargo.toml`, `eir-ui/Cargo.toml` → `[package] version`.
-- `Cargo.lock` must contain exactly one matching package entry for each crate.
+- `eir-proto/Cargo.toml`, `eir-svc/Cargo.toml`, `eir-ui/Cargo.toml`, `eir-cli/Cargo.toml` → `[package] version`.
+- `Cargo.lock` must contain exactly one matching package entry for each crate (the
+  `eir-cli` directory's package is named `eirctl`).
 
-There is **no `package.json`**, so the WattMail blueprint's "bump `package.json`" step does not apply here. The release-commit `[release]` marker convention is visible in git history (e.g. `0752c08 ... (v0.10.2) [release]`).
+The app has **no `package.json`** (`e2e/package.json` belongs to the test suite and is not versioned with releases), so the WattMail blueprint's "bump `package.json`" step does not apply here. The release-commit `[release]` marker convention is visible in git history (e.g. `0752c08 ... (v0.10.2) [release]`).
 
 ### Build/release control flow (summary)
 
-Developer bumps the 3 `Cargo.toml` versions + `tauri.conf.json`, refreshes `Cargo.lock`,
+Developer bumps the 4 `Cargo.toml` versions + `tauri.conf.json`, refreshes `Cargo.lock`,
 commits with `[release]`, pushes to `master`, waits for CI on that exact SHA, then pushes
 the exact tag `vX.Y.Z` → `release.yml` checks out and gates that tag SHA, builds the
 signed bundle as a draft, verifies the exact installer/signature and updater metadata,
@@ -322,13 +335,19 @@ pubkey, and self-update (NSIS hooks stop/replace/restart `EirSvc`).
 
 ## Pipe protocol & tray UI
 
-The UI subsystem is a thin Tauri tray app (`eir-ui`) that talks to the LocalSystem service (`eir-svc`) over a single Windows named pipe, `\\.\pipe\EirSvc`. All wire types live in the shared `eir-proto` crate so both ends serialize/deserialize the same shapes. The service owns all state; the UI renders a locally-cached snapshot and correlates mutating commands with service outcomes when protocol v2 is available.
+The UI subsystem is a thin Tauri tray app (`eir-ui`) that talks to the LocalSystem service (`eir-svc`) over a single Windows named pipe, `\\.\pipe\EirSvc`. All wire types live in the shared `eir-proto` crate so both ends serialize/deserialize the same shapes. The service owns all state; the UI renders a locally-cached snapshot and correlates mutating commands with service outcomes when protocol v2 is available. On Linux, `eirctl` is the client and the transport is a Unix socket; the protocol is byte-identical (see [Linux platform split](#linux-platform-split)).
+
+`eir-svc/src/pipe_server/` is a directory module: `mod.rs` holds the transport-neutral
+parts — the status/result channels, `handle_connection<S: AsyncRead + AsyncWrite>` (the
+per-connection reader/writer loop both transports share), and outbound bounding — while
+`windows.rs` owns the named pipe, its security descriptor and client identity checks,
+and `unix.rs` the Unix socket and its `SO_PEERCRED` check.
 
 ### Transport & framing
 
-- **Pipe name**: `eir_proto::PIPE_NAME = r"\\.\pipe\EirSvc"` (`eir-proto/src/lib.rs:3`), used by both server (`pipe_server.rs:55`) and client (`pipe_client.rs:16`).
-- **Framing**: newline-delimited JSON ("JSON lines"). Each direction writes one `serde_json` object per line terminated with `\n`; readers use `BufReader::read_line` and `serde_json::from_str` on the trimmed line. Pipe mode is **byte stream** (`PipeMode::Byte`, `pipe_server.rs:87`), not message mode — framing is purely the newline.
-- **Bidirectional, split**: on both ends the connected pipe is `tokio::io::split` into an independent reader and writer. The service runs the writer as a spawned task and the reader inline (`pipe_server.rs:126-182`); the client runs both as `async` blocks joined by `tokio::select!` (`pipe_client.rs:63-113`).
+- **Pipe name**: `eir_proto::PIPE_NAME = r"\\.\pipe\EirSvc"` (`eir-proto/src/lib.rs`), used by both server (`pipe_server/windows.rs`) and client (`pipe_client.rs`).
+- **Framing**: newline-delimited JSON ("JSON lines"). Each direction writes one `serde_json` object per line terminated with `\n`; readers use `BufReader::read_line` and `serde_json::from_str` on the trimmed line. Pipe mode is **byte stream** (`PipeMode::Byte`), not message mode — framing is purely the newline, which is also what lets a Unix stream socket carry the same protocol unchanged.
+- **Bidirectional, split**: on both ends the connected pipe is `tokio::io::split` into an independent reader and writer. The service runs the writer as a spawned task and the reader inline (`pipe_server::handle_connection`); the client runs both as `async` blocks joined by `tokio::select!` (`pipe_client.rs`).
 
 ### Wire types (`eir-proto/src/lib.rs`)
 
@@ -347,13 +366,13 @@ Supporting types:
 - **`UpdaterStatus`**: `enabled`, `running`, `phase`, durable `last_run`/`last_clean_run`, `next_run`, cost/notes, saved app guidance, per-app results, rich recent attempts, and settings. A current app is distinct from an installed/verified update, and incomplete source coverage prevents a clean-cycle claim.
 - **`LearnedFactView`** (`lib.rs:42-60`): `id`, `summary`, `detail`, `status`, `source` for the UI's "What Eir has learned" card.
 - **`AdvisorStatus`** (`lib.rs:64-77`): `enabled`, `escalated`, `escalation_model`, `reason`, `spent_today_usd`, `settings: AdvisorSettingsView`.
-- **`UiSettings`** / **`UsageSummary`** plus the `*Update` mirrors (`SettingsUpdate`, `UpdaterSettingsUpdate`, `AdvisorSettingsUpdate`) that flow back as `UiMsg` payloads. The provider settings carry `openrouter`/`anthropic` key flags and secrets, plus `kilo_cli_user_profile`/`kilo_cli_path` hint fields and `ollama_base_url` for the local Ollama server; the removed OpenAI-compatible provider's `base_url`/`api_key_set` remain on `UiSettings` as always-empty **deprecated wire fields** so a not-yet-updated v0.16 tray app (which requires them) can still decode the payload during an update's skew window. The API-key-based `kilocode` gateway provider (and its `kilocode_api_key`/`kilocode_key_set` wire fields) was removed in v0.19 in favour of the subscription-based `kilo_cli` path — an old config's `provider = "kilocode"` now aliases to `kilo_cli` on load rather than failing to parse.
+- **`UiSettings`** / **`UsageSummary`** plus the `*Update` mirrors (`SettingsUpdate`, `UpdaterSettingsUpdate`, `AdvisorSettingsUpdate`) that flow back as `UiMsg` payloads. The provider settings carry the four CLIs' path and profile overrides (`opencode_cli_*`, `cursor_cli_*`, and the Claude/Codex fields). The removed providers' fields — `openrouter`/`anthropic` key flags and secrets, `kilo_cli_*` hints, `ollama_base_url`/`ollama_key_set`, and the OpenAI-compatible provider's `base_url`/`api_key_set` — remain as **deprecated wire fields**, always empty/false from the service and ignored on the way in, so an older tray app can still decode the payload during an update's skew window. An old config naming a removed provider loads as its replacement (see [Provider abstraction](#provider-abstraction-aiclientrs)).
 
 **Backward-compat invariant**: additive status fields use `#[serde(default)]`, and `UiRequest.request_id` is optional + flattened. This keeps the original top-level command JSON valid across the installer’s UI/service skew window; capabilities tell the tray when it may rely on command results or provider testing.
 
-**Secret-handling invariant**: `UiSettings` never carries secret values, only booleans (`openrouter_key_set`, `anthropic_key_set`, `ollama_key_set`) so the UI shows "configured" without exposing keys. OpenRouter and native Anthropic take pasted API keys; `ollama` uses a separate cloud key only for web search; `claude_cli`, `codex_cli`, and `kilo_cli` borrow a locally logged-in subscription session instead. Inbound `SettingsUpdate` uses `Option<String>` for secrets where `None` = "unchanged" and a non-empty value replaces the stored secret; the JS sends `null` to preserve.
+**Secret-handling invariant**: Eir stores no provider secrets — all four providers borrow the CLI's own locally logged-in session — and `UiSettings` never carries secret values. The deprecated `*_key_set` booleans are always false, and the deprecated secret fields on inbound `SettingsUpdate` (`Option<String>`, where `None` = "unchanged") are ignored; the JS sends `null`.
 
-### Named-pipe security / ACL model (`pipe_server.rs:16-48`)
+### Named-pipe security / ACL model (`pipe_server/windows.rs`)
 
 A pipe created by a LocalSystem service defaults to granting only SYSTEM + Administrators, so a non-elevated, medium-integrity UI would get "Access is denied." `build_pipe_security_descriptor()` builds an explicit descriptor from the SDDL string:
 
@@ -374,19 +393,19 @@ D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x0012008b;;;IU)S:(ML;;NWNR;;;ME)
   or switching users releases the only listener. Portable same-path hashes are not
   accepted as process identity because the file could be replaced after launch.
 
-Implementation details: the descriptor is **intentionally leaked** and returned as a `usize` (not a raw pointer) so it can cross the listener's `.await` points (a raw pointer is not `Send`); `pipe_server.rs:32,47`. The `SECURITY_ATTRIBUTES` is constructed inside a block that ends before the first `.await`, so the non-`Send` pointer is never held across an await (`pipe_server.rs:83-104`), and the pipe is created via `create_with_security_attributes_raw`. If descriptor construction fails the server falls back to a default-ACL pipe and warns (`pipe_server.rs:77-79, 102`).
+Implementation details: the descriptor is **intentionally leaked** and returned as a `usize` (not a raw pointer) so it can cross the listener's `.await` points (a raw pointer is not `Send`). The `SECURITY_ATTRIBUTES` is constructed inside a block that ends before the first `.await`, so the non-`Send` pointer is never held across an await, and the pipe is created via `create_with_security_attributes_raw`. If descriptor construction fails the server falls back to a default-ACL pipe and warns.
 
-### Service side: listener & broadcast (`pipe_server.rs`)
+### Service side: listener & broadcast (`pipe_server/`)
 
-- `spawn()` creates a `watch::channel<StatusPayload>` (status fan-out) and an `mpsc::channel<UiMsg>` (size 8, command intake), returns a `PipeServer { status_tx }` plus the `UiMsg` receiver, and spawns `listener_task` (`pipe_server.rs:54-69`).
-- `PipeServer::broadcast_status()` just does `status_tx.send()` — the rest of the service pushes a fresh snapshot here whenever state changes (`pipe_server.rs:187-191`).
+- `spawn()` (per platform, both built on `mod.rs`'s `new_server()`) creates a `watch::channel<StatusPayload>` (status fan-out), a broadcast channel for correlated `CommandResult`s, a client-count `watch`, and an `mpsc` command-intake channel; it returns a `PipeServer` plus the command receiver and spawns the platform's `listener_task`.
+- `PipeServer::broadcast_status()` stores each snapshot with `status_tx.send_replace()` — the rest of the service pushes a fresh snapshot here whenever state changes. `send_replace`, not `send`: `watch::Sender::send` discards the value when no receiver exists, so while no client was connected every update was dropped and the next client to connect (every `eirctl` call on Linux; the Windows tray after a reconnect) was first handed a stale snapshot. A regression test pins this.
 - **Listener loop**: connects one client, enforces process and active-session identity,
   then splits it. The writer sends a protocol-v2 starting snapshot and broadcasts
   status/command results; both directions cap a JSON line at 12 MiB. Status projection
   also bounds approval/learned-fact collections and non-finite numbers, with a smaller
   recovery projection if a snapshot still cannot fit. Oversized inbound frames drop the
   connection; malformed bounded messages are logged and skipped.
-- **Single-consumer design**: the listener handles one connection at a time; on disconnect (`read_line` returns `Ok(0)` EOF) it aborts the writer task and loops back to accept the next client (`pipe_server.rs:182-184`). There is no concurrent multi-client support.
+- **Single-consumer design (Windows)**: the named-pipe listener handles one connection at a time; on disconnect (`read_line` returns `Ok(0)` EOF) it aborts the writer task and loops back to accept the next client. There is no concurrent multi-client support on Windows. The Linux socket listener instead serves several `eirctl` connections at once: every client receives every `CommandResult` on the broadcast channel and keeps only the one matching its own `request_id`.
 - **Critical invariant**: Approve/Reject are resolved only by the decision loop against
   the persistent queue. Claiming is atomic in SQLite; rejected rows cannot resurrect,
   and an approved-but-not-durably-completed row returns to pending at startup for a
@@ -455,7 +474,7 @@ The frontend was fully rebuilt in v0.17 (still hand-written vanilla HTML/CSS/JS,
 - **Activity feed** merges `recent_problems` + `recent_executions` into one list sorted by `at` descending, with emoji/tag per kind (`activityItems`).
 - **v0.24.3 UX pass**: Escape hides the window (blurs first when a field has focus); Ask Eir sends on plain Enter (Shift+Enter = newline, IME composition guarded); every `data-ts` relative age gets an absolute local-time tooltip (set once per element); the sidebar Pause button turns amber with a ▶ icon while paused; a config-shaped `status.error` (provider/key/model/config) surfaces an "Open Settings" quick link in the hero; the Disk/Startup card headers summarise the last scan ("2.1 GB cleanable" / "12 entries, 3 disabled"); the "What the agent is thinking" meta line shows "analysed Xm ago" from the new `last_analysis_at` wire field; and numeric settings inputs are clamped to their declared min/max on save (`numVal`).
 - **v0.25.1 UX pass** (frontend-only, no wire/service change): **toasts** (`toast(msg, kind)` → `#toast-wrap`, `textContent` only, auto-dismiss 2.6 s / 5 s for errors, click-to-dismiss, stack capped at 4) originally gave the then-fire-and-forget commands a neutral acknowledgement. Protocol v2 supersedes that constraint: current toasts use the returned command outcome, while neutral “queued” wording remains only for an older service during version skew. **Copy-to-clipboard** (`copyText`, `navigator.clipboard` with a textarea/`execCommand` fallback) on the hero error and per-approval target+details supports pasting a diagnosis elsewhere. **Activity filter chips** (All / Fixes / Diagnoses / Failures): `activityItems` tags each row `type` (`fix`/`diag`) + `fail`; `renderActivity` filters via `matchesActivityFilter`, folds `activityFilter` into the signature so a chip switch forces one rebuild, and keeps undo bookkeeping keyed on the *unfiltered* list so a hidden row cannot drop its in-flight Undo.
-- **Settings** is a full view (no modal) populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. The App Updates card shows the persisted ignored IDs only when the list is non-empty and restores one through the existing `set_app_ignore` command, so refresh cannot strand an ignored app. Since v0.24.3 the view guards unsaved edits; v0.24.4 made the tracking **per-card** (`dirtyCards` set keyed on the four card ids `card-autostart`/`card-provider`/`card-advisor`/`card-updater`): any input marks its enclosing card dirty and a successful save clears only that card. A disconnect invalidates the cached service settings and disables those controls; the next complete snapshot rehydrates each clean card independently while retaining dirty edits, and updater/advisor cards stay disabled and retry hydration until their nested snapshots exist. The grouped provider select offers OpenRouter / Anthropic API / Claude CLI / Codex CLI / Kilo CLI / Ollama and hides fields irrelevant to the selected provider. All three model controls use one native filterable `datalist`; `list_provider_models` reads OpenRouter's live catalogue, `codex debug models`, `kilo models`, or Ollama's `/api/tags`, with static Claude and offline fallbacks. A request sequence rejects stale provider-A results after a switch to B, while per-provider in-memory selections and persisted-but-vanished ids remain visible. Changing provider clears incompatible model controls; the service also clears the old advisor escalation model at the authoritative config boundary. JS pre-validates key/model requirements before sending (`AiClient::new` remains authoritative). Provider/model settings apply live; only collector channels/poll intervals/log directories trigger the restart helper.
+- **Settings** is a full view (no modal) populated from `lastStatus.settings`/`.updater.settings`/`.advisor.settings` plus the UI-local autostart command. The App Updates card shows the persisted ignored IDs only when the list is non-empty and restores one through the existing `set_app_ignore` command, so refresh cannot strand an ignored app. Since v0.24.3 the view guards unsaved edits; v0.24.4 made the tracking **per-card** (`dirtyCards` set keyed on the four card ids `card-autostart`/`card-provider`/`card-advisor`/`card-updater`): any input marks its enclosing card dirty and a successful save clears only that card. A disconnect invalidates the cached service settings and disables those controls; the next complete snapshot rehydrates each clean card independently while retaining dirty edits, and updater/advisor cards stay disabled and retry hydration until their nested snapshots exist. The provider select offers OpenCode CLI / Claude CLI / Codex CLI / Cursor CLI and hides fields irrelevant to the selected provider. All three model controls use one native filterable `datalist`; `list_provider_models` (`eir-ui/src/provider_models.rs`) runs `opencode models`, `codex debug models` or `agent --list-models`, with a static Claude list and static Codex/Cursor fallbacks. A request sequence rejects stale provider-A results after a switch to B, while per-provider in-memory selections and persisted-but-vanished ids remain visible. Changing provider clears incompatible model controls; the service also clears the old advisor escalation model at the authoritative config boundary. JS pre-validates key/model requirements before sending (`AiClient::new` remains authoritative). Provider/model settings apply live; only collector channels/poll intervals/log directories trigger the restart helper.
 
 ### Clear / Approve / Ignore / Update-now flows
 
@@ -472,7 +491,7 @@ The heart of `eir-svc` is a single async supervisory loop in `eir-svc/src/main.r
 
 ### Process entry & service boilerplate
 
-`main()` (lines 141-160) branches on `argv[1]`: `install`/`uninstall` manage the SCM registration, anything else attempts SCM dispatch via `service_dispatcher::start(SERVICE_NAME, ffi_service_main)`; if that fails (dev/standalone run) it builds a multi-thread Tokio runtime and calls `eir_main` with a Ctrl-C shutdown future.
+`main()` (Windows) branches on `argv[1]`: `install`/`uninstall` manage the SCM registration, anything else attempts SCM dispatch via `service_dispatcher::start(SERVICE_NAME, ffi_service_main)`; if that fails (dev/standalone run) it builds a multi-thread Tokio runtime and calls `eir_main` with a Ctrl-C shutdown future. The Linux `main()` accepts only `run` (or no argument), sets the runtime root to `/etc/eir` (or `$EIR_RUNTIME_ROOT`), and runs `eir_main` until SIGTERM/SIGINT; systemd supervises it (see [Linux platform split](#linux-platform-split)).
 
 - `define_windows_service!(ffi_service_main, svc_main)` (line 42) wires the SCM entry point.
 - `run_service()` (lines 50-102) registers an event handler that, on `Stop`/`Shutdown`, sets a shared `AtomicBool`; reports `ServiceState::Running` (accepting STOP|SHUTDOWN); builds the runtime; and `block_on(eir_main(...))` where the shutdown future polls the atomic every 500 ms (lines 81-89). After the loop returns it reports `ServiceState::Stopped`. `Interrogate` returns `NoError`; other controls return `NotImplemented`.
@@ -524,7 +543,7 @@ The outer `tokio::select!` races the main loop future against the `shutdown` fut
 3. `sleep_until(react_at)` (enabled only while a reaction is scheduled) — drains any coalesced pings and falls through to the decision body, exactly like a tick. The body clears `react_at` (a scheduled tick that fires first also cancels the pending reaction so the same signals aren't analysed twice).
 4. `update_done_rx` — an update task finished: clears `updater_running`/`updater.running`, records cost/evidence, sets `phase="idle"`, refreshes history, and recomputes `next_run`. Full cycles replace all app rows and advance `last_run`; targeted retries replace only the selected row and deliberately leave `last_run` unchanged so they cannot postpone whole-machine coverage.
 5. `update_progress_rx` — coarse live phase label; **guarded on `updater_running`** so a straggling message can't overwrite the `idle` a just-finished cycle set.
-6. `exec_done_rx` — a fix finished on the worker: removes its semantic key from `in_flight`, reloads the durable pending queue when a panic/timeout or rolled-back registry reset was requeued, pushes an execution + an `auto_executed=true` problem entry, and settles `resting_status`. It explicitly **does not touch `st.error`** so an execution outcome cannot wipe an unrelated AI/connection error.
+6. `exec_done_rx` — a fix finished on the worker: removes its semantic key from `in_flight`, reloads the durable pending queue when a panic/timeout or rolled-back registry reset was requeued, pushes an execution + an `auto_executed=true` problem entry, and settles `resting_status`. After a **successful** fix it re-reads the failed-services list at once (`wmi::rescan_failed_services`, the same fast rescan `RefreshStatus` uses), so a restarted service stops being listed as failed immediately instead of at the next services poll minutes later — which matters most to `eirctl status`, a fresh snapshot per call. It explicitly **does not touch `st.error`** so an execution outcome cannot wipe an unrelated AI/connection error.
 7. `analysis_done_rx` — the off-loop AI analysis (and optional advisor escalation) finished: on `Err`, sets `status="Error"`/`error` and continues; on `Ok`, destructures the returned `AnalysisSuccess`, logs usage, updates `last_fingerprint`/`last_analysis_at`/`st.advisor*`, reloads `learned_facts` fresh (they may have changed during the multi-minute call), then runs `audit::log_decision` and the **same per-problem routing + tray-status logic previously inline in the per-cycle body** (see below).
 8. `ui_rx` — UI commands (see below).
 
@@ -550,8 +569,11 @@ The outer `tokio::select!` races the main loop future against the `shutdown` fut
   accepted row remains durable as `approved` until the executor transaction completes
   or requeues it; startup requeues an interrupted claim for a fresh click rather than
   replaying an uncertain external action. Current policy and target preflight are
-  rechecked before execution. A rejection is recorded for learning and then retired.
-  Always resettle status + broadcast.
+  rechecked before execution; a row the preflight refuses is retired and the command
+  result carries the reason (for example "The same fix already ran, or failed
+  repeatedly, in the last 30 minutes" from the rate limit), so the tray toast or
+  `eirctl approve` says why rather than only "no longer allowed". A rejection is
+  recorded for learning and then retired. Always resettle status + broadcast.
 - `RunUpdatesNow` → requires monitoring to be resumed and no cycle already running, but deliberately bypasses the updater's enabled/schedule gate so the user can request a one-off check.
 - `ClearUpdateHistory`, `UpdateUpdaterSettings`, `SetAppIgnore`, `SetAdvisorSettings` → applied **live, no restart** (unlike provider settings), each persisting via `config::save`.
 
@@ -569,7 +591,7 @@ The AI call — `ai.analyze(...)` plus its optional advisor-escalation `ai.analy
 - `AnalysisSuccess` carries everything the receiving arm needs back from the task: `snapshot`, `fingerprint`, `decision`, `usage: Vec<CallUsage>`, `advisor: AdvisorStatus`, `advisor_spent_today`, `advisor_escalations_today`. The channel carries `Result<AnalysisSuccess, String>` directly — no separate outcome wrapper.
 - The spawned task mirrors `spawn_update_cycle`'s hardening: the real work runs in a nested inner `tokio::spawn` under a `tokio::time::timeout(ANALYSIS_MAX = 10 min, …)`, so a panic (`JoinError`) or a hang still sends a `Result::Err` and releases `analysis_running` — an analysis can never latch "running" forever.
 - Inside the task: `ai.analyze(...)`; if `should_escalate` returns `Some(reason)`, re-analyses via `ai.analyze_with(model, effort)` and folds the escalation's usage/decision/`AdvisorStatus` in — the same advisor logic as before, just running off-loop.
-- `analyze_with` wraps each provider call in a bounded transient-retry loop (`MAX_AI_RETRIES = 2`, 2s/4s backoff) gated by `is_transient_ai_error` (HTTP 429/5xx/overload/timeout/connection markers). A CLI subprocess (Claude/Codex/Kilo) that exits non-zero with **empty stderr** is also transient: each CLI adapter emits a distinct "…and no error output (transient)" message so a swallowed API/overload blip retries instead of latching `st.error` red, while an exit that *did* print a diagnostic (auth/config) still fails immediately.
+- `analyze_with` wraps each provider call in a bounded transient-retry loop (`MAX_AI_RETRIES = 2`, 2s/4s backoff) gated by `is_transient_ai_error` (HTTP 429/5xx/overload/timeout/connection markers). A CLI subprocess (any of the four) that exits non-zero with **empty stderr** is also transient: each CLI adapter emits a distinct "…and no error output (transient)" message so a swallowed API/overload blip retries instead of latching `st.error` red, while an exit that *did* print a diagnostic (auth/config) still fails immediately.
 - The `analysis_done_rx` arm (see the select-arm list above) is where `audit::log_decision`, the **per-problem routing**, and the tray-status broadcast now live, unchanged from before the move: `parse_fix_action()` (unparseable → blocked problem), then `pol.evaluate(&action, confidence)` → `Block(reason)` pushes a blocked problem; `AutoApprove` checks `safety::rate_limited` + `in_flight` dedupe and sends an `ExecJob` (reason `None`); `RequireApproval(reason)` dedupes against `pending`/`in_flight`, builds `ApprovalInfo`, and `insert_pending_approval`s. Finally computes the tray status (`Paused > PendingApproval > Executing > Warning(problems_found) > Active`) and broadcasts.
 
 ### `actionable_fingerprint` (lines 465-525)
@@ -586,12 +608,12 @@ Identical fingerprints across cycles mean nothing changed → skipped until the 
 
 - `resting_status` (363-374): the non-cycle status with precedence **Paused > PendingApproval > Executing > Active**. Asserted by `status_tests::resting_status_precedence`.
 - `should_escalate` (271-302): pure. Returns `Some(reason)` only when advisor `enabled`, a deeper tier is configured (`escalation_model` or `escalation_effort` non-empty), `escalations_today < MAX_ESCALATIONS_PER_DAY` (=24, the provider-agnostic backstop), and either `needs_deeper_analysis` ("the agent flagged the signals as ambiguous") or non-empty problems whose max confidence < `low_confidence_threshold` ("confidence was low"). Spend is retained for visibility, not gating. Covered by `advisor_tests`.
-- `restart_self`: spawns a detached PowerShell helper (LocalSystem, no UAC, survives this process exiting) that waits for EirSvc to stop cleanly, then retries `sc start` every 5s over a 60s window checking for Running each second; all helper streams redirect to `eir-restart.log`. The caller flushes the correlated settings result to the UI before returning and reporting STOPPED. A helper spawn failure keeps the service alive instead of stopping into the void.
+- `restart_self`: on Windows, spawns a detached PowerShell helper (LocalSystem, no UAC, survives this process exiting) that waits for EirSvc to stop cleanly, then retries `sc start` every 5s over a 60s window checking for Running each second; all helper streams redirect to `eir-restart.log`. The caller flushes the correlated settings result to the UI before returning and reporting STOPPED. A helper spawn failure keeps the service alive instead of stopping into the void. On Linux it is a deliberate `process::exit(0)` and systemd's `Restart=always` starts the service again with the new config (only reachable through a settings update, which `eirctl` does not send).
 - `spawn_update_cycle` (307-359): runs a cycle on a detached task with a nested inner `tokio::spawn` + `CYCLE_MAX = 60 min` timeout watchdog, so a panic (JoinError) or hang still produces a `CycleSummary` and releases `updater_running` — the updater can never latch "running" forever.
 
 ## Signal sources
 
-Eir's signal layer is three independent background collectors in the service plus an on-screen watcher in the tray (Source 4), each feeding its own bounded buffer, plus a per-cycle aggregation step in the decision loop that drains them into one `SignalSnapshot`. Each collector runs on its own cadence and writes to a shared, lock-guarded buffer; the decision loop reads a consistent slice of all three on each tick. All collectors live under `eir-svc/src/signals/` (`mod.rs` is just the module list — `event_log`, `file_watch`, `log_parser`, `wmi`).
+Eir's signal layer is three independent background collectors in the service plus an on-screen watcher in the tray (Source 4), each feeding its own bounded buffer, plus a per-cycle aggregation step in the decision loop that drains them into one `SignalSnapshot`. Each collector runs on its own cadence and writes to a shared, lock-guarded buffer; the decision loop reads a consistent slice of all three on each tick. All collectors live under `eir-svc/src/signals/` (`mod.rs` holds the module list and the reactive trigger channel). `event_log`, `wmi` and `profile` are directory modules whose `windows.rs` bodies are described below and whose `unix.rs` bodies (journald, `/proc`/`systemctl`/`ip`, `/etc/os-release`) are summarised in [Linux platform split](#linux-platform-split); `file_watch` is Windows-only in practice (an inert stub on Linux).
 
 ### Data model (`eir-svc/src/models.rs`)
 
@@ -600,7 +622,7 @@ Eir's signal layer is three independent background collectors in the service plu
 - **`SecurityPosture`** (lines 72–76) = `FirewallStatus` + `DefenderStatus`, both `Default`. `FirewallStatus` (80–85) holds `domain/private/public: Option<bool>` (`true`=on, `None`=unreadable, deliberately not a fault). `DefenderStatus` (90–98): `realtime_enabled`, `antivirus_enabled`, `signature_age_days`, all `Option`, `None` when Defender is absent or the query fails.
 - **`EventLogEntry`** (14–21): `timestamp`, `level`, `source`, `message`, `event_id`. **`FileChange`** (23–31): `path`, `kind`, `size_bytes`, `timestamp`, `log_event: Option<LogEvent>`. **`LogEvent`** (34–48): `program`, `log_path`, `severity` (FATAL/ERROR/WARN/INFO), `error_snippets` (≤5), `content_excerpt` (capped raw text so the AI can disambiguate a benign `"error"` JSON field from real corruption).
 
-### Source 1 — Windows Event Log (`signals/event_log.rs`)
+### Source 1 — Windows Event Log (`signals/event_log/windows.rs`; journald on Linux)
 
 - **Collects:** Error/Warning/Information records from configured channels (default `["System", "Application"]`, `config.rs:282`) via the legacy Win32 EventLog API (`OpenEventLogW`/`ReadEventLogW` reading `SEQUENTIAL_BACKWARDS` = newest-first, line 16).
 - **Cadence:** `event_log_poll_interval_secs`, default 45 (struct default `config.rs:280`; embedded sample uses 30; clamped to a 5 s floor on update, `config.rs:210`).
@@ -618,7 +640,7 @@ Eir's signal layer is three independent background collectors in the service plu
 - **Bounding:** `RING_SIZE = 50`, a true rolling ring buffer (`pop_front` when full). File changes are **drained**, so each `FileChange` is delivered to the AI at most once.
 - **Reactive trigger:** a change whose parsed `LogEvent::is_actionable()` (severity ≠ INFO, or error snippets present — the shared predicate in `models.rs`) pings the decision-loop trigger channel from the watcher thread (`try_send`, never blocks).
 
-### Source 3 — System state / WMI (`signals/wmi.rs`)
+### Source 3 — System state / WMI (`signals/wmi/windows.rs`; `/proc`, `systemctl` and `ip` on Linux)
 
 - **Cadence/freshness:** `wmi_poll_interval_secs`, default 300, with a 30 s floor. `snapshot_state` runs in `spawn_blocking`; the cache records its collection timestamp and per-probe error tokens. A failed probe keeps the last known good value but marks that collector degraded; before the first collection, metrics are explicitly `not_collected` and the UI renders `—`, never a healthy zero. A failed manual service rescan preserves the prior service state.
 - **What it collects** (mostly direct Win32, not WMI, despite the name):
@@ -682,26 +704,24 @@ summaries are one line, ≤ 240 chars. The dashboard renders the newest 8 with *
 
 ## AI layer & prompts
 
-The AI layer lives in `eir-svc/src/ai/` (`mod.rs` re-exports `client` and `prompt`). It turns a `SignalSnapshot` into a structured `ClaudeDecision` (analysis + ranked problems + proposed fix actions), behind a provider abstraction that covers six backends. The monitoring loop in `eir-svc/src/main.rs` drives it, layers advisor-mode escalation on top, and records token/cost usage. By the codebase's layering convention this is an infrastructure adapter (concrete HTTP/subprocess clients) plus a pure prompt-builder; the domain types it produces (`ClaudeDecision`, `Problem`, `FixAction`) live in `eir-svc/src/models.rs`.
+The AI layer lives in `eir-svc/src/ai/` (`mod.rs` re-exports `client` and `prompt`). It turns a `SignalSnapshot` into a structured `ClaudeDecision` (analysis + ranked problems + proposed fix actions), behind a provider abstraction over four CLI backends. The monitoring loop in `eir-svc/src/main.rs` drives it, layers advisor-mode escalation on top, and records token/cost usage. By the codebase's layering convention this is an infrastructure adapter (subprocess clients) plus a pure prompt-builder; the domain types it produces (`ClaudeDecision`, `Problem`, `FixAction`) live in `eir-svc/src/models.rs`.
 
 ### Provider abstraction (`ai/client.rs`)
 
-`AiClient` (`ai/client.rs`) wraps a single `reqwest::Client` (300s timeout, set for slow free OpenRouter models), the normalised reasoning `effort` string, and an internal `enum AiClientConfig` with one variant per provider: three native HTTP backends (`Anthropic`, `OpenRouter`, `Ollama`) and three subprocess backends (`ClaudeCli`, `CodexCli`, `KiloCli`) that borrow a locally logged-in subscription session instead of taking a pasted key (only the OpenAI-compatible proxy stays removed — its legacy config value aliases to Anthropic on load). **v0.19 removed the API-key-based `KiloCode` gateway provider** (`api.kilo.ai`) in favour of `KiloCli`; a `provider = "kilocode"` (or legacy `"kilo"`) in an old config loads as `kilo_cli`:
+Since v0.34.18 every provider is a local CLI that signs in with its own login; Eir holds
+no API keys and makes no HTTP calls to a model. `AiClient` (`ai/client.rs`) carries the
+normalised reasoning `effort` string and an internal `enum AiClientConfig` with one
+variant per provider — `OpenCode`, `Claude`, `Codex`, `Cursor` — each holding the
+configured binary override, model and (except Codex) a profile hint. Configs written for
+the removed providers still load: `openrouter`, `kilo_cli`/`kilocode`/`kilo` and
+`ollama` alias to `opencode_cli`, and `anthropic`/`openai_compatible` to `claude_cli`
+(`config::ApiProvider`). Shared plumbing lives in `ai/cli_*.rs`: NDJSON decoding
+(`cli_ndjson`), bounded process execution with a 300 s deadline and concurrently
+drained, size-capped stdout/stderr (`cli_process`), and launching as the right user
+(`cli_user`, `cli_user_launch`, `cli_user_launch_unix`).
 
-All three subscription CLIs share one privilege boundary: when EirSvc is LocalSystem, it obtains the active console user's primary token with `WTSQueryUserToken` and starts a hidden process with `CreateProcessAsUserW`. Scratch-file redirection replaces standard-handle inheritance, which Windows forbids across sessions. User-owned CLI binaries therefore never execute as SYSTEM.
+All four CLIs share one privilege boundary. On Windows, when EirSvc is LocalSystem, it obtains the sole active console/RDP user's primary token with `WTSQueryUserToken` and starts a hidden process with `CreateProcessAsUserW`; scratch-file redirection replaces standard-handle inheritance, which Windows forbids across sessions. On Linux, when `eir-svc` is root, the CLI runs as `[api] linux_ai_user` with only its primary group and no-new-privileges ([Linux platform split](#linux-platform-split)). User-owned CLI binaries therefore never execute as SYSTEM or root. Each call runs in a fresh scratch workspace under that user's profile.
 
-- **`Anthropic`** — native `/v1/messages`, streaming SSE, `x-api-key` + `anthropic-version: 2023-06-01`. Requires `anthropic_api_key` and a non-empty model or `new()` bails. Sends `output_config.effort` when an effort is configured — except for Haiku models, which do not support the dial. Parses per-call usage from the stream (`message_start` input/cache tokens, `message_delta` output tokens) and **estimates** cost from a small list-price table (`anthropic_price_per_mtok` / `estimate_anthropic_cost` — prices drift) for the usage card and advisor spend visibility.
-- **`OpenRouter`** — OpenAI-compatible streaming against
-  `https://openrouter.ai/api/v1`. The key comes from config or the sole active desktop
-  user's `~/.openrouter/config.json`, read while impersonating that user; Eir never
-  searches other profiles. Blank model defaults to `"openrouter/free"`. Adds
-  `HTTP-Referer`/`X-Title` attribution and requests a final usage chunk. Effort maps to
-  `reasoning.effort` (`xhigh`/`max` collapse to `high`). Analysis calls send
-  `SYSTEM_PROMPT` as a `system` role and the per-cycle snapshot as `user`, so weaker
-  models do not bury the schema in one concatenated blob. SSE `delta.content` accepts a
-  string or `{type,text}` parts array; if content is empty, accumulated
-  `reasoning`/`reasoning_content` is used. A chunk that fails the typed parse is still
-  scraped as a `Value` rather than dropped.
 - **`ClaudeCli`** — Claude on the active user's **subscription**: spawns the local
   `claude` binary (`--print --output-format json`, optional `--model`, `--effort`),
   **no API key**. Under LocalSystem, the sole active session's token supplies both the
@@ -738,15 +758,16 @@ All three subscription CLIs share one privilege boundary: when EirSvc is LocalSy
   Ids are validated (`ses_` + `[A-Za-z0-9_-]`) before reaching a command line. Opt-in real
   checks: `cargo test -p eir-svc -- --ignored real_opencode` (a bogus-model run spends no
   model call; mutation-tested by disabling cleanup).
-- **`Ollama`** — local OpenAI-compatible streaming against `api.ollama_base_url`
-  (default `http://127.0.0.1:11434/v1`). Model is required; local chat needs no key.
-  Optional `ollama_api_key` (or `OLLAMA_API_KEY`) calls Ollama's cloud
-  `https://ollama.com/api/web_search` before app-update checks, then inlines results
-  into a local chat completion. `supports_images()` is true (model-dependent).
-  Settings lists only models returned by live `GET …/api/tags` (no static catalogue).
+- **`CursorCli`** — Cursor Agent on the active user's **Cursor subscription**, **no API
+  key**: spawns `agent -p --mode ask --output-format json --trust [--model …]
+  --workspace <scratch>` (ask mode is read-only) with the prompt on stdin. Binary
+  resolution tries the configured path, the active profile's `.local\bin\agent.cmd`,
+  then PATH. The reply is one JSON envelope (`{type:result, result, usage}`); tokens are
+  recorded with zero cost. There is no effort dial and no image input.
 
-Both SSE readers share a UTF-8-safe byte accumulator. Streaming and non-streaming HTTP
-bodies have a 4 MiB aggregate cap; CLI stdout/stderr are drained concurrently with fixed
+Local Ollama models are reached through OpenCode (`ollama/<model>`), not a separate
+provider. Only Codex and OpenCode accept image attachments (`supports_images()`); Claude
+and Cursor get a text-only note. CLI stdout/stderr are drained concurrently with fixed
 per-stream memory caps; provider-reported numeric usage/cost is normalised before storage.
 Ask validates attachment metadata/content again in the service, bounds prompt history and
 stored answers, and digest/status projections are bounded before crossing the pipe. CLI
@@ -757,14 +778,12 @@ envelope/NDJSON decoding and these limits have regression checks.
 ### Analysis entry points & response parsing
 
 `analyze` delegates to `analyze_with` with no overrides. `analyze_with` is the single dispatch point:
-1. Builds the per-cycle context via `prompt::build_context` (the static `SYSTEM_PROMPT` is sent separately on Anthropic/OpenRouter).
+1. Builds the per-cycle context via `prompt::build_context` and prepends the static system prompt (`prompt::system_prompt()`, the Windows or Linux variant by `cfg`) into one stdin blob — a CLI has no separate system role.
 2. Applies a `model_override` and an `effort_override` to **every** provider (both trimmed and ignored if empty). This is the advisor escalation lever.
-3. Dispatches to the per-provider call, returning raw text + `Option<CallUsage>` (every provider now reports usage where available; Anthropic's cost is estimated, OpenRouter's is provider-reported, the Kilo CLI's step_finish cost is provider-reported where present).
+3. Dispatches to the per-provider CLI call, returning raw text + `Option<CallUsage>` (usage comes from each CLI's own JSON/NDJSON output where it reports any).
 4. Parses via `ai::json::parse_decision`: strip `<think>`/`<thinking>`/`<reasoning>` tags and opening code fences, walk every complete top-level object/array (so a prose `{error}` token is not taken over a later payload), sanitise trailing commas / `//` `/* */` comments / raw newlines in strings / smart quotes, then deserialize. `ClaudeDecision`/`Problem` accept missing fields, string/percent confidence, and string/number booleans. A flattened `action` (+ fields) on a problem is lifted into `proposed_fix`; a bare problem or problems array is wrapped. `proposed_fix` as a JSON string or `"process_kill: name"` shorthand is coerced only into known single-field/`unit` actions — unknown shapes still fail `parse_fix_action` and are dropped by `bound_model_output`. A truncated object is passed through so serde reports EOF rather than a silently narrowed fragment. If nothing recoverable remains, one repair turn appends `JSON_REPAIR_HINT` and retries; a hard failure still attaches a truncated raw preview. The same sanitise/extract path backs `parse_model_json`, used by the updater's check/diagnose/native-installer parsers and the startup classifier.
 
-Each streaming path surfaces mid-stream provider errors instead of returning empty: OpenAI-style bails on a streamed `error` object and on an empty final body; Anthropic only accumulates `content_block_delta`/`text_delta` events.
-
-Each streaming path surfaces mid-stream provider errors instead of returning empty: OpenAI-style bails on a streamed `error` object and on an empty final body (`client.rs:445-448`, `469-471`); Anthropic only accumulates `content_block_delta`/`text_delta` events.
+A CLI that exits non-zero with empty stderr is reported as transient and retried by `analyze_with`'s backoff loop; one that printed a diagnostic (auth, config) fails at once with that text. AI error messages keep their full cause chain.
 
 ### The monitoring prompt (`ai/prompt.rs`)
 
@@ -799,11 +818,11 @@ Escalation flow (`main.rs:1122-1179`): runs the base `analyze` first, then at mo
 
 ### Usage / cost accounting
 
-Per-provider usage extraction in `client.rs`: OpenRouter reads a streamed final usage chunk (prompt/completion tokens + `cost` USD where reported); Anthropic native parses token counts from the SSE events and **estimates** cost from list pricing; the Claude CLI reports its envelope usage including cache tokens and the equivalent API cost (no actual charge — subscription); the Kilo CLI reports its NDJSON `step_finish` tokens and cost the same way (also no actual charge — subscription; cost may be absent on some event shapes → 0). Both base and escalation calls log via `audit::log_usage` into the `usage_log` table and refresh `audit::usage_summary` (24h + 7d aggregate of calls/tokens/cost) into broadcast status. Escalation cost additionally accrues to `advisor_spent_today` for visibility, but the only remaining escalation backstop is the hard 24/day count cap.
+Per-provider usage extraction lives in each CLI adapter: the Claude CLI reports its envelope usage including cache tokens and `total_cost_usd`, the equivalent API value (no actual charge on a subscription); OpenCode reports the last NDJSON `step_finish` tokens and cost where the event carries one (a local or free model reports 0); Codex reports `turn.completed` tokens with zero cost; Cursor reports envelope tokens with zero cost. Both base and escalation calls log via `audit::log_usage` into the `usage_log` table and refresh `audit::usage_summary` (24h + 7d aggregate of calls/tokens/cost) into broadcast status. Escalation cost additionally accrues to `advisor_spent_today` for visibility, but the only remaining escalation backstop is the hard 24/day count cap.
 
 ### Web-search path (used by the updater, not monitoring)
 
-`AiClient::complete` is a separate entry point for the app-updater to resolve installer URLs / read failures with live web search where the provider supports it. **OpenRouter** uses its `web` plugin (`call_openrouter_web`, non-streaming). **Anthropic** uses the native `web_search_20250305` server tool (`call_anthropic_web`, non-streaming, max 5 searches at ~$0.01 each folded into the cost estimate; bails clearly if the turn produced no text); the model is resolved by `anthropic_web_model` — blank/bare-alias/non-Claude ids fall back to `claude-haiku-4-5`. **Claude CLI** uses the CLI's built-in web search; `claude_cli_model` coerces blank/non-Claude ids to the `haiku` alias. **Kilo CLI** does its own web search as part of its `--auto` agent loop, same as the base analysis call — the updater's plan validator, download gates, and signature policy still bound anything it returns regardless.
+`AiClient::complete` (`ai/client_complete.rs`) is a separate entry point for the app-updater to resolve installer URLs / read failures with live web search where the CLI offers it: **Codex** adds its global `--search` flag, **OpenCode** runs with `--auto`, and **Claude** uses the CLI's built-in web search (`claude_cli_model` coerces blank/non-Claude ids to the `haiku` alias). **Cursor** runs in read-only ask mode and relies on its own agent tooling. The updater's plan validator, download gates, and signature policy bound anything any provider returns regardless.
 
 `AiClient::complete_text` is the no-web sibling used by the learned-fact labeller (`learn/label.rs`) — a plain completion so a one-sentence label can't spend budget on searches.
 
@@ -909,6 +928,15 @@ Both behaviours are covered by unit tests against the real migrations. The match
 `explain.rs`. `ActionExplanation { summary, target, reversible }` (`explain.rs:13`). `explain(action)` (`explain.rs:23`) returns a hand-written, deterministic description per variant — derived only from the action type and its fields, **never from the AI** — so the user can trust it when approving. The AI's own `side_effects`/`undo_instructions` are shown alongside as supporting detail (`main.rs:1308`). Notable: `software_uninstall`'s summary states it is policy-blocked and won't run; `powershell_diagnostic` uses `with_target_first_line` (`explain.rs:171`) to put a 60-char script snippet in `target`.
 
 `target_details(action)` (`explain.rs:227`) gathers factual on-disk detail — for `FileDelete` it runs `file_facts` (size, last-modified+age, read-only flag, and a `classify_file` risk heuristic distinguishing regenerable cache vs personal-folder data vs config); for `PowerShellDiagnostic` it returns the full script. Does file I/O, so it is called only on the approval path, off the hot loop.
+
+**Linux wording.** The same functions have Linux variants so approval cards read right on
+a server: service actions describe a systemd service rather than a Windows service, a
+file delete no longer mentions the Recycle Bin, and `classify_file` understands Linux
+paths — `~/.cache` and other cache folders, `/tmp`, `/var/tmp` and `/var/crash` are
+low-risk, while `Documents`, `Desktop`, `Pictures`, `Downloads`, `Videos` and `Music`
+under a home directory are flagged as personal data (the Windows matcher only understood
+backslash paths). Windows output is unchanged; the Windows-path tests run on Windows only
+and Linux has its own.
 
 ### Current gaps / dead code
 
@@ -1038,7 +1066,9 @@ request grants no extra authority. When the analysis finishes (or fails), the lo
 `investigation_in_flight` flag makes `finish_investigation` add one Ask history entry
 ("Investigate & fix: …") with `ask::investigation_answer` — the analysis plus each finding
 and the plain-English fix from `explain::explain` — and clears `st.investigation`
-(broadcast as `StatusPayload.investigation` while queued/running).
+(broadcast as `StatusPayload.investigation` while queued/running). The answer's closing
+line points at the tray's Approvals and Activity on Windows, and at `eirctl approvals` /
+`eirctl status` on Linux, where `eirctl investigate` waits for this Ask entry and prints it.
 
 ### F11 — Health timeline (`audit::metric_history` + `ui` sparklines)
 
@@ -1070,6 +1100,13 @@ display-only; **nothing is parsed or executed from it** — fixes still come onl
 cycle. History (`st.ask_entries`) is memory-only (cap 10, newest first), lost on restart. As of
 v0.29.0 the last 5 Q&A pairs are folded into the prompt as "Previous conversation" context, so
 follow-ups keep continuity, and a `ClearAsk` message resets the chat.
+
+On Linux (`eirctl ask`) the prompt is worded for a server: `ASK_RULES` casts Eir as a Linux
+server guardian answering about THIS SERVER, `HOW_EIR_WORKS` describes the systemd service,
+journal and `eirctl` instead of the tray, the machine profile comes from `/etc/os-release`,
+`/proc` and DMI (`signals/profile/unix.rs`), and `describe_state` leaves out the Windows
+Update, Firewall and Defender lines, which the Linux collector leaves unknown and which would
+otherwise prime the model to talk about Windows.
 
 ### F12 — Disk-space insights (`disk_scan.rs`)
 
@@ -1178,7 +1215,7 @@ Written by `audit::log_decision`; `executed` is flipped inside the same `persist
 - `recorded_at TEXT`
 - Written by `feedback::record` after the execution transaction commits; after-states, score, and targeted outcome are filled by `feedback::update_after_states`; read by `feedback::recent_summary` and the conservative fix-effectiveness detector.
 
-**`usage_log`** (`migrations/0005_usage.sql`) — per-call AI token/cost accounting (populated for every provider as of v0.17: OpenRouter and the Kilo CLI report cost, Anthropic's is estimated, both subscription CLIs' cost is an equivalent-cost figure with no actual charge).
+**`usage_log`** (`migrations/0005_usage.sql`) — per-call AI token/cost accounting for every provider: Claude and OpenCode report a cost figure (Claude's is equivalent API value, not a charge on a subscription), while Codex and Cursor record tokens at zero cost.
 - `id`, `timestamp TEXT`, `input_tokens`, `output_tokens`, `cache_creation`, `cache_read` (all INTEGER), `cost_usd REAL`.
 - Written by `audit::log_usage` (`audit.rs:123`); aggregated by `audit::usage_summary` (`audit.rs:142`) over 24h / 7d windows into `UsageSummary { calls, tokens, cost }` shown in the UI.
 
@@ -1458,24 +1495,47 @@ bodies differ:
 | `executor::services` | SCM (`OpenSCManagerW`/`ControlService`), `CRITICAL_SERVICES` backstop | `systemctl`, a two-layer protected-units backstop (below) |
 | `executor::logs` | Drive-letter paths, reparse-point guard | Plain-root paths, symlink guard; both share the same canonicalize-then-recheck shape and `PROTECTED_DIRS` idea (different paths) |
 | `executor::process` | `Stop-Process -Name` via PowerShell | Exact-name `/proc/<pid>/comm` match + `SIGKILL` |
-| `executor::startup`, `service_install`, updater `winget`/`choco`/`native` install paths | Real implementations | No Linux equivalent — hard `#[cfg(unix)]` stub (startup/service_install) or simply unreachable behind an empty `enabled_methods()` (updater) |
+| `executor::startup`, `service_install`, updater `winget`/`choco`/`native` install paths | Real implementations | No Linux equivalent — hard `#[cfg(unix)]` stub (startup/service_install). The updater is not supported on Linux: `[updater] enabled` defaults to false, no Linux client can turn it on, and its methods drive Windows package managers and installers |
 | `ai::cli_user` | `CreateProcessAsUserW` as the active desktop user | Privilege-drop `fork`+`setgroups`/`setgid`/`setuid` to `[api] linux_ai_user` (`ai::cli_user_launch_unix`) |
 
 ### Control plane
 
-Linux has no tray, so `eirctl` (workspace crate `eir-cli`) is the control surface: a
-small, dependency-light binary that speaks the *same* `UiRequest`/`ServiceMsg`/
-`CommandResult`/`StatusPayload` JSON-line protocol as the Windows pipe, over the Unix
-socket. It never runs on Windows (a two-line stub ships there so
+Linux has no tray, so `eirctl` (workspace directory `eir-cli`, package `eirctl`) is the
+control surface: a small, dependency-light binary that speaks the *same* `UiRequest`/
+`ServiceMsg`/`CommandResult`/`StatusPayload` JSON-line protocol as the Windows pipe, over
+the Unix socket. It never runs on Windows (a two-line stub ships there so
 `cargo clippy`/`test --workspace` stay green); `main.rs`'s Linux entry point
-(`#[cfg(unix)] fn main`) calls `config::set_runtime_root("/etc/eir")` — reusing the
-same mechanism portable mode already exercises for path resolution — then runs
-`eir_main` under a SIGTERM/SIGINT shutdown future. `packaging/systemd/eir.service`
-runs it as `eir-svc run`, `Restart=always` (not `on-failure`): the settings-restart
-path's `restart_self()` is a deliberate `process::exit(0)` on Linux, and systemd only
-withholds an automatic restart after an *operator-issued* `systemctl stop`, never
-after the unit exits on its own — so a clean, deliberate exit still picks up new
-config on the next start, with no PowerShell-polling helper needed.
+(`#[cfg(unix)] fn main`) calls `config::set_runtime_root("/etc/eir")` — or
+`$EIR_RUNTIME_ROOT` when set, which lets tests (and an unprivileged, systemd-less
+install) use a disposable config/state directory — reusing the same mechanism portable
+mode already exercises for path resolution, then runs `eir_main` under a SIGTERM/SIGINT
+shutdown future. `packaging/systemd/eir.service` runs it as `eir-svc run`,
+`Restart=always` (not `on-failure`): the settings-restart path's `restart_self()` is a
+deliberate `process::exit(0)` on Linux, and systemd only withholds an automatic restart
+after an *operator-issued* `systemctl stop`, never after the unit exits on its own — so a
+clean, deliberate exit still picks up new config on the next start, with no
+PowerShell-polling helper needed. The unit also creates `/run/eir` (`RuntimeDirectory=`)
+and `/var/lib/eir` (`StateDirectory=`) before each start.
+
+Each `eirctl` call is one short connection (`eir-cli/src/unix.rs`, hand-rolled argument
+parsing, no `clap`): connect (3 s timeout) to `$EIR_SOCKET` or `/run/eir/eir.sock`, read
+the initial `StatusPayload` the server pushes on connect, send at most one `UiRequest`
+with a fresh `request_id`, and wait (15 s) for the matching `CommandResult`.
+
+| Command | Wire message / behaviour |
+|---|---|
+| `status`, `approvals` | Print from the initial snapshot only; `--json` prints the payload (or `pending_approvals`) as JSON |
+| `approve <id>` / `reject <id>` | `UiMsg::Approve { id, approved }` |
+| `pause` / `resume` | `UiMsg::TogglePause`, sent only when the snapshot's `paused` differs from the request (a no-op otherwise; a race with another client is accepted) |
+| `ask "<question>"` | `UiMsg::AskEir` (no attachments); after the accept, watches status broadcasts until the newest Ask entry is finished and newer than the request, then prints its answer |
+| `investigate "<description>"` | `UiMsg::Investigate`; waits the same way for the "Investigate & fix: …" Ask entry |
+
+`ask`/`investigate` wait up to 5 minutes (`--timeout <secs>`), printing "still waiting…"
+once when 15 s pass with no message. Exit codes: 0 success, 1 the service refused the request (or the Ask
+failed), 2 usage error, 3 connect/disconnect/timeout. Because every call is a new client,
+the service keeps its latest status even while nothing is connected (`send_replace`, see
+[Service side](#service-side-listener--broadcast-pipe_server)) and rescans failed services
+straight after a successful fix, so `eirctl status` is current.
 
 ### Protected units (two layers)
 
@@ -1555,7 +1615,8 @@ are unchanged — Linux and Windows speak byte-identical JSON lines.
 
 ## Current limitations and roadmap
 
-This section records the v0.34.6 baseline. [PLAN.md](PLAN.md) holds the release gate and
+This section records the v0.34.6 baseline, plus the headless Linux build's own limits at
+the end. [PLAN.md](PLAN.md) holds the release gate and
 next work; [CONTEXT.md](CONTEXT.md) records durable decisions and releases.
 
 ### Verification baseline
@@ -1581,7 +1642,7 @@ next work; [CONTEXT.md](CONTEXT.md) records durable decisions and releases.
 
 ### Pipe and UI
 
-- The pipe accepts one active-interactive-session client at a time; concurrent tray clients
+- The Windows pipe accepts one active-interactive-session client at a time; concurrent tray clients
   are unsupported.
 - Protocol v2 correlates command results. During service/UI skew, protocol v1 retains the
   flattened command shape and can only return a neutral queued result.
@@ -1604,9 +1665,11 @@ next work; [CONTEXT.md](CONTEXT.md) records durable decisions and releases.
 
 ### AI and learning
 
-- Anthropic cost uses a list-price estimate; subscription CLI “cost” is an equivalent-value
-  estimate, so totals are visibility rather than billing.
-- CLI providers depend on the active user's installed binary layout and logged-in session.
+- Cost is whatever each CLI reports: Claude's is an equivalent-value figure, OpenCode's
+  depends on the model, and Codex/Cursor record zero, so totals are visibility rather than
+  billing.
+- CLI providers depend on the active user's (Linux: `linux_ai_user`'s) installed binary
+  layout and logged-in session.
   Unsupported model/effort combinations surface as call errors rather than being fully
   prevalidated.
 - Model JSON has a bounded extraction fallback, and decision/feedback context windows remain
@@ -1638,5 +1701,22 @@ next work; [CONTEXT.md](CONTEXT.md) records durable decisions and releases.
 - Version normalisation still has edge cases around prereleases and vendor-specific version
   shapes. Native installer execution under the packaged LocalSystem service remains part
   of the candidate acceptance workflow.
+
+### Headless Linux
+
+- Built from source only; releases carry no Linux artifact and the Linux build has no
+  self-update. It has been run on an Ubuntu 26.04 server under systemd and, unprivileged,
+  in a container without systemd; other distributions are untested.
+- Only 7 of 22 fix actions have a Linux mechanism, and none auto-executes by default.
+- No arbitrary log-directory watching (`file_watch` is an inert stub); the journal is the
+  only log source. Firewall, Defender and Windows Update fields stay unknown.
+- No Linux client for settings, app updates, disk/startup tools, Game Mode, learned-fact
+  controls or Ignore/Always Approve preferences; configuration is `/etc/eir/config.toml`
+  plus a service restart.
+- The optional `[notify]` alert hook (`notify.rs`) is implemented and tested but has no
+  decision-loop call site, so configuring it currently sends nothing.
+- Without root or systemd (`EIR_RUNTIME_ROOT`, e.g. in a container) the journal and
+  failed-unit collectors fail (and the network collector, where `ip` is missing), and
+  root-only fixes cannot run.
 
 No new repair authority is planned until these trust-loop gaps are closed.
