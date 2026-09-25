@@ -1,13 +1,6 @@
-## Projects
+# Eir decisions
 
-Eir — Rust/Tauri v2 Windows desktop agent, plus a headless Linux guardian build of its service. The current release line is v0.35.0 (published 2026-09-24, Windows assets only). The headless Linux build landed on `master` after that tag and is unreleased: it is built from source and runs on swatbox and swatbot. It has four crates:
-
-- `eir-proto`: shared serde wire contract for the UI/service named pipe (Windows) or Unix socket (Linux) — same JSON-line protocol either way.
-- `eir-svc`: LocalSystem Windows service / root-or-configured-user Linux systemd service that collects signals, calls AI providers, gates actions through policy, executes fixes, runs app updates, and owns the SQLite audit DB.
-- `eir-ui`: Tauri tray app using committed static frontend files in `ui/`; no npm/Vite build step. Windows only.
-- `eir-cli` (package and binary `eirctl`, so Cargo commands use `-p eirctl`): Linux-only control CLI over the Unix control socket; a two-line stub on Windows.
-
-Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.json` and dead root `build.rs` were removed in v0.23.0 (resolving the long-standing open question).
+Durable decisions and releases, newest first, each with its reason. The project overview, build and verification steps, constraints and open questions are in [AGENTS.md](AGENTS.md); the architecture is in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Architectural decisions
 
@@ -146,35 +139,3 @@ Canonical build config is `eir-ui/tauri.conf.json`. The stale root `tauri.conf.j
 2026-06-26 | Eir | Self-improvement is conservative-only learned facts | Audit-derived learning may skip, deprioritise, suppress noise, or reduce confidence, but it cannot enable actions or raise confidence; this keeps local adaptation from expanding authority.
 
 2026-06-26 | Eir | Advisor mode is bounded escalation, not model-controlled policy | The AI may ask for deeper analysis or trigger low-confidence escalation, but Rust chooses the configured tier and enforces a daily escalation count cap (the only remaining backstop after budget removal in v0.30.0).
-
-## Cross-project patterns
-
-Maintain `ARCHITECTURE.md` as the deep technical reference and update it with behavior changes. Keep `CONTEXT.md` short: current state, durable decisions, and open questions only.
-
-For this repo, release versions must stay synchronized across `eir-proto/Cargo.toml`, `eir-svc/Cargo.toml`, `eir-ui/Cargo.toml`, `eir-cli/Cargo.toml`, `eir-ui/tauri.conf.json`, and the four corresponding `Cargo.lock` package entries (`eir-proto`, `eir-svc`, `eir-ui`, `eirctl`); `scripts/check-versions.ps1` gates all nine. Cargo invocations that consume the release graph use `--locked`.
-
-## Open questions / deferred decisions
-
-Consider moving learning thresholds/windows/half-lives from constants into config once the current detector behavior has more real-world history.
-
-The resource-trend thresholds (audit `summarise_trend`) and disk-health/SMART wording are heuristic — tune against real machine history.
-
-Headless Linux: whether to publish Linux release artifacts (today it is source-only with no self-update), and whether to add arbitrary log-directory watching (`signals::file_watch` is an inert stub there). Wiring `[notify]` call sites stays deferred until Swatto approves external messaging.
-
-`network_errors` is now collected defensively (falls back to 0 on any query failure) rather than dropped; confirm the CIM class/properties resolve on the target machines or drop the field.
-
-(Resolved in v0.23.0: stale root `tauri.conf.json`/`build.rs` removed; automated version-sync CI check added — `scripts/check-versions.ps1`.)
-
-## Environment constraints
-
-Primary target is Windows with the MSVC Rust toolchain. CI runs on `windows-latest` and pins Rust 1.95.0 to match `rust-toolchain.toml`. The headless Linux build (`eir-proto`, `eir-svc`, `eirctl`) is gated by CI's `ubuntu-latest` `verify-linux` job (clippy + tests); releases do not build it.
-
-No JavaScript package manager is part of the build; frontend assets are committed static HTML/JS.
-
-## Operational notes (migrated from mem0, 2026-07-23)
-
-_Facts recovered from the decommissioned shared mem0 store. May overlap existing docs above; integrate/prune as you touch these areas._
-
-### eir-local-linux-gtk-deps
-
-On a Linux host, workspace-wide `cargo clippy --workspace` / `cargo test --workspace` fail before project code because the Tauri tray (`eir-ui`) pulls GTK and `gdk-3.0.pc` is not installed. Scope Linux runs to the headless crates instead — `cargo clippy --locked -p eir-proto -p eir-svc -p eirctl --all-targets -- -D warnings` and the matching `cargo test` — exactly as CI's `verify-linux` job does; the Windows `verify` job covers the full workspace and the Tauri build. Why: avoid misreading local Linux GTK dependency failures as regressions in Eir code.
