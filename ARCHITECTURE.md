@@ -63,6 +63,7 @@ which is the substrate the self-improvement layer learns from (see
 - [User-facing on-demand tools (Ask / Timeline / Disk / Startup)](#user-facing-on-demand-tools-ask--timeline--disk--startup)
 - [Persistence, audit DB & the existing feedback loop](#persistence-audit-db--the-existing-feedback-loop)
 - [Self-improvement: machine-pattern learning](#self-improvement-machine-pattern-learning)
+- [Linux platform split](#linux-platform-split)
 - [Current limitations and roadmap](#current-limitations-and-roadmap)
 
 ---
@@ -1435,6 +1436,122 @@ one app already known to behave this way.
 
 
 ---
+
+## Linux platform split
+
+`eir-svc` is one binary crate that builds for both Windows and Linux; `eir-ui` (the
+Tauri tray) is Windows-only and is never built on Linux. The decision loop, policy
+gate, approvals, learning, audit DB, and Ask/Investigate logic in `main.rs` and its
+neighbours are OS-neutral and untouched by the Linux port — every OS-facing edge gets
+a `#[cfg(windows)]`/`#[cfg(unix)]` split, most as a `mod.rs`/`windows.rs`/`unix.rs`
+directory (matching the codebase's existing `signals::wmi`-style convention) so the
+shared parts (types, glue, orchestration) live once in `mod.rs` and only the collector
+bodies differ:
+
+| Module | Windows | Linux |
+|---|---|---|
+| `pipe_server` | Named pipe (`\\.\pipe\EirSvc`), PID/session-based client identity re-checked every second | Unix socket (`service.socket_path`), `SO_PEERCRED` checked once at accept; several concurrent clients (the wire's `request_id` makes broadcast-to-all safe) |
+| `signals::event_log` | `ReadEventLogW`, per-channel numeric cursor | `journalctl -o json`, polled on the same `event_log_poll_interval_secs`, a persisted `__CURSOR` string; `event_log_channels` reinterpreted as an optional `-u <unit>` scope |
+| `signals::wmi` | WMI/registry/`GetDiskFreeSpaceExW`/SCM enumeration | `/proc/stat`,`/proc/meminfo`,`libc::statvfs`,`systemctl list-units`,`ip -j addr show`,`/proc/net/dev`; firewall/Defender/Windows-Update fields stay at their "unknown" defaults |
+| `signals::profile` | Registry (`CurrentVersion`, BIOS keys) | `/etc/os-release`, `/proc/cpuinfo`, `/proc/meminfo`, `/sys/class/dmi/id/*` |
+| `signals::file_watch` | `notify` (ReadDirectoryChangesW-backed) + impersonation-guarded directory discovery | Journald-first for v1 — arbitrary path discovery/watching is deferred; the same API shape (`SharedChanges`/`ShutdownHandle`/`DirUpdateSender`) is kept as an inert stub so call sites need no `#[cfg]` |
+| `executor::services` | SCM (`OpenSCManagerW`/`ControlService`), `CRITICAL_SERVICES` backstop | `systemctl`, a two-layer protected-units backstop (below) |
+| `executor::logs` | Drive-letter paths, reparse-point guard | Plain-root paths, symlink guard; both share the same canonicalize-then-recheck shape and `PROTECTED_DIRS` idea (different paths) |
+| `executor::process` | `Stop-Process -Name` via PowerShell | Exact-name `/proc/<pid>/comm` match + `SIGKILL` |
+| `executor::startup`, `service_install`, updater `winget`/`choco`/`native` install paths | Real implementations | No Linux equivalent — hard `#[cfg(unix)]` stub (startup/service_install) or simply unreachable behind an empty `enabled_methods()` (updater) |
+| `ai::cli_user` | `CreateProcessAsUserW` as the active desktop user | Privilege-drop `fork`+`setgroups`/`setgid`/`setuid` to `[api] linux_ai_user` (`ai::cli_user_launch_unix`) |
+
+### Control plane
+
+Linux has no tray, so `eirctl` (workspace crate `eir-cli`) is the control surface: a
+small, dependency-light binary that speaks the *same* `UiRequest`/`ServiceMsg`/
+`CommandResult`/`StatusPayload` JSON-line protocol as the Windows pipe, over the Unix
+socket. It never runs on Windows (a two-line stub ships there so
+`cargo clippy`/`test --workspace` stay green); `main.rs`'s Linux entry point
+(`#[cfg(unix)] fn main`) calls `config::set_runtime_root("/etc/eir")` — reusing the
+same mechanism portable mode already exercises for path resolution — then runs
+`eir_main` under a SIGTERM/SIGINT shutdown future. `packaging/systemd/eir.service`
+runs it as `eir-svc run`, `Restart=always` (not `on-failure`): the settings-restart
+path's `restart_self()` is a deliberate `process::exit(0)` on Linux, and systemd only
+withholds an automatic restart after an *operator-issued* `systemctl stop`, never
+after the unit exits on its own — so a clean, deliberate exit still picks up new
+config on the next start, with no PowerShell-polling helper needed.
+
+### Protected units (two layers)
+
+Mirrors `executor::services`'s Windows `CRITICAL_SERVICES` — an adapter-level backstop
+independent of `policy.toml`, so an edited/misconfigured policy file can't expose a
+unit whose *stop* would take out the box (`start` is never guarded, matching the
+Windows rationale that starting something is not disruptive):
+
+1. **Compiled** (`executor::services::unix::PROTECTED_EXACT`/`PROTECTED_GLOBS`):
+   `ssh.service`, `tailscaled.service`, core `systemd-*`/`dbus`/`polkit`/`cron`/
+   `auditd` units, `docker`/`containerd`/`snapd`, `eir.service` itself, and glob
+   families `systemd-*`, `user@*`, `getty@*`, `serial-getty@*`.
+2. **Host-specific drop-in** (`/etc/eir/protected-units.d/*.conf`, one glob pattern
+   per line): additive only, survives an Eir binary update with no rebuild, and ships
+   **empty by default** — an operator adds their own app services (Caddy, a database,
+   …) there once they've confirmed Eir should never auto-restart them without review.
+
+### Privilege drop for the AI CLI
+
+`ai::cli_user::running_as_local_system()` is `geteuid() == 0` on Linux (previously
+hardcoded `false`, which would have run the AI CLI as root with zero privilege drop —
+a gap fixed as an explicit, blocking prerequisite before enabling Ask/Investigate on
+Linux). When true, `ai::cli_user_launch_unix::run_cli_as_active_user` resolves
+`[api] linux_ai_user` via `getpwnam_r` and refuses if it is unset, unresolvable, uid 0,
+or has a root-equivalent PRIMARY group (`docker`/`sudo`/`wheel`/`adm`). It then forks
+with a `pre_exec` closure that sets `PR_SET_NO_NEW_PRIVS` and calls `setgroups([primary
+gid])`→`setgid`→`setuid` (supplementary groups are dropped, so docker/sudo membership
+never reaches the child, and no setuid binary such as sudo can raise it again), before
+`exec`ing the CLI with `HOME`/`USER`/`LOGNAME`/`PATH` set to that user's and stdio
+redirected to files in a scratch workspace under that user's `~/.cache/eir/` (created
+with `openat`/`O_NOFOLLOW` so the user cannot redirect root's writes via symlinks). All
+four provider call sites needed no change beyond widening their `#[cfg(windows)]`
+import guard. Verified live on swatbox: the claude child runs as uid/gid 1000 with
+`Groups: 1000`, `CapEff: 0` and `NoNewPrivs: 1`.
+
+**systemd gotcha:** the unit must not set `User=root`/`Group=root`. On Ubuntu 26.04's
+systemd those lines start the service without `CAP_SETUID`, and the `setuid` above
+fails with EPERM (reproduced with `systemd-run -p User=root`). Root is the default, so
+the lines are simply omitted. The AI user's home needs a host drop-in
+(`ReadWritePaths=`) because of `ProtectHome=read-only`.
+
+**Real-time failure detection:** journald polling uses a `--priority=warning` floor, so
+a service that starts and then crashes produces no Error-level line of its own — only
+PID 1's warning-level "Failed with result" message. Entries with systemd's unit-result
+`MESSAGE_ID` (`d9b373ed55a64feb8242e02dbe79a49c`) are therefore mapped to Error,
+attributed to the `UNIT`, and trigger a reaction at once. Each decision cycle also
+re-reads `systemctl list-units --state=failed` (the full system-state poll is only every
+few minutes) and attaches the last 15 lines of every failed unit's own journal (any
+priority — the real error is usually an info-level stdout/stderr line), so both the
+reaction and any later Investigate see why the unit is down. Live on swatbox, a crashed
+service was analysed within ~30–50 s (bounded by the 60 s minimum gap between cycles)
+with its actual error text.
+
+### Policy and fix-set scope
+
+Of `FixAction`'s 22 variants, 7 have real Linux mechanisms
+(`service_restart`/`stop`/`start`, `log_cleanup`, `disk_cleanup`, `process_kill`,
+`file_delete`); the other 15 are hard-blocked in `policy.linux.toml`'s
+`blocklist.actions` *and* compiled out with a coded refusal by `executor::mod`'s
+`#[cfg(unix)]` `linux_unsupported` stub arms (defense in depth — the Linux system
+prompt never offers them, but a hallucinated proposal is still refused twice) *and*
+simply never mentioned in the Linux system prompt variant
+(`ai::prompt::system_prompt()` picks the Windows or Linux catalogue by `cfg`). The
+Linux auto-execute whitelist is empty (every fix needs `eirctl approve`) — see
+[CONTEXT.md](CONTEXT.md)'s decision entry for the reasoning (a shared,
+security-tool-dense multi-service host is a different risk profile from a single-user
+Windows PC).
+
+### What did not change
+
+`boot.rs`, `driver.rs`, `registry.rs`, `repair.rs`, `security.rs`, `software.rs`,
+`tasks.rs`, `powershell.rs`, and the updater's `winget`/`choco`/`msstore` methods are
+untouched — they already compiled on Linux as pure PowerShell-script-building/portable
+code (their *business logic* has no Linux meaning and is simply never reached, gated
+out by the policy blocklist and `executor::mod`'s stub arms). `eir-proto`'s wire types
+are unchanged — Linux and Windows speak byte-identical JSON lines.
 
 ## Current limitations and roadmap
 

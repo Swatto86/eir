@@ -270,13 +270,101 @@ For v0.34.6 and later, the tag workflow also requires the exact tag
 `v<manifest-version>`, reruns its gates from that tag SHA, and keeps the release draft
 until the exact installer `.sig` and `latest.json` version, URL, and signature agree.
 
+## Linux (headless)
+
+`eir-svc` also builds and runs as a headless guardian on Linux under systemd — no
+tray, no named pipe. The decision loop, policy gate, approvals, learning, audit DB,
+and Ask/Investigate are the same OS-neutral code as Windows; every OS-facing edge
+(collectors, executor, AI-CLI launch, control-plane transport) has a Linux
+implementation alongside the Windows one. `eir-ui` (the Tauri tray) is never built on
+Linux — control is entirely through `eirctl`, a small companion CLI (workspace crate
+`eir-cli`) that talks the exact same `UiRequest`/`ServiceMsg` JSON-line wire protocol
+as the Windows tray, over a Unix domain socket instead of a named pipe.
+
+**What's different from Windows:**
+- **Collectors**: `journald` (polled, not streamed) replaces the Windows Event Log;
+  `/proc`, `systemctl`, and `ip -j addr show` replace WMI/registry reads. There is no
+  Linux analogue of the Windows Firewall/Defender/Windows-Update fields — they stay at
+  their "unknown" defaults.
+- **Fixes**: only `service_restart`/`service_stop`/`service_start` (via `systemctl`),
+  `log_cleanup`, `disk_cleanup` (`apt-get clean` / `journalctl --vacuum-time` / a
+  bounded `/tmp` purge), `process_kill` (exact-name, via `/proc`), and `file_delete`
+  have real Linux implementations. Every other `FixAction` (registry, scheduled tasks,
+  drivers, BCD, Windows Firewall/Defender, SFC/DISM, startup entries) is hard-blocked
+  on Linux, both in the AI's own prompt and in `policy.linux.toml`.
+- **Policy defaults are stricter**: the Linux auto-execute whitelist is empty — every
+  fix, including log and disk clean-ups, needs a human `eirctl approve` first, unlike
+  Windows' whitelisted `service_restart`/`stop`/`start`. Add action names to the
+  `[whitelist]` in `/etc/eir/policy.toml` to opt in.
+  See CONTEXT.md's decision entry for why.
+- **Protected units**: a two-layer backstop independent of `policy.toml` guards
+  `systemctl stop`/`restart` (never `start`, which is not disruptive) on core system
+  units — a compiled list (`ssh.service`, `tailscaled.service`, `systemd-*`, `docker`,
+  `eir.service` itself, …) plus an optional, additive, host-specific drop-in at
+  `/etc/eir/protected-units.d/*.conf` (one glob per line; ships empty by default).
+- **AI CLI privilege drop**: when `eir-svc` runs as root (the systemd unit's default),
+  it never launches the AI CLI as root. `[api] linux_ai_user` names the local, non-root
+  account whose CLI login is used; the CLI child keeps only that account's primary
+  group (docker, sudo, adm and every other supplementary group are dropped) and runs
+  with no-new-privileges, so even a passwordless sudo rule cannot raise it. An ordinary
+  admin login is therefore fine. Leaving it unset disables the AI subsystem rather than
+  running the CLI as root — collectors, the executor and approvals still run.
+- **Logs** go to the journal: `journalctl -u eir`.
+- **Real time**: a unit that crashes is an immediate trigger (systemd's "unit result"
+  journal event), each analysis re-reads the failed-unit list and includes the recent
+  log of every failed unit, so the AI sees why it failed.
+
+### Install
+
+```bash
+# 1. Build (from this repo, on Linux)
+cargo build --release --locked -p eir-svc -p eir-cli
+
+# 2. Install the binaries, config and policy
+sudo install -m 755 target/release/eir-svc /usr/local/bin/eir-svc
+sudo install -m 755 target/release/eirctl  /usr/local/bin/eirctl
+sudo mkdir -p /etc/eir /etc/eir/protected-units.d   # /var/lib/eir: eir.service's own StateDirectory= creates it
+sudo install -m 640 config.toml.linux.example /etc/eir/config.toml   # then edit it
+sudo install -m 640 policy.linux.toml          /etc/eir/policy.toml
+
+# 3. Install and start the service
+sudo install -m 644 packaging/systemd/eir.service /etc/systemd/system/eir.service
+# The AI CLI writes its scratch workspace and login state in linux_ai_user's home,
+# which the unit's sandbox (ProtectHome=read-only) otherwise blocks:
+sudo mkdir -p /etc/systemd/system/eir.service.d
+printf '[Service]\nReadWritePaths=/home/ubuntu/.cache -/home/ubuntu/.claude -/home/ubuntu/.claude.json\n' \
+  | sudo tee /etc/systemd/system/eir.service.d/10-ai-user.conf   # use your linux_ai_user's home
+sudo systemctl daemon-reload
+sudo systemctl enable --now eir
+systemctl status eir
+```
+
+At minimum, edit `/etc/eir/config.toml`'s `[api]` section: set `provider` and
+`linux_ai_user` to a real, already-logged-in local account (e.g. `claude login` /
+`codex login` / `opencode auth login` run once as that user). Then drive it with
+`eirctl` (as that user, or any uid/gid listed in `[service] socket_allow_uids`/
+`socket_allow_gids` — root is always allowed):
+
+```bash
+eirctl status               # live metrics, failed units, pending approvals
+eirctl approvals             # actions awaiting a human decision
+eirctl approve <id>          # or: eirctl reject <id>
+eirctl pause                 # toggle pause
+eirctl ask "what is eating memory right now"
+eirctl investigate "check for anything unusual"
+```
+
+`eirctl --json <command>` emits the raw decoded payload for scripting. Set `$EIR_SOCKET`
+to point at a non-default `service.socket_path`.
+
 ## Project layout
 
 | Crate | Layer | Responsibility |
 |-------|-------|----------------|
-| `eir-proto` | shared | Wire types for the UI ↔ service pipe protocol. |
-| `eir-svc` | service | LocalSystem service: signal collection, AI client, policy, execution, audit DB. |
-| `eir-ui` | presentation | Tauri tray app; static frontend in `ui/`. |
+| `eir-proto` | shared | Wire types for the UI ↔ service pipe/socket protocol. |
+| `eir-svc` | service | LocalSystem/root service: signal collection, AI client, policy, execution, audit DB. |
+| `eir-ui` | presentation | Tauri tray app; static frontend in `ui/`. Windows only. |
+| `eir-cli` (binary `eirctl`) | presentation | Linux control CLI over the Unix control socket. |
 
 ## Security model
 

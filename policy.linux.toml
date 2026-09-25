@@ -1,0 +1,73 @@
+# Linux policy defaults — deployed to /etc/eir/policy.toml (see README.md's "Linux
+# (headless)" section and packaging/systemd/eir.service).
+#
+# The auto-execute whitelist is intentionally EMPTY: every Linux fix — service
+# restarts, process kills, file deletes and even log/disk clean-ups, which on a
+# security-monitored host can remove evidence other tools rely on — requires a human
+# `eirctl approve` first, diverging from Windows (which
+# auto-whitelists service_restart/service_stop/service_start). This is a deliberate,
+# stricter default for a shared, security-tool-dense multi-service host: swatbox alone
+# runs 30+ confirmed services (Caddy, Wazuh, CrowdSec, Suricata, MariaDB, Postfix,
+# Docker, Tailscale, SSH, plus its own remediation agent) where an unattended restart
+# by a second autonomous agent is a materially higher coordination risk than on a
+# single-user Windows PC. See CONTEXT.md's decision entry for the full rationale.
+
+[execution]
+confidence_threshold = 0.85
+max_retries_per_issue = 3
+rate_limit_mins = 30
+auto_approve_on_success_rate = 0.95
+
+[whitelist]
+# Nothing auto-executes on Linux by default; add action names here to opt in.
+actions = []
+
+[blocklist]
+# Every FixAction with no real Linux implementation (see executor::mod's
+# linux_unsupported, whose #[cfg(unix)] stub arms in execute() are the compiled-in
+# second layer) is hard-blocklisted here too — defense in depth: the Linux system
+# prompt never offers them, but a hallucinated proposal is still refused before
+# policy.evaluate() ever reaches the whitelist check.
+actions = [
+    "powershell_diagnostic",
+    "task_disable",
+    "task_enable",
+    "registry_reset",
+    "network_diagnostic",
+    "driver_disable",
+    "driver_enable",
+    "software_uninstall",
+    "bcd_edit",
+    "firewall_enable",
+    "defender_signature_update",
+    "defender_realtime_enable",
+    "sfc_scan",
+    "dism_restore_health",
+    "startup_set",
+]
+
+# No Linux service is blocklisted by name here: the protected-units backstop
+# (executor::services::unix — compiled exact names/globs plus the empty-by-default
+# /etc/eir/protected-units.d/*.conf host drop-in) is the real, adapter-level guard for
+# ssh.service/tailscaled.service/etc. and cannot be bypassed by editing this file.
+services = []
+
+# No scheduled-task concept on Linux (systemd timers are units, already covered by the
+# protected-units backstop above).
+tasks = []
+
+paths = [
+    # The machine's own package/boot/binary trees — mirrors executor::logs::unix's
+    # compiled PROTECTED_DIRS, as defense in depth if this file is ever hand-edited.
+    "/etc",
+    "/boot",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/root",
+    "/var/lib/dpkg",
+    "/var/lib/docker",
+]

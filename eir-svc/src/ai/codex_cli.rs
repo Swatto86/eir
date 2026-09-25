@@ -3,13 +3,10 @@
 use crate::ai::cli_process::{
     char_preview, cli_process, is_real, validate_cli_model_id, wait_capped, CliProcessOutput,
 };
-use crate::ai::cli_user::running_as_local_system;
+use crate::ai::cli_user::{run_cli_as_active_user, running_as_local_system, UserCliSpec};
 use crate::models::CallUsage;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
-
-#[cfg(windows)]
-use crate::ai::cli_user::{run_cli_as_active_user, UserCliSpec};
 
 pub(crate) async fn call_codex_cli(
     configured_binary: Option<&str>,
@@ -98,6 +95,7 @@ fn resolve_codex_binary(configured: Option<&str>, user_profile: Option<&str>) ->
     if let Some(p) = configured.filter(|p| is_real(p)) {
         return p.trim().to_string();
     }
+    #[cfg(windows)]
     if let Some(up) = user_profile {
         for candidate in [
             format!("{up}\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe"),
@@ -115,6 +113,17 @@ fn resolve_codex_binary(configured: Option<&str>, user_profile: Option<&str>) ->
             }
         }
     }
+    #[cfg(unix)]
+    if let Some(home) = user_profile {
+        for candidate in [
+            format!("{home}/.npm-global/bin/codex"),
+            format!("{home}/.local/bin/codex"),
+        ] {
+            if std::path::Path::new(&candidate).is_file() {
+                return candidate;
+            }
+        }
+    }
     "codex".into()
 }
 
@@ -126,37 +135,29 @@ async fn run_codex_cli(
     seq: u64,
 ) -> Result<CliProcessOutput> {
     if running_as_local_system() {
-        #[cfg(windows)]
-        {
-            let binary = configured_binary.map(str::to_owned);
-            let args = args.to_vec();
-            let prompt = prompt.to_owned();
-            let files = files.to_vec();
-            return tokio::task::spawn_blocking(move || {
-                run_cli_as_active_user(
-                    UserCliSpec {
-                        configured_binary: binary.as_deref(),
-                        resolve_binary: resolve_codex_binary,
-                        what: "codex CLI",
-                        scratch_prefix: "eir-codex",
-                        workspace_flag: None,
-                        workspace_files: |_| Vec::new(),
-                        timeout_ms: 300_000,
-                    },
-                    &args,
-                    &prompt,
-                    &files,
-                    seq,
-                )
-            })
-            .await
-            .context("Join Codex user-process task")?;
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (configured_binary, args, prompt, files, seq);
-            bail!("codex LocalSystem launch is Windows-only");
-        }
+        let binary = configured_binary.map(str::to_owned);
+        let args = args.to_vec();
+        let prompt = prompt.to_owned();
+        let files = files.to_vec();
+        return tokio::task::spawn_blocking(move || {
+            run_cli_as_active_user(
+                UserCliSpec {
+                    configured_binary: binary.as_deref(),
+                    resolve_binary: resolve_codex_binary,
+                    what: "codex CLI",
+                    scratch_prefix: "eir-codex",
+                    workspace_flag: None,
+                    workspace_files: |_| Vec::new(),
+                    timeout_ms: 300_000,
+                },
+                &args,
+                &prompt,
+                &files,
+                seq,
+            )
+        })
+        .await
+        .context("Join Codex user-process task")?;
     }
 
     let configured_binary = configured_binary.map(str::to_owned);
@@ -315,6 +316,7 @@ mod tests {
             .contains("login required"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn codex_binary_resolution_prefers_real_installs() {
         assert_eq!(

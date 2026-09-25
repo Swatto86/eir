@@ -1,6 +1,5 @@
 use anyhow::{bail, Result};
 use std::time::{Duration, Instant};
-use tracing::info;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_NOT_ACTIVE};
 use windows::Win32::System::Services::{
@@ -51,13 +50,6 @@ fn validate_name(name: &str) -> Result<()> {
         bail!("Invalid Windows service name");
     }
     Ok(())
-}
-
-pub fn restart(name: &str) -> Result<String> {
-    info!(service = name, "Restarting service");
-    stop(name)?;
-    start(name)?;
-    Ok(format!("Service '{name}' restarted successfully"))
 }
 
 pub fn stop(name: &str) -> Result<String> {

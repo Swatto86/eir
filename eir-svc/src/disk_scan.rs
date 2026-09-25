@@ -9,12 +9,10 @@ use crate::models::FixAction;
 use crate::session::{active_user_profile_dir, system_drive_root};
 use eir_proto::DiskEntryView;
 use std::collections::HashMap;
-use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use walkdir::{DirEntry, WalkDir};
 
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 /// Entries smaller than this are dropped as noise.
 const MIN_REPORT_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
 /// Keep at most this many entries (largest first).
@@ -125,12 +123,18 @@ fn system_specs_at(root: &Path) -> Vec<Spec> {
     ]
 }
 
-/// A directory-junction/symlink guard: never descend into a reparse point (avoids cycles
-/// and double-counting a linked tree — the same class of bug the v0.23.1 LogCleanup
-/// canonicalisation fix guarded against).
+/// A directory-junction/symlink guard: never descend into a reparse point (avoids
+/// cycles and double-counting a linked tree — the same class of bug the v0.23.1
+/// LogCleanup canonicalisation fix guarded against). `WalkDir` (`follow_links(false)`)
+/// reports the link's own metadata, not its target's — on Windows a directory
+/// junction/symlink reports BOTH `is_dir()` and `is_symlink()` true (there is no
+/// separate reparse-point bit needed once read this way); on Unix `is_dir()` is never
+/// true for a symlink's own (lstat) metadata, so this is a portable, behaviourally
+/// identical replacement for the former Windows-only `FILE_ATTRIBUTE_REPARSE_POINT`
+/// check.
 fn is_reparse_dir(e: &DirEntry) -> bool {
     match e.metadata() {
-        Ok(md) => md.is_dir() && (md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0),
+        Ok(md) => md.is_dir() && md.is_symlink(),
         Err(_) => false,
     }
 }
@@ -364,6 +368,7 @@ mod tests {
         assert_eq!(cleanable, 3);
     }
 
+    #[cfg(windows)]
     #[test]
     fn system_targets_follow_the_windows_drive() {
         let specs = system_specs_at(Path::new("D:\\"));
@@ -376,6 +381,7 @@ mod tests {
         }));
     }
 
+    #[cfg(windows)]
     #[test]
     fn profile_container_never_expands_to_a_drive_root() {
         assert_eq!(
@@ -400,6 +406,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
     #[test]
     fn per_user_scan_rejects_a_reparse_local_root() {
         let base =

@@ -115,6 +115,7 @@ mod tests {
         assert!(script.contains("Non-MSI"));
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn missing_package_is_reported_as_a_failure() {
         let name = format!("EirMissingPackage-{}", std::process::id());

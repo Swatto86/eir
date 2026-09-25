@@ -2,12 +2,12 @@
 
 ## System Overview
 
-Eir is a Rust/Tauri v2 Windows desktop agent: a LocalSystem service (`eir-svc`) diagnoses issues and runs repairs behind policy gates, while a medium-integrity tray UI (`eir-ui` + static `ui/`) renders status and sends commands over a mutually authenticated named pipe (`eir-proto` wire contract).
+Eir is a Rust/Tauri v2 Windows desktop agent: a LocalSystem service (`eir-svc`) diagnoses issues and runs repairs behind policy gates, while a medium-integrity tray UI (`eir-ui` + static `ui/`) renders status and sends commands over a mutually authenticated named pipe (`eir-proto` wire contract). `eir-svc` also builds and runs headless on Linux under systemd (no tray), controlled by `eirctl` (crate `eir-cli`) over a Unix domain socket instead — same wire protocol, `SO_PEERCRED`-authorised. See ARCHITECTURE.md's "Linux platform split" and README.md's "Linux (headless)" section.
 
 ## Tech Stack & Architecture
 
-- **Languages:** Rust 2021 (MSVC on Windows), static HTML/JS frontend (no npm/Vite).
-- **Crates:** `eir-proto` (serde wire), `eir-svc` (service + SQLite audit), `eir-ui` (Tauri v2 tray).
+- **Languages:** Rust 2021 (MSVC on Windows, also builds `eir-svc`/`eir-cli` on Linux/glibc), static HTML/JS frontend (no npm/Vite).
+- **Crates:** `eir-proto` (serde wire), `eir-svc` (service + SQLite audit; Windows LocalSystem or Linux systemd), `eir-ui` (Tauri v2 tray, Windows only), `eir-cli` (binary `eirctl`, Linux control CLI, two-line stub on Windows).
 - **Persistence:** SQLite via sqlx migrations under `migrations/`; config in `config.toml`.
 - **Patterns:** decision loop with off-loop AI/executor workers; policy AutoApprove / RequireApproval / Block; conservative self-improvement (`learn/`); durable user action preferences (`prefs`).
 
@@ -43,6 +43,7 @@ flowchart LR
 
 ## Recent Context & Decisions
 
+- **2026-09-25** — Headless Linux build: `eir-svc` runs under systemd (`packaging/systemd/eir.service`, `Restart=always`), controlled by the new `eirctl` CLI (`eir-cli` crate) over a Unix socket (`pipe_server::unix`, `SO_PEERCRED`-checked). Directory-module splits (`mod.rs`/`windows.rs`/`unix.rs`) for `pipe_server`, `signals::{event_log,wmi,profile}`, `executor::{logs,services}`. Privilege-drop AI-CLI launcher `ai/cli_user_launch_unix.rs` (`setgroups`→`setgid`→`setuid` to `[api] linux_ai_user`) fixes `running_as_local_system()`'s previous hardcoded-`false` gap. Linux auto-execute whitelist is empty (`policy.linux.toml`); two-layer protected-units backstop in `executor/services/unix.rs`. `[notify]` hook (`notify.rs`) implemented+tested, disabled by default, no call site yet.
 - **2026-09-24** — OpenCode session cleanup: `eir-svc/src/ai/opencode_sessions.rs` deletes each run's session (NDJSON `sessionID`, fallback `session list -n 50` from the temp folder matched by scratch dir name); wired in `opencode_cli::call_opencode_cli` for every outcome.
 - **2026-09-24** — v0.35.0 guardian work: tray `screen_watch.rs` reports error dialogs / hung windows (`ReportScreenError`) → `signals/screen.rs` → prompt ON-SCREEN ERRORS + feed; `Investigate` runs a focused analysis (`SignalSnapshot.user_report`) and posts the outcome to Ask; Ask context adds `signals/profile.rs`, `ask::describe_state`, feed lines and HOW EIR WORKS; fixed collector buffers being drained and discarded during an in-flight analysis.
 - **2026-09-06** — Cut v0.34.18: CLI-only providers (OpenCode/Claude/Codex/Cursor), Evergreen WebView2 (no fixed runtime; ~8 MB installer), OpenCode model list uses `opencode.cmd` instead of the Unix npm shim fallback of four fake models.

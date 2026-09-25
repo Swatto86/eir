@@ -12,29 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 eir-proto = { path = "../eir-proto" }
-windows = { version = "0.58", features = [
-    "Win32_System_EventLog",
-    "Win32_System_Com",
-    "Win32_Foundation",
-    "Win32_System_Registry",
-    "Win32_System_Services",
-    "Win32_System_Diagnostics_Debug",
-    "Win32_System_SystemInformation",
-    "Win32_System_Threading",
-    "Win32_System_RemoteDesktop",
-    "Win32_System_Environment",
-    "Win32_System_JobObjects",
-    "Win32_NetworkManagement_IpHelper",
-    "Win32_NetworkManagement_Ndis",
-    "Win32_System_Wmi",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_System_Ole",
-    "Win32_System_Variant",
-    "Win32_Storage_FileSystem",
-    "Win32_UI_Shell",
-] }
-windows-service = "0.7"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["stream", "json"] }
 serde = { version = "1", features = ["derive"] }
@@ -62,6 +39,38 @@ zip = { version = "4", default-features = false, features = ["deflate-flate2-zli
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 tar = { version = "0.4", default-features = false }
 sevenz-rust2 = { version = "0.21", default-features = false, features = ["util", "bzip2", "ppmd", "deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_System_EventLog",
+    "Win32_System_Com",
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Environment",
+    "Win32_System_JobObjects",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_System_Wmi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+] }
+windows-service = "0.7"
+
+# Linux headless build: privilege drop (setuid/setgid/setgroups), SO_PEERCRED and
+# statvfs. A normal (not target-gated) dependency, unlike `windows` above, because it is
+# a small, always-available pure-FFI crate — `cfg(unix)` code within eir-svc uses it
+# directly rather than needing a second target table.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 sevenz-rust2 = { version = "0.21", default-features = false, features = ["util", "compress"] }

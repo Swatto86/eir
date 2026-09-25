@@ -8,11 +8,11 @@
 //!     active-user process launcher.
 //!   - Only Chocolatey is auto-bootstrapped.
 
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use tracing::{info, warn};
 
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Package-family hash for the official winget (Microsoft.DesktopAppInstaller) MSIX.
@@ -152,11 +152,14 @@ fn resolve_winget() -> WingetResolution {
 }
 
 fn resolve_winget_from_path() -> Result<Option<PathBuf>, String> {
-    let out = std::process::Command::new("where")
-        .arg("winget")
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| e.to_string())?;
+    let mut command = std::process::Command::new("where");
+    command.arg("winget");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = command.output().map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Ok(None);
     }
@@ -207,17 +210,20 @@ fn resolve_winget_from_windowsapps() -> Result<Option<PathBuf>, String> {
 
 fn resolve_winget_from_appx() -> Result<Option<PathBuf>, String> {
     const SCRIPT: &str = "Get-AppxPackage -AllUsers | Where-Object { $_.Name -eq 'Microsoft.DesktopAppInstaller' } | Select-Object -First 1 -ExpandProperty InstallLocation";
-    let out = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            SCRIPT,
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| e.to_string())?;
+    let mut command = std::process::Command::new("powershell");
+    command.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        SCRIPT,
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = command.output().map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(format!(
             "Get-AppxPackage query failed (exit {}): {}",

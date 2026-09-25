@@ -24,6 +24,47 @@ pub struct Config {
     /// so a `config.toml` without an `[advisor]` section still loads.
     #[serde(default)]
     pub advisor: AdvisorConfig,
+    /// Linux only: the Unix-socket control surface `eirctl` connects to. Ignored on
+    /// Windows (which keeps its named pipe). `#[serde(default)]` so a `config.toml`
+    /// without a `[service]` section still loads.
+    #[serde(default)]
+    pub service: ServiceConfig,
+    /// Linux only: an optional external command Eir invokes to alert the owner
+    /// (Discord/Telegram/etc). Disabled (empty) by default. Ignored on Windows.
+    /// `#[serde(default)]` so a `config.toml` without a `[notify]` section still loads.
+    #[serde(default)]
+    pub notify: NotifyConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(default)]
+pub struct ServiceConfig {
+    /// Unix-domain socket path eirctl connects to.
+    pub socket_path: String,
+    /// Additional uids (beyond uid 0/root, always implicitly allowed) permitted to
+    /// connect to the control socket.
+    pub socket_allow_uids: Vec<u32>,
+    /// Additional gids permitted to connect to the control socket.
+    pub socket_allow_gids: Vec<u32>,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            socket_path: "/run/eir/eir.sock".to_string(),
+            socket_allow_uids: Vec::new(),
+            socket_allow_gids: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(default)]
+pub struct NotifyConfig {
+    /// `argv` of an external alert command; empty (the default) disables the hook.
+    /// Eir appends the alert text as the final argument at call time — see
+    /// `notify::send` — never interpolated into the command itself.
+    pub command: Vec<String>,
 }
 
 /// When the AI flags a hard/ambiguous situation (or its confidence is low), Eir can
@@ -170,6 +211,13 @@ pub struct ApiConfig {
     /// cursor_cli: optional profile hint for interactive/dev runs.
     #[serde(default)]
     pub cursor_cli_user_profile: Option<String>,
+    /// Linux only: the local system user the AI CLI runs as (the privilege-drop
+    /// target) when eir-svc itself runs as root under systemd. Required non-empty in
+    /// that case — see `ai::cli_user_launch_unix`'s fail-closed startup guard, which
+    /// refuses to launch the CLI as root rather than silently skipping the drop.
+    /// Ignored on Windows.
+    #[serde(default)]
+    pub linux_ai_user: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -199,8 +247,11 @@ pub struct MonitoringConfig {
     /// Run decision cycles, the autonomous updater and the digest only while the tray app
     /// is connected. On by default: with no tray there is nobody to see findings or approve
     /// fixes, so the service keeps collecting signals and resumes the moment the tray opens.
-    /// Set false for a headless machine that should self-heal unattended.
-    #[serde(default = "default_true")]
+    /// Set false for a headless machine that should self-heal unattended. Defaults to
+    /// `false` on Linux (there is no tray to connect at all) and `true` on Windows —
+    /// a dedicated default fn, not the shared `default_true` above (which stays used
+    /// by `game_mode_auto`/`watch_screen_errors`, whose default is `true` on both OSes).
+    #[serde(default = "default_require_tray")]
     pub require_tray: bool,
     /// Have the tray report error message boxes and hung ("Not Responding") windows so
     /// Eir reacts to the errors the user actually sees. On by default; the text goes to
@@ -216,6 +267,16 @@ fn default_confidence() -> f32 {
 fn default_true() -> bool {
     true
 }
+
+#[cfg(windows)]
+fn default_require_tray() -> bool {
+    true
+}
+#[cfg(unix)]
+fn default_require_tray() -> bool {
+    false
+}
+
 fn default_el_poll() -> u64 {
     30
 }
@@ -635,6 +696,7 @@ audit_db = "./eir.db"
         toml::from_str::<Config>(example).expect("config.toml.example must deserialize");
     }
 
+    #[cfg(windows)]
     #[test]
     fn portable_root_overrides_executable_directory_for_relative_state() {
         let portable_root = std::path::Path::new(r"C:\Users\Alice\AppData\Local\EirPortable");
@@ -650,6 +712,7 @@ audit_db = "./eir.db"
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn apply_update_then_toml_round_trips() {
         let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
@@ -729,6 +792,7 @@ audit_db = "./eir.db"
         assert!(cfg.settings_update_needs_restart(&changed));
     }
 
+    #[cfg(windows)]
     #[test]
     fn configured_log_roots_are_local_bounded_and_deduplicated() {
         let roots = normalize_log_directories(vec![
@@ -778,6 +842,7 @@ audit_db = "./eir.db"
         assert_eq!(toml::to_string(&cfg).unwrap(), before);
     }
 
+    #[cfg(windows)]
     #[test]
     fn unsafe_legacy_log_roots_are_skipped_without_bricking_config() {
         let roots = sanitize_loaded_log_directories(vec![

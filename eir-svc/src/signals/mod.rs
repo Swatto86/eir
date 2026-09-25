@@ -1,6 +1,9 @@
 pub mod event_log;
 pub mod feed;
 pub mod file_watch;
+// Only file_watch.rs's Windows log-tail parser (`try_parse_log`) uses this — Linux
+// file watching is journald-first for v1 (see `event_log`), so it has no caller there.
+#[cfg(windows)]
 pub mod log_parser;
 pub mod profile;
 pub mod screen;

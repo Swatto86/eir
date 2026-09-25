@@ -5,13 +5,10 @@ use crate::ai::cli_process::{
     char_preview, cli_process, current_user_profile, is_real, validate_cli_model_id, wait_capped,
     CliProcessOutput,
 };
-use crate::ai::cli_user::running_as_local_system;
+use crate::ai::cli_user::{run_cli_as_active_user, running_as_local_system, UserCliSpec};
 use crate::models::CallUsage;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-
-#[cfg(windows)]
-use crate::ai::cli_user::{run_cli_as_active_user, UserCliSpec};
 
 pub(crate) fn resolve_cursor_profile(configured: Option<&str>) -> Option<String> {
     if let Some(profile) = configured.filter(|p| is_real(p)) {
@@ -28,6 +25,7 @@ pub(crate) fn resolve_cursor_binary(
     if let Some(p) = configured.filter(|p| is_real(p)) {
         return p.trim().to_string();
     }
+    #[cfg(windows)]
     if let Some(up) = user_profile {
         for candidate in [
             format!("{up}\\.local\\bin\\agent.cmd"),
@@ -36,6 +34,13 @@ pub(crate) fn resolve_cursor_binary(
             if std::path::Path::new(&candidate).is_file() {
                 return candidate;
             }
+        }
+    }
+    #[cfg(unix)]
+    if let Some(home) = user_profile {
+        let candidate = format!("{home}/.local/bin/agent");
+        if std::path::Path::new(&candidate).is_file() {
+            return candidate;
         }
     }
     "agent".into()
@@ -115,36 +120,28 @@ pub(crate) async fn call_cursor_cli(
     let args = build_args(model)?;
 
     let output = if running_as_local_system() {
-        #[cfg(windows)]
-        {
-            let binary = configured_binary.map(str::to_owned);
-            let args = args.clone();
-            let prompt = prompt.to_string();
-            tokio::task::spawn_blocking(move || {
-                run_cli_as_active_user(
-                    UserCliSpec {
-                        configured_binary: binary.as_deref(),
-                        resolve_binary: resolve_cursor_binary,
-                        what: "cursor CLI",
-                        scratch_prefix: "eir-cursor",
-                        workspace_flag: Some("--workspace"),
-                        workspace_files: |_| Vec::new(),
-                        timeout_ms: 300_000,
-                    },
-                    &args,
-                    &prompt,
-                    &[],
-                    seq,
-                )
-            })
-            .await
-            .context("Join Cursor user-process task")??
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (configured_binary, user_profile, seq);
-            bail!("cursor LocalSystem launch is Windows-only")
-        }
+        let binary = configured_binary.map(str::to_owned);
+        let args = args.clone();
+        let prompt = prompt.to_string();
+        tokio::task::spawn_blocking(move || {
+            run_cli_as_active_user(
+                UserCliSpec {
+                    configured_binary: binary.as_deref(),
+                    resolve_binary: resolve_cursor_binary,
+                    what: "cursor CLI",
+                    scratch_prefix: "eir-cursor",
+                    workspace_flag: Some("--workspace"),
+                    workspace_files: |_| Vec::new(),
+                    timeout_ms: 300_000,
+                },
+                &args,
+                &prompt,
+                &[],
+                seq,
+            )
+        })
+        .await
+        .context("Join Cursor user-process task")??
     } else {
         let configured_binary = configured_binary.map(str::to_owned);
         let user_profile = user_profile.map(str::to_owned);

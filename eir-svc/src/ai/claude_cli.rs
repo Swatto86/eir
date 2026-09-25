@@ -5,13 +5,10 @@ use crate::ai::cli_process::{
     char_preview, cli_process, current_user_profile, is_real, resolve_profile_with_marker,
     validate_cli_model_id, wait_capped, CliProcessOutput,
 };
-use crate::ai::cli_user::running_as_local_system;
+use crate::ai::cli_user::{run_cli_as_active_user, running_as_local_system, UserCliSpec};
 use crate::models::CallUsage;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-
-#[cfg(windows)]
-use crate::ai::cli_user::{run_cli_as_active_user, UserCliSpec};
 
 #[derive(Deserialize)]
 struct ClaudeCliResult {
@@ -45,6 +42,7 @@ pub(crate) fn resolve_claude_binary(
     if let Some(p) = configured.filter(|p| is_real(p)) {
         return p.trim().to_string();
     }
+    #[cfg(windows)]
     if let Some(up) = user_profile {
         for candidate in [
             format!("{up}\\.local\\bin\\claude.exe"),
@@ -52,6 +50,19 @@ pub(crate) fn resolve_claude_binary(
                 "{up}\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe"
             ),
             format!("{up}\\AppData\\Roaming\\npm\\claude.cmd"),
+        ] {
+            if std::path::Path::new(&candidate).is_file() {
+                return candidate;
+            }
+        }
+    }
+    // Linux native install path (`npm install -g @anthropic-ai/claude-code` with a
+    // user-level prefix), confirmed live on swatbox.
+    #[cfg(unix)]
+    if let Some(home) = user_profile {
+        for candidate in [
+            format!("{home}/.local/bin/claude"),
+            format!("{home}/.npm-global/bin/claude"),
         ] {
             if std::path::Path::new(&candidate).is_file() {
                 return candidate;
@@ -121,36 +132,28 @@ pub(crate) async fn call_claude_cli(
     let args = build_args(model, effort)?;
 
     let output = if running_as_local_system() {
-        #[cfg(windows)]
-        {
-            let binary = configured_binary.map(str::to_owned);
-            let args = args.clone();
-            let prompt = prompt.to_string();
-            tokio::task::spawn_blocking(move || {
-                run_cli_as_active_user(
-                    UserCliSpec {
-                        configured_binary: binary.as_deref(),
-                        resolve_binary: resolve_claude_binary,
-                        what: "claude CLI",
-                        scratch_prefix: "eir-claude",
-                        workspace_flag: None,
-                        workspace_files: |_| Vec::new(),
-                        timeout_ms: 300_000,
-                    },
-                    &args,
-                    &prompt,
-                    &[],
-                    seq,
-                )
-            })
-            .await
-            .context("Join Claude user-process task")??
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = seq;
-            bail!("claude LocalSystem launch is Windows-only")
-        }
+        let binary = configured_binary.map(str::to_owned);
+        let args = args.clone();
+        let prompt = prompt.to_string();
+        tokio::task::spawn_blocking(move || {
+            run_cli_as_active_user(
+                UserCliSpec {
+                    configured_binary: binary.as_deref(),
+                    resolve_binary: resolve_claude_binary,
+                    what: "claude CLI",
+                    scratch_prefix: "eir-claude",
+                    workspace_flag: None,
+                    workspace_files: |_| Vec::new(),
+                    timeout_ms: 300_000,
+                },
+                &args,
+                &prompt,
+                &[],
+                seq,
+            )
+        })
+        .await
+        .context("Join Claude user-process task")??
     } else {
         let configured_binary = configured_binary.map(str::to_owned);
         let user_profile = user_profile.map(str::to_owned);
@@ -216,6 +219,7 @@ mod tests {
         assert_eq!(claude_cli_model("openrouter/free"), "haiku");
     }
 
+    #[cfg(windows)]
     #[test]
     fn claude_binary_resolution_prefers_real_installs() {
         assert_eq!(

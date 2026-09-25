@@ -133,3 +133,27 @@ jobs:
       - name: Build and smoke self-contained portable executable
         shell: pwsh
         run: ./scripts/portable-smoke.ps1 -EirExe target/release/eir.exe -ServiceExe target/release/eir-svc.exe -Output target/release/Eir_ci_windows-x64.exe
+
+  # Headless Linux build of eir-svc + eirctl (eir-cli). Deliberately -p scoped, never
+  # --workspace and never -p eir-ui: eir-ui (the Tauri tray) is Windows-only and its
+  # Linux bundling needs GTK/webkit2gtk packages this repo does not install here. The
+  # existing `verify` (Windows) and `dependency-audit` jobs above are untouched.
+  verify-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+
+      - name: Cache Rust build artefacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --locked -p eir-proto -p eir-svc -p eirctl --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked -p eir-proto -p eir-svc -p eirctl --all-targets

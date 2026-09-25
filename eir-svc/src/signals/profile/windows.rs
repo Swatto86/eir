@@ -2,6 +2,7 @@
 //! so "Ask Eir" can explain the system it is actually running on. Read from the registry
 //! and `GlobalMemoryStatusEx` on demand; every field is optional.
 
+use super::MachineProfile;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Registry::{
@@ -12,18 +13,6 @@ use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTAT
 const CURRENT_VERSION: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
 const CPU: &str = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0";
 const BIOS: &str = r"HARDWARE\DESCRIPTION\System\BIOS";
-
-#[derive(Default)]
-pub struct MachineProfile {
-    pub product: Option<String>,
-    pub display_version: Option<String>,
-    pub build: Option<String>,
-    pub ubr: Option<u32>,
-    pub manufacturer: Option<String>,
-    pub model: Option<String>,
-    pub cpu: Option<String>,
-    pub ram_gb: Option<f64>,
-}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -97,89 +86,15 @@ pub fn read() -> MachineProfile {
     }
 }
 
-/// Render the profile as one line, or `None` when nothing could be read.
-pub fn describe(p: &MachineProfile) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(product) = &p.product {
-        // Windows 11 still reports "Windows 10" in ProductName; the build is authoritative.
-        let is_11 = p
-            .build
-            .as_deref()
-            .and_then(|b| b.parse::<u32>().ok())
-            .is_some_and(|b| b >= 22_000);
-        let mut os = if is_11 {
-            product.replacen("Windows 10", "Windows 11", 1)
-        } else {
-            product.clone()
-        };
-        if let Some(v) = &p.display_version {
-            os.push_str(&format!(" {v}"));
-        }
-        match (&p.build, p.ubr) {
-            (Some(b), Some(u)) => os.push_str(&format!(" (build {b}.{u})")),
-            (Some(b), None) => os.push_str(&format!(" (build {b})")),
-            _ => {}
-        }
-        parts.push(os);
-    }
-    let device = [p.manufacturer.as_deref(), p.model.as_deref()]
-        .into_iter()
-        .flatten()
-        .filter(|s| !s.eq_ignore_ascii_case("System Product Name"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if !device.is_empty() {
-        parts.push(device);
-    }
-    if let Some(cpu) = &p.cpu {
-        parts.push(cpu.split_whitespace().collect::<Vec<_>>().join(" "));
-    }
-    if let Some(gb) = p.ram_gb {
-        parts.push(format!("{gb:.0} GB RAM"));
-    }
-    (!parts.is_empty()).then(|| parts.join(", "))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn describes_windows_11_from_its_build_and_skips_missing_parts() {
-        let p = MachineProfile {
-            product: Some("Windows 10 Pro".into()),
-            display_version: Some("24H2".into()),
-            build: Some("26100".into()),
-            ubr: Some(4652),
-            manufacturer: Some("Dell Inc.".into()),
-            model: Some("XPS 8960".into()),
-            cpu: Some("13th Gen Intel(R) Core(TM) i7-13700   ".into()),
-            ram_gb: Some(31.7),
-        };
-        assert_eq!(
-            describe(&p).as_deref(),
-            Some(
-                "Windows 11 Pro 24H2 (build 26100.4652), Dell Inc. XPS 8960, \
-                 13th Gen Intel(R) Core(TM) i7-13700, 32 GB RAM"
-            )
-        );
-        let win10 = MachineProfile {
-            product: Some("Windows 10 Home".into()),
-            build: Some("19045".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            describe(&win10).as_deref(),
-            Some("Windows 10 Home (build 19045)")
-        );
-        assert_eq!(describe(&MachineProfile::default()), None);
-    }
 
     #[test]
     fn reads_this_machine() {
         // Every supported Windows has a product name and build in the registry.
         let p = read();
         assert!(p.product.is_some() && p.build.is_some());
-        assert!(describe(&p).is_some_and(|d| d.contains("build")));
+        assert!(super::super::describe(&p).is_some_and(|d| d.contains("build")));
     }
 }

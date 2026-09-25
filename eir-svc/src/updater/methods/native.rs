@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 /// CREATE_NO_WINDOW — keep any spawned installer's console hidden.
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// The prompt that asks the model for one app's official direct installer. The
@@ -387,7 +388,9 @@ async fn run_installer(staged: &Staged, kind: InstallerKind, args: &[String]) ->
             return -3
         }
     };
-    cmd.creation_flags(CREATE_NO_WINDOW).kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.kill_on_drop(true);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => return -3,

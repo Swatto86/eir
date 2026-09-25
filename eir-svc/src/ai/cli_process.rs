@@ -206,6 +206,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn automatic_cli_profile_is_scoped_to_the_process_user() {
         let root = std::env::temp_dir().join(format!("eir-cli-profile-{}", std::process::id()));

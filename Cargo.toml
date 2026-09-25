@@ -1,5 +1,5 @@
 [workspace]
-members = ["eir-proto", "eir-svc", "eir-ui"]
+members = ["eir-proto", "eir-svc", "eir-ui", "eir-cli"]
 resolver = "2"
 
 # Panics are a service outage: EirSvc runs unattended as LocalSystem, so a panicking

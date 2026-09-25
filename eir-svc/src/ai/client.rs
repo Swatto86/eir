@@ -236,7 +236,7 @@ impl AiClient {
         model_ov: Option<&str>,
         effort: &str,
     ) -> Result<(String, Option<CallUsage>)> {
-        let blob = format!("{}\n\n{}", crate::ai::prompt::SYSTEM_PROMPT, context);
+        let blob = format!("{}\n\n{}", crate::ai::prompt::system_prompt(), context);
         match &self.config {
             AiClientConfig::OpenCode {
                 configured_binary,

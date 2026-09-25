@@ -479,6 +479,7 @@ async fn classify(
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn enumeration_script_scopes_user_entries_to_the_active_sid() {
         let script = enumeration_script("S-1-5-21-1-2-3-1001").unwrap();
@@ -488,6 +489,7 @@ mod tests {
         assert!(enumeration_script("S-1-5-21-1'; Get-ChildItem").is_err());
     }
 
+    #[cfg(windows)]
     #[test]
     fn enumeration_script_filters_other_users_scheduled_tasks() {
         let script = enumeration_script("S-1-5-21-1-2-3-1001").unwrap();

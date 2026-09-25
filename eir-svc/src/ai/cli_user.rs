@@ -1,20 +1,36 @@
-//! LocalSystem → active-user CLI launch. Winget and subscription CLIs must not
-//! run with SYSTEM authority against user-writable binaries.
+//! LocalSystem/root → active-user CLI launch. Winget and subscription CLIs must not
+//! run with SYSTEM (Windows) or root (Linux) authority against user-writable binaries.
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 use anyhow::bail;
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 #[cfg(windows)]
 #[path = "cli_user_launch.rs"]
 mod launch;
-
 #[cfg(windows)]
-pub(crate) use launch::{run_cli_as_active_user, running_as_local_system, UserCliSpec};
+pub(crate) use launch::{run_cli_as_active_user, running_as_local_system};
 
-#[cfg(not(windows))]
-pub(crate) fn running_as_local_system() -> bool {
-    false
+#[cfg(unix)]
+#[path = "cli_user_launch_unix.rs"]
+mod launch_unix;
+#[cfg(unix)]
+pub(crate) use launch_unix::{run_cli_as_active_user, running_as_local_system};
+
+/// Extra scratch-workspace files for a CLI run, derived from the desktop/service
+/// user's profile — e.g. a project-level CLI config. Never attached to the prompt.
+pub(crate) type WorkspaceFiles = fn(&str) -> Vec<(String, Vec<u8>)>;
+
+pub(crate) struct UserCliSpec<'a> {
+    pub configured_binary: Option<&'a str>,
+    pub resolve_binary: fn(Option<&str>, Option<&str>) -> String,
+    pub what: &'a str,
+    pub scratch_prefix: &'a str,
+    /// Extra files written into the scratch workspace (never attached to the prompt), given
+    /// the desktop/service user's profile directory — e.g. a project-level CLI config.
+    pub workspace_flag: Option<&'a str>,
+    pub workspace_files: WorkspaceFiles,
+    pub timeout_ms: u32,
 }
 
 #[cfg(windows)]
@@ -29,6 +45,7 @@ pub(crate) async fn run_winget_as_active_user(
     args: &[String],
     timeout: std::time::Duration,
 ) -> Result<(i32, String)> {
+    use anyhow::Context;
     static USER_PROGRAM_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let program = program.to_string_lossy().into_owned();
     let args = args.to_vec();
@@ -61,13 +78,15 @@ pub(crate) async fn run_winget_as_active_user(
     Ok((i32::from_ne_bytes(output.code.to_ne_bytes()), merged))
 }
 
-#[cfg(not(windows))]
+/// winget is a Windows package manager with no Linux equivalent wired up here (see
+/// `updater/methods` — the autonomous updater has no `apt` method in this phase).
+#[cfg(unix)]
 pub(crate) async fn run_winget_as_active_user(
     _program: &std::path::Path,
     _args: &[String],
     _timeout: std::time::Duration,
 ) -> Result<(i32, String)> {
-    bail!("winget active-user launch is Windows-only")
+    bail!("winget is Windows-only")
 }
 
 #[cfg(all(test, windows))]

@@ -1,16 +1,38 @@
-use crate::executor::logs::{checked_local_path, root_too_broad};
 use crate::models::FileChange;
-use crate::session::{active_user_session_id, system_drive_root, user_profile_dir_for_token};
-use chrono::Utc;
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::{HashSet, VecDeque};
-use std::os::windows::ffi::OsStrExt;
-use std::path::{Component, Path, PathBuf, Prefix};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+use std::time::Duration;
+
+#[cfg(windows)]
+use crate::executor::logs::{checked_local_path, root_too_broad};
+#[cfg(windows)]
+use crate::session::{active_user_session_id, system_drive_root, user_profile_dir_for_token};
+#[cfg(windows)]
+use chrono::Utc;
+#[cfg(windows)]
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+#[cfg(windows)]
+use std::collections::HashSet;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::path::Path;
+#[cfg(windows)]
+use std::path::{Component, Prefix};
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::time::UNIX_EPOCH;
+#[cfg(windows)]
+use std::time::{Instant, SystemTime};
+#[cfg(windows)]
+use tracing::info;
+#[cfg(windows)]
+use tracing::warn;
+#[cfg(windows)]
 use windows::core::PCWSTR;
+#[cfg(windows)]
 use windows::Win32::{
     Foundation::{CloseHandle, HANDLE},
     Security::{ImpersonateLoggedOnUser, RevertToSelf},
@@ -23,14 +45,22 @@ use windows::Win32::{
     System::RemoteDesktop::WTSQueryUserToken,
 };
 
+#[cfg(windows)]
 const RING_SIZE: usize = 50;
+#[cfg(windows)]
 const EVENT_QUEUE_SIZE: usize = 256;
+#[cfg(windows)]
 const MAX_READ_BYTES: u64 = 65_536;
+#[cfg(windows)]
 const DISCOVERY_WINDOW_DAYS: u64 = 30;
+#[cfg(windows)]
 const DISCOVERY_MAX: Duration = Duration::from_secs(30);
+#[cfg(windows)]
 const MAX_AUTO_WATCH_DIRS: usize = 96;
+#[cfg(windows)]
 const MAX_DISCOVERY_ENTRIES_PER_ROOT: usize = 4096;
 
+#[cfg(windows)]
 pub const TEXT_EXTENSIONS: &[&str] = &[
     "log", "txt", "csv", "json", "xml", "ini", "cfg", "conf", "err", "out", "trace", "debug",
     "warn", "error", "info",
@@ -44,6 +74,7 @@ pub type ShutdownHandle = std::sync::mpsc::SyncSender<()>;
 
 // ── Log parsing ───────────────────────────────────────────────────────────────
 
+#[cfg(windows)]
 fn try_parse_log(path: &Path, size_bytes: u64) -> Option<crate::models::LogEvent> {
     if size_bytes == 0 {
         return None;
@@ -65,8 +96,10 @@ fn try_parse_log(path: &Path, size_bytes: u64) -> Option<crate::models::LogEvent
     }
 }
 
+#[cfg(windows)]
 struct ActiveUserImpersonation(HANDLE);
 
+#[cfg(windows)]
 impl ActiveUserImpersonation {
     fn new() -> Option<Self> {
         let session = active_user_session_id()?;
@@ -87,6 +120,7 @@ impl ActiveUserImpersonation {
     }
 }
 
+#[cfg(windows)]
 impl Drop for ActiveUserImpersonation {
     fn drop(&mut self) {
         unsafe {
@@ -96,8 +130,10 @@ impl Drop for ActiveUserImpersonation {
     }
 }
 
+#[cfg(windows)]
 struct WatchPathGuard(Vec<HANDLE>);
 
+#[cfg(windows)]
 impl WatchPathGuard {
     fn open(path: &Path) -> Result<Self, String> {
         let mut guard = Self(Vec::new());
@@ -158,6 +194,7 @@ impl WatchPathGuard {
     }
 }
 
+#[cfg(windows)]
 impl Drop for WatchPathGuard {
     fn drop(&mut self) {
         for handle in self.0.drain(..).rev() {
@@ -168,6 +205,7 @@ impl Drop for WatchPathGuard {
     }
 }
 
+#[cfg(windows)]
 fn arm_watch(watcher: &mut RecommendedWatcher, path: &Path) -> Result<(), String> {
     let _user = ActiveUserImpersonation::new()
         .ok_or_else(|| "active-user token is unavailable".to_string())?;
@@ -180,6 +218,7 @@ fn arm_watch(watcher: &mut RecommendedWatcher, path: &Path) -> Result<(), String
         .map_err(|e| e.to_string())
 }
 
+#[cfg(windows)]
 fn replacement_watch_dirs(directories: &[PathBuf]) -> HashSet<PathBuf> {
     directories.iter().cloned().collect()
 }
@@ -187,10 +226,12 @@ fn replacement_watch_dirs(directories: &[PathBuf]) -> HashSet<PathBuf> {
 /// Whether the watched directory set actually changed (a fast-user-switch), as
 /// opposed to a routine re-arm of the same roots. Only a real change justifies
 /// dropping buffered, un-drained events.
+#[cfg(windows)]
 fn watched_set_changed(previous: &HashSet<PathBuf>, next: &HashSet<PathBuf>) -> bool {
     previous != next
 }
 
+#[cfg(windows)]
 fn parse_path(path: &Path, as_active_user: bool) -> Option<(u64, crate::models::LogEvent)> {
     let _user = if as_active_user {
         Some(ActiveUserImpersonation::new()?)
@@ -204,6 +245,7 @@ fn parse_path(path: &Path, as_active_user: bool) -> Option<(u64, crate::models::
 /// Read up to the last `max_bytes` of a file as (lossy) UTF-8. If the file is
 /// larger, seeks to the tail and drops the first — likely partial — line so the
 /// parser never keys off a truncated leading record.
+#[cfg(windows)]
 fn read_tail(path: &Path, max_bytes: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
@@ -231,6 +273,7 @@ fn read_tail(path: &Path, max_bytes: u64) -> Option<String> {
 ///
 /// Always includes any `extra` paths from `config.toml` that exist on disk,
 /// regardless of age. Designed to run via `tokio::task::spawn_blocking`.
+#[cfg(windows)]
 pub fn discover_watch_dirs(extra: &[String]) -> Option<Vec<PathBuf>> {
     let Some(user) = ActiveUserImpersonation::new() else {
         warn!("Log directory discovery deferred: active user token unavailable");
@@ -297,6 +340,7 @@ pub fn discover_watch_dirs(extra: &[String]) -> Option<Vec<PathBuf>> {
     Some(dirs)
 }
 
+#[cfg(windows)]
 fn profile_watch_roots(profile: &Path) -> [PathBuf; 3] {
     [
         profile.join("AppData\\Local"),
@@ -306,6 +350,7 @@ fn profile_watch_roots(profile: &Path) -> [PathBuf; 3] {
 }
 
 /// Resolve configured roots while already impersonating the active desktop user.
+#[cfg(windows)]
 fn configured_watch_dirs_current_user(extra: &[String]) -> Vec<PathBuf> {
     let mut dirs = HashSet::new();
     for path in extra {
@@ -327,6 +372,7 @@ fn configured_watch_dirs_current_user(extra: &[String]) -> Vec<PathBuf> {
 
 /// Returns true if `dir` contains at least one recognised text-extension file
 /// modified after `cutoff`, looking no deeper than `max_depth` levels.
+#[cfg(windows)]
 fn has_recent_log_files(
     dir: &Path,
     cutoff: SystemTime,
@@ -367,6 +413,7 @@ fn has_recent_log_files(
 
 // ── Spawn ─────────────────────────────────────────────────────────────────────
 
+#[cfg(windows)]
 fn create_watcher(
     event_tx: std::sync::mpsc::SyncSender<notify::Result<Event>>,
     overflowed: Arc<AtomicBool>,
@@ -388,6 +435,7 @@ fn create_watcher(
 ///
 /// Returns a `ShutdownHandle` — dropping it signals the thread to exit — and a
 /// `DirUpdateSender` for replacing the complete directory set at runtime.
+#[cfg(windows)]
 pub fn spawn(
     directories: Vec<PathBuf>,
     trigger: super::TriggerTx,
@@ -527,6 +575,39 @@ pub fn spawn(
     (shared, shutdown_tx, dir_tx)
 }
 
+/// Linux log-directory watching is journald-first for v1 (see `signals::event_log`):
+/// arbitrary path discovery/watching is deferred, so this always reports nothing to
+/// watch. `monitoring.log_directories`' Windows-drive-shaped validation also means
+/// `extra` is always empty in practice on Linux (see `config::normalize_log_directories`).
+#[cfg(unix)]
+pub fn discover_watch_dirs(_extra: &[String]) -> Option<Vec<PathBuf>> {
+    Some(Vec::new())
+}
+
+/// Linux has no arbitrary-path file watcher yet (see [`discover_watch_dirs`]); this
+/// keeps the exact same API shape as Windows — a live `SharedChanges`/`ShutdownHandle`/
+/// `DirUpdateSender` triple — so `main.rs`'s call site needs zero `#[cfg]` of its own.
+/// The background thread drains `DirUpdateSender` updates (so a caller can never block
+/// sending one) and exits when `ShutdownHandle` is dropped, exactly like the Windows
+/// watcher's shutdown contract.
+#[cfg(unix)]
+pub fn spawn(
+    _directories: Vec<PathBuf>,
+    _trigger: super::TriggerTx,
+) -> (SharedChanges, ShutdownHandle, DirUpdateSender) {
+    let shared: SharedChanges = Arc::new(Mutex::new(VecDeque::new()));
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel::<()>(0);
+    let (dir_tx, dir_rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
+
+    std::thread::spawn(move || {
+        while let Err(std::sync::mpsc::TryRecvError::Empty) = shutdown_rx.try_recv() {
+            let _ = dir_rx.recv_timeout(Duration::from_millis(500));
+        }
+    });
+
+    (shared, shutdown_tx, dir_tx)
+}
+
 pub fn drain(shared: &SharedChanges) -> Vec<FileChange> {
     shared
         .lock()
@@ -534,7 +615,7 @@ pub fn drain(shared: &SharedChanges) -> Vec<FileChange> {
         .unwrap_or_default()
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
@@ -657,5 +738,29 @@ mod tests {
         assert!(!desired.contains(&old_user));
         assert!(desired.contains(&new_user));
         assert!(desired.contains(&shared));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_reports_nothing_to_watch_in_this_phase() {
+        assert_eq!(discover_watch_dirs(&[]), Some(Vec::new()));
+        assert_eq!(
+            discover_watch_dirs(&["/var/log".to_string()]),
+            Some(Vec::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_accepts_directory_updates_without_blocking_and_shuts_down_cleanly() {
+        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (shared, shutdown, updates) = spawn(Vec::new(), trigger_tx);
+        assert!(drain(&shared).is_empty());
+        // Never blocks, even though nothing is draining it on a tight loop.
+        updates.send(vec![PathBuf::from("/tmp")]).expect("send");
+        drop(shutdown); // signals the background thread to exit
     }
 }

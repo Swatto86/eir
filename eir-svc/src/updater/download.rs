@@ -14,13 +14,13 @@ use super::proc::{self, VERIFY};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
 /// CREATE_NO_WINDOW — keep any spawned console (powershell/icacls) hidden.
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 // ── SYSTEM-only staging ──────────────────────────────────────────────────────
@@ -42,17 +42,21 @@ fn staging_root() -> PathBuf {
 /// not best-effort.
 fn lock_down_acl(dir: &Path) -> bool {
     let p = dir.to_string_lossy().to_string();
-    let status = std::process::Command::new("icacls")
-        .args([
-            p.as_str(),
-            "/inheritance:r",
-            "/grant:r",
-            "*S-1-5-18:(OI)(CI)F", // NT AUTHORITY\SYSTEM
-            "/grant:r",
-            "*S-1-5-32-544:(OI)(CI)F", // BUILTIN\Administrators
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status();
+    let mut command = std::process::Command::new("icacls");
+    command.args([
+        p.as_str(),
+        "/inheritance:r",
+        "/grant:r",
+        "*S-1-5-18:(OI)(CI)F", // NT AUTHORITY\SYSTEM
+        "/grant:r",
+        "*S-1-5-32-544:(OI)(CI)F", // BUILTIN\Administrators
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let status = command.status();
     matches!(status, Ok(s) if s.success())
 }
 

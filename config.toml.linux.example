@@ -1,0 +1,59 @@
+# Linux (headless) config.toml — deployed to /etc/eir/config.toml. See README.md's
+# "Linux (headless)" section for the full install walkthrough.
+
+[api]
+# Same four CLI providers as Windows: "opencode_cli", "claude_cli", "codex_cli",
+# "cursor_cli". claude_cli is the tested default for the headless setup.
+provider = "claude_cli"
+model = "haiku"
+# codex_cli_path / opencode_cli_path / cursor_cli_path left blank: auto-detected under
+# linux_ai_user's PATH (~/.local/bin, ~/.npm-global/bin).
+
+# REQUIRED when eir-svc runs as root (the systemd unit's default): the local,
+# non-root user the AI CLI is launched as (uid/gid/groups dropped, HOME/USER/PATH set
+# to that user's). eir-svc refuses to start its AI subsystem — collectors, the
+# executor and approvals still run — if this is unset while running as root, rather
+# than silently launching the CLI with root authority. Must not be root. The AI-CLI
+# child keeps only this account's PRIMARY group (docker, sudo, adm and every other
+# supplementary group are dropped) and runs with no-new-privileges, so sudo cannot
+# raise it back — an ordinary admin login such as "ubuntu" is therefore safe to use.
+# An account whose primary group is itself root-equivalent is refused.
+linux_ai_user = "ubuntu"
+
+[monitoring]
+# The sweep is a safety net; reactive Error triggers (journald) do the real-time work.
+decision_interval_secs = 1800
+event_log_poll_interval_secs = 30
+wmi_poll_interval_secs = 300
+confidence_threshold = 0.85
+# Compiled default is already `false` on Linux (no tray to wait for) — explicit here
+# for clarity; a headless box always self-heals unattended.
+require_tray = false
+# event_log_channels reinterpreted on Linux: an optional list of systemd unit names to
+# scope journald monitoring to (`journalctl -u <name>`); empty (the default) means all
+# of journald at priority <= warning.
+# event_log_channels = ["caddy.service", "ssh.service"]
+
+[advisor]
+# Escalation (a deeper, more expensive re-analysis pass) is disabled by default on
+# Linux per the owner's deployment decision — see CONTEXT.md's decision entry.
+enabled = false
+
+[service]
+# Unix-domain socket eirctl connects to (or set $EIR_SOCKET to override per-call).
+socket_path = "/run/eir/eir.sock"
+# Extra uids/gids allowed to connect beyond uid 0/root (always implicitly allowed).
+socket_allow_uids = [1000]   # e.g. ubuntu
+socket_allow_gids = []
+
+[notify]
+# Optional external alert command; empty (the default) disables the hook entirely.
+# DISABLED by default — do not configure this without the machine owner's explicit
+# go-ahead, since it sends messages to an external chat (Discord/Telegram/etc).
+# Eir appends the alert text as the command's final argument at call time and applies
+# the same hash+TTL dedup pattern common host-notify scripts use, so a repeated fault
+# does not re-alert every cycle.
+command = []
+
+[persistence]
+audit_db = "/var/lib/eir/eir.db"

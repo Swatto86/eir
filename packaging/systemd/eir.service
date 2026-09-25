@@ -1,0 +1,84 @@
+[Unit]
+Description=Eir headless guardian
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/eir-svc run
+# Runs as root by default. Do NOT add User=root / Group=root: with them this systemd
+# (Ubuntu 26.04) starts the service without CAP_SETUID, so handing the AI CLI to
+# [api] linux_ai_user fails with "Operation not permitted" (verified on swatbox).
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+
+# /run is tmpfs, recreated empty on every boot — RuntimeDirectory= is systemd's own
+# mechanism for this: it creates /run/eir (owned by root) BEFORE the
+# ProtectSystem= sandbox below is set up, and removes it on stop. Without this,
+# ReadWritePaths=.../run/eir fails the whole unit with a namespace-setup error
+# (226/NAMESPACE) on every fresh boot, since ReadWritePaths does not create missing
+# targets. Mode 0755: eir-svc itself further tightens/loosens the socket underneath
+# this directory at runtime (see pipe_server/unix.rs's own doc comment on why 0755 is
+# correct there) — this is only the directory's own starting mode.
+RuntimeDirectory=eir
+RuntimeDirectoryMode=0755
+# /var/lib/eir is persistent (unlike /run), so a missing directory only ever bites once
+# rather than every boot — but StateDirectory= creates it (owned by root)
+# before every start regardless, the same self-healing RuntimeDirectory= gives /run/eir,
+# so a re-image or an accidentally-cleaned /var/lib doesn't depend on the README's
+# manual `mkdir -p /var/lib/eir` step having been run first.
+StateDirectory=eir
+
+# Hardening — modelled on this host's own proven swatbox-agent.service profile
+# (confirmed live to permit privilege-dropping subprocess launches from inside it).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# /var/log and /var/cache/apt/archives are required for the Linux fix set that is
+# actually documented as supported (README.md, ARCHITECTURE.md): log_cleanup's default
+# targets live under /var/log, and disk_cleanup's "apt"/"journal" targets run
+# `apt-get clean` / `journalctl --vacuum-time` — both fail with "Read-only file system"
+# under ProtectSystem=strict without these (live-verified: reproduced the read-only
+# failure in an ephemeral sandbox with this unit's own hardening before adding them).
+# log_cleanup itself still accepts any operator/AI-approved directory, so a path
+# outside these two — and outside /var/lib/eir — will still fail read-only; that is
+# intentional least-privilege, not a bug: widen further only for a path you actually
+# intend eir-svc to clean.
+ReadWritePaths=/var/lib/eir /run/eir /var/log /var/cache/apt/archives
+# Required whenever [api] linux_ai_user is configured: prepare_workspace() writes each
+# AI-CLI scratch workspace under that user's own $HOME/.cache/eir, which ProtectHome=
+# read-only otherwise blocks even for root. Widen with the configured linux_ai_user's
+# own AI-CLI state directories, e.g.:
+#   ReadWritePaths=/var/lib/eir /run/eir /var/log /var/cache/apt/archives /home/ubuntu/.cache /home/ubuntu/.claude /home/ubuntu/.codex /home/ubuntu/.local/share/opencode /home/ubuntu/.cursor
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+# PrivateTmp is deliberately NOT set: disk_cleanup's "tmp" target purges the real
+# /tmp and /var/tmp (see executor::mod's purge_dirs doc comment — top-level files
+# only, never recursing into another service's own subdirectory) to reclaim host disk
+# space other services fill up. PrivateTmp=yes would give this unit its own isolated,
+# empty tmpfs for /tmp (live-verified: 0 entries in the sandboxed /tmp vs. 552 on the
+# real host, and a file written there never reaches the real host) — the cleanup would
+# "succeed" every time while doing nothing for the actual problem it exists to fix.
+# The trade-off: this unit's own transient files (there are none today — it uses only
+# RuntimeDirectory=/run/eir and StateDirectory=/var/lib/eir) would land in the shared,
+# world-writable /tmp rather than an isolated one if that ever changes.
+# NoNewPrivileges is compatible with eir-svc's own setuid()/setgid() drop to
+# linux_ai_user (dropping privilege is not "gaining" it). If CapabilityBoundingSet= is
+# ever added, it MUST retain CAP_SETUID/CAP_SETGID or the AI-CLI launch silently starts
+# failing (or worse, silently stops dropping privilege) — see ai/cli_user_launch_unix.rs's
+# fail-closed startup guard, which refuses rather than launching as root either way.
+
+# Restart=always (not on-failure): eir-svc's own settings-restart path exits(0)
+# deliberately to pick up new config — systemd only suppresses an automatic restart
+# after an operator-issued `systemctl stop`, never after the unit exits on its own, so
+# this is safe and is what makes that clean exit actually restart the service.
+
+[Install]
+WantedBy=multi-user.target

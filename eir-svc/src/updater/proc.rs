@@ -11,6 +11,7 @@ use std::process::Command as StdCommand;
 use std::time::Duration;
 
 /// CREATE_NO_WINDOW — keep spawned consoles hidden.
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Exit code reported when a command overran its deadline and was terminated. Negative
@@ -31,9 +32,15 @@ pub const VERIFY: Duration = Duration::from_secs(60);
 /// timeout the child is killed (via `kill_on_drop`) and `(TIMED_OUT, explanation)` is
 /// returned. Callers that need custom env/program paths build the [`StdCommand`]
 /// themselves and hand it over; creation flags are applied here.
-pub async fn run_capped_cmd(mut cmd: StdCommand, dur: Duration) -> (i32, String) {
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(CREATE_NO_WINDOW);
+pub async fn run_capped_cmd(
+    #[cfg_attr(not(windows), allow(unused_mut))] mut cmd: StdCommand,
+    dur: Duration,
+) -> (i32, String) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     let mut cmd = tokio::process::Command::from(cmd);
     cmd.kill_on_drop(true);
     match tokio::time::timeout(dur, cmd.output()).await {
@@ -82,6 +89,7 @@ pub fn checked_output<'a>(action: &str, code: i32, output: &'a str) -> Result<&'
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn fast_command_returns_its_output() {
         let (code, out) = run_capped(
@@ -94,6 +102,7 @@ mod tests {
         assert!(out.contains("eir-proc-test"), "got: {out:?}");
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn overrunning_command_is_killed_and_flagged() {
         // `ping -n 4` runs ~3s; a 300ms cap must terminate it and report TIMED_OUT,

@@ -447,6 +447,7 @@ mod tests {
         assert!(e.summary.to_lowercase().contains("delete"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn missing_file_says_nothing_to_delete() {
         let details = file_facts_as_active_user("C:\\definitely\\not\\here\\nope.bin");

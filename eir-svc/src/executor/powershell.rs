@@ -13,6 +13,7 @@ const MAX_DIAGNOSTIC_STREAM_BYTES: usize = 1024 * 1024;
 /// untrusted data (AI-supplied names/paths) in a PowerShell command — a double-quoted
 /// string would still evaluate `$(...)`, `$var`, and backtick escapes. Returns the
 /// value INCLUDING its surrounding quotes, e.g. `ps_single_quote("a'b") == "'a''b'"`.
+#[cfg(any(windows, test))]
 pub fn ps_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -114,6 +115,7 @@ mod tests {
         assert_eq!(ps_single_quote("$(calc.exe)"), "'$(calc.exe)'");
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn diagnostic_output_is_retained_with_a_fixed_cap() {
         // StringBuilder.Append(char, count) is much faster than ('x' * n) on a

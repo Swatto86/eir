@@ -624,6 +624,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn lock_remedy_cannot_kill_a_protected_process() {
         let ctx = StepContext {

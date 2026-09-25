@@ -1,0 +1,24 @@
+[package]
+name = "eirctl"
+version = "0.35.0"
+edition = "2021"
+authors = ["Swatto <claude.ai@swatto.co.uk>"]
+description = "Command-line control surface for the headless Linux Eir guardian"
+license = "MIT"
+
+[[bin]]
+name = "eirctl"
+path = "src/main.rs"
+
+[dependencies]
+eir-proto = { path = "../eir-proto" }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+# "sync" is dev-only in this crate (tests serialise access to the process-global
+# EIR_SOCKET env var with a tokio::sync::Mutex) but tiny, so it isn't worth a separate
+# dev-dependencies override of the same crate/target.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "signal", "sync"] }
+
+[lints]
+workspace = true

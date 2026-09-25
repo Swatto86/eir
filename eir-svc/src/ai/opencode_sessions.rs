@@ -8,15 +8,12 @@
 //! by its scratch directory name (`eir-opencode-<pid>-<seq>`, unique per run).
 
 use crate::ai::cli_process::{cli_process, wait_capped, CliProcessOutput};
-use crate::ai::cli_user::running_as_local_system;
+use crate::ai::cli_user::{run_cli_as_active_user, running_as_local_system, UserCliSpec};
 use crate::ai::opencode_cli::resolve_opencode_binary;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::time::Duration;
 use tracing::{info, warn};
-
-#[cfg(windows)]
-use crate::ai::cli_user::{run_cli_as_active_user, UserCliSpec};
 
 /// Bound on each `session list` / `session delete` call (OpenCode takes a few seconds to start).
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -133,32 +130,27 @@ async fn cleanup(target: CleanupTarget) -> Result<usize> {
 async fn run_opencode(target: &CleanupTarget, args: &[&str]) -> Result<CliProcessOutput> {
     let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
     if running_as_local_system() {
-        #[cfg(windows)]
-        {
-            let binary = target.configured_binary.clone();
-            let seq = target.seq;
-            return tokio::task::spawn_blocking(move || {
-                run_cli_as_active_user(
-                    UserCliSpec {
-                        configured_binary: binary.as_deref(),
-                        resolve_binary: resolve_opencode_binary,
-                        what: "opencode session cleanup",
-                        scratch_prefix: "eir-opencode-cleanup",
-                        workspace_flag: None,
-                        workspace_files: |_| Vec::new(),
-                        timeout_ms: 30_000,
-                    },
-                    &args,
-                    "",
-                    &[],
-                    seq,
-                )
-            })
-            .await
-            .context("Join OpenCode cleanup task")?;
-        }
-        #[cfg(not(windows))]
-        bail!("opencode LocalSystem launch is Windows-only");
+        let binary = target.configured_binary.clone();
+        let seq = target.seq;
+        return tokio::task::spawn_blocking(move || {
+            run_cli_as_active_user(
+                UserCliSpec {
+                    configured_binary: binary.as_deref(),
+                    resolve_binary: resolve_opencode_binary,
+                    what: "opencode session cleanup",
+                    scratch_prefix: "eir-opencode-cleanup",
+                    workspace_flag: None,
+                    workspace_files: |_| Vec::new(),
+                    timeout_ms: 30_000,
+                },
+                &args,
+                "",
+                &[],
+                seq,
+            )
+        })
+        .await
+        .context("Join OpenCode cleanup task")?;
     }
     let configured = target.configured_binary.clone();
     let profile = target.user_profile.clone();

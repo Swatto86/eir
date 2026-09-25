@@ -1162,6 +1162,7 @@ pub async fn prune_old(pool: &SqlitePool, days: i64) -> anyhow::Result<u64> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn init_db_accepts_a_canonical_windows_path() {
         let root = std::env::temp_dir().join(format!("eir-canonical-db-{}", std::process::id()));

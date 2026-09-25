@@ -10,10 +10,13 @@ mod feedback;
 mod game_mode;
 mod learn;
 mod models;
+#[cfg(unix)]
+mod notify;
 mod pipe_server;
 mod policy;
 mod prefs;
 mod safety;
+#[cfg(windows)]
 mod service_install;
 mod session;
 mod signals;
@@ -29,12 +32,15 @@ use models::{
     SystemState,
 };
 use sqlx::SqlitePool;
+#[cfg(windows)]
+use std::path::Path;
 use std::{
     collections::{HashSet, VecDeque},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
+#[cfg(windows)]
 use windows_service::{
     define_windows_service,
     service::{
@@ -46,13 +52,17 @@ use windows_service::{
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
 
+#[cfg(windows)]
 const SERVICE_NAME: &str = "EirSvc";
+#[cfg(windows)]
 const SERVICE_DISPLAY: &str = "Eir System Monitor";
 
 // ── Windows service boilerplate ───────────────────────────────────────────────
 
+#[cfg(windows)]
 define_windows_service!(ffi_service_main, svc_main);
 
+#[cfg(windows)]
 fn svc_main(_arguments: Vec<std::ffi::OsString>) {
     if let Err(e) = run_service() {
         eprintln!("Service run error: {e:?}");
@@ -61,6 +71,7 @@ fn svc_main(_arguments: Vec<std::ffi::OsString>) {
 
 // The Tokio runtime build below is fail-fast on purpose: without a runtime there is no
 // service to degrade into, and SCM reports the failure to the event log.
+#[cfg(windows)]
 #[allow(clippy::expect_used)]
 fn run_service() -> windows_service::Result<()> {
     service_install::validate_current_binary().map_err(|error| {
@@ -149,6 +160,7 @@ fn run_service() -> windows_service::Result<()> {
 // Fail-fast CLI path: `eir-svc install` is run interactively by an admin (or the
 // installer), so a panic with a readable reason is the intended outcome — there is no
 // service to keep alive yet and no caller to hand an error to.
+#[cfg(windows)]
 #[allow(clippy::expect_used)]
 fn install_service() {
     service_install::install_or_update(SERVICE_NAME, SERVICE_DISPLAY)
@@ -158,6 +170,7 @@ fn install_service() {
 }
 
 // Fail-fast CLI path — see `install_service`.
+#[cfg(windows)]
 #[allow(clippy::expect_used)]
 fn uninstall_service() {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::ALL_ACCESS)
@@ -170,6 +183,7 @@ fn uninstall_service() {
     println!("{SERVICE_NAME} uninstalled.");
 }
 
+#[cfg(windows)]
 fn validated_portable_sentinel_at(sentinel: &Path, executable: &Path) -> Option<PathBuf> {
     if sentinel.file_name()?.to_string_lossy() != "eir-portable.running" {
         return None;
@@ -183,10 +197,12 @@ fn validated_portable_sentinel_at(sentinel: &Path, executable: &Path) -> Option<
         .then_some(sentinel)
 }
 
+#[cfg(windows)]
 fn validated_portable_sentinel(value: &str) -> Option<PathBuf> {
     validated_portable_sentinel_at(Path::new(value), &std::env::current_exe().ok()?)
 }
 
+#[cfg(windows)]
 fn validated_portable_pipe_name(value: &str) -> Option<String> {
     const PREFIX: &str = r"\\.\pipe\EirSvcPortable-";
     let nonce = value.strip_prefix(PREFIX)?;
@@ -194,6 +210,7 @@ fn validated_portable_pipe_name(value: &str) -> Option<String> {
         .then(|| value.to_string())
 }
 
+#[cfg(windows)]
 fn validated_portable_state_root_at(value: &Path, local_app_data: &Path) -> Option<PathBuf> {
     let value = executor::logs::checked_local_path(value).ok()??;
     let expected =
@@ -205,12 +222,14 @@ fn validated_portable_state_root_at(value: &Path, local_app_data: &Path) -> Opti
     .then_some(value)
 }
 
+#[cfg(windows)]
 fn validated_portable_state_root(value: &str) -> Option<PathBuf> {
     let local_app_data = std::env::var_os("LOCALAPPDATA")?;
     validated_portable_state_root_at(Path::new(value), Path::new(&local_app_data))
 }
 
 // Standalone-mode runtime build is fail-fast — see `run_service`.
+#[cfg(windows)]
 #[allow(clippy::expect_used)]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -279,7 +298,73 @@ fn main() {
     }
 }
 
-#[cfg(test)]
+/// Linux has no SCM/portable-mode analogue: the systemd unit
+/// (`packaging/systemd/eir.service`) runs `eir-svc run` directly, in the foreground,
+/// restarting it on exit — see `restart_self` below. `eir-svc` with no arguments also
+/// runs (development convenience, mirroring the Windows standalone fallback); any
+/// other argument prints usage and exits non-zero rather than silently doing nothing.
+#[cfg(unix)]
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("run") | None => {
+            // `EIR_RUNTIME_ROOT` overrides the default `/etc/eir`, mirroring eirctl's own
+            // `EIR_SOCKET` override — this is what lets the real compiled binary be
+            // integration-tested against a disposable config+state directory (no config
+            // there yet resolves relative to it too, e.g. a temp `policy.toml`) without
+            // writing to the real `/etc/eir` or requiring root. Unset in production, where
+            // systemd's `eir.service` runs `eir-svc run` with no environment override.
+            let runtime_root = std::env::var_os("EIR_RUNTIME_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/etc/eir"));
+            if let Err(error) = config::set_runtime_root(runtime_root) {
+                eprintln!("could not configure the runtime root: {error}");
+                std::process::exit(2);
+            }
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(error) => {
+                    eprintln!("could not start the Tokio runtime: {error}");
+                    std::process::exit(2);
+                }
+            };
+            rt.block_on(eir_main(unix_shutdown_signal(), None));
+        }
+        Some(other) => {
+            eprintln!(
+                "Unknown command '{other}'. Eir on Linux is managed by systemd — see \
+                 packaging/systemd/eir.service. Run with no arguments (or 'run') to start \
+                 the guardian in the foreground."
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Waits for SIGTERM or SIGINT (`systemctl stop`/Ctrl-C), whichever comes first.
+#[cfg(unix)]
+async fn unix_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+        // No SIGTERM handler could be installed — fall back to Ctrl-C alone rather
+        // than a service that can never be told to stop.
+        let _ = tokio::signal::ctrl_c().await;
+        return;
+    };
+    let Ok(mut interrupt) = signal(SignalKind::interrupt()) else {
+        terminate.recv().await;
+        return;
+    };
+    tokio::select! {
+        _ = terminate.recv() => {}
+        _ = interrupt.recv() => {}
+    }
+}
+
+#[cfg(all(test, windows))]
 mod portable_mode_tests {
     use super::*;
 
@@ -573,6 +658,7 @@ fn should_restart_service_after_settings(needs_restart: bool, portable_mode: boo
 /// STOPPED (up to 60s; a missing service also exits the wait), then retries
 /// `sc start` every 5s over a 60s window, checking for Running every second —
 /// wide enough to ride out a lingering old process or transient SCM refusal.
+#[cfg(windows)]
 #[must_use]
 fn restart_self() -> bool {
     use std::os::windows::process::CommandExt;
@@ -609,6 +695,17 @@ fn restart_self() -> bool {
             false
         }
     }
+}
+
+/// `packaging/systemd/eir.service` sets `Restart=always` (deliberately NOT
+/// `Restart=on-failure`, which would never restart a clean `exit(0)`): systemd only
+/// suppresses an automatic restart after an operator-issued `systemctl stop`, never
+/// after the unit exits on its own — so this clean, deliberate exit is enough to pick
+/// up the new config on the next start. No PowerShell-polling helper is needed.
+#[cfg(unix)]
+#[must_use]
+fn restart_self() -> bool {
+    std::process::exit(0)
 }
 
 fn startup_owner_matches(owner_sid: Option<&str>, active_sid: Option<&str>) -> bool {
@@ -1428,22 +1525,28 @@ fn push_execution(
 // ── Decision loop ─────────────────────────────────────────────────────────────
 
 async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pipe: Option<String>) {
-    // Log to a file next to the executable. A Windows service has no console, so
-    // stdout is discarded — the file is the only way to see what the service did.
-    let log_dir = config::resolve(".");
-    let file_appender = tracing_appender::rolling::never(&log_dir, "eir.log");
-    let (file_writer, log_guard) = tracing_appender::non_blocking(file_appender);
-    // Keep the writer worker alive for the whole process.
-    std::mem::forget(log_guard);
-    tracing_subscriber::fmt()
+    let subscriber = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_ansi(false)
-        .with_writer(file_writer)
-        .with_target(false)
-        .init();
+        .with_target(false);
+    // Log to a file next to the executable. A Windows service has no console, so
+    // stdout is discarded — the file is the only way to see what the service did.
+    #[cfg(windows)]
+    {
+        let log_dir = config::resolve(".");
+        let file_appender = tracing_appender::rolling::never(&log_dir, "eir.log");
+        let (file_writer, log_guard) = tracing_appender::non_blocking(file_appender);
+        // Keep the writer worker alive for the whole process.
+        std::mem::forget(log_guard);
+        subscriber.with_writer(file_writer).init();
+    }
+    // Under systemd, stdout goes to the journal (`journalctl -u eir`); the config
+    // directory is read-only there, so no log file is written.
+    #[cfg(not(windows))]
+    subscriber.with_writer(std::io::stdout).init();
 
     let portable_mode = portable_pipe.is_some();
     let (pipe, mut ui_rx) = match portable_pipe {
@@ -1468,6 +1571,33 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
         Err(e) => fatal!(format!("config.toml: {e}")),
     };
     st.settings = Some(cfg.to_ui_settings());
+
+    // Fail-closed startup notice (Linux only): the AI subsystem itself already refuses
+    // every call rather than launch a CLI as root (see
+    // `ai::cli_user_launch_unix::resolve_configured_user`) whenever `linux_ai_user` is
+    // unset while running as root — this just makes that fact visible once at boot,
+    // rather than only as a repeated per-call error once something first tries to use
+    // the AI subsystem.
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid() takes no arguments and cannot fail.
+        let running_as_root = unsafe { libc::geteuid() == 0 };
+        let ai_user_configured = cfg
+            .api
+            .linux_ai_user
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|user| !user.is_empty());
+        if running_as_root && !ai_user_configured {
+            warn!(
+                "eir-svc is running as root with no [api] linux_ai_user configured in \
+                 config.toml — the AI subsystem (Ask/Investigate/AI-driven decisions) will \
+                 refuse every call rather than launch the CLI as root; collectors, the \
+                 executor and approvals still run normally. Set [api] linux_ai_user to a \
+                 real, non-root local account to enable it."
+            );
+        }
+    }
 
     let mut pol = match policy::ExecutionPolicy::load(
         config::resolve("policy.toml")
@@ -3551,7 +3681,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                                 }
                                                 (t, u)
                                             })
-                                            .map_err(|e| e.to_string())
+                                            .map_err(|e| format!("{e:#}"))
                                     });
                                     let result =
                                         match tokio::time::timeout(ASK_MAX, &mut inner).await {
@@ -3912,6 +4042,11 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                 }
 
                 // ── Update metrics in broadcast ──────────────────────────────
+                // Linux: a unit can fail seconds before a journald-triggered reaction,
+                // but the full system-state poll runs only every few minutes. Re-read
+                // the failed-unit list (two quick systemctl calls) so each cycle sees it.
+                #[cfg(unix)]
+                let _ = signals::wmi::rescan_failed_services(&wmi_shared).await;
                 let system_state = signals::wmi::current(&wmi_shared);
                 apply_live_metrics(&mut st, &system_state);
                 // Refresh the dashboard resource timeline (last 24h, thinned) once per
@@ -3978,7 +4113,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                 // Report failure with an empty text + a real timestamp: the
                                 // arm clears digest_running and pushes the next attempt out a
                                 // week (no retry storm), without overwriting a prior digest.
-                                warn!("Health digest generation failed: {e}");
+                                warn!("Health digest generation failed: {e:#}");
                                 let _ = done_d.send((
                                     eir_proto::DigestView {
                                         text: String::new(),
@@ -4011,9 +4146,28 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                         vec![]
                     });
 
+                let event_log = signals::event_log::drain(&event_log_shared);
+                // Linux: give the analysis the recent log of every unit that is still
+                // failed, not only on the cycle its crash was first seen.
+                #[cfg(unix)]
+                let event_log = {
+                    let mut event_log = event_log;
+                    let failed = system_state.failed_services.clone();
+                    let seen = event_log.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        signals::event_log::failed_units_context(&failed, &seen)
+                    })
+                    .await
+                    {
+                        Ok(extra) => event_log.extend(extra),
+                        Err(e) => warn!("failed-unit context task failed: {e}"),
+                    }
+                    event_log
+                };
+
                 let snapshot = SignalSnapshot {
                     timestamp:        chrono::Utc::now(),
-                    event_log:        signals::event_log::drain(&event_log_shared),
+                    event_log,
                     file_changes:     signals::file_watch::drain(&file_watch_shared),
                     system_state,
                     decision_history: history.clone(),
@@ -4234,7 +4388,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                     escalation_cost_usd: spent - spent_baseline,
                                 })
                             }
-                            Err(e) => Err(e.to_string()),
+                            Err(e) => Err(format!("{e:#}")),
                         }
                     });
                     let outcome = match tokio::time::timeout(ANALYSIS_MAX, &mut inner).await {

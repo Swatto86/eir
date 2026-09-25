@@ -4,6 +4,7 @@
 //! pull replacement files from Windows Update), and only ever run after explicit user
 //! approval — they are never on the auto-execute whitelist.
 
+#[cfg(windows)]
 use anyhow::Result;
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use std::time::Duration;
 pub const REPAIR_TIMEOUT: Duration = Duration::from_secs(40 * 60);
 
 /// Verify and repair protected Windows system files with `sfc /scannow`.
+#[cfg(windows)]
 pub async fn sfc_scan() -> Result<String> {
     let script = "$out = sfc /scannow 2>&1 | Out-String; \
                   Write-Output ($out.Trim()); \
@@ -22,6 +24,7 @@ pub async fn sfc_scan() -> Result<String> {
 }
 
 /// Repair the Windows component store with DISM's online RestoreHealth.
+#[cfg(windows)]
 pub async fn dism_restore_health() -> Result<String> {
     let script = "$out = DISM /Online /Cleanup-Image /RestoreHealth 2>&1 | Out-String; \
                   Write-Output ($out.Trim()); \
@@ -33,6 +36,7 @@ pub async fn dism_restore_health() -> Result<String> {
 /// These tools emit pages of progress; keep the last few meaningful lines (where the
 /// outcome — "did not find any integrity violations", "successfully repaired", etc. —
 /// lives), capped for the activity feed.
+#[cfg(any(windows, test))]
 fn summarise(tool: &str, raw: &str) -> String {
     let lines: Vec<&str> = raw
         .lines()

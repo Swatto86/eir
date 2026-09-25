@@ -5,15 +5,12 @@ use crate::ai::cli_process::{
     char_preview, cli_process, current_user_profile, is_real, validate_cli_model_id, wait_capped,
     CliProcessOutput,
 };
-use crate::ai::cli_user::running_as_local_system;
+use crate::ai::cli_user::{run_cli_as_active_user, running_as_local_system, UserCliSpec};
 use crate::ai::json::sanitize_json;
 use crate::ai::opencode_sessions::{spawn_cleanup, CleanupTarget};
 use crate::models::CallUsage;
 use anyhow::{bail, Context, Result};
 use tracing::warn;
-
-#[cfg(windows)]
-use crate::ai::cli_user::{run_cli_as_active_user, UserCliSpec};
 
 /// Configured profile, else the process USERPROFILE/HOME (OpenCode stores session under it).
 pub(crate) fn resolve_opencode_profile(configured: Option<&str>) -> Option<String> {
@@ -31,11 +28,23 @@ pub(crate) fn resolve_opencode_binary(
     if let Some(p) = configured.filter(|p| is_real(p)) {
         return p.trim().to_string();
     }
+    #[cfg(windows)]
     if let Some(up) = user_profile {
         for candidate in [
             format!("{up}\\.local\\bin\\opencode.exe"),
             format!("{up}\\AppData\\Roaming\\npm\\opencode.cmd"),
             format!("{up}\\AppData\\Roaming\\npm\\opencode.exe"),
+        ] {
+            if std::path::Path::new(&candidate).is_file() {
+                return candidate;
+            }
+        }
+    }
+    #[cfg(unix)]
+    if let Some(home) = user_profile {
+        for candidate in [
+            format!("{home}/.npm-global/bin/opencode"),
+            format!("{home}/.local/bin/opencode"),
         ] {
             if std::path::Path::new(&candidate).is_file() {
                 return candidate;
@@ -152,38 +161,30 @@ pub(crate) async fn call_opencode_cli(
     let args = build_args(model, effort, web_search, &names)?;
 
     let run: Result<CliProcessOutput> = if running_as_local_system() {
-        #[cfg(windows)]
-        {
-            let binary = configured_binary.map(str::to_owned);
-            let args = args.clone();
-            let prompt = prompt.to_string();
-            let files = files.to_vec();
-            tokio::task::spawn_blocking(move || {
-                run_cli_as_active_user(
-                    UserCliSpec {
-                        configured_binary: binary.as_deref(),
-                        resolve_binary: resolve_opencode_binary,
-                        what: "opencode CLI",
-                        scratch_prefix: "eir-opencode",
-                        workspace_flag: Some("--dir"),
-                        workspace_files: opencode_workspace_files,
-                        timeout_ms: 300_000,
-                    },
-                    &args,
-                    &prompt,
-                    &files,
-                    seq,
-                )
-            })
-            .await
-            .context("Join OpenCode user-process task")
-            .and_then(|result| result)
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (configured_binary, user_profile, seq, files);
-            bail!("opencode LocalSystem launch is Windows-only")
-        }
+        let binary = configured_binary.map(str::to_owned);
+        let args = args.clone();
+        let prompt = prompt.to_string();
+        let files = files.to_vec();
+        tokio::task::spawn_blocking(move || {
+            run_cli_as_active_user(
+                UserCliSpec {
+                    configured_binary: binary.as_deref(),
+                    resolve_binary: resolve_opencode_binary,
+                    what: "opencode CLI",
+                    scratch_prefix: "eir-opencode",
+                    workspace_flag: Some("--dir"),
+                    workspace_files: opencode_workspace_files,
+                    timeout_ms: 300_000,
+                },
+                &args,
+                &prompt,
+                &files,
+                seq,
+            )
+        })
+        .await
+        .context("Join OpenCode user-process task")
+        .and_then(|result| result)
     } else {
         let configured_binary = configured_binary.map(str::to_owned);
         let user_profile = user_profile.map(str::to_owned);

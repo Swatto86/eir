@@ -3,9 +3,10 @@
 .SYNOPSIS
     Verify the release version is identical across manifests and Cargo.lock.
 .DESCRIPTION
-    Eir's version lives in four manifests whose three package entries must also
+    Eir's version lives in five manifests whose four package entries must also
     match Cargo.lock (see ARCHITECTURE.md
-    "Version-bump locations"): the three crate Cargo.toml files and
+    "Version-bump locations"): the four crate Cargo.toml files (including the
+    headless-Linux `eirctl` control CLI, package `eir-cli`) and
     eir-ui/tauri.conf.json. A partial bump would ship a
     self-update whose installer name / About box / updater compare disagree with the
     binaries. This script fails (exit 1) on any mismatch so CI catches drift before a
@@ -87,10 +88,12 @@ $sources = @(
     [pscustomobject]@{ File = 'eir-proto/Cargo.toml';    Version = (Get-CargoVersion (Join-Path $RepoRoot 'eir-proto/Cargo.toml')) }
     [pscustomobject]@{ File = 'eir-svc/Cargo.toml';      Version = (Get-CargoVersion (Join-Path $RepoRoot 'eir-svc/Cargo.toml')) }
     [pscustomobject]@{ File = 'eir-ui/Cargo.toml';       Version = (Get-CargoVersion (Join-Path $RepoRoot 'eir-ui/Cargo.toml')) }
+    [pscustomobject]@{ File = 'eir-cli/Cargo.toml';      Version = (Get-CargoVersion (Join-Path $RepoRoot 'eir-cli/Cargo.toml')) }
     [pscustomobject]@{ File = 'eir-ui/tauri.conf.json';  Version = (Get-TauriVersion (Join-Path $RepoRoot 'eir-ui/tauri.conf.json')) }
     [pscustomobject]@{ File = 'Cargo.lock (eir-proto)';  Version = (Get-CargoLockVersion $lockPath 'eir-proto') }
     [pscustomobject]@{ File = 'Cargo.lock (eir-svc)';    Version = (Get-CargoLockVersion $lockPath 'eir-svc') }
     [pscustomobject]@{ File = 'Cargo.lock (eir-ui)';     Version = (Get-CargoLockVersion $lockPath 'eir-ui') }
+    [pscustomobject]@{ File = 'Cargo.lock (eirctl)';     Version = (Get-CargoLockVersion $lockPath 'eirctl') }
 )
 
 $sources | Format-Table -AutoSize | Out-String | Write-Host

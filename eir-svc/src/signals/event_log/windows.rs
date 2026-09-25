@@ -1,4 +1,6 @@
+use super::SharedEntries;
 use crate::models::EventLogEntry;
+use crate::signals::TriggerTx;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -30,8 +32,6 @@ const SEQUENTIAL_BACKWARDS: READ_EVENT_LOG_READ_FLAGS = READ_EVENT_LOG_READ_FLAG
 const ETYPE_ERROR: REPORT_EVENT_TYPE = REPORT_EVENT_TYPE(0x0001);
 const ETYPE_WARNING: REPORT_EVENT_TYPE = REPORT_EVENT_TYPE(0x0002);
 const ETYPE_INFORMATION: REPORT_EVENT_TYPE = REPORT_EVENT_TYPE(0x0004);
-
-pub type SharedEntries = Arc<Mutex<VecDeque<EventLogEntry>>>;
 
 fn win32_time_to_datetime(seconds_since_1970: u32) -> DateTime<Utc> {
     DateTime::from_timestamp(seconds_since_1970 as i64, 0).unwrap_or_else(Utc::now)
@@ -230,7 +230,7 @@ fn read_channel_since(
 pub fn spawn(
     channels: Vec<String>,
     poll_interval_secs: u64,
-    trigger: super::TriggerTx,
+    trigger: TriggerTx,
 ) -> (SharedEntries, watch::Sender<()>) {
     let shared: SharedEntries = Arc::new(Mutex::new(VecDeque::new()));
     let shared_clone = shared.clone();
@@ -371,15 +371,6 @@ fn insertion_strings(
         }
     }
     out
-}
-
-/// Take (and clear) everything collected since the last drain — each entry is
-/// delivered to the decision loop exactly once, like the file-watch buffer.
-pub fn drain(shared: &SharedEntries) -> Vec<EventLogEntry> {
-    shared
-        .lock()
-        .map(|mut g| g.drain(..).collect())
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
