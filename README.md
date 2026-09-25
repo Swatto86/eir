@@ -349,7 +349,7 @@ At minimum, edit `/etc/eir/config.toml`'s `[api]` section: set `provider` and
 eirctl status               # live metrics, failed units, pending approvals
 eirctl approvals             # actions awaiting a human decision
 eirctl approve <id>          # or: eirctl reject <id>
-eirctl pause                 # toggle pause
+eirctl pause                 # pause monitoring (eirctl resume to continue)
 eirctl ask "what is eating memory right now"
 eirctl investigate "check for anything unusual"
 ```

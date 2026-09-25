@@ -204,7 +204,9 @@ pub(crate) struct ResultEnvelope {
 
 impl PipeServer {
     pub fn broadcast_status(&self, status: StatusPayload) {
-        let _ = self.status_tx.send(status);
+        // send_replace, not send: `send` discards the value while no client is
+        // connected, so the next client would be handed a stale snapshot.
+        self.status_tx.send_replace(status);
     }
 
     /// Whether a verified UI/control client is connected right now.
@@ -467,6 +469,18 @@ pub(crate) async fn handle_connection<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_status_broadcast_with_no_client_connected_reaches_the_next_client() {
+        let (srv, _ui_rx, status_tx, _results, _ui_tx, _clients) = new_server();
+        srv.broadcast_status(StatusPayload {
+            status: "Fresh".to_string(),
+            ..Default::default()
+        });
+        // A client that connects afterwards subscribes and must see the latest value,
+        // not the stale one from the last time a client happened to be connected.
+        assert_eq!(status_tx.subscribe().borrow().status, "Fresh");
+    }
 
     #[test]
     fn outbound_status_collections_are_bounded_without_mutating_persistent_state() {

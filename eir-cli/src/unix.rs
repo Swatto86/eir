@@ -64,7 +64,8 @@ fn print_usage() {
            approvals                 list actions awaiting approval\n  \
            approve <id>               approve a pending action\n  \
            reject <id>                reject a pending action\n  \
-           pause                     toggle pause (no-op if already paused)\n  \
+           pause                     pause monitoring (no-op if already paused)\n  \
+           resume                    resume monitoring (no-op if already running)\n  \
            ask \"<question>\"           ask Eir a question\n  \
            investigate \"<description>\" investigate and fix a described problem"
     );
@@ -81,7 +82,8 @@ async fn async_main() -> ExitCode {
         "approvals" => cmd_approvals(args.json).await,
         "approve" => cmd_approve_or_reject(args.positional.get(1), true).await,
         "reject" => cmd_approve_or_reject(args.positional.get(1), false).await,
-        "pause" => cmd_pause().await,
+        "pause" => cmd_set_paused(true).await,
+        "resume" => cmd_set_paused(false).await,
         "ask" => cmd_ask_or_investigate(&args, false).await,
         "investigate" => cmd_ask_or_investigate(&args, true).await,
         "help" | "-h" | "--help" => {
@@ -342,7 +344,7 @@ async fn cmd_approve_or_reject(id_arg: Option<&String>, approved: bool) -> ExitC
     send_and_report(&mut conn, UiMsg::Approve { id, approved }).await
 }
 
-async fn cmd_pause() -> ExitCode {
+async fn cmd_set_paused(pause: bool) -> ExitCode {
     let mut conn = match connect().await {
         Ok(conn) => conn,
         Err(code) => return code,
@@ -353,8 +355,15 @@ async fn cmd_pause() -> ExitCode {
     };
     // Documented TOCTOU race with another client is accepted as an inherent
     // CLI-tool limitation: worst case, a concurrent toggle flips it back.
-    if status.paused {
-        println!("Already paused");
+    if status.paused == pause {
+        println!(
+            "{}",
+            if pause {
+                "Already paused"
+            } else {
+                "Already running"
+            }
+        );
         return ExitCode::SUCCESS;
     }
     send_and_report(&mut conn, UiMsg::TogglePause).await
