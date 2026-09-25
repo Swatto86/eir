@@ -365,6 +365,49 @@ fn file_facts_as_active_user(path: &str) -> String {
     lines.join("\n")
 }
 
+/// Lowercased path fragments that mark a regenerable cache / temp / crash location on
+/// this platform (on Linux: ~/.cache, other cache folders, /tmp, /var/tmp, /var/crash).
+#[cfg(windows)]
+const CACHE_DIRS: &[&str] = &[
+    "\\cache",
+    "\\temp",
+    "\\tmp\\",
+    "\\prefetch",
+    "crashdump",
+    "minidump",
+];
+#[cfg(not(windows))]
+const CACHE_DIRS: &[&str] = &[
+    "/.cache/",
+    "/cache/",
+    "/tmp/",
+    "/var/crash/",
+    "crashdump",
+    "minidump",
+];
+
+/// Lowercased path fragments that mark a personal folder on this platform (on Linux the
+/// XDG folders in a home directory, e.g. /home/<user>/Documents or /root/Desktop).
+#[cfg(windows)]
+const PERSONAL_DIRS: &[&str] = &[
+    "\\documents",
+    "\\desktop",
+    "\\pictures",
+    "\\downloads",
+    "\\videos",
+    "\\music",
+    "\\onedrive",
+];
+#[cfg(not(windows))]
+const PERSONAL_DIRS: &[&str] = &[
+    "/documents/",
+    "/desktop/",
+    "/pictures/",
+    "/downloads/",
+    "/videos/",
+    "/music/",
+];
+
 /// A hedged guess at what kind of file this is, to flag the difference between a
 /// throwaway cache and someone's only copy of a document.
 fn classify_file(path: &str) -> String {
@@ -378,27 +421,11 @@ fn classify_file(path: &str) -> String {
             .unwrap_or(false)
     };
 
-    if dir_hits(&[
-        "\\cache",
-        "\\temp",
-        "\\tmp\\",
-        "\\prefetch",
-        "crashdump",
-        "minidump",
-    ]) || ext_is(&["tmp", "dmp", "etl", "old", "bak", "lock"])
-    {
+    if dir_hits(CACHE_DIRS) || ext_is(&["tmp", "dmp", "etl", "old", "bak", "lock"]) {
         "Looks like a regenerable cache / temp / crash file — programs normally recreate these \
          automatically, so deleting it is usually low-risk."
             .to_string()
-    } else if dir_hits(&[
-        "\\documents",
-        "\\desktop",
-        "\\pictures",
-        "\\downloads",
-        "\\videos",
-        "\\music",
-        "\\onedrive",
-    ]) {
+    } else if dir_hits(PERSONAL_DIRS) {
         "Looks like it lives in a personal folder (Documents/Desktop/etc.) — deleting it could be \
          permanent loss of your own data. Be sure before approving."
             .to_string()
@@ -480,6 +507,7 @@ mod tests {
         assert!(details.contains("does not currently exist"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn cache_path_is_flagged_low_risk() {
         assert!(
@@ -489,11 +517,50 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn documents_path_is_flagged_risky() {
         assert!(classify_file("C:\\Users\\a\\Documents\\thesis.json")
             .to_lowercase()
             .contains("permanent loss"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_cache_and_temp_paths_are_flagged_low_risk() {
+        for path in [
+            "/home/alice/.cache/app/blob.bin",
+            "/root/.cache/pip/http/entry",
+            "/var/cache/apt/archives/pkg.deb",
+            "/tmp/build-1/output.bin",
+            "/var/tmp/session.db",
+            "/var/crash/_usr_bin_app.1000.crash",
+        ] {
+            assert!(
+                classify_file(path).contains("low-risk"),
+                "{path} should be low-risk"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_personal_folders_are_flagged_risky() {
+        for path in [
+            "/home/alice/Documents/thesis.json",
+            "/home/alice/Desktop/notes.txt",
+            "/home/alice/Pictures/cat.png",
+            "/home/alice/Downloads/report.pdf",
+            "/root/Videos/talk.mp4",
+            "/root/Music/song.flac",
+        ] {
+            assert!(
+                classify_file(path).contains("permanent loss"),
+                "{path} should be flagged as a personal folder"
+            );
+        }
+        // A config file outside those folders is not mistaken for personal data.
+        assert!(!classify_file("/home/alice/.config/app/settings.json").contains("permanent loss"));
     }
 
     #[test]

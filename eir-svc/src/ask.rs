@@ -148,6 +148,17 @@ pub fn describe_state(s: &crate::models::SystemState) -> Vec<String> {
     if !s.disk_health.is_empty() {
         out.push(format!("Drive health: {}", s.disk_health));
     }
+    // Windows Update, the Windows Firewall and Defender have no Linux analogue (the Linux
+    // collector leaves them "unknown"); naming them would prime the AI to talk about
+    // Windows on a Linux server.
+    #[cfg(windows)]
+    push_windows_posture(&mut out, s);
+    out
+}
+
+/// The Windows Update, Firewall and Defender lines of [`describe_state`].
+#[cfg(windows)]
+fn push_windows_posture(out: &mut Vec<String>, s: &crate::models::SystemState) {
     if !s.windows_update_status.is_empty() {
         out.push(format!(
             "Last successful Windows Update install: {}",
@@ -179,7 +190,6 @@ pub fn describe_state(s: &crate::models::SystemState) -> Vec<String> {
             on_off(d.realtime_enabled)
         ));
     }
-    out
 }
 
 const MAX_QUESTION_CHARS: usize = 1000;
@@ -588,11 +598,40 @@ mod tests {
         assert!(d.contains(&"Running for 2 day(s) 5 hour(s) since the last restart".into()));
         assert!(d.contains(&"7.2 GB memory free, 120 GB free on the system drive".into()));
         assert!(d.contains(&"Connected network adapters: Ethernet".into()));
-        assert!(d.contains(&"Firewall: domain unknown, private unknown, public OFF".into()));
-        assert!(d.contains(&"Defender real-time protection on, definitions 1 day(s) old".into()));
+        #[cfg(windows)]
+        {
+            assert!(d.contains(&"Firewall: domain unknown, private unknown, public OFF".into()));
+            assert!(
+                d.contains(&"Defender real-time protection on, definitions 1 day(s) old".into())
+            );
+            s.security.defender.antivirus_enabled = Some(false);
+            assert!(describe_state(&s)
+                .contains(&"Defender is passive (another antivirus is in charge)".into()));
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_state_details_never_mention_windows_only_posture() {
+        use crate::models::SystemState;
+        // As the Linux collector builds it (signals/wmi/unix.rs), plus posture fields set,
+        // to show the lines are left out on Linux whatever those fields hold.
+        let mut s = SystemState {
+            collected_at: 1,
+            disk_health: "unknown".into(),
+            windows_update_status: "unknown".into(),
+            ..Default::default()
+        };
+        s.security.firewall.public = Some(false);
+        s.security.defender.realtime_enabled = Some(true);
         s.security.defender.antivirus_enabled = Some(false);
-        assert!(describe_state(&s)
-            .contains(&"Defender is passive (another antivirus is in charge)".into()));
+        let d = describe_state(&s);
+        assert!(!d.is_empty());
+        for line in &d {
+            for word in ["Windows", "Firewall", "Defender"] {
+                assert!(!line.contains(word), "{line:?} mentions {word}");
+            }
+        }
     }
 
     #[test]
