@@ -315,12 +315,21 @@ pub fn investigation_answer(decision: &crate::models::ClaudeDecision) -> String 
             .unwrap_or_else(|| "no automatic fix is available".to_string());
         out.push_str(&format!("\n• {} — Fix: {fix}", p.diagnosis.trim()));
     }
-    out.push_str(
-        "\n\nSafe fixes run automatically; anything disruptive waits in Approvals and \
-         anything unsafe is blocked. Activity shows each result.",
-    );
+    out.push_str(INVESTIGATION_FOOTER);
     out
 }
+
+/// Where a finished investigation's fixes end up, in this platform's terms (the tray
+/// app's tabs on Windows, `eirctl` on the headless Linux build).
+#[cfg(windows)]
+const INVESTIGATION_FOOTER: &str =
+    "\n\nSafe fixes run automatically; anything disruptive waits in Approvals and \
+     anything unsafe is blocked. Activity shows each result.";
+#[cfg(not(windows))]
+const INVESTIGATION_FOOTER: &str =
+    "\n\nSafe fixes run automatically; anything disruptive waits in `eirctl approvals` \
+     (approve or reject it by id) and anything unsafe is blocked. `eirctl status` lists \
+     each result under recent fixes.";
 
 /// One "What Eir noticed" feed item as a prompt line.
 pub fn feed_line(v: &eir_proto::SignalView) -> String {
@@ -702,9 +711,21 @@ mod tests {
         ];
         let a = investigation_answer(&d);
         assert!(a.starts_with("Outlook fails because"));
-        assert!(a.contains("• Print Spooler stopped — Fix: Restarts the Windows service 'Spooler'"));
+        #[cfg(windows)]
+        {
+            assert!(
+                a.contains("• Print Spooler stopped — Fix: Restarts the Windows service 'Spooler'")
+            );
+            assert!(a.contains("waits in Approvals"));
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(
+                a.contains("• Print Spooler stopped — Fix: Restarts the systemd service 'Spooler'")
+            );
+            assert!(a.contains("waits in `eirctl approvals`"));
+        }
         assert!(a.contains("• Unknown fault — Fix: no automatic fix is available"));
-        assert!(a.contains("Approvals"));
     }
 
     #[test]

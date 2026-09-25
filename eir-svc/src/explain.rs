@@ -19,12 +19,25 @@ pub struct ActionExplanation {
     pub reversible: bool,
 }
 
+/// What an approval card calls a service on this platform.
+#[cfg(windows)]
+const SERVICE_KIND: &str = "Windows service";
+#[cfg(not(windows))]
+const SERVICE_KIND: &str = "systemd service";
+
+/// Why a deleted file cannot come back on this platform.
+#[cfg(windows)]
+const DELETE_IS_FINAL: &str =
+    "It is removed with force and does NOT go to the Recycle Bin, so it cannot be restored from there.";
+#[cfg(not(windows))]
+const DELETE_IS_FINAL: &str = "There is no trash to restore it from.";
+
 /// Describe what executing `action` will do, in terms a non-expert can act on.
 pub fn explain(action: &FixAction) -> ActionExplanation {
     match action {
         FixAction::ServiceRestart { service_name } => ActionExplanation {
             summary: format!(
-                "Restarts the Windows service '{service_name}' (stops it, then starts it again). \
+                "Restarts the {SERVICE_KIND} '{service_name}' (stops it, then starts it again). \
                  The service is briefly unavailable while it cycles."
             ),
             target: service_name.clone(),
@@ -32,14 +45,14 @@ pub fn explain(action: &FixAction) -> ActionExplanation {
         },
         FixAction::ServiceStop { service_name } => ActionExplanation {
             summary: format!(
-                "Stops the Windows service '{service_name}'. It stays stopped until something \
+                "Stops the {SERVICE_KIND} '{service_name}'. It stays stopped until something \
                  starts it again."
             ),
             target: service_name.clone(),
             reversible: true,
         },
         FixAction::ServiceStart { service_name } => ActionExplanation {
-            summary: format!("Starts the Windows service '{service_name}'."),
+            summary: format!("Starts the {SERVICE_KIND} '{service_name}'."),
             target: service_name.clone(),
             reversible: true,
         },
@@ -136,10 +149,7 @@ pub fn explain(action: &FixAction) -> ActionExplanation {
             reversible: false,
         },
         FixAction::FileDelete { path } => ActionExplanation {
-            summary: format!(
-                "Permanently deletes the file '{path}'. It is removed with force and does NOT go \
-                 to the Recycle Bin, so it cannot be restored from there."
-            ),
+            summary: format!("Permanently deletes the file '{path}'. {DELETE_IS_FINAL}"),
             target: path.clone(),
             reversible: false,
         },
@@ -435,6 +445,22 @@ fn human_age(d: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_actions_name_this_platforms_kind_of_service() {
+        let e = explain(&FixAction::ServiceRestart {
+            service_name: "demo".to_string(),
+        });
+        #[cfg(windows)]
+        assert!(e.summary.starts_with("Restarts the Windows service 'demo'"));
+        #[cfg(not(windows))]
+        assert!(e.summary.starts_with("Restarts the systemd service 'demo'"));
+        assert!(!explain(&FixAction::FileDelete {
+            path: "x".to_string()
+        })
+        .summary
+        .contains("  "));
+    }
 
     #[test]
     fn file_delete_is_irreversible_and_targets_the_path() {

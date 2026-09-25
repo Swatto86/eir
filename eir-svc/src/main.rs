@@ -2252,6 +2252,14 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                             true,
                             outcome.reason,
                         );
+                        // A fix can change what is failed (a restarted service runs again).
+                        // Rescan now, as the manual refresh does, so status (and anything
+                        // reading it, like eirctl) doesn't list it until the next services
+                        // poll minutes later.
+                        if outcome.success {
+                            st.failed_services =
+                                signals::wmi::rescan_failed_services(&wmi_shared).await;
+                        }
                         // Don't touch st.error here: an execution outcome must not wipe
                         // an unrelated AI/connection error set by another path.
                         st.status = resting_status(&st);
@@ -2916,6 +2924,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                     Err(ApprovalPreflightError::Resolved(reason)) => {
                                         warn!(id, %reason, "Approved action no longer passes safety preflight");
                                         let _ = audit::delete_pending_approval(&db, id).await;
+                                        command_result = Err(format!(
+                                            "Action is no longer allowed by current safety policy: {reason}"
+                                        ));
                                         push_problem(
                                             &mut st,
                                             &pa.info.diagnosis,
@@ -2925,8 +2936,6 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                             false,
                                             Some(reason),
                                         );
-                                        command_result =
-                                            Err("Action is no longer allowed by current safety policy".to_string());
                                     }
                                     Err(ApprovalPreflightError::Retry(reason)) => {
                                         warn!(id, %reason, "Approved action safety preflight could not complete");
@@ -3136,10 +3145,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                                                     &db, id,
                                                                 )
                                                                 .await;
-                                                                command_result = Err(
-                                                                    "Preference saved, but this action is no longer allowed by current safety policy"
-                                                                        .to_string(),
-                                                                );
+                                                                command_result = Err(format!(
+                                                                    "Preference saved, but this action is no longer allowed by current safety policy: {reason}"
+                                                                ));
                                                             }
                                                             Err(
                                                                 ApprovalPreflightError::Retry(
@@ -4724,9 +4732,10 @@ async fn approved_action_ready(
     }
     match safety::rate_limited(db, &approval.action, pol.execution.rate_limit_mins).await {
         Ok(false) => Ok(()),
-        Ok(true) => Err(ApprovalPreflightError::Resolved(
-            "Already completed or repeatedly failed recently".to_string(),
-        )),
+        Ok(true) => Err(ApprovalPreflightError::Resolved(format!(
+            "The same fix already ran, or failed repeatedly, in the last {} minutes",
+            pol.execution.rate_limit_mins
+        ))),
         Err(e) => Err(ApprovalPreflightError::Retry(format!(
             "Safety preflight failed: {e}"
         ))),
