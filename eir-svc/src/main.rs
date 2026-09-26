@@ -1439,11 +1439,15 @@ fn actionable_fingerprint(snap: &SignalSnapshot) -> Option<String> {
     for fc in &snap.file_changes {
         if let Some(le) = &fc.log_event {
             if le.is_actionable() {
+                // The watcher reports only lines a log newly wrote, so the lines are the
+                // identity: two different new errors in one file must not look unchanged.
+                let mut lines = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&le.error_snippets, &mut lines);
                 parts.push(format!(
-                    "F|{}|{}|{}",
+                    "F|{}|{}|{:016x}",
                     le.log_path,
                     le.severity,
-                    le.error_snippets.len()
+                    std::hash::Hasher::finish(&lines)
                 ));
             }
         }
@@ -4926,6 +4930,33 @@ mod analysis_outcome_tests {
             screen_errors: vec![],
             user_report: None,
         }
+    }
+
+    #[test]
+    fn a_different_new_error_in_the_same_log_is_a_change() {
+        let with_line = |line: &str| {
+            let mut snap = snapshot();
+            snap.file_changes = vec![models::FileChange {
+                path: "C:\\Logs\\app.log".into(),
+                kind: "modified".into(),
+                size_bytes: 10,
+                timestamp: chrono::Utc::now(),
+                log_event: Some(models::LogEvent {
+                    program: "App".into(),
+                    log_path: "C:\\Logs\\app.log".into(),
+                    severity: "ERROR".into(),
+                    error_snippets: vec![line.into()],
+                    content_excerpt: String::new(),
+                }),
+            }];
+            actionable_fingerprint(&snap)
+        };
+        assert_eq!(with_line("ERROR disk full"), with_line("ERROR disk full"));
+        assert_ne!(
+            with_line("ERROR disk full"),
+            with_line("ERROR cannot reach the licence server"),
+            "same file, severity and count, but a new error"
+        );
     }
 
     #[test]
