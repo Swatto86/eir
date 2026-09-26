@@ -674,8 +674,12 @@ Eir's signal layer is three independent background collectors in the service plu
     whose title/Static text contains error wording (`looks_like_error`). Control text is
     read with `SendMessageTimeoutW(WM_GETTEXT, SMTO_ABORTIFHUNG, 250 ms)`.
   - **Hung windows** — visible top-level windows `IsHungAppWindow` reports on two
-    consecutive polls (so ≥ ~7 s unresponsive), excluding DWM `Ghost` windows. Titles
-    come from `GetWindowTextW`, which does not message the hung window.
+    consecutive polls (so ≥ ~7 s unresponsive), excluding DWM `Ghost` windows and
+    helper windows a person cannot see (`WS_EX_TOOLWINDOW` or `WS_EX_TRANSPARENT`, e.g.
+    every Tauri app's single-instance `<identifier>-siw` window, style `0x080800A0`, and
+    Discord's in-game overlay — a busy AllTheThings was once reported as "Stopped
+    responding: co.swatto.allthethings-siw"). Titles come from `GetWindowTextW`, which
+    does not message the hung window.
   Each window handle is reported once while it stays on screen (`Tracker`), only while
   the pipe is connected, the service advertises `CAP_SCREEN_ERRORS`, and
   `monitoring.watch_screen_errors` (default on) is set. Eir's own windows are skipped.

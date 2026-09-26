@@ -20,9 +20,9 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, GetClassNameW, GetWindowTextW, GetWindowThreadProcessId,
-    IsHungAppWindow, IsWindowVisible, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
-    WM_GETTEXT,
+    EnumChildWindows, EnumWindows, GetClassNameW, GetWindowLongPtrW, GetWindowTextW,
+    GetWindowThreadProcessId, IsHungAppWindow, IsWindowVisible, SendMessageTimeoutW, GWL_EXSTYLE,
+    SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_GETTEXT, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 
 const POLL: Duration = Duration::from_secs(2);
@@ -262,6 +262,14 @@ fn read_dialog(hwnd: HWND) -> Option<String> {
     Some(text.chars().take(MAX_TEXT_CHARS).collect())
 }
 
+/// Whether a window with these extended styles is one a person can see as "Not
+/// Responding". Tool and click-through windows are helpers: every Tauri app keeps a
+/// visible, transparent tool window titled `<identifier>-siw` for its single-instance
+/// check, and a busy app's helper was reported as a hung app nobody could see.
+fn user_facing(ex_style: u32) -> bool {
+    ex_style & (WS_EX_TOOLWINDOW.0 | WS_EX_TRANSPARENT.0) == 0
+}
+
 /// Blocking Win32 enumeration — call from a blocking task.
 pub fn observe(own_pid: u32) -> Vec<Observation> {
     let mut out = Vec::new();
@@ -278,9 +286,10 @@ pub fn observe(own_pid: u32) -> Vec<Observation> {
         }
         let class = class_name(hwnd);
         let key = hwnd.0 as isize;
-        // SAFETY: a plain query on a window handle.
+        // SAFETY: plain queries on a window handle.
         let hung = unsafe { IsHungAppWindow(hwnd) }.as_bool();
-        if hung && class != "Ghost" {
+        let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+        if hung && class != "Ghost" && user_facing(u32::try_from(ex_style).unwrap_or(0)) {
             let title = window_title(hwnd);
             if !title.trim().is_empty() {
                 if let Some(app) = process_name(pid) {
@@ -348,6 +357,20 @@ pub async fn run(status: SharedStatus, cmd_tx: Sender<UiRequest>, connected: Arc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_tool_windows_are_not_reported_as_hung_apps() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_WINDOWEDGE,
+        };
+        // tauri-plugin-single-instance's `<identifier>-siw` window.
+        let single_instance_helper =
+            WS_EX_NOACTIVATE.0 | WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0;
+        assert!(!user_facing(single_instance_helper));
+        assert!(!user_facing(WS_EX_TOOLWINDOW.0));
+        assert!(user_facing(0));
+        assert!(user_facing(WS_EX_WINDOWEDGE.0));
+    }
 
     fn dialog(hwnd: isize, title: &str, text: &str) -> Observation {
         Observation::Dialog {
