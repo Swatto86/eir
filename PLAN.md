@@ -1,4 +1,4 @@
-# Eir roadmap — v0.36.0 candidate
+# Eir roadmap — v0.36.0
 
 **Release line:** v0.35.0 (published 2026-09-24 from 3b3837a; Windows assets only)
 
@@ -30,6 +30,16 @@ v0.34.18–v0.35.0 service's own log and audit database on the owner's PC.
 
 The only protocol change is the additive, capability-gated `ClearNoticed`: with a v0.35.0
 tray or service on either end, Clear and Dismiss are simply not shown.
+
+Pre-publish evidence (2026-09-26): exact-SHA CI green on 262f232 (version sync, installer,
+release and portable-runner gates, fmt, clippy, tests, the WebDriver e2e suite including
+Dismiss and Clear, the full Tauri build, the installed LocalSystem service smoke, and the
+standalone and self-contained portable smokes; the Linux gate; the dependency audit); the
+local full gate passed on the same tree; the packaged v0.35.0 → v0.36.0 upgrade was
+installed on the owner's PC — the service started as 0.36.0, the tray relaunched from
+Program Files and reconnected, the stored Always Approve for scripts was removed and the
+next proposed script was queued for approval, and analyses that had failed every minute on
+v0.35.0 (Codex's 1,048,576-character input limit) succeeded.
 
 ## What v0.35.0 adds
 
