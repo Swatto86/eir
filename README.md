@@ -162,7 +162,12 @@ are reported instead of being silently treated as queued.
   and time. Partial inventories, deferred checks, and failed empty runs are shown as
   warnings with their notes, never as “No updates found”. One **⬆ Update everything**
   button does the lot; per-app notes still let you correct or silence false positives
-  for your own self-built apps.
+  for your own self-built apps. An app whose update fails in two runs in a row is paused
+  (2 days, then 4, then a week) instead of failing every day; its row says when Eir will
+  next try and why it failed, and **Retry** tries it straight away. Apps installed only
+  for your user account (most self-updating apps, including Tauri and Electron apps) and
+  apps that report no installed version (such as Battle.net) are left to update
+  themselves unless winget handles them, and each run's notes name them.
 - **Usage transparency** — shows AI calls, tokens, and estimated cost in **GBP**.
   Free models are clearly marked as no-cost.
 - **Self-updating** — signed auto-updates via the GitHub releases feed.

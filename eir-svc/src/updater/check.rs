@@ -69,43 +69,92 @@ fn should_skip(cfg: &UpdaterConfig, learned: &HashSet<String>, id: &str) -> bool
             .any(|ig| ig.eq_ignore_ascii_case(id) || ig.eq_ignore_ascii_case(base))
 }
 
-/// Add a manager candidate if it isn't ignored or already covered by an
-/// earlier (more-preferred) manager. The app's primary method is `primary`; the
-/// native installer is appended as a self-healing fallback when available.
-#[allow(clippy::too_many_arguments)]
-fn push_candidate(
-    out: &mut Vec<UpdateCandidate>,
-    seen: &mut HashSet<String>,
-    cfg: &UpdaterConfig,
-    learned: &HashSet<String>,
+/// Whether an installed version can be compared and an update verified. winget lists
+/// apps that register no version (Battle.net) as "Unknown"; it then refuses to upgrade
+/// them without `--include-unknown`, and no update of them could ever be verified, so
+/// they failed in every cycle. They are left to update themselves.
+fn version_known(version: &str) -> bool {
+    let version = version.trim();
+    !version.is_empty() && !version.eq_ignore_ascii_case("unknown")
+}
+
+/// Up to five names for a note, then how many more there are.
+fn name_list(names: &[String]) -> String {
+    let mut shown = names.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+    if names.len() > 5 {
+        shown.push_str(&format!(" and {} more", names.len() - 5));
+    }
+    shown
+}
+
+/// Package-manager candidates gathered so far, de-duplicated by app identity (earlier,
+/// more-preferred managers win).
+struct Collected<'a> {
+    cfg: &'a UpdaterConfig,
+    learned: &'a HashSet<String>,
     native_avail: bool,
-    name: &str,
-    current: &str,
-    available: &str,
-    package_id: Option<String>,
-    primary: Method,
-) {
-    let id = app_id(name);
-    if id.is_empty()
-        || crate::updater::winget_parse::is_noise(name)
-        || should_skip(cfg, learned, &id)
-        || !seen.insert(id.clone())
-    {
-        return;
+    candidates: Vec<UpdateCandidate>,
+    seen: HashSet<String>,
+    /// Apps a manager offers an update for whose installed version is unknown.
+    unknown_version: Vec<String>,
+}
+
+impl<'a> Collected<'a> {
+    fn new(cfg: &'a UpdaterConfig, learned: &'a HashSet<String>, native_avail: bool) -> Self {
+        Self {
+            cfg,
+            learned,
+            native_avail,
+            candidates: Vec::new(),
+            seen: HashSet::new(),
+            unknown_version: Vec::new(),
+        }
     }
-    let mut methods = vec![primary];
-    if native_avail && primary != Method::Native {
-        methods.push(Method::Native);
+
+    /// Add a manager candidate unless it is ignored, noise, already covered by an
+    /// earlier manager (Chocolatey's `vlc` and `vlc.install` are one app — upgrading
+    /// the first brings the second along), or its installed version is unknown. The
+    /// app's primary method is `primary`; the native installer is appended as a
+    /// self-healing fallback when available.
+    fn push(
+        &mut self,
+        name: &str,
+        current: &str,
+        available: &str,
+        package_id: Option<String>,
+        primary: Method,
+    ) {
+        let id = app_id(name);
+        if id.is_empty()
+            || crate::updater::winget_parse::is_noise(name)
+            || should_skip(self.cfg, self.learned, &id)
+        {
+            return;
+        }
+        let base = base_id(&id).to_string();
+        if self.seen.contains(&id) || self.seen.contains(&base) {
+            return;
+        }
+        if !version_known(current) {
+            self.unknown_version.push(name.to_string());
+            return;
+        }
+        self.seen.insert(base);
+        self.seen.insert(id.clone());
+        let mut methods = vec![primary];
+        if self.native_avail && primary != Method::Native {
+            methods.push(Method::Native);
+        }
+        self.candidates.push(UpdateCandidate {
+            guidance: self.cfg.guidance_for(&id).map(str::to_string),
+            id,
+            name: name.to_string(),
+            current: current.to_string(),
+            available: available.to_string(),
+            package_id,
+            methods,
+        });
     }
-    out.push(UpdateCandidate {
-        guidance: cfg.guidance_for(&id).map(str::to_string),
-        id,
-        name: name.to_string(),
-        current: current.to_string(),
-        available: available.to_string(),
-        package_id,
-        methods,
-    });
 }
 
 /// Collect every update candidate across the available methods, de-duplicated by app
@@ -120,8 +169,7 @@ pub async fn collect(
     target_id: Option<&str>,
 ) -> CheckResult {
     let native_avail = available.contains(&Method::Native);
-    let mut candidates: Vec<UpdateCandidate> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut collected = Collected::new(cfg, learned_skips, native_avail);
     let mut notes: Vec<String> = Vec::new();
     let mut had_errors = false;
     let mut cost = 0.0;
@@ -133,12 +181,7 @@ pub async fn collect(
             Ok(updates) => {
                 for u in updates {
                     managed.insert(app_id(&u.name));
-                    push_candidate(
-                        &mut candidates,
-                        &mut seen,
-                        cfg,
-                        learned_skips,
-                        native_avail,
+                    collected.push(
                         &u.name,
                         &u.current,
                         &u.available,
@@ -158,12 +201,7 @@ pub async fn collect(
             Ok(updates) => {
                 for u in updates {
                     managed.insert(app_id(&u.name));
-                    push_candidate(
-                        &mut candidates,
-                        &mut seen,
-                        cfg,
-                        learned_skips,
-                        native_avail,
+                    collected.push(
                         &u.name,
                         &u.current,
                         &u.available,
@@ -183,12 +221,7 @@ pub async fn collect(
             Ok(updates) => {
                 for u in updates {
                     managed.insert(app_id(&u.name));
-                    push_candidate(
-                        &mut candidates,
-                        &mut seen,
-                        cfg,
-                        learned_skips,
-                        native_avail,
+                    collected.push(
                         &u.name,
                         &u.current,
                         &u.available,
@@ -208,12 +241,7 @@ pub async fn collect(
             Ok(updates) => {
                 for u in updates {
                     managed.insert(app_id(&u.name));
-                    push_candidate(
-                        &mut candidates,
-                        &mut seen,
-                        cfg,
-                        learned_skips,
-                        native_avail,
+                    collected.push(
                         &u.name,
                         &u.current,
                         &u.available,
@@ -228,6 +256,17 @@ pub async fn collect(
             }
         }
     }
+    if !collected.unknown_version.is_empty() {
+        notes.push(format!(
+            "Left to update themselves because their installed version is unknown: {}.",
+            name_list(&collected.unknown_version)
+        ));
+    }
+    let Collected {
+        mut candidates,
+        mut seen,
+        ..
+    } = collected;
 
     // The AI web-search pass over apps no manager covers -> native candidates.
     if native_avail {
@@ -388,7 +427,10 @@ async fn check_unmanaged(
             Ok(list_text) => {
                 for (n, v) in parse_unmanaged(list_text, managed) {
                     let key = app_id(&n);
-                    if !should_skip(cfg, learned_skips, &key) && seen.insert(key) {
+                    if version_known(&v)
+                        && !should_skip(cfg, learned_skips, &key)
+                        && seen.insert(key)
+                    {
                         apps.push((n, v));
                     }
                 }
@@ -424,6 +466,28 @@ async fn check_unmanaged(
                     continue;
                 }
                 merge_registry_app(&mut apps, &mut seen, n, v);
+            }
+            // A per-user install lives in the user's profile, so its installer run as
+            // SYSTEM would install a second copy in the wrong place; such apps (the
+            // owner's Tauri apps, Electron apps) also keep themselves current. A name
+            // winget listed from a user registration is dropped here too.
+            let per_user: Vec<String> = inventory
+                .per_user
+                .into_iter()
+                .filter(|name| {
+                    let key = app_id(name);
+                    !managed.contains(&key) && !should_skip(cfg, learned_skips, &key)
+                })
+                .collect();
+            apps.retain(|(name, _)| {
+                let key = app_id(name);
+                !per_user.iter().any(|user_app| app_id(user_app) == key)
+            });
+            if !per_user.is_empty() {
+                notes.push(format!(
+                    "Installed for this user only, so left to update themselves: {}.",
+                    name_list(&per_user)
+                ));
             }
         }
         Err(e) => {
@@ -545,7 +609,7 @@ fn native_candidates_from(
             Some((id, version)) => (id.clone(), version.clone()),
             None => continue,
         };
-        if !is_newer(&u.latest, &cur) {
+        if !version_known(&cur) || !is_newer(&u.latest, &cur) {
             continue;
         }
         if should_skip(cfg, learned_skips, &id) {
@@ -612,20 +676,107 @@ mod tests {
 
     #[test]
     fn windows_components_never_become_update_candidates() {
-        let mut candidates = Vec::new();
-        push_candidate(
-            &mut candidates,
-            &mut HashSet::new(),
-            &UpdaterConfig::default(),
-            &HashSet::new(),
-            true,
+        let cfg = UpdaterConfig::default();
+        let none = HashSet::new();
+        let mut collected = Collected::new(&cfg, &none, true);
+        collected.push(
             "Windows Subsystem for Linux",
             "2.7.8.0",
             "2.7.11",
             Some("Microsoft.WSL".to_string()),
             Method::Winget,
         );
-        assert!(candidates.is_empty());
+        assert!(collected.candidates.is_empty());
+    }
+
+    #[test]
+    fn an_app_with_an_unknown_installed_version_is_left_to_itself() {
+        // winget listed Battle.net (no registered version) as upgradable every day,
+        // then refused the upgrade without --include-unknown: a failure every cycle.
+        let cfg = UpdaterConfig::default();
+        let none = HashSet::new();
+        let mut collected = Collected::new(&cfg, &none, true);
+        collected.push(
+            "Battle.net",
+            "Unknown",
+            "1.19.3.3219",
+            Some("Blizzard.BattleNet".to_string()),
+            Method::Winget,
+        );
+        collected.push(
+            "Blank Version",
+            " ",
+            "2.0",
+            Some("x".to_string()),
+            Method::Winget,
+        );
+        collected.push(
+            "Google Chrome",
+            "153.0",
+            "154.0",
+            Some("Google.Chrome".to_string()),
+            Method::Winget,
+        );
+        let names: Vec<&str> = collected
+            .candidates
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, ["Google Chrome"]);
+        assert_eq!(collected.unknown_version, ["Battle.net", "Blank Version"]);
+    }
+
+    #[test]
+    fn a_choco_package_and_its_install_variant_are_one_candidate() {
+        // `vlc` and `vlc.install` were both upgraded in one cycle; upgrading the first
+        // brings the second along.
+        let cfg = UpdaterConfig::default();
+        let none = HashSet::new();
+        let mut collected = Collected::new(&cfg, &none, true);
+        collected.push(
+            "vlc",
+            "3.0.23",
+            "3.0.24",
+            Some("vlc".to_string()),
+            Method::Choco,
+        );
+        collected.push(
+            "vlc.install",
+            "3.0.23",
+            "3.0.24",
+            Some("vlc.install".to_string()),
+            Method::Choco,
+        );
+        collected.push(
+            "git.install",
+            "2.50",
+            "2.51",
+            Some("git.install".to_string()),
+            Method::Choco,
+        );
+        collected.push(
+            "git",
+            "2.50",
+            "2.51",
+            Some("git".to_string()),
+            Method::Choco,
+        );
+        let names: Vec<&str> = collected
+            .candidates
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, ["vlc", "git.install"]);
+    }
+
+    #[test]
+    fn notes_list_at_most_five_names() {
+        let names: Vec<String> = (1..=7).map(|index| format!("App {index}")).collect();
+        assert_eq!(name_list(&names[..2]), "App 1, App 2");
+        assert_eq!(
+            name_list(&names),
+            "App 1, App 2, App 3, App 4, App 5 and 2 more"
+        );
     }
 
     #[test]
@@ -643,6 +794,7 @@ mod tests {
             ("obsidian".to_string(), "1.5.0".to_string()),
             ("krita".to_string(), "5.2.0".to_string()),
             ("oldtool".to_string(), "2.9.0".to_string()),
+            ("battle.net".to_string(), "Unknown".to_string()),
         ]
         .into_iter()
         .collect();
@@ -651,11 +803,12 @@ mod tests {
             ..UpdaterConfig::default()
         };
         let updates = vec![
-            upd("Obsidian", "1.6.0"), // installed + newer -> kept
-            upd("Krita", "5.3.0"),    // newer but ignored -> dropped
-            upd("OldTool", "2.7.5"),  // installed but older -> dropped
-            upd("Empty", ""),         // no latest -> dropped
-            upd("GhostApp", "9.0"),   // NOT installed (AI fabrication) -> dropped
+            upd("Obsidian", "1.6.0"),  // installed + newer -> kept
+            upd("Krita", "5.3.0"),     // newer but ignored -> dropped
+            upd("OldTool", "2.7.5"),   // installed but older -> dropped
+            upd("Empty", ""),          // no latest -> dropped
+            upd("GhostApp", "9.0"),    // NOT installed (AI fabrication) -> dropped
+            upd("Battle.net", "1.19"), // installed version unknown -> dropped
         ];
         let cands = native_candidates_from(&updates, &installed, &cfg, &HashSet::new());
         let names: Vec<&str> = cands.iter().map(|c| c.name.as_str()).collect();

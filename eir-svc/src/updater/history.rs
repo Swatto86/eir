@@ -257,6 +257,42 @@ pub async fn clear(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+/// Attempts since the display cutoff (Clear starts the repeated-failure count over)
+/// and within the last 60 days, oldest first, for [`crate::updater::backoff`].
+pub async fn attempt_records(
+    pool: &SqlitePool,
+) -> Result<Vec<crate::updater::backoff::AttemptRecord>> {
+    let rows = sqlx::query(
+        "SELECT app_id, cycle_id, success, category, method, detail, created_at \
+         FROM update_attempts \
+         WHERE julianday(created_at) > COALESCE( \
+             (SELECT julianday(value) FROM app_state WHERE key = ?), 0) \
+           AND julianday(created_at) > julianday('now', '-60 days') \
+         ORDER BY id",
+    )
+    .bind(HISTORY_CLEARED_AT_KEY)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let created: String = r.try_get("created_at")?;
+        let category: Option<String> = r.try_get("category")?;
+        out.push(crate::updater::backoff::AttemptRecord {
+            app_id: r.try_get("app_id")?,
+            cycle_id: r.try_get("cycle_id")?,
+            settled: r.try_get::<i64, _>("success")? != 0
+                || category.as_deref()
+                    == category_str(Some(ErrorCategory::AlreadyCurrent)).as_deref(),
+            method: r.try_get("method")?,
+            detail: r.try_get("detail").unwrap_or_default(),
+            at: chrono::DateTime::parse_from_rfc3339(&created)
+                .map(|d| d.timestamp())
+                .unwrap_or(0),
+        });
+    }
+    Ok(out)
+}
+
 /// The most recent attempts, newest first, for the UI's history view.
 pub async fn recent(pool: &SqlitePool, limit: i64) -> Result<Vec<eir_proto::UpdateAttemptRow>> {
     let rows = sqlx::query(
@@ -465,6 +501,74 @@ mod tests {
             last_clean_run(&pool).await.expect("preserved clean run"),
             1234
         );
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn repeated_failures_pause_an_app_until_clear_starts_over() {
+        let path = std::env::temp_dir().join(format!("eir-backoff-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let url = format!(
+            "sqlite:{}?mode=rwc",
+            path.to_string_lossy().replace('\\', "/")
+        );
+        let pool = SqlitePool::connect(&url).await.expect("open db");
+        sqlx::migrate!("../migrations")
+            .run(&pool)
+            .await
+            .expect("migrate");
+        let lua = UpdateCandidate {
+            id: "lua".into(),
+            name: "Lua".into(),
+            current: "5.4.6".into(),
+            available: "5.5.1".into(),
+            package_id: None,
+            guidance: None,
+            methods: vec![Method::Native],
+        };
+        let chrome = UpdateCandidate {
+            id: "google chrome".into(),
+            name: "Google Chrome".into(),
+            ..lua.clone()
+        };
+        let no_url = || {
+            AttemptOutcome::failed(
+                Method::Native,
+                ErrorCategory::NotFound,
+                "no direct installer URL",
+            )
+        };
+        let current = || {
+            AttemptOutcome::failed(
+                Method::Winget,
+                ErrorCategory::AlreadyCurrent,
+                "already current",
+            )
+        };
+        for cycle in [100, 200] {
+            record_attempts(&pool, cycle, &lua, &[no_url()])
+                .await
+                .expect("lua");
+            record_attempts(&pool, cycle, &chrome, &[current()])
+                .await
+                .expect("chrome");
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let records = attempt_records(&pool).await.expect("records");
+        let pauses = crate::updater::backoff::paused_apps(&records, now);
+        assert_eq!(pauses["lua"].failed_runs, 2);
+        assert_eq!(pauses["lua"].last_detail, "no direct installer URL");
+        assert!(
+            !pauses.contains_key("google chrome"),
+            "an app found already current is settled, not failing"
+        );
+
+        clear(&pool).await.expect("clear");
+        let records = attempt_records(&pool).await.expect("records after clear");
+        assert!(crate::updater::backoff::paused_apps(&records, now).is_empty());
 
         drop(pool);
         let _ = std::fs::remove_file(&path);

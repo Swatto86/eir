@@ -191,19 +191,25 @@ pub fn is_winget_catalog_id(id: &str) -> bool {
 ///
 /// We skip only what winget genuinely owns or what updates elsewhere:
 ///   - `MSIX\` packages and msstore-source rows (true Store apps — update via the Store);
+///   - `ARP\User\` registrations (installed in a user's profile — a native installer
+///     run as SYSTEM would install a second copy for SYSTEM);
 ///   - winget-source rows with a real `Publisher.App` catalog id (winget upgrade owns these);
 ///   - noise (drivers/runtimes/etc.);
 ///   - anything already flagged by the winget upgrade pass (`already_managed`,
 ///     case-insensitive by name).
 ///
-/// Everything else — store-correlated standalone apps (Discord) and ARP/unmanaged
-/// apps — is kept. Returns (name, version).
+/// Everything else — store-correlated standalone apps (Discord) and machine-wide
+/// ARP/unmanaged apps — is kept. Returns (name, version).
 pub fn parse_unmanaged(text: &str, already_managed: &HashSet<String>) -> Vec<(String, String)> {
     let (offsets, rows) = winget_table(text);
     let mut apps = Vec::new();
     for row in &rows {
         let id = column(&offsets, row, "Id");
-        if id.starts_with("MSIX\\") {
+        if id.starts_with("MSIX\\")
+            || id
+                .get(..9)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ARP\\User\\"))
+        {
             continue;
         }
         let name = column(&offsets, row, "Name");
@@ -397,6 +403,29 @@ mod tests {
         assert!(!names.contains(&"NVIDIA Graphics Driver"));
         assert!(!names.contains(&"AV1 Video Extension"));
         assert!(!names.contains(&"Microsoft .NET Runtime"));
+    }
+
+    #[test]
+    fn unmanaged_skips_apps_installed_for_one_user() {
+        let widths = [16, 28, 10, 7];
+        let header = ["Name", "Id", "Version", "Source"];
+        let table = render(
+            &widths,
+            &header,
+            &[
+                &["PSForge", "ARP\\User\\X64\\PSForge", "1.4.53", ""],
+                &["Tea", "arp\\user\\x64\\Tea", "2.0.0", ""],
+                &[
+                    "AllTheThings",
+                    "ARP\\Machine\\X64\\AllTheThings",
+                    "0.21.1",
+                    "",
+                ],
+            ],
+        );
+        let apps = parse_unmanaged(&table, &HashSet::new());
+        let names: Vec<&str> = apps.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["AllTheThings"]);
     }
 
     #[test]

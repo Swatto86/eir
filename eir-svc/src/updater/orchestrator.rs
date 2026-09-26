@@ -12,7 +12,7 @@ use crate::updater::domain::{
 };
 use crate::updater::methods::{choco, detect, msstore, native, scoop, winget};
 use crate::updater::verify::{verify_app, VerifyTarget};
-use crate::updater::{check, diagnose, history};
+use crate::updater::{backoff, check, diagnose, history};
 use sqlx::SqlitePool;
 use tracing::warn;
 
@@ -398,6 +398,26 @@ pub async fn run_cycle(
         .unwrap_or_default();
     let mut candidates = check.candidates;
     candidates.sort_by_key(|c| last_attempt.get(&c.id).copied().unwrap_or(0));
+    // An app that failed in consecutive runs waits before Eir tries it again on its own
+    // (see backoff); it is listed with the reason, and Retry on its row tries at once.
+    let pauses = match history::attempt_records(pool).await {
+        Ok(records) => backoff::paused_apps(&records, chrono::Utc::now().timestamp()),
+        Err(e) => {
+            had_errors = true;
+            notes.push(format!(
+                "couldn't read update history for repeated failures: {e}"
+            ));
+            std::collections::HashMap::new()
+        }
+    };
+    let mut paused = Vec::new();
+    candidates.retain(|cand| match pauses.get(&cand.id) {
+        Some(pause) => {
+            paused.push((cand.clone(), pause.clone()));
+            false
+        }
+        None => true,
+    });
     let cap = ctx.config.max_apps_per_run as usize;
     let deferred = candidates.len().saturating_sub(cap);
     if deferred > 0 {
@@ -419,6 +439,14 @@ pub async fn run_cycle(
             had_errors = true;
         }
         results.push((cand, outcomes));
+    }
+    // Listed, not recorded: nothing was attempted, so the failure count stays as it is.
+    for (cand, pause) in paused {
+        let method = Method::from_token(&pause.last_method)
+            .or_else(|| cand.methods.first().copied())
+            .unwrap_or(Method::Native);
+        let outcome = AttemptOutcome::failed(method, ErrorCategory::Blocked, pause.describe());
+        results.push((cand, vec![outcome]));
     }
 
     // Learn from this cycle's (and recent) attempts: an app that keeps timing out with no

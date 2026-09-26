@@ -24,6 +24,9 @@ struct RawEntry {
     name: String,
     #[serde(default)]
     version: String,
+    /// Registered in a user's hive (HKCU/HKU) rather than machine-wide (HKLM).
+    #[serde(default)]
+    user: bool,
 }
 
 #[derive(Deserialize)]
@@ -35,7 +38,11 @@ struct RawInventory {
 }
 
 pub struct InventoryResult {
+    /// Machine-wide apps as `(display_name, display_version)`.
     pub apps: Vec<(String, String)>,
+    /// Apps registered only for a user (installed in a profile), by clean name. Their
+    /// installers must not run as SYSTEM, which would install a copy for SYSTEM.
+    pub per_user: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -81,7 +88,7 @@ function Add-Warning([string]$message) {
   if ($message.Length -gt 300) { $message = $message.Substring(0,300) }
   if ($message) { $warnings.Add($message) }
 }
-function Add-UninstallRoot([string]$path) {
+function Add-UninstallRoot([string]$path, [bool]$perUser) {
   try {
     if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) { return }
     if ($out.Count -ge $maxApps) {
@@ -102,7 +109,7 @@ function Add-UninstallRoot([string]$path) {
           if ($n.Length -gt $maxNameChars -or $v.Length -gt $maxVersionChars) {
             Add-Warning 'registry product entry exceeded field limits'
           } else {
-            $out.Add([pscustomobject]@{name=$n;version=$v})
+            $out.Add([pscustomobject]@{name=$n;version=$v;user=$perUser})
           }
         }
       } catch {
@@ -114,16 +121,16 @@ function Add-UninstallRoot([string]$path) {
   }
 }
 $cv = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
-Add-UninstallRoot "Registry::HKEY_LOCAL_MACHINE\$cv"
-Add-UninstallRoot 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
-Add-UninstallRoot "Registry::HKEY_CURRENT_USER\$cv"
+Add-UninstallRoot "Registry::HKEY_LOCAL_MACHINE\$cv" $false
+Add-UninstallRoot 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall' $false
+Add-UninstallRoot "Registry::HKEY_CURRENT_USER\$cv" $true
 try {
   Get-ChildItem -LiteralPath 'Registry::HKEY_USERS' -Name -ErrorAction Stop |
     Where-Object {
       $_ -match '^S-1-5-21-(?:\d+-){3}\d+$' -or
       $_ -match '^S-1-12-1-(?:\d+-){3}\d+$'
     } |
-    ForEach-Object { Add-UninstallRoot "Registry::HKEY_USERS\$_\$cv" }
+    ForEach-Object { Add-UninstallRoot "Registry::HKEY_USERS\$_\$cv" $true }
 } catch {
   Add-Warning ("could not enumerate loaded user hives: {0}" -f $_.Exception.Message)
 }
@@ -158,7 +165,8 @@ fn parse_inventory(text: &str) -> Result<InventoryResult, String> {
     }
     let mut indexes: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut ambiguous = std::collections::HashSet::new();
-    let mut out: Vec<(String, String)> = Vec::new();
+    // (name, version, registered only for a user so far)
+    let mut out: Vec<(String, String, bool)> = Vec::new();
     let mut warnings = inventory.warnings;
     for e in inventory.apps {
         let name = e.name.trim();
@@ -182,20 +190,30 @@ fn parse_inventory(text: &str) -> Result<InventoryResult, String> {
             if !same {
                 ambiguous.insert(key);
             }
+            // One machine-wide registration makes it a machine-wide app.
+            out[index].2 &= e.user;
             continue;
         }
         indexes.insert(key, out.len());
-        out.push((name.to_string(), version.to_string()));
+        out.push((name.to_string(), version.to_string(), e.user));
     }
     if !ambiguous.is_empty() {
-        out.retain(|(name, _)| !ambiguous.contains(&app_id(name)));
+        out.retain(|(name, _, _)| !ambiguous.contains(&app_id(name)));
         warnings.push(format!(
             "{} ambiguous registry product registration(s) skipped",
             ambiguous.len()
         ));
     }
+    let (per_user, machine): (Vec<_>, Vec<_>) = out.into_iter().partition(|app| app.2);
     Ok(InventoryResult {
-        apps: out,
+        apps: machine
+            .into_iter()
+            .map(|(name, version, _)| (name, version))
+            .collect(),
+        per_user: per_user
+            .into_iter()
+            .map(|(name, _, _)| crate::updater::names::clean_app_name(&name))
+            .collect(),
         warnings: bounded_warnings(warnings),
     })
 }
@@ -229,6 +247,39 @@ mod tests {
 ],"warnings":[]}"#;
         let inventory = parse_inventory(json).expect("parse");
         assert!(inventory.apps.is_empty());
+    }
+
+    #[test]
+    fn per_user_only_apps_are_listed_apart_from_machine_wide_apps() {
+        // PSForge, WattMail and Grok Bot install into the user's profile; running their
+        // installer as SYSTEM would install a second copy for SYSTEM.
+        let json = r#"{"apps":[
+{"name":"AllTheThings","version":"0.21.1","user":false},
+{"name":"PSForge","version":"1.4.53","user":true},
+{"name":"Grok Bot 0.58.0","version":"0.58.0","user":true},
+{"name":"Shared Tool","version":"2.0","user":true},
+{"name":"Shared Tool","version":"2.0","user":false},
+{"name":"Old Script Output","version":"1.0"}
+],"warnings":[]}"#;
+        let inventory = parse_inventory(json).expect("parse");
+        let machine: Vec<&str> = inventory.apps.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            machine,
+            ["AllTheThings", "Shared Tool", "Old Script Output"]
+        );
+        assert_eq!(inventory.per_user, ["PSForge", "Grok Bot"]);
+    }
+
+    #[test]
+    fn inventory_script_marks_user_hives_as_per_user() {
+        assert!(INVENTORY_SCRIPT.contains("user=$perUser"));
+        assert!(INVENTORY_SCRIPT
+            .contains(r#"Add-UninstallRoot "Registry::HKEY_LOCAL_MACHINE\$cv" $false"#));
+        assert!(INVENTORY_SCRIPT
+            .contains(r#"Add-UninstallRoot "Registry::HKEY_CURRENT_USER\$cv" $true"#));
+        assert!(
+            INVENTORY_SCRIPT.contains(r#"Add-UninstallRoot "Registry::HKEY_USERS\$_\$cv" $true"#)
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //! It runs inside the LocalSystem service, so package managers and installers run
 //! with no UAC prompt.
 
+pub mod backoff;
 pub mod check;
 pub mod config;
 pub mod diagnose;
