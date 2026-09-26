@@ -1821,6 +1821,18 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
         }
         Err(e) => warn!("Failed to load pending approvals: {e}"),
     }
+    // Earlier builds let a script be always-approved, which approved every future
+    // script (see FixAction::can_always_approve). Such a grant is never honoured now;
+    // remove it so the Learned view does not show a preference that has no effect.
+    let script_key = FixAction::PowerShellDiagnostic {
+        script: String::new(),
+    }
+    .dedup_key();
+    match prefs::clear_always_approve(&db, &script_key).await {
+        Ok(true) => warn!("Removed a saved Always Approve for PowerShell scripts: each script now needs its own approval"),
+        Ok(false) => {}
+        Err(e) => warn!("Failed to remove the Always Approve for scripts: {e}"),
+    }
     match prefs::list_preferences(&db).await {
         Ok(prefs) => st.action_preferences = prefs,
         Err(e) => warn!("Failed to load action preferences: {e}"),
@@ -2471,14 +2483,17 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                         );
                                         continue;
                                     }
-                                    Ok(Some(prefs::Preference::AlwaysApprove)) => {
+                                    Ok(Some(prefs::Preference::AlwaysApprove))
+                                        if action.can_always_approve() =>
+                                    {
                                         info!(
                                             action = %action_label,
                                             "Always-approve preference — auto-executing"
                                         );
                                         verdict = policy::Verdict::AutoApprove;
                                     }
-                                    Ok(None) => {}
+                                    // A script is never approved in advance, whatever is stored.
+                                    Ok(Some(prefs::Preference::AlwaysApprove)) | Ok(None) => {}
                                     Err(e) => {
                                         warn!("Action preference lookup failed (continuing without it): {e}");
                                     }
@@ -3038,6 +3053,14 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                 (_, None) => {
                                     command_result =
                                         Err("Approval is stale or already resolved".to_string());
+                                }
+                                (Some(prefs::Preference::AlwaysApprove), Some(pa))
+                                    if !pa.action.can_always_approve() =>
+                                {
+                                    command_result = Err(
+                                        "A script is written afresh each time, so it can't be approved in advance; approve this one on its own"
+                                            .to_string(),
+                                    );
                                 }
                                 (Some(pref), Some(pa)) => {
                                     let key = pa.action.dedup_key();

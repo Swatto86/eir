@@ -481,7 +481,7 @@ The frontend was fully rebuilt in v0.17 (still hand-written vanilla HTML/CSS/JS,
 
 ### Clear / Approve / Ignore / Update-now flows
 
-- **Approve / Reject / Ignore / Always Approve**: a delegated click handler on `#approvals` parses the card's `data-id`, **disables all action buttons** to prevent double-submit, and calls `decide_approval` or `set_action_preference`. **Ignore** dismisses the card and persists an `action_preferences` row keyed by `FixAction::dedup_key` so the same semantic fix is never re-queued. **Always Approve** saves the same preference, then claims and executes like Approve; future analysis-loop `RequireApproval` verdicts for that key are promoted to AutoApprove (still rate-limited; Block is never overridden; user-initiated `force_approval` paths are unaffected). Irreversible Always Approve takes the same two-click confirm as Approve. Both preferences are reversible from the Learned view (`clear_action_preference`). Reject still records into `approval_rejections` for RejectedSignal learning.
+- **Approve / Reject / Ignore / Always Approve**: a delegated click handler on `#approvals` parses the card's `data-id`, **disables all action buttons** to prevent double-submit, and calls `decide_approval` or `set_action_preference`. **Ignore** dismisses the card and persists an `action_preferences` row keyed by `FixAction::dedup_key` so the same semantic fix is never re-queued. **Always Approve** saves the same preference, then claims and executes like Approve; future analysis-loop `RequireApproval` verdicts for that key are promoted to AutoApprove (still rate-limited; Block is never overridden; user-initiated `force_approval` paths are unaffected). Irreversible Always Approve takes the same two-click confirm as Approve. It is not offered for a PowerShell diagnostic script, and the service refuses and never honours it there (`FixAction::can_always_approve`): every script shares the one key `powershell_diagnostic` and is written afresh by the AI, so one advance approval would have let any future script run as SYSTEM unreviewed — which is why the policy keeps scripts off the auto-run list. A script grant saved by an earlier build is removed at service start. Both preferences are reversible from the Learned view (`clear_action_preference`). Reject still records into `approval_rejections` for RejectedSignal learning.
 - **Pause**: header button (and tray menu) → `toggle_pause` → `UiMsg::TogglePause`; the button label flips Pause/Resume based on `status.paused` (`main.js:228-229, 266-269`).
 - **Clear (Activity)**: one button fires both `clear_problems` and `clear_executions` then `refresh()`s (`main.js:601-604`).
 - **Clear / Dismiss (What Eir noticed)**: the card's Clear sends `clear_noticed` with no item and toasts the count; an item's Dismiss sends that item. Both are shown only when the service advertises `clear_noticed`, and neither asks for confirmation because nothing recorded is deleted. **Clear (Updates)** → `clear_update_history` (clears displayed attempts and learned update facts, but preserves scheduler timestamps so it cannot trigger an update).
@@ -1322,8 +1322,9 @@ conservative** (skip, deprioritise, lower confidence, go idle), never more aggre
 They are explicit, reversible overrides keyed by `FixAction::dedup_key` in
 `action_preferences` (migration 0020). Ignore suppresses recurring approval cards;
 Always Approve promotes a matching analysis-loop `RequireApproval` to AutoApprove
-without expanding Block or bypassing rate limits / safety preflight. They are the hard
-controls when RejectedSignal's capped confidence haircut is not enough.
+without expanding Block or bypassing rate limits / safety preflight, and only for actions
+whose key pins down what runs (never a PowerShell script). They are the hard controls
+when RejectedSignal's capped confidence haircut is not enough.
 
 ### Approach: deterministic core, AI as a later read-only advisor
 

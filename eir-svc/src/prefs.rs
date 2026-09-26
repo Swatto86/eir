@@ -120,6 +120,18 @@ pub async fn clear_preference(pool: &SqlitePool, action_key: &str) -> Result<boo
     Ok(res.rows_affected() > 0)
 }
 
+/// Remove an Always Approve for `action_key`, leaving any Ignore in place. Returns true
+/// when a row was deleted.
+pub async fn clear_always_approve(pool: &SqlitePool, action_key: &str) -> Result<bool> {
+    let key = validate_key(action_key)?;
+    let res = sqlx::query("DELETE FROM action_preferences WHERE action_key = ? AND preference = ?")
+        .bind(&key)
+        .bind(Preference::AlwaysApprove.as_token())
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// Look up the preference for one semantic action, if any.
 pub async fn get_preference(pool: &SqlitePool, action_key: &str) -> Result<Option<Preference>> {
     let key = validate_key(action_key)?;
@@ -244,6 +256,48 @@ mod tests {
         assert_eq!(list[0].action_key, "b|2");
         assert_eq!(list[0].preference, "always_approve");
         assert_eq!(list[1].preference, "ignore");
+    }
+
+    #[tokio::test]
+    async fn clearing_an_always_approve_leaves_an_ignore_alone() {
+        let pool = pool().await;
+        set_preference(
+            &pool,
+            "powershell_diagnostic",
+            Preference::AlwaysApprove,
+            "Runs a PowerShell script",
+            "",
+        )
+        .await
+        .unwrap();
+        set_preference(
+            &pool,
+            "service_stop|spooler",
+            Preference::Ignore,
+            "Stop",
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(clear_always_approve(&pool, "powershell_diagnostic")
+            .await
+            .unwrap());
+        assert!(!clear_always_approve(&pool, "powershell_diagnostic")
+            .await
+            .unwrap());
+        assert!(!clear_always_approve(&pool, "service_stop|spooler")
+            .await
+            .unwrap());
+        assert_eq!(
+            get_preference(&pool, "service_stop|spooler").await.unwrap(),
+            Some(Preference::Ignore)
+        );
+        assert_eq!(
+            get_preference(&pool, "powershell_diagnostic")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

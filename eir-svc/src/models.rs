@@ -457,6 +457,16 @@ pub enum FixAction {
 }
 
 impl FixAction {
+    /// Whether a standing Always Approve may cover this action. The preference is keyed
+    /// by [`Self::dedup_key`], so the key must pin down what would run. A PowerShell
+    /// script is written afresh by the AI every time and shares one key with every other
+    /// script, so approving one in advance would let any future script run as SYSTEM
+    /// unreviewed — the policy keeps scripts off the auto-run list for exactly that
+    /// reason. Each script is approved on its own card instead.
+    pub fn can_always_approve(&self) -> bool {
+        !matches!(self, FixAction::PowerShellDiagnostic { .. })
+    }
+
     /// Stable identity of the *issue* an action addresses, used to stop duplicate
     /// approval cards piling up across analysis runs. A persistent fault is re-proposed
     /// every cycle, and AI-generated parameters (a PowerShell script body, a registry
@@ -792,6 +802,21 @@ mod tests {
             windows_update_status: "ok".into(),
             security: SecurityPosture::default(),
         }
+    }
+
+    #[test]
+    fn only_actions_whose_key_pins_down_what_runs_can_be_always_approved() {
+        // Every script shares one preference key, so approving one in advance would
+        // approve any future script as SYSTEM.
+        assert!(!FixAction::PowerShellDiagnostic {
+            script: "Get-CimInstance Win32_OperatingSystem".into()
+        }
+        .can_always_approve());
+        assert!(FixAction::DismRestoreHealth.can_always_approve());
+        assert!(FixAction::ServiceRestart {
+            service_name: "Spooler".into()
+        }
+        .can_always_approve());
     }
 
     #[test]

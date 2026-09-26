@@ -1075,6 +1075,13 @@ document.getElementById('startup-list').addEventListener('click', (e) => {
 
 // ── Approvals ────────────────────────────────────────────────────────────────
 
+// A PowerShell script is written afresh each time and one standing approval would cover
+// every future script, so the service refuses Always Approve for it (see
+// FixAction::can_always_approve); `action` is the service's rendering of the fix.
+function canAlwaysApprove(info) {
+  return !String(info.action || '').startsWith('PowerShellDiagnostic');
+}
+
 function approvalCard(info) {
   const flag = info.reversible
     ? '<span class="tag tag-ok">Reversible</span>'
@@ -1106,7 +1113,7 @@ function approvalCard(info) {
       <div class="approval-grid">${grid}</div>
       <div class="approval-actions">
         <button class="btn-approve" data-id="${info.id}"${info.reversible ? '' : ' data-irreversible="1"'}>Approve &amp; run</button>
-        <button class="btn-always-approve" data-id="${info.id}"${info.reversible ? '' : ' data-irreversible="1"'} title="Approve now and auto-approve this fix when it comes up again">Always approve</button>
+        ${canAlwaysApprove(info) ? `<button class="btn-always-approve" data-id="${info.id}"${info.reversible ? '' : ' data-irreversible="1"'} title="Approve now and auto-approve this fix when it comes up again">Always approve</button>` : ''}
         <button class="btn-reject"  data-id="${info.id}">Reject</button>
         <button class="btn-ignore-fix" data-id="${info.id}" title="Dismiss and do not ask about this fix again">Ignore</button>
       </div>
