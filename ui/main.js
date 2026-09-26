@@ -35,7 +35,7 @@ const SERVICE_ACTION_SELECTOR = [
   '#disk-scan', '.disk-clean',
   '#startup-scan', '.startup-toggle',
   '.btn-approve', '.btn-reject', '.btn-ignore-fix', '.btn-always-approve',
-  '.act-undo', '#clear-activity', '#refresh-status',
+  '.act-undo', '#clear-activity', '#clear-noticed', '#refresh-status',
   '#upd-now', '#clear-updates', '.upd-retry', '.upd-ignore', '.upd-note-save',
   '.learned-act', '.pref-clear', '#set-save', '#test-provider', '#set-adv-save', '#set-upd-save',
   '#pause-btn', '#game-btn',
@@ -623,13 +623,18 @@ let lastNoticedSig = '';
 let noticedItems = [];
 function renderNoticed(status) {
   const items = (status.recent_signals || []).slice(0, 8);
-  const canFix = (status.capabilities || []).includes('investigate')
-    && !status.investigation && !status.paused;
-  const sig = JSON.stringify({ items, canFix });
+  const capabilities = status.capabilities || [];
+  const canFix = capabilities.includes('investigate') && !status.investigation && !status.paused;
+  // Older services cannot clear the list, so the buttons only appear when it is supported.
+  const canClear = capabilities.includes('clear_noticed');
+  const sig = JSON.stringify({ items, canFix, canClear });
   if (sig === lastNoticedSig) return;
   lastNoticedSig = sig;
   noticedItems = items;
   document.getElementById('noticed-card').style.display = items.length ? 'block' : 'none';
+  const clearBtn = document.getElementById('clear-noticed');
+  clearBtn.hidden = !canClear;
+  clearBtn.disabled = false;
   document.getElementById('noticed-list').innerHTML = items.map((v, i) => `
     <div class="act-item">
       <div class="act-icon" aria-hidden="true">${SIGNAL_ICONS[v.source] || '•'}</div>
@@ -639,10 +644,30 @@ function renderNoticed(status) {
         <div class="noticed-actions">
           <button class="act-undo" data-explain="${i}" title="Ask Eir what this means and why it happened">Explain</button>
           <button class="act-undo" data-fix="${i}" title="Have Eir investigate this now and fix what it safely can"${canFix ? '' : ' disabled'}>Fix</button>
+          ${canClear ? `<button class="act-undo" data-dismiss="${i}" title="Remove this from the list">Dismiss</button>` : ''}
         </div>
       </div>
     </div>`).join('');
 }
+
+// Clear the whole list (item = null) or dismiss one item. Display-only: nothing Eir
+// recorded is deleted, so no confirmation is needed.
+async function clearNoticed(item, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const result = await invoke('clear_noticed', { item });
+    if (!item) toast(commandMessage(result, 'Cleared'), 'ok');
+  } catch (e) {
+    toast('Could not update the list: ' + e, 'err');
+    if (btn) btn.disabled = false;
+  } finally {
+    refresh();
+  }
+}
+
+document.getElementById('clear-noticed').addEventListener('click', (e) => {
+  clearNoticed(null, e.currentTarget);
+});
 
 async function investigateProblem(description, btn) {
   if (btn) btn.disabled = true;
@@ -660,8 +685,13 @@ async function investigateProblem(description, btn) {
 }
 
 document.getElementById('noticed-list').addEventListener('click', (e) => {
-  const btn = e.target.closest('[data-explain], [data-fix]');
+  const btn = e.target.closest('[data-explain], [data-fix], [data-dismiss]');
   if (!btn) return;
+  if (btn.dataset.dismiss !== undefined) {
+    const item = noticedItems[Number(btn.dataset.dismiss)];
+    if (item) clearNoticed(item, btn);
+    return;
+  }
   const isExplain = btn.dataset.explain !== undefined;
   const item = noticedItems[Number(isExplain ? btn.dataset.explain : btn.dataset.fix)];
   if (!item) return;

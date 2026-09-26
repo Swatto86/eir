@@ -197,7 +197,9 @@ WebdriverIO 9 + `tauri-driver` drive the real debug `eir.exe` and `eir-svc.exe`
 (`target/debug`, built side by side) through the real WebView2 webview and named pipe —
 no app-side test plugin or feature flag. Specs: boot (and proof the UI is on the isolated
 pipe via `is_portable` plus the fake analysis text), the "What Eir noticed" feed from a
-real injected error message box, Explain → Ask answer, Investigate & fix → Ask entry,
+real injected error message box (Dismiss removes it while its dialog stays open, without
+it being listed again; Clear empties the list), Explain → Ask answer, Investigate & fix →
+Ask entry,
 "Watch on-screen errors" persisting across a service + UI restart, and clean exit with
 intact state files.
 
@@ -355,7 +357,7 @@ Two tagged enums carry service output, while a flattened request wrapper preserv
 
 - **`ServiceMsg`** (service → UI) carries either `Status(StatusPayload)` or a correlated `CommandResult { request_id, ok, message }`.
 - **`UiRequest`** flattens an optional `request_id` beside the existing tagged **`UiMsg`**, so old services can still deserialize new commands and new services can acknowledge whether a command was actually applied. The tray falls back to neutral queued feedback when connected to protocol v1.
-- **`UiMsg`** includes approval, pause, settings, refresh, updater, learned-fact, Ask, disk, startup, Game Mode, `RetryAppUpdate`, and `TestProvider`. `RetryAppUpdate` accepts only an id from a currently failed update row and starts a targeted guided retry. `TestProvider` exercises the saved provider/model from the LocalSystem service context without exposing credentials. `RefreshStatus` forces an immediate services-only rescan and status re-settle.
+- **`UiMsg`** includes approval, pause, settings, refresh, updater, learned-fact, Ask, disk, startup, Game Mode, `RetryAppUpdate`, `TestProvider`, the guardian messages (`ReportScreenError`, `Investigate`) and `ClearNoticed`. `RetryAppUpdate` accepts only an id from a currently failed update row and starts a targeted guided retry. `ClearNoticed { item }` clears the "What Eir noticed" feed or dismisses one item. `TestProvider` exercises the saved provider/model from the LocalSystem service context without exposing credentials. `RefreshStatus` forces an immediate services-only rescan and status re-settle.
 
 **`StatusPayload`** is the single snapshot the UI renders. In addition to health, activity, settings, updater/advisor, on-demand-tool, and learned-fact state, protocol v2 adds `protocol_version`, `capabilities`, `svc_version`, `signals_at`, and `signal_errors`. All new fields default so an old peer remains decodable; unavailable metrics render as unknown rather than healthy zeroes.
 
@@ -435,6 +437,7 @@ Commands (`main.rs:28-112`, plus `util.rs`):
 - `set_learned_fact { id, op }` → `UiMsg::SetLearnedFact` (`op` is `pin`, `disable`, or `forget`).
 - `toggle_pause` → `UiMsg::TogglePause`.
 - `clear_problems` / `clear_executions` → `ClearProblems` / `ClearExecutions`.
+- `clear_noticed { item? }` → `ClearNoticed` (refused locally unless the service advertises `CAP_CLEAR_NOTICED`).
 - `refresh_status` → `RefreshStatus` (Dashboard "Refresh" in the Failed Services card; forces a services rescan so a recovered service clears immediately).
 - `update_settings(SettingsUpdate)` → `UpdateSettings`.
 - `run_updates_now` → `RunUpdatesNow`.
@@ -480,7 +483,8 @@ The frontend was fully rebuilt in v0.17 (still hand-written vanilla HTML/CSS/JS,
 
 - **Approve / Reject / Ignore / Always Approve**: a delegated click handler on `#approvals` parses the card's `data-id`, **disables all action buttons** to prevent double-submit, and calls `decide_approval` or `set_action_preference`. **Ignore** dismisses the card and persists an `action_preferences` row keyed by `FixAction::dedup_key` so the same semantic fix is never re-queued. **Always Approve** saves the same preference, then claims and executes like Approve; future analysis-loop `RequireApproval` verdicts for that key are promoted to AutoApprove (still rate-limited; Block is never overridden; user-initiated `force_approval` paths are unaffected). Irreversible Always Approve takes the same two-click confirm as Approve. Both preferences are reversible from the Learned view (`clear_action_preference`). Reject still records into `approval_rejections` for RejectedSignal learning.
 - **Pause**: header button (and tray menu) → `toggle_pause` → `UiMsg::TogglePause`; the button label flips Pause/Resume based on `status.paused` (`main.js:228-229, 266-269`).
-- **Clear (Activity)**: one button fires both `clear_problems` and `clear_executions` then `refresh()`s (`main.js:601-604`). **Clear (Updates)** → `clear_update_history` (clears displayed attempts and learned update facts, but preserves scheduler timestamps so it cannot trigger an update).
+- **Clear (Activity)**: one button fires both `clear_problems` and `clear_executions` then `refresh()`s (`main.js:601-604`).
+- **Clear / Dismiss (What Eir noticed)**: the card's Clear sends `clear_noticed` with no item and toasts the count; an item's Dismiss sends that item. Both are shown only when the service advertises `clear_noticed`, and neither asks for confirmation because nothing recorded is deleted. **Clear (Updates)** → `clear_update_history` (clears displayed attempts and learned update facts, but preserves scheduler timestamps so it cannot trigger an update).
 - **Ignore / AI guidance (per app)**: Ignore sends `set_app_ignore { id, ignore, note:"" }`; blank remains **"unchanged"** so a toggle cannot wipe guidance. Ignoring an app **removes it from Updates Available immediately** (and from the persisted last-cycle snapshot) and stops future checks; Unignore lives in Settings → Ignored apps. “Guide AI” sends `set_app_note`, and the saved-guidance list provides full create/read/update/delete access even after an ignored app leaves the latest results. A failed row also exposes **Retry**, capability-gated by `targeted_update_retry`; it re-checks only that app with the latest guidance and renders the resulting success/current/failure reason in the same row.
 - **Learned fact override**: delegated click on `#learned-list` sends `set_learned_fact { id, op }`; the service updates the persisted fact and refreshes the broadcast list. The same Learned view lists durable **Ignore / Always Approve** preferences (`#pref-list`) with one-click clear via `clear_action_preference`.
 - **Update now**: `#upd-now` → `run_updates_now` → `UiMsg::RunUpdatesNow`. Manual runs work even when scheduling is off; pause or an active updater task disables the button.
@@ -633,11 +637,15 @@ Eir's signal layer is three independent background collectors in the service plu
 
 ### Source 2 — File / log watcher (`signals/file_watch.rs` + `signals/log_parser.rs`)
 
-- **Discovery (`discover_watch_dirs`):** scans fixed roots (`C:\Windows\Logs`, `C:\Windows\Temp`, `C:\Temp`, `C:\Logs`) plus active-user roots (`LOCALAPPDATA`, `APPDATA`, `TEMP`, `TMP`) and `PROGRAMDATA`. A root/subdir is watched only if it contains a recognised recent text file; configured extras are always included when present. Discovery and all subsequent watcher/file reads run while impersonating the active desktop user, so LocalSystem never traverses user-controlled reparse points with SYSTEM authority. The active SID is checked before and after discovery; a user switch discards the previous complete root set before retrying discovery for the new session.
-- **Watching:** `notify` `RecommendedWatcher`, `RecursiveMode::Recursive`, on a dedicated OS thread. It reacts to `Create`/`Modify` only and stays alive when startup discovery is empty. Re-discovery sends an authoritative complete directory set: the watcher is rebuilt, prior OS handles are dropped, and parsed/queued events from the old roots are cleared. This both re-arms recreated directories and prevents roots from a switched-away user accumulating indefinitely.
-- **Per-event parse:** for each changed path it reads `size_bytes` and calls `try_parse_log` (lines 200–209). `try_parse_log` (27–42) skips empty files, requires one of `TEXT_EXTENSIONS` (log/txt/csv/json/xml/ini/cfg/conf/err/out/trace/debug/warn/error/info, lines 14–17), reads at most the **last** `MAX_READ_BYTES = 65_536` of the file (`read_tail`, dropping the partial first line) so a rolling log that has grown past 64 KB still has its newest lines parsed, and runs `log_parser::parse`. A result that is INFO with no error snippets is dropped to `None` (line 37) — only "interesting" log events attach to the `FileChange`.
-- **`log_parser::parse`** (`log_parser.rs:38–48): infers `program` from path shape (Program Files / ProgramData / Windows\Logs\<Subsystem> / AppData\(Local|Roaming|LocalLow), lines 64–125, falling back to parent dir name); `extract_errors` (129–171) walks lines, classifies against `ERROR_KEYWORDS`/`WARN_KEYWORDS` (lines 4–30), raises a severity ceiling (FATAL > ERROR > WARN > INFO), and collects up to 5 non-overlapping snippets (1 line before + 2 after, lines 161–167); `excerpt` caps raw content at `MAX_EXCERPT_CHARS = 2500` with a truncation marker (lines 35, 52–60).
-- **Bounding:** `RING_SIZE = 50`, a true rolling ring buffer (`pop_front` when full). File changes are **drained**, so each `FileChange` is delivered to the AI at most once.
+- **Discovery (`discover_watch_dirs`):** scans fixed roots (`C:\Windows\Logs`, `C:\Windows\Temp`, `C:\Temp`, `C:\Logs`) plus the active user's `AppData\Local` and `AppData\Roaming`, and `PROGRAMDATA`. A root/subdir is watched only if it contains a recognised recent log file; configured extras are always included when present. Discovery and all subsequent watcher/file reads run while impersonating the active desktop user, so LocalSystem never traverses user-controlled reparse points with SYSTEM authority. The active SID is checked before and after discovery; a user switch discards the previous complete root set before retrying discovery for the new session.
+- **Ignored paths (`is_ignored_dir`):** Eir never reads its own folders (a path component `eir`, `co.swatto.eir` or `eir-*`: its data, the tray's WebView2 profile and the scratch folders its AI runs work in, which hold the prompt and the model's reply — watching them made Eir analyse its own analyses) or anything under the user's `AppData\Local\Temp` (build tools and installers leave short-lived logs full of expected errors there; on the owner's PC it was a constant source of alarms and never of a finding). Because `AppData\Local` is watched recursively, this is applied per event, not only at discovery, and it applies to configured directories too.
+- **Watching:** `notify` `RecommendedWatcher`, `RecursiveMode::Recursive`, on a dedicated OS thread. The notify callback queues only `Create`/`Modify` events that touch a log candidate (`worth_queueing`: a `TEXT_EXTENSIONS` file outside the ignored paths, a path-only check) into a bounded channel (`EVENT_QUEUE_SIZE = 256`). Queueing every cache and temp write in the recursive trees, and impersonating the user to stat each before the extension check, overflowed that queue about 440,000 times in three weeks on the owner's PC, dropping real log events and filling `eir.log`; dropped events are now counted and warned about at most every 10 minutes (`DROP_WARNING_EVERY`). It stays alive when startup discovery is empty. Re-discovery sends an authoritative complete directory set: the watcher is rebuilt, prior OS handles are dropped, and parsed/queued events and the per-file memory from the old roots are cleared. This both re-arms recreated directories and prevents roots from a switched-away user accumulating indefinitely.
+- **Per-event parse (`try_parse_log`):** requires one of `TEXT_EXTENSIONS` (log/txt/err/out/trace/debug/warn/error/info). Structured state files — `.json`, `.xml`, `.ini`, `.cfg`, `.conf`, `.csv` — are not logs: apps rewrite them constantly and they are full of keys such as `"errors": 0` or `"crashed": false`, which made them the largest source of false alarms (Sentry session files, statsig caches, Visual Studio state) without once contributing a real finding. What is read comes from `signals/log_memory.rs`, a per-file memory (`LogMemory`, at most 512 files):
+  - **Only new bytes:** a file is read from where the last read stopped (`read_start`/`read_chunk`), at most `MAX_READ_BYTES = 65_536`. A file seen for the first time, one that shrank (rotated or truncated), or one that grew by more than the cap is read from its last 64 KiB with the partial first line dropped, so a busy log past 64 KiB is never skipped. A line still being written (no newline yet) is left for the next read, so it is never parsed in two halves.
+  - **Only new lines:** each error/warning line gets a signature (case-folded words, every token containing a digit — timestamps, counters, ids — collapsed), and a line already reported for that file within `SEEN_TTL` (6 h, the analysis heartbeat) counts toward neither the severity nor the excerpts. Before this, every write re-read the whole 64 KiB tail and re-reported every old error in it: on the owner's PC one harmless Discord line (`[error] Permissions policy violation: encrypted-media`) started an AI analysis every two to three minutes around the clock, and 4,366 of 4,390 analyses in three weeks found nothing.
+  A result that is INFO with no error snippets is dropped to `None` — only new findings attach to the `FileChange`.
+- **`log_parser::parse`:** infers `program` from path shape (Program Files / ProgramData / Windows\Logs\<Subsystem> / AppData\(Local|Roaming|LocalLow), falling back to parent dir name); `extract_errors` walks lines, classifies against `ERROR_KEYWORDS`/`WARN_KEYWORDS`, asks the memory whether each matching line is new, raises a severity ceiling (FATAL > ERROR > WARN > INFO), and collects up to `MAX_SNIPPETS = 5` non-overlapping snippets (1 line before + 2 after), each line clipped to 300 characters (a minified single-line file used to put 75 KiB into one snippet, and snapshots of up to 3.4 MB into the prompt and the audit DB — Codex rejected 37 prompts as over its 1,048,576-character limit); `excerpt` caps raw content at `MAX_EXCERPT_CHARS = 2500` with a truncation marker.
+- **Bounding:** `RING_SIZE = 50`, a true rolling ring buffer (`pop_front` when full). A change to a file that already has an undrained entry is merged into it (`merge_change`: highest severity, snippets appended up to the cap), so a busy log is one entry per analysis rather than dozens. File changes are **drained**, so each `FileChange` is delivered to the AI at most once.
 - **Reactive trigger:** a change whose parsed `LogEvent::is_actionable()` (severity ≠ INFO, or error snippets present — the shared predicate in `models.rs`) pings the decision-loop trigger channel from the watcher thread (`try_send`, never blocks).
 
 ### Source 3 — System state / WMI (`signals/wmi/windows.rs`; `/proc`, `systemctl` and `ip` on Linux)
@@ -687,13 +695,23 @@ Eir's signal layer is three independent background collectors in the service plu
 
 ### "What Eir noticed" feed (`signals/feed.rs`)
 
-`st.recent_signals` (memory-only, newest first, cap 30) is broadcast as
+`st.recent_signals` (`feed::Feed`, memory-only, newest first, cap 30) is broadcast as
 `StatusPayload.recent_signals: Vec<SignalView {at, source, app, summary}>`. Sources:
 Error-level event-log entries and ERROR/FATAL log events from each drained snapshot
 (`feed::from_snapshot`; warnings are too noisy to list), plus screen reports at the moment
 they arrive (`feed::screen_view`). An identical item within 10 min is not repeated;
 summaries are one line, ≤ 240 chars. The dashboard renders the newest 8 with **Explain**
-(pre-fills and sends an Ask question) and **Fix** (starts an investigation).
+(pre-fills and sends an Ask question), **Fix** (starts an investigation) and **Dismiss**,
+and the card header has **Clear**.
+
+Clear and Dismiss send `UiMsg::ClearNoticed { item }` (`item` absent = everything),
+capability-gated by `CAP_CLEAR_NOTICED` so a tray talking to an older service hides both
+buttons. They are display-only: nothing recorded in the audit DB changes, so no
+confirmation is asked. `Feed` remembers what was removed (up to 60 items) so the same
+report arriving again within the 10-minute repeat window is not listed again — a dialog
+still on screen, or the next drain of the same event — while the same problem happening
+later is listed as new. Dismiss matches every field of the item; one already gone
+(truncated from the feed) is reported as such, not as an error.
 
 ### Aggregation and the actionable fingerprint (`eir-svc/src/main.rs`)
 
@@ -1653,9 +1671,15 @@ next work; [CONTEXT.md](CONTEXT.md) records durable decisions and releases.
 
 - Event Log polling and the in-memory drain buffer each cap bursts at 100 records per
   channel; excess older records are not replayed.
-- Automatic file discovery is one directory level deep, limited to recent files, and reads
-  the newest 64 KiB per change. Explicit watched directories bypass discovery, not the tail
-  limit.
+- Automatic file discovery is one directory level deep and limited to recent files. Each
+  change reads at most 64 KiB of newly written text (more than that and only the newest
+  64 KiB), and a line already reported for a file is not reported again for 6 hours — so
+  an app repeating the same real error is re-analysed at most that often. Structured
+  state files (`.json`, `.xml`, `.ini`, `.cfg`, `.conf`, `.csv`), the user's Temp folder
+  and Eir's own folders are never read, including under explicit watched directories.
+- The service log (`eir.log`) is not rotated. The routine lines that grew it to 61 MB in
+  three weeks (dropped-event bursts, a success-rate warning after every analysis, a
+  line per quiet 30-second event-log poll) are gone, but it still grows with activity.
 - The on-screen watcher reads classic Win32 message boxes (`#32770`) only. Custom-drawn
   dialogs (WPF, Electron, UWP) and TaskDialog body text are not read; those apps are still
   covered through their event-log crash/hang records and log files.

@@ -316,7 +316,10 @@ pub fn spawn(
                     if actionable {
                         let _ = trigger.try_send(());
                     }
-                    info!(entries = count, "Event log polled");
+                    // A quiet poll every 30 seconds is not news for the log.
+                    if count > 0 {
+                        info!(entries = count, "Event log polled");
+                    }
                 }
                 _ = shutdown_rx.changed() => break,
             }

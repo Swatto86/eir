@@ -8,9 +8,9 @@ mod screen_watch;
 mod util;
 
 use eir_proto::{
-    AdvisorSettingsUpdate, CommandResult, SettingsUpdate, StatusPayload, UiMsg, UiRequest,
-    UpdaterSettingsUpdate, CAP_COMMAND_RESULTS, CAP_INVESTIGATE, CAP_PROVIDER_TEST,
-    CAP_TARGETED_UPDATE_RETRY,
+    AdvisorSettingsUpdate, CommandResult, SettingsUpdate, SignalView, StatusPayload, UiMsg,
+    UiRequest, UpdaterSettingsUpdate, CAP_CLEAR_NOTICED, CAP_COMMAND_RESULTS, CAP_INVESTIGATE,
+    CAP_PROVIDER_TEST, CAP_TARGETED_UPDATE_RETRY,
 };
 use pipe_client::{CommandWaiters, SharedStatus};
 use serde::{Deserialize, Serialize};
@@ -531,6 +531,15 @@ async fn set_startup_entry(
 #[tauri::command]
 async fn clear_problems(tx: State<'_, UiCmdTx>) -> Result<String, String> {
     send_command(&tx, UiMsg::ClearProblems).await
+}
+
+/// Remove "What Eir noticed" items: the given one, or all of them when `item` is absent.
+#[tauri::command]
+async fn clear_noticed(item: Option<SignalView>, tx: State<'_, UiCmdTx>) -> Result<String, String> {
+    if !supports(&tx.status, CAP_CLEAR_NOTICED) {
+        return Err("The running service cannot clear this list; update it first".to_string());
+    }
+    send_command(&tx, UiMsg::ClearNoticed { item }).await
 }
 
 #[tauri::command]
@@ -1343,6 +1352,7 @@ fn main() {
             update_settings,
             test_provider,
             clear_problems,
+            clear_noticed,
             clear_executions,
             refresh_status,
             set_gaming,

@@ -76,20 +76,67 @@ pub fn screen_view(e: &ScreenError) -> SignalView {
     }
 }
 
-/// Add items newest-first, skipping repeats of an item already listed recently.
-pub fn push(feed: &mut VecDeque<SignalView>, items: Vec<SignalView>) {
-    for item in items {
-        let repeat = feed.iter().any(|f| {
-            f.source == item.source
-                && f.app == item.app
-                && f.summary == item.summary
-                && (item.at - f.at).abs() < REPEAT_WINDOW_SECS
-        });
-        if repeat {
-            continue;
+/// The feed, newest first, plus what the user cleared or dismissed from it. Cleared
+/// items are remembered for the repeat window so the same report arriving again straight
+/// away is not listed again; the same problem happening later is listed as new.
+#[derive(Default)]
+pub struct Feed {
+    items: VecDeque<SignalView>,
+    dismissed: VecDeque<SignalView>,
+}
+
+fn is_repeat(listed: &SignalView, item: &SignalView) -> bool {
+    listed.source == item.source
+        && listed.app == item.app
+        && listed.summary == item.summary
+        && (item.at - listed.at).abs() < REPEAT_WINDOW_SECS
+}
+
+impl Feed {
+    /// The listed items, newest first.
+    pub fn items(&self) -> impl Iterator<Item = &SignalView> {
+        self.items.iter()
+    }
+
+    /// Add items newest-first, skipping repeats of an item listed or dismissed recently.
+    pub fn push(&mut self, items: Vec<SignalView>) {
+        for item in items {
+            if self
+                .items
+                .iter()
+                .chain(self.dismissed.iter())
+                .any(|listed| is_repeat(listed, &item))
+            {
+                continue;
+            }
+            self.items.push_front(item);
+            self.items.truncate(FEED_CAP);
         }
-        feed.push_front(item);
-        feed.truncate(FEED_CAP);
+    }
+
+    /// Remove every listed item; returns how many there were.
+    pub fn clear(&mut self) -> usize {
+        let cleared = self.items.len();
+        let items = std::mem::take(&mut self.items);
+        self.remember_dismissed(items);
+        cleared
+    }
+
+    /// Remove one listed item (matched on every field); returns whether it was listed.
+    pub fn dismiss(&mut self, item: &SignalView) -> bool {
+        let Some(index) = self.items.iter().position(|listed| listed == item) else {
+            return false;
+        };
+        let removed = self.items.remove(index);
+        self.remember_dismissed(removed);
+        true
+    }
+
+    fn remember_dismissed(&mut self, items: impl IntoIterator<Item = SignalView>) {
+        for item in items {
+            self.dismissed.push_front(item);
+        }
+        self.dismissed.truncate(FEED_CAP * 2);
     }
 }
 
@@ -146,28 +193,69 @@ mod tests {
         assert_eq!(items[1].summary, "ERROR disk full");
     }
 
-    #[test]
-    fn push_is_newest_first_bounded_and_skips_recent_repeats() {
-        let mut feed = VecDeque::new();
-        let item = |at: i64, summary: &str| SignalView {
+    fn item(at: i64, summary: &str) -> SignalView {
+        SignalView {
             at,
             source: "screen".into(),
             app: "a.exe".into(),
             summary: summary.into(),
-        };
-        push(&mut feed, vec![item(1, "x"), item(2, "y"), item(3, "x")]);
-        assert_eq!(feed.len(), 2);
-        assert_eq!(feed[0].summary, "y");
-        push(&mut feed, vec![item(1 + REPEAT_WINDOW_SECS, "x")]);
-        assert_eq!(feed[0].summary, "x", "an old repeat is listed again");
-        push(
-            &mut feed,
+        }
+    }
+
+    fn summaries(feed: &Feed) -> Vec<&str> {
+        feed.items().map(|v| v.summary.as_str()).collect()
+    }
+
+    #[test]
+    fn clear_empties_the_feed_and_a_prompt_repeat_stays_hidden() {
+        let mut feed = Feed::default();
+        feed.push(vec![item(10, "a"), item(20, "b")]);
+        assert_eq!(feed.clear(), 2);
+        assert!(summaries(&feed).is_empty());
+        feed.push(vec![item(30, "a")]);
+        assert!(
+            summaries(&feed).is_empty(),
+            "the same report arriving again straight away stays cleared"
+        );
+        feed.push(vec![item(30 + REPEAT_WINDOW_SECS, "a"), item(40, "c")]);
+        assert_eq!(
+            summaries(&feed),
+            ["c", "a"],
+            "a later recurrence and anything new are listed"
+        );
+        assert_eq!(feed.clear(), 2);
+        assert_eq!(feed.clear(), 0);
+    }
+
+    #[test]
+    fn dismiss_removes_only_the_matching_item() {
+        let mut feed = Feed::default();
+        feed.push(vec![item(10, "a"), item(20, "b")]);
+        assert!(feed.dismiss(&item(10, "a")));
+        assert_eq!(summaries(&feed), ["b"]);
+        assert!(!feed.dismiss(&item(10, "a")), "it is no longer listed");
+        assert!(
+            !feed.dismiss(&item(99, "b")),
+            "an item is matched on every field, not the text alone"
+        );
+        feed.push(vec![item(15, "a")]);
+        assert_eq!(summaries(&feed), ["b"], "a dismissed item stays dismissed");
+    }
+
+    #[test]
+    fn push_is_newest_first_bounded_and_skips_recent_repeats() {
+        let mut feed = Feed::default();
+        feed.push(vec![item(1, "x"), item(2, "y"), item(3, "x")]);
+        assert_eq!(summaries(&feed), ["y", "x"]);
+        feed.push(vec![item(1 + REPEAT_WINDOW_SECS, "x")]);
+        assert_eq!(summaries(&feed)[0], "x", "an old repeat is listed again");
+        feed.push(
             (0..50)
                 .map(|i| item(100_000 + i, &format!("m{i}")))
                 .collect(),
         );
-        assert_eq!(feed.len(), FEED_CAP);
-        assert_eq!(feed[0].summary, "m49");
+        assert_eq!(feed.items().count(), FEED_CAP);
+        assert_eq!(summaries(&feed)[0], "m49");
     }
 
     #[test]

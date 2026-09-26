@@ -523,7 +523,7 @@ struct SvcState {
     /// On-screen error reports from the tray, waiting for the next decision cycle.
     screen_errors: signals::screen::ScreenErrorBuffer,
     /// The dashboard's "What Eir noticed" feed (newest first, capped). Memory-only.
-    recent_signals: VecDeque<eir_proto::SignalView>,
+    recent_signals: signals::feed::Feed,
     /// The user-requested investigation that is queued or running.
     investigation: Option<String>,
     /// Unix seconds the last investigation was accepted (0 = never), for the spend guard.
@@ -576,7 +576,7 @@ impl Default for SvcState {
             gaming_until: 0,
             gaming_manual: false,
             screen_errors: signals::screen::ScreenErrorBuffer::default(),
-            recent_signals: VecDeque::new(),
+            recent_signals: signals::feed::Feed::default(),
             investigation: None,
             last_investigate_at: 0,
         }
@@ -625,6 +625,22 @@ fn updater_due(enabled: bool, interval_secs: i64, last_run: i64, st: &SvcState, 
         && !st.updater_running
         && !is_gaming_at(st, now)
         && (last_run == 0 || now.saturating_sub(last_run) >= interval_secs)
+}
+
+/// Apply a "What Eir noticed" clear (`item: None`) or single dismissal and describe it.
+fn noticed_cleared_message(
+    feed: &mut signals::feed::Feed,
+    item: Option<&eir_proto::SignalView>,
+) -> String {
+    match item {
+        Some(item) if feed.dismiss(item) => "Dismissed".to_string(),
+        Some(_) => "That item was already gone".to_string(),
+        None => match feed.clear() {
+            0 => "Nothing to clear".to_string(),
+            1 => "Cleared 1 item".to_string(),
+            count => format!("Cleared {count} items"),
+        },
+    }
 }
 
 fn failed_update_for_retry(
@@ -839,7 +855,7 @@ fn build_status(st: &SvcState) -> StatusPayload {
         svc_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         signals_at: st.signals_at,
         signal_errors: st.signal_errors.clone(),
-        recent_signals: st.recent_signals.iter().cloned().collect(),
+        recent_signals: st.recent_signals.items().cloned().collect(),
         investigation: st.investigation.clone(),
     }
 }
@@ -1909,6 +1925,9 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
     let mut was_gaming = false;
     // Last analysed actionable-signal fingerprint; identical states are skipped.
     let mut last_fingerprint: Option<String> = None;
+    // Last logged fix success rate. It only moves after an execution, so it is logged
+    // when it changes rather than after every analysis (thousands of identical lines).
+    let mut last_success_rate: Option<f32> = None;
     // When we last ran an analysis. None = never (forces a baseline run). Even on
     // a healthy/idle system we re-analyse on this heartbeat so the UI shows a
     // current "system healthy" result and the user can see it's alive.
@@ -2390,12 +2409,15 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                         };
 
                         if let Ok(rate) = safety::success_rate(&db).await {
-                            info!(success_rate = format!("{:.1}%", rate * 100.0), "Execution stats");
-                            if rate < 0.85 {
-                                warn!(
-                                    success_rate = format!("{:.1}%", rate * 100.0),
-                                    "Success rate below 85% — consider raising confidence_threshold"
-                                );
+                            if last_success_rate != Some(rate) {
+                                last_success_rate = Some(rate);
+                                info!(success_rate = format!("{:.1}%", rate * 100.0), "Execution stats");
+                                if rate < 0.85 {
+                                    warn!(
+                                        success_rate = format!("{:.1}%", rate * 100.0),
+                                        "Success rate below 85% — consider raising confidence_threshold"
+                                    );
+                                }
                             }
                         }
 
@@ -2675,6 +2697,13 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                         UiMsg::ClearExecutions => {
                             st.recent_executions.clear();
                             command_result = Ok("Activity cleared".to_string());
+                            pipe.broadcast_status(build_status(&st));
+                        }
+                        UiMsg::ClearNoticed { item } => {
+                            command_result = Ok(noticed_cleared_message(
+                                &mut st.recent_signals,
+                                item.as_ref(),
+                            ));
                             pipe.broadcast_status(build_status(&st));
                         }
                         UiMsg::RefreshStatus => {
@@ -3625,7 +3654,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                     ask::describe_state(&signals::wmi::current(&wmi_shared));
                                 let noticed: Vec<String> = st
                                     .recent_signals
-                                    .iter()
+                                    .items()
                                     .take(12)
                                     .map(ask::feed_line)
                                     .collect();
@@ -3731,7 +3760,7 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                                         let view = signals::feed::screen_view(&report);
                                         if st.screen_errors.push(report) {
                                             info!(app = %view.app, hung, "On-screen error reported by the tray");
-                                            signals::feed::push(&mut st.recent_signals, vec![view]);
+                                            st.recent_signals.push(vec![view]);
                                             // Wake the reactive path like any other collector.
                                             let _ = loop_trigger.try_send(());
                                             pipe.broadcast_status(build_status(&st));
@@ -4189,10 +4218,8 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
                     screen_errors = snapshot.screen_errors.len(),
                     "Signal snapshot collected"
                 );
-                signals::feed::push(
-                    &mut st.recent_signals,
-                    signals::feed::from_snapshot(&snapshot),
-                );
+                st.recent_signals
+                    .push(signals::feed::from_snapshot(&snapshot));
 
                 // ── Feedback after-states ────────────────────────────────────
                 if let Err(e) =
@@ -4446,6 +4473,42 @@ async fn eir_main<F: std::future::Future<Output = ()>>(shutdown: F, portable_pip
 #[cfg(test)]
 mod status_tests {
     use super::*;
+
+    #[test]
+    fn clearing_noticed_items_reaches_the_broadcast_status() {
+        let mut st = SvcState::default();
+        let item = |summary: &str| eir_proto::SignalView {
+            at: 100,
+            source: "app_log".to_string(),
+            app: "discord".to_string(),
+            summary: summary.to_string(),
+        };
+        st.recent_signals
+            .push(vec![item("a"), item("b"), item("c")]);
+        assert_eq!(
+            noticed_cleared_message(&mut st.recent_signals, Some(&item("b"))),
+            "Dismissed"
+        );
+        let listed: Vec<String> = build_status(&st)
+            .recent_signals
+            .into_iter()
+            .map(|v| v.summary)
+            .collect();
+        assert_eq!(listed, ["c", "a"]);
+        assert_eq!(
+            noticed_cleared_message(&mut st.recent_signals, Some(&item("b"))),
+            "That item was already gone"
+        );
+        assert_eq!(
+            noticed_cleared_message(&mut st.recent_signals, None),
+            "Cleared 2 items"
+        );
+        assert!(build_status(&st).recent_signals.is_empty());
+        assert_eq!(
+            noticed_cleared_message(&mut st.recent_signals, None),
+            "Nothing to clear"
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn abort_task_waits_until_the_cancelled_future_is_dropped() {

@@ -134,8 +134,12 @@ are reported instead of being silently treated as queued.
 - **Sees the errors you see** — the tray spots classic error message boxes and apps that
   stop responding ("Not Responding") within a few seconds and hands them to the service
   as a high-priority signal. The dashboard's **What Eir noticed** card lists every error,
-  failing app log, on-screen message and frozen app as it happens, each with **Explain**
-  and **Fix** buttons. Switch it off in Settings → *Watch on-screen errors*.
+  failing app log, on-screen message and frozen app as it happens, each with **Explain**,
+  **Fix** and **Dismiss** buttons; **Clear** empties the list (nothing Eir recorded is
+  deleted, and a problem that happens again is listed again). An app log is reported for
+  what it newly wrote, and a line it keeps repeating is reported at most every six hours,
+  so one chatty app no longer fills the list or keeps the AI busy. Switch on-screen
+  watching off in Settings → *Watch on-screen errors*.
 - **Investigate & fix on demand** — describe a problem in Ask Eir (or press Fix beside a
   noticed error) and Eir runs a focused analysis straight away, reports what it found in
   the chat, and applies fixes through the same safety policy (disruptive ones still wait
@@ -248,8 +252,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify.ps1
 
 `e2e/` is a WebdriverIO + `tauri-driver` suite that drives the real debug
 `eir.exe` + `eir-svc.exe` through the real webview and named pipe — boot,
-"What Eir noticed" from a real injected error dialog, Explain, Investigate &
-fix, settings persistence across a restart, and a clean exit. It runs fully
+"What Eir noticed" from a real injected error dialog (with Dismiss and Clear),
+Explain, Investigate & fix, settings persistence across a restart, and a clean exit. It runs fully
 isolated from an installed Eir: a random portable pipe
 (`EIR_PORTABLE=1` / `\\.\pipe\EirSvcPortable-<random>`), its own temp state
 under an overridden `LOCALAPPDATA`, and a fake `claude_cli` binary

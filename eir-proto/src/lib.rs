@@ -9,6 +9,8 @@ pub const CAP_TARGETED_UPDATE_RETRY: &str = "targeted_update_retry";
 pub const CAP_SCREEN_ERRORS: &str = "screen_errors";
 /// The service accepts [`UiMsg::Investigate`] (user-requested focused analysis).
 pub const CAP_INVESTIGATE: &str = "investigate";
+/// The service accepts [`UiMsg::ClearNoticed`] (clear or dismiss "What Eir noticed").
+pub const CAP_CLEAR_NOTICED: &str = "clear_noticed";
 
 /// Everything this service build supports, for every StatusPayload it sends —
 /// the startup seed, the degraded projection, and the decision loop's snapshot.
@@ -21,6 +23,7 @@ pub fn service_capabilities() -> Vec<String> {
         CAP_TARGETED_UPDATE_RETRY.to_string(),
         CAP_SCREEN_ERRORS.to_string(),
         CAP_INVESTIGATE.to_string(),
+        CAP_CLEAR_NOTICED.to_string(),
     ]
 }
 
@@ -790,6 +793,14 @@ pub enum UiMsg {
     Investigate {
         description: String,
     },
+    /// Remove items from "What Eir noticed": the one given in `item`, or every item
+    /// when `item` is absent. Display-only — nothing Eir recorded is deleted, and the
+    /// same problem happening again later is listed again. Capability-gated by
+    /// [`CAP_CLEAR_NOTICED`].
+    ClearNoticed {
+        #[serde(default)]
+        item: Option<SignalView>,
+    },
 }
 
 #[cfg(test)]
@@ -973,5 +984,37 @@ mod tests {
         assert_eq!(update.watch_screen_errors, None);
         assert!(service_capabilities().contains(&CAP_SCREEN_ERRORS.to_string()));
         assert!(service_capabilities().contains(&CAP_INVESTIGATE.to_string()));
+    }
+
+    #[test]
+    fn clear_noticed_has_stable_wire_shape_and_is_advertised() {
+        let item = SignalView {
+            at: 1_790_000_000,
+            source: "app_log".to_string(),
+            app: "discord".to_string(),
+            summary: "[error] Permissions policy violation".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(UiMsg::ClearNoticed {
+                item: Some(item.clone())
+            })
+            .expect("serialize dismiss"),
+            serde_json::json!({
+                "type": "clear_noticed",
+                "item": {
+                    "at": 1_790_000_000,
+                    "source": "app_log",
+                    "app": "discord",
+                    "summary": "[error] Permissions policy violation"
+                }
+            })
+        );
+        // Clearing everything is the bare command.
+        assert!(matches!(
+            serde_json::from_value::<UiMsg>(serde_json::json!({"type": "clear_noticed"}))
+                .expect("decode clear all"),
+            UiMsg::ClearNoticed { item: None }
+        ));
+        assert!(service_capabilities().contains(&CAP_CLEAR_NOTICED.to_string()));
     }
 }
