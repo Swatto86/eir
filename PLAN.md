@@ -1,9 +1,35 @@
-# Eir roadmap — v0.35.0
+# Eir roadmap — v0.36.0 candidate
 
 **Release line:** v0.35.0 (published 2026-09-24 from 3b3837a; Windows assets only)
 
-**Current code:** v0.35.0 plus the headless Linux build (`eir-svc` + `eirctl`) on `master`,
-not yet released
+**Current code:** v0.36.0 candidate on `master`, not yet published: the headless Linux build
+(`eir-svc` + `eirctl`) and the fixes below, all found in three weeks of the installed
+v0.34.18–v0.35.0 service's own log and audit database on the owner's PC.
+
+## What v0.36.0 adds
+
+- "What Eir noticed" has **Clear** and a per-item **Dismiss** (`ClearNoticed`,
+  capability-gated). Display-only: nothing recorded is deleted.
+- The log watcher reports only what a log newly wrote, once per line per 6 h, and never
+  reads structured state files, the user's Temp folder or Eir's own folders. It had been
+  starting an AI analysis every 2–3 minutes on one harmless Discord line (4,366 of 4,390
+  analyses found nothing; ~10 M input tokens a day), and its dropped-event warnings made
+  up 81% of a 61 MB service log.
+- App updates: apps with no known installed version (Battle.net, which failed every day)
+  and apps installed only for a user (the owner's unsigned per-user Tauri apps, Electron
+  apps) are left to update themselves and named in notes; an app that fails in two runs
+  in a row is paused for 2, then 4, then 7 days, with Retry to try at once; a Chocolatey
+  package and its `.install` variant are one candidate.
+- Safety: a PowerShell script can no longer be always-approved. One such approval had
+  covered every future AI-written script run as SYSTEM; a stored grant is removed at
+  service start.
+- Game Mode holds for up to 10 minutes out of fullscreen while the game still runs, instead
+  of dropping after 60 s and starting deferred analysis mid-session.
+- Hung-window reports skip invisible helper windows (every Tauri app's `-siw` window,
+  Discord's overlay).
+
+The only protocol change is the additive, capability-gated `ClearNoticed`: with a v0.35.0
+tray or service on either end, Clear and Dismiss are simply not shown.
 
 ## What v0.35.0 adds
 
