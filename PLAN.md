@@ -1,10 +1,10 @@
 # Eir roadmap — v0.36.0
 
-**Release line:** v0.35.0 (published 2026-09-24 from 3b3837a; Windows assets only)
+**Release line:** v0.36.0 (published 2026-09-26 from 5fc6d44; Windows assets only)
 
-**Current code:** v0.36.0 candidate on `master`, not yet published: the headless Linux build
-(`eir-svc` + `eirctl`) and the fixes below, all found in three weeks of the installed
-v0.34.18–v0.35.0 service's own log and audit database on the owner's PC.
+**Current code:** v0.36.0: the headless Linux build (`eir-svc` + `eirctl`, source only) and
+the fixes below, all found in three weeks of the installed v0.34.18–v0.35.0 service's own log
+and audit database on the owner's PC.
 
 ## What v0.36.0 adds
 
@@ -64,7 +64,7 @@ the owner's PC (service running, tray launched from the Start Menu and connected
 box reported by the installed tray); a portable live pass with a real provider analysed an
 on-screen error and a hung window; the e2e suite covers Explain and Investigate & fix.
 
-## Headless Linux build (on `master`, unreleased)
+## Headless Linux build (in the v0.36.0 source; no Linux artifacts)
 
 - `eir-svc` builds and runs on Linux under systemd with no tray. `eirctl` (directory
   `eir-cli`, package `eirctl`) drives it over a Unix socket whose peer credentials are
