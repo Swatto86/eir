@@ -485,7 +485,7 @@ async fn check_unmanaged(
             });
             if !per_user.is_empty() {
                 notes.push(format!(
-                    "Installed for this user only, so left to update themselves: {}.",
+                    "Installed for this user only, so updated only by winget or by the app itself: {}.",
                     name_list(&per_user)
                 ));
             }
