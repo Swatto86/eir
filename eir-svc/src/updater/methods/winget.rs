@@ -8,9 +8,9 @@ use crate::updater::domain::{
     classify_error, AttemptOutcome, ErrorCategory, Method, UpdateCandidate, Verification,
 };
 use crate::updater::methods::detect;
-use crate::updater::proc::{self, INSTALL, LIST};
+use crate::updater::proc::{self, INSTALL, LIST, VERIFY};
 use crate::updater::verify::{verify_app, VerifyTarget};
-use crate::updater::winget_parse::{parse_upgrades, AppUpdate};
+use crate::updater::winget_parse::{column, parse_upgrades, winget_table, AppUpdate};
 
 /// List apps with an available update (`winget upgrade`). Runs unprivileged-style
 /// (listing needs no special rights) and parses the fixed-width table.
@@ -44,10 +44,15 @@ pub(crate) fn parse_update_listing(action: &str, output: &str) -> Result<Vec<App
 /// portable-integrity check. `exact` adds `--exact`; it must be OFF when the id is a
 /// truncated prefix (winget truncates long ids in the `winget upgrade` listing), since
 /// `--exact` disables the prefix/substring matching that would otherwise resolve it.
-fn upgrade_args(id: &str, force: bool, exact: bool) -> Vec<String> {
+/// `machine` pins the upgrade to the machine-wide installation when the service runs
+/// it in its own context.
+fn upgrade_args(id: &str, force: bool, exact: bool, machine: bool) -> Vec<String> {
     let mut a = vec!["upgrade".to_string(), "--id".to_string(), id.to_string()];
     if exact {
         a.push("--exact".to_string());
+    }
+    if machine {
+        a.extend(["--scope".to_string(), "machine".to_string()]);
     }
     a.extend([
         "--silent".to_string(),
@@ -59,6 +64,58 @@ fn upgrade_args(id: &str, force: bool, exact: bool) -> Vec<String> {
         a.push("--force".to_string());
     }
     a
+}
+
+/// Whether `winget list --id <id> --exact --scope machine` output lists the package,
+/// i.e. it is installed machine-wide.
+fn listed_machine_wide(output: &str, id: &str) -> bool {
+    let (offsets, rows) = winget_table(output);
+    rows.iter()
+        .any(|row| column(&offsets, row, "Id").eq_ignore_ascii_case(id))
+}
+
+/// Ask winget, in the desktop user's context (which sees every scope), whether a package
+/// is installed machine-wide. Any failure answers no, which keeps the upgrade in the
+/// user's context as before.
+async fn installed_machine_wide(id: &str) -> bool {
+    let (code, output) = run_winget(
+        [
+            "list",
+            "--id",
+            id,
+            "--exact",
+            "--scope",
+            "machine",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+        VERIFY,
+    )
+    .await;
+    code == 0 && listed_machine_wide(&output, id)
+}
+
+/// Run an upgrade in the service's own (LocalSystem) context when `as_service`, else in
+/// the desktop user's context. A machine-wide package's installer needs administrator
+/// rights: started from the desktop user's token it raised a UAC prompt (Chrome,
+/// PowerShell 7, the Visual Studio installer's setup.exe), while run by the service it
+/// needs none. Per-user packages stay in the user's context, where their installers
+/// install into the right profile and need no elevation. The user's elevated token is
+/// deliberately never used: its installers would run as administrator from the user's
+/// writable Temp folder, a silent route to admin rights for anything running as the user.
+async fn run_upgrade(args: Vec<String>, as_service: bool) -> (i32, String) {
+    if !as_service {
+        return run_winget(args, INSTALL).await;
+    }
+    match detect::winget_path_async().await {
+        Some(path) => proc::run_capped(&path.to_string_lossy(), &args, INSTALL).await,
+        None => (
+            -1,
+            "could not find winget for a machine-wide upgrade".to_string(),
+        ),
+    }
 }
 
 /// winget could not resolve the id to an installed/available package — the signature
@@ -121,19 +178,29 @@ pub async fn attempt_with(candidate: &UpdateCandidate, force_first: bool) -> Att
         }
     };
 
-    let (mut code, mut output) = run_winget(upgrade_args(&id, force_first, true), INSTALL).await;
+    // Only the LocalSystem service has rights to lend; a portable or dev run is the user.
+    let mut as_service =
+        crate::ai::cli_user::running_as_local_system() && installed_machine_wide(&id).await;
+    let (mut code, mut output) =
+        run_upgrade(upgrade_args(&id, force_first, true, as_service), as_service).await;
+    // The service's winget could not start or could not see the package: fall back to
+    // the desktop user's context, as before (the installer may then ask for UAC).
+    if as_service && code != 0 && (code == -1 || no_package_found(&output)) {
+        as_service = false;
+        (code, output) = run_upgrade(upgrade_args(&id, force_first, true, false), false).await;
+    }
     // Only auto-escalate to --force when we didn't already start with it.
     if !force_first && code != 0 && portable_modified(&output) {
-        let (c, o) = run_winget(upgrade_args(&id, true, true), INSTALL).await;
-        code = c;
-        output = o;
+        (code, output) = run_upgrade(upgrade_args(&id, true, true, as_service), as_service).await;
     }
     // If --exact found nothing, the id is likely a truncated prefix from the upgrade
     // listing; retry with prefix matching (no --exact) so long-id apps still update.
     if code != 0 && no_package_found(&output) {
-        let (c, o) = run_winget(upgrade_args(&id, force_first, false), INSTALL).await;
-        code = c;
-        output = o;
+        (code, output) = run_upgrade(
+            upgrade_args(&id, force_first, false, as_service),
+            as_service,
+        )
+        .await;
     }
     let clean = clean_winget_output(&output);
 
@@ -298,11 +365,11 @@ mod tests {
 
     #[test]
     fn upgrade_args_appends_force_only_when_asked() {
-        let plain = upgrade_args("GitHub.Copilot", false, true);
+        let plain = upgrade_args("GitHub.Copilot", false, true, false);
         assert_eq!(plain.first().map(String::as_str), Some("upgrade"));
         assert!(plain.iter().any(|a| a == "GitHub.Copilot"));
         assert!(!plain.iter().any(|a| a == "--force"));
-        assert!(upgrade_args("GitHub.Copilot", true, true)
+        assert!(upgrade_args("GitHub.Copilot", true, true, false)
             .iter()
             .any(|a| a == "--force"));
     }
@@ -311,15 +378,50 @@ mod tests {
     fn upgrade_args_exact_flag_is_optional() {
         // A truncated-prefix id must be upgradable WITHOUT --exact (prefix matching).
         assert!(
-            upgrade_args("Microsoft.VisualStudio.2022.Buil", false, true)
+            upgrade_args("Microsoft.VisualStudio.2022.Buil", false, true, false)
                 .iter()
                 .any(|a| a == "--exact")
         );
         assert!(
-            !upgrade_args("Microsoft.VisualStudio.2022.Buil", false, false)
+            !upgrade_args("Microsoft.VisualStudio.2022.Buil", false, false, false)
                 .iter()
                 .any(|a| a == "--exact")
         );
+    }
+
+    #[test]
+    fn a_machine_wide_upgrade_is_pinned_to_the_machine_scope() {
+        let machine = upgrade_args("Microsoft.VisualStudio.BuildTools", false, true, true);
+        let scope = machine
+            .iter()
+            .position(|a| a == "--scope")
+            .expect("--scope present");
+        assert_eq!(machine[scope + 1], "machine");
+        assert!(!upgrade_args("OpenCode.OpenCode", false, true, false)
+            .iter()
+            .any(|a| a == "--scope"));
+    }
+
+    #[test]
+    fn machine_wide_lookup_reads_the_scoped_list_table() {
+        // Recorded from `winget list --id <id> --exact --scope machine` on the owner's PC.
+        let found =
+            "Name                           Id                                Version Source\n\
+--------------------------------------------------------------------------------\n\
+Visual Studio Build Tools 2026 Microsoft.VisualStudio.BuildTools 18.10.2 winget\n";
+        assert!(listed_machine_wide(
+            found,
+            "Microsoft.VisualStudio.BuildTools"
+        ));
+        assert!(listed_machine_wide(
+            found,
+            "microsoft.visualstudio.buildtools"
+        ));
+        assert!(!listed_machine_wide(found, "Microsoft.VisualStudio"));
+        assert!(!listed_machine_wide(
+            "No installed package found matching input criteria.",
+            "OpenCode.OpenCode"
+        ));
     }
 
     #[test]
