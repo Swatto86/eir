@@ -1,4 +1,4 @@
-# Eir roadmap — v0.36.1 candidate
+# Eir roadmap — v0.36.1
 
 **Release line:** v0.36.0 (published 2026-09-26 from 5fc6d44; Windows assets only)
 
@@ -13,6 +13,11 @@
   temporary SYSTEM task running Eir's exact upgrade command for VS Build Tools: it saw the
   machine-wide install and found it current.
 - The run notes say per-user apps are updated only by winget or by the app itself.
+
+Pre-publish evidence (2026-09-27): exact-SHA CI green on 98fad8f (full Windows gate with the
+e2e suite, Tauri build, LocalSystem and portable smokes; Linux gate; dependency audit); the
+local full gate passed on the same tree; the packaged v0.36.0 → v0.36.1 upgrade was installed
+on the owner's PC and the service started as 0.36.1 with the tray connected.
 
 ## What v0.36.0 adds
 
