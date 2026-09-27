@@ -5,7 +5,7 @@ Eir is an autonomous system-repair agent written in Rust. On Windows a LocalSyst
 (OpenCode, Claude, Codex or Cursor) to diagnose them, and applies fixes behind a policy gate;
 a Tauri v2 tray app (`eir-ui`) shows status, approvals and settings over a secured named pipe.
 The same service also builds for Linux, where it runs headless under systemd and is driven by
-the `eirctl` CLI over a Unix socket. The release line is v0.36.0 (Windows assets only); the
+the `eirctl` CLI over a Unix socket. The release line is v0.36.1 (Windows assets only); the
 Linux build ships as source only and is built from source.
 
 ## Layout

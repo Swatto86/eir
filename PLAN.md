@@ -1,8 +1,8 @@
 # Eir roadmap — v0.36.1
 
-**Release line:** v0.36.0 (published 2026-09-26 from 5fc6d44; Windows assets only)
+**Release line:** v0.36.1 (published 2026-09-27 from 8c74f8b; Windows assets only)
 
-**Current code:** v0.36.1 candidate on `master`, not yet published.
+**Current code:** v0.36.1
 
 ## What v0.36.1 adds
 
