@@ -1,12 +1,24 @@
-# Eir roadmap — v0.36.0
+# Eir roadmap — v0.36.1 candidate
 
 **Release line:** v0.36.0 (published 2026-09-26 from 5fc6d44; Windows assets only)
 
-**Current code:** v0.36.0: the headless Linux build (`eir-svc` + `eirctl`, source only) and
-the fixes below, all found in three weeks of the installed v0.34.18–v0.35.0 service's own log
-and audit database on the owner's PC.
+**Current code:** v0.36.1 candidate on `master`, not yet published.
+
+## What v0.36.1 adds
+
+- Machine-wide winget updates are installed by the LocalSystem service itself
+  (`--scope machine`), so their installers no longer raise UAC prompts on the desktop
+  (Chrome, PowerShell 7, the Visual Studio installer's `setup.exe`); per-user packages
+  still update as the user, where they need no elevation. Checked on the owner's PC with a
+  temporary SYSTEM task running Eir's exact upgrade command for VS Build Tools: it saw the
+  machine-wide install and found it current.
+- The run notes say per-user apps are updated only by winget or by the app itself.
 
 ## What v0.36.0 adds
+
+The headless Linux build (`eir-svc` + `eirctl`, source only) and the fixes below, all found
+in three weeks of the installed v0.34.18–v0.35.0 service's own log and audit database on the
+owner's PC.
 
 - "What Eir noticed" has **Clear** and a per-item **Dismiss** (`ClearNoticed`,
   capability-gated). Display-only: nothing recorded is deleted.
