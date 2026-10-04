@@ -71,7 +71,7 @@ gitignored build artifact staged by `eir-ui/build-svc.ps1`.
 - `README.md`: the user guide, install, the Linux (headless) walkthrough and the security model.
 - `ARCHITECTURE.md`: the deep technical reference. Update it in the same commit as a behaviour
   change; read only the sections a task needs.
-- `CONTEXT.md`: durable decisions and releases, newest first, each with its reason.
+- `CONTEXT.md`: the decisions still in force, newest first, each with its reason (releases are Git tags).
 - `PLAN.md`: release line, roadmap and release gate.
 - The public page is `content/projects/eir.md` in the swatto.co.uk repo; keep it in step with
   user-facing features and platforms.

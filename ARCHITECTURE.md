@@ -1642,7 +1642,7 @@ are unchanged — Linux and Windows speak byte-identical JSON lines.
 
 This section records the v0.34.6 baseline, plus the headless Linux build's own limits at
 the end. [PLAN.md](PLAN.md) holds the release gate and
-next work; [CONTEXT.md](CONTEXT.md) records durable decisions and releases.
+next work; [CONTEXT.md](CONTEXT.md) records the decisions still in force.
 
 ### Verification baseline
 
