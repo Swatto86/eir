@@ -1,0 +1,43 @@
+# Code files over 400 lines when the size check was adopted, with their size then.
+# They may not grow: split one, or give it a "size-exception: <reason>" line, to take it off this list.
+# pwsh ~/.agents/scripts/check-file-size.ps1 -WriteBaseline tightens it; it never adds a file or raises a size.
+eir-cli/src/unix.rs	752
+eir-proto/src/lib.rs	1020
+eir-svc/src/ai/cli_user_launch_unix.rs	632
+eir-svc/src/ai/json.rs	591
+eir-svc/src/ai/prompt.rs	692
+eir-svc/src/ask.rs	789
+eir-svc/src/audit.rs	2210
+eir-svc/src/config.rs	1193
+eir-svc/src/disk_scan.rs	460
+eir-svc/src/executor/mod.rs	492
+eir-svc/src/executor/registry.rs	903
+eir-svc/src/explain.rs	571
+eir-svc/src/learn/detect.rs	606
+eir-svc/src/learn/store.rs	576
+eir-svc/src/main.rs	5046
+eir-svc/src/models.rs	972
+eir-svc/src/pipe_server/mod.rs	678
+eir-svc/src/pipe_server/windows.rs	988
+eir-svc/src/policy/mod.rs	522
+eir-svc/src/service_install.rs	427
+eir-svc/src/signals/event_log/unix.rs	648
+eir-svc/src/signals/event_log/windows.rs	426
+eir-svc/src/signals/file_watch.rs	1067
+eir-svc/src/signals/wmi/unix.rs	455
+eir-svc/src/signals/wmi/windows.rs	693
+eir-svc/src/startup_scan.rs	627
+eir-svc/src/updater/check.rs	916
+eir-svc/src/updater/config.rs	490
+eir-svc/src/updater/domain.rs	691
+eir-svc/src/updater/download.rs	965
+eir-svc/src/updater/history.rs	576
+eir-svc/src/updater/methods/native.rs	510
+eir-svc/src/updater/methods/winget.rs	478
+eir-svc/src/updater/orchestrator.rs	988
+eir-svc/src/updater/plan.rs	661
+eir-svc/src/updater/winget_parse.rs	509
+eir-ui/src/main.rs	1837
+eir-ui/src/pipe_client.rs	885
+eir-ui/src/screen_watch.rs	494
+ui/main.js	2470

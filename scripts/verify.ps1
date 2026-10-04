@@ -26,6 +26,15 @@ function Invoke-Step {
 # Version skew between the manifests and Cargo.lock ships mismatched binaries, so it
 # gates first — it is also the cheapest check.
 Invoke-Step 'check-versions' { & (Join-Path $PSScriptRoot 'check-versions.ps1') }
+# File-size guideline (the agent-standards engineering skill): a code file over 400 lines needs a
+# reason on record or a split; files already over it are listed in scripts/file-size-baseline.txt
+# and may not grow.
+Invoke-Step 'file size guideline' {
+    $global:LASTEXITCODE = 0
+    $sizeCheck = Join-Path $HOME '.agents/scripts/check-file-size.ps1'
+    if (Test-Path -LiteralPath $sizeCheck) { pwsh -NoProfile -File $sizeCheck -Root (Get-Location).Path }
+    else { Write-Host 'skip - file size check: ~/.agents/scripts/check-file-size.ps1 not found' }
+}
 Invoke-Step 'installer hooks' { & (Join-Path $PSScriptRoot 'test-installer-hooks.ps1') }
 Invoke-Step 'release gates' { & (Join-Path $PSScriptRoot 'test-release-gates.ps1') }
 Invoke-Step 'portable runner' { & (Join-Path $PSScriptRoot 'test-portable-runner.ps1') }
