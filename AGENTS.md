@@ -31,7 +31,7 @@ gitignored build artifact staged by `eir-ui/build-svc.ps1`.
 - Full Windows gate: `pwsh scripts/verify.ps1` runs version sync, installer/release/portable
   regressions, fmt, clippy, tests, a release build, `cargo deny` and the WebDriver e2e suite
   (`scripts/run-e2e.ps1`, which needs `tauri-driver` and a WebView2-matched `msedgedriver`).
-  It opens real windows and error dialogs and saturates the CPU: on SwatPC, check that Swatto
+  It opens real windows and error dialogs and saturates the CPU: check that Swatto
   is not using the PC before running it.
 - Linux: `cargo clippy --locked -p eir-proto -p eir-svc -p eirctl --all-targets -- -D warnings`
   and the matching `cargo test`. Never `--workspace` there: the tray pulls GTK, which is not
@@ -75,4 +75,4 @@ gitignored build artifact staged by `eir-ui/build-svc.ps1`.
 - `PLAN.md`: release line, roadmap and release gate.
 - The public page is `content/projects/eir.md` in the swatto.co.uk repo; keep it in step with
   user-facing features and platforms.
-- Live installs on SwatPC, swatbox and swatbot are recorded in agent-memory host facts.
+- Live installs are recorded in the maintainer's agent-memory host facts.

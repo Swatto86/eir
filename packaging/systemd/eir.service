@@ -8,7 +8,7 @@ Type=simple
 ExecStart=/usr/local/bin/eir-svc run
 # Runs as root by default. Do NOT add User=root / Group=root: with them this systemd
 # (Ubuntu 26.04) starts the service without CAP_SETUID, so handing the AI CLI to
-# [api] linux_ai_user fails with "Operation not permitted" (verified on swatbox).
+# [api] linux_ai_user fails with "Operation not permitted" (verified on a Linux server).
 Restart=always
 RestartSec=5s
 TimeoutStopSec=30s
@@ -30,7 +30,7 @@ RuntimeDirectoryMode=0755
 # manual `mkdir -p /var/lib/eir` step having been run first.
 StateDirectory=eir
 
-# Hardening — modelled on this host's own proven swatbox-agent.service profile
+# Hardening — modelled on another agent service's proven profile on the same host
 # (confirmed live to permit privilege-dropping subprocess launches from inside it).
 NoNewPrivileges=yes
 ProtectSystem=strict

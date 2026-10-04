@@ -58,7 +58,7 @@ fn already_sent_recently(key: &str) -> bool {
 ///
 /// `#[allow(dead_code)]`: implemented and tested as a ready-to-enable primitive per
 /// the owner's override (ship the hook, but it stays disabled and no call site sends
-/// anything on swatbox without their explicit go-ahead); wiring specific decision-loop
+/// anything on Linux without their explicit go-ahead); wiring specific decision-loop
 /// trigger points is deferred to that follow-up, not part of this port.
 #[allow(dead_code)]
 pub(crate) async fn send(cfg: &NotifyConfig, severity: &str, source: &str, message: &str) {

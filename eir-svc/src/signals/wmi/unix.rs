@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn loopback_with_unknown_operstate_but_carrier_is_up() {
-        // Real `ip -j addr show` shape for lo on swatbox, plus a genuinely down link.
+        // Real `ip -j addr show` shape for lo on a Linux server, plus a genuinely down link.
         let json: serde_json::Value = serde_json::from_str(
             r#"[{"ifname":"lo","flags":["LOOPBACK","UP","LOWER_UP"],"operstate":"UNKNOWN","addr_info":[{"family":"inet","local":"127.0.0.1"}]},
                 {"ifname":"eth1","flags":["BROADCAST","MULTICAST"],"operstate":"DOWN","addr_info":[]},

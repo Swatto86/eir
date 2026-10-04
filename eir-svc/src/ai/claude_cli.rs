@@ -57,7 +57,7 @@ pub(crate) fn resolve_claude_binary(
         }
     }
     // Linux native install path (`npm install -g @anthropic-ai/claude-code` with a
-    // user-level prefix), confirmed live on swatbox.
+    // user-level prefix), confirmed live on a Linux server.
     #[cfg(unix)]
     if let Some(home) = user_profile {
         for candidate in [

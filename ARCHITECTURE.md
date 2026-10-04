@@ -1593,7 +1593,7 @@ never reaches the child, and no setuid binary such as sudo can raise it again), 
 redirected to files in a scratch workspace under that user's `~/.cache/eir/` (created
 with `openat`/`O_NOFOLLOW` so the user cannot redirect root's writes via symlinks). All
 four provider call sites needed no change beyond widening their `#[cfg(windows)]`
-import guard. Verified live on swatbox: the claude child runs as uid/gid 1000 with
+import guard. Verified live on a Linux server: the claude child runs as uid/gid 1000 with
 `Groups: 1000`, `CapEff: 0` and `NoNewPrivs: 1`.
 
 **systemd gotcha:** the unit must not set `User=root`/`Group=root`. On Ubuntu 26.04's
@@ -1610,7 +1610,7 @@ attributed to the `UNIT`, and trigger a reaction at once. Each decision cycle al
 re-reads `systemctl list-units --state=failed` (the full system-state poll is only every
 few minutes) and attaches the last 15 lines of every failed unit's own journal (any
 priority — the real error is usually an info-level stdout/stderr line), so both the
-reaction and any later Investigate see why the unit is down. Live on swatbox, a crashed
+reaction and any later Investigate see why the unit is down. Live on a Linux server, a crashed
 service was analysed within ~30–50 s (bounded by the 60 s minimum gap between cycles)
 with its actual error text.
 

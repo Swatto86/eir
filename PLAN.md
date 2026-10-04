@@ -92,7 +92,7 @@ on-screen error and a hung window; the e2e suite covers Explain and Investigate 
   fix waits for `eirctl approve`), a protected-units backstop, and the AI CLI dropped to a
   non-root `linux_ai_user` with only its primary group and no-new-privileges.
 - Built from source only (README "Linux (headless)"); CI's `verify-linux` job gates it.
-  Running on swatbox (systemd, root) and swatbot (container without systemd, as an
+  Running on a systemd host (as root) and in a container without systemd (as an
   ordinary user).
 
 The Windows build, policy and behaviour are unchanged by it.

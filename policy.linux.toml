@@ -6,9 +6,9 @@
 # security-monitored host can remove evidence other tools rely on — requires a human
 # `eirctl approve` first, diverging from Windows (which
 # auto-whitelists service_restart/service_stop/service_start). This is a deliberate,
-# stricter default for a shared, security-tool-dense multi-service host: swatbox alone
-# runs 30+ confirmed services (Caddy, Wazuh, CrowdSec, Suricata, MariaDB, Postfix,
-# Docker, Tailscale, SSH, plus its own remediation agent) where an unattended restart
+# stricter default for a shared, security-tool-dense multi-service host: one such server
+# can run dozens of services (reverse proxy, intrusion detection, database, mail,
+# containers, VPN, SSH, plus its own remediation agent) where an unattended restart
 # by a second autonomous agent is a materially higher coordination risk than on a
 # single-user Windows PC. See CONTEXT.md's decision entry for the full rationale.
 

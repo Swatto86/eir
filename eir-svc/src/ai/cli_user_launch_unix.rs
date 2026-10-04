@@ -554,7 +554,7 @@ mod tests {
     #[test]
     fn a_root_equivalent_primary_group_is_refused_when_present_on_this_host() {
         // Best-effort: only meaningful where one of DANGEROUS_GROUPS actually exists as
-        // a local group (true on swatbox, and most dev boxes with docker/sudo
+        // a local group (true on most servers and dev boxes with docker/sudo
         // installed) — skip quietly elsewhere rather than failing on a minimal image.
         let Some(gid) = DANGEROUS_GROUPS.iter().find_map(|name| {
             let c_name = CString::new(*name).ok()?;

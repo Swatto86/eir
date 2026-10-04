@@ -513,11 +513,11 @@ mod tests {
         );
     }
 
-    /// Real swatbox `journalctl -o json` samples (fetched live during this session)
+    /// Real `journalctl -o json` samples from a Linux server (fetched live)
     /// decode into the mapped `EventLogEntry` shape.
     #[test]
-    fn a_real_swatbox_kernel_sample_maps_to_an_error_level_entry() {
-        let sample = r#"{"SYSLOG_IDENTIFIER":"kernel","__REALTIME_TIMESTAMP":"1790328612438306","__CURSOR":"s=9626dfc4ac6241148501266f238bebb1;i=25c932;b=4b13c5c21c9f4e66823e122f43d63961;m=1990d4e388;t=65c4b5cf9c122;x=3e4bc76d146d5774","MESSAGE":"[UFW BLOCK] SRC=78.128.112.6 DST=51.195.201.245","__SEQNUM":"2476338","PRIORITY":"4"}"#;
+    fn a_real_linux_kernel_sample_maps_to_an_error_level_entry() {
+        let sample = r#"{"SYSLOG_IDENTIFIER":"kernel","__REALTIME_TIMESTAMP":"1790328612438306","__CURSOR":"s=9626dfc4ac6241148501266f238bebb1;i=25c932;b=4b13c5c21c9f4e66823e122f43d63961;m=1990d4e388;t=65c4b5cf9c122;x=3e4bc76d146d5774","MESSAGE":"[UFW BLOCK] SRC=198.51.100.7 DST=203.0.113.9","__SEQNUM":"2476338","PRIORITY":"4"}"#;
         let raw: RawEntry = serde_json::from_str(sample).expect("real sample decodes");
         let entry = parse_entry(&raw).expect("mapped entry");
         assert_eq!(entry.level, "Warning");
@@ -525,9 +525,9 @@ mod tests {
         assert!(entry.message.contains("UFW BLOCK"));
     }
 
-    /// Real swatbox `journalctl -o json -u ssh.service` sample.
+    /// Real `journalctl -o json -u ssh.service` sample from a Linux server.
     #[test]
-    fn a_real_swatbox_unit_sample_falls_back_to_systemd_unit_as_source() {
+    fn a_real_linux_unit_sample_falls_back_to_systemd_unit_as_source() {
         let sample = r#"{"UNIT":"ssh.service","_SYSTEMD_UNIT":"ssh.service","MESSAGE":"Started ssh.service - OpenBSD Secure Shell server.","_SOURCE_REALTIME_TIMESTAMP":"1790218813199405","__REALTIME_TIMESTAMP":"1790218813199405","PRIORITY":"6"}"#;
         let raw: RawEntry = serde_json::from_str(sample).expect("real sample decodes");
         // PRIORITY 6 (info) is dropped — matches the Windows collector's Error/Warning-only floor.
@@ -625,7 +625,7 @@ mod tests {
 
     #[test]
     fn a_crashed_unit_is_an_error_attributed_to_the_unit() {
-        // Real swatbox shape: systemd (PID 1) reporting a service that exited with an error.
+        // Real shape: systemd (PID 1) reporting a service that exited with an error.
         let raw: RawEntry = serde_json::from_str(
             r#"{"MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","UNIT":"report-exporter.service","SYSLOG_IDENTIFIER":"systemd","PRIORITY":"4","MESSAGE":"report-exporter.service: Failed with result 'exit-code'.","__REALTIME_TIMESTAMP":"1790341213000000"}"#,
         )
